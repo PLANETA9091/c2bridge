@@ -82,7 +82,7 @@ jobs:
             strace zstd curl jq rsync build-essential \
             libc6:i386 libstdc++6:i386 libglib2.0-0:i386 \
             libnss3:i386 libx11-6:i386 libgbm1:i386 libgl1:i386 \
-            libcurl4-gnutls libasound2t64 libpulse0 \
+            libcurl3-gnutls libasound2t64 libpulse0 \
             libxrandr2 libxcursor1 libxi6 libxinerama1 libxxf86vm1 \
             libxss1 libxkbcommon0 libwayland-client0 libwayland-cursor0 \
             libxrender1 libxext6 libxfixes3 libxcomposite1 libxdamage1 \
@@ -93,7 +93,7 @@ jobs:
             strace zstd curl jq rsync build-essential \
             libc6:i386 libstdc++6:i386 libglib2.0-0:i386 \
             libnss3:i386 libx11-6:i386 libgbm1:i386 libgl1:i386 \
-            libcurl4-gnutls libasound2 libpulse0 \
+            libcurl3-gnutls libasound2 libpulse0 \
             libxrandr2 libxcursor1 libxi6 libxinerama1 libxxf86vm1 \
             libxss1 libxkbcommon0 libwayland-client0 libwayland-cursor0 \
             libxrender1 libxext6 libxfixes3 libxcomposite1 libxdamage1 \

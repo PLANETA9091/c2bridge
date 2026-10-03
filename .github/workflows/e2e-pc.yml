@@ -1,0 +1,56 @@
+name: e2e-pc
+
+# Full end-to-end test: launch CS:GO legacy client headless with the bridge
+# injected and connect it to a real CS2 server.
+#
+# Runs on the SELF-HOSTED runner on the test rig (the sleeping PC), because a
+# real Steam session is required for server auth - GitHub-hosted runners have
+# no Steam login (see README "e2e tiers").
+#
+# One-time rig setup (as the user that owns the Steam library):
+#   1. Install the actions runner: config.sh --url <repo> --token <t> --labels c2b-pc
+#      and run ./svc.sh install (runner service must run as that user, needs sudo NOPASSWD).
+#   2. run-test.sh here is invoked with --no-sleep so CI never suspends the rig.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "CS2 target ip:port"
+        default: "152.233.19.133:28022"
+        required: false
+      duration:
+        description: "per-attempt wait, seconds"
+        default: "240"
+        required: false
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, c2b-pc]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deploy harness + run full e2e
+        run: |
+          cp -f run-test.sh /home/agent/c2b-test/run-test.sh
+          bash /home/agent/c2b-test/run-test.sh \
+            --target "${{ inputs.target }}" \
+            --duration "${{ inputs.duration }}" \
+            --no-sleep
+
+      - name: collect run artifacts
+        if: always()
+        run: |
+          L=$(ls -t /home/agent/c2b-test/runs/ | head -1)
+          mkdir -p "$GITHUB_WORKSPACE/e2e-out"
+          cp -f /home/agent/c2b-test/runs/$L/* "$GITHUB_WORKSPACE/e2e-out/" 2>/dev/null || true
+          cat /home/agent/c2b-test/last-result.txt || true
+
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ github.run_id }}
+          path: e2e-out/
+          retention-days: 30

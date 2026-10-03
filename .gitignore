@@ -1,0 +1,20 @@
+build/
+runs/
+e2e-out/
+bundle/
+csgo-lite/
+live_state/
+
+*.so
+*.o
+*.log
+*.snap
+
+# Valve assets must never be committed - not even accidentally:
+reference/
+*.vpk
+*.dll
+*.dylib
+pak01_*
+
+__pycache__/

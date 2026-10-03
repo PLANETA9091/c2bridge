@@ -1,0 +1,97 @@
+name: e2e-node
+
+# Full e2e WITHOUT the user's PC: runs on a self-hosted runner labeled `c2b-node`
+# (a cheap x86 VPS, see scripts/setup-node.sh). The node:
+#   1. pulls the private "lite" CS:GO bundle from MEGA (cached, never in the repo)
+#   2. logs in a burner Steam account (client session needed for server auth)
+#   3. launches the legacy client headless (Xvfb) with the bridge preloaded
+#      in TRANSLATE mode (C2B_UPLINK=1 C2B_DOWNLINK=1)
+#   4. triggers the connection via `steam://connect/<ip:port>` — engine-level
+#      IPC, NO UI automation (the legacy client's modal dialogs are irrelevant)
+#   5. verdict from connection markers / bridge traffic, artifacts uploaded
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "CS2 target ip:port"
+        default: "152.233.19.133:28022"
+        required: false
+      duration:
+        description: "per-phase wait, seconds"
+        default: "240"
+        required: false
+  schedule:
+    - cron: "0 4 * * *"   # daily 04:00 UTC smoke: node alive, bundle present, client boots
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, c2b-node]
+    timeout-minutes: 45
+    env:
+      C2B_TARGET: ${{ inputs.target || '152.233.19.133:28022' }}
+      C2B_DURATION: ${{ inputs.duration || '240' }}
+      C2B_NODE_HOME: ${{ runner.temp }}/c2b-node
+      C2B_GAME_DIR: ${{ runner.temp }}/csgo-lite
+      STEAM_USER: ${{ secrets.STEAM_USER }}
+      STEAM_PASS: ${{ secrets.STEAM_PASS }}
+      STEAM_GUARD_CODE: ${{ secrets.STEAM_GUARD_CODE }}
+      MEGA_URL: ${{ secrets.MEGA_URL }}
+      MEGA_USER: ${{ secrets.MEGA_USER }}
+      MEGA_PASS: ${{ secrets.MEGA_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fetch lite bundle (cached; MEGA hit only on cache miss)
+        uses: actions/cache@v4
+        with:
+          path: ~/csgo-lite
+          key: csgo-lite-v1
+
+      - name: fetch bundle if cache missed
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-bundle.sh "$C2B_GAME_DIR"
+
+      - name: build bridge artifacts
+        run: |
+          mkdir -p "$C2B_NODE_HOME/bridge/lib12"
+          gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2bridge64.so" src/c2bridge.c -ldl
+          gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2b_spy64.so" src/c2b_spy.c -ldl
+          gcc -O2 -DC2B_SELFTEST -o /tmp/c2b-selftest src/c2bridge.c && /tmp/c2b-selftest
+
+      - name: stage libpng12 (project lib12 if present, else build from source)
+        run: |
+          if compgen -G "lib12/libpng12*" >/dev/null; then
+            cp -f lib12/* "$C2B_NODE_HOME/bridge/lib12/"
+          else
+            curl -sL https://sourceforge.net/projects/libpng/files/libpng12/1.2.59/libpng-1.2.59.tar.gz \
+              | tar xz -C /tmp
+            (cd /tmp/libpng-1.2.59 && ./configure --prefix=/usr >/dev/null && make -j2 >/dev/null 2>&1 || true)
+            find /tmp/libpng-1.2.59/.libs -name 'libpng12.so.0*' -exec cp -f {} "$C2B_NODE_HOME/bridge/lib12/" \; 2>/dev/null || true
+          fi
+          ls -la "$C2B_NODE_HOME/bridge/lib12/" || true
+
+      - name: steam client session (burner account)
+        run: bash scripts/steam-login.sh || echo "WARNING: steam login failed — run will likely fail auth"
+
+      - name: run full e2e
+        run: |
+          cp -f scripts/steam-login.sh "$C2B_NODE_HOME/steam-login.sh" 2>/dev/null || true
+          echo "$C2B_TARGET" > "$C2B_NODE_HOME/target.conf"
+          bash run-test-node.sh
+
+      - name: collect artifacts
+        if: always()
+        run: |
+          L=$(ls -t "$C2B_NODE_HOME/runs/" | head -1)
+          mkdir -p e2e-out
+          cp -f "$C2B_NODE_HOME/runs/$L"/* e2e-out/ 2>/dev/null || true
+          cat e2e-out/verdict.txt 2>/dev/null || true
+
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-node-${{ github.run_id }}
+          path: e2e-out/
+          retention-days: 30

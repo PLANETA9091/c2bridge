@@ -1,0 +1,174 @@
+name: e2e-cloud
+
+# FREE e2e on GitHub HOSTED runners — no user PC, no VPS.
+#
+#   runs-on: ubuntu-latest   (public repo: free minutes; private: 2000 min/mo)
+#
+# Where the heavy bytes come from:
+#   - CS:GO "lite bundle" (minimal client, ~1-3 GiB, packed by tools/pack-bundle.sh)
+#     lives in a PRIVATE MEGA folder -> actions/cache keeps it (10 GiB cap), MEGA is
+#     hit only on cache misses. Valve assets NEVER enter the repo.
+#   - Steam client + runtime + login sentry (~1.5 GiB) are cached too, so the
+#     burner account's Steam Guard code is needed only on the very first run.
+#
+# Modes:
+#   smoke (daily schedule): boot legacy client headless -> main menu + bridge
+#     evidence. No server connect, no target involvement.
+#   full (manual): smoke + steam://connect/<target> e2e attempt with translate on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke = boot only; full = boot + connect"
+        default: "full"
+        type: choice
+        options: [smoke, full]
+      target:
+        description: "CS2 target ip:port (full mode)"
+        default: "152.233.19.133:28022"
+        required: false
+      steam_guard_code:
+        description: "Steam Guard code (ONLY for the very first run / new device)"
+        required: false
+  schedule:
+    - cron: "0 4 * * *"   # daily 04:00 UTC smoke
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MODE: ${{ inputs.mode || 'smoke' }}
+      C2B_TARGET: ${{ inputs.target || '152.233.19.133:28022' }}
+      C2B_NODE_HOME: ${{ github.workspace }}/c2b-node
+      C2B_GAME_DIR: ${{ github.workspace }}/csgo-lite
+      STEAM_USER: ${{ secrets.STEAM_USER }}
+      STEAM_PASS: ${{ secrets.STEAM_PASS }}
+      STEAM_GUARD_CODE: ${{ inputs.steam_guard_code || secrets.STEAM_GUARD_CODE }}
+      MEGA_URL: ${{ secrets.MEGA_URL }}
+      MEGA_USER: ${{ secrets.MEGA_USER }}
+      MEGA_PASS: ${{ secrets.MEGA_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- caches: bundle + steam client/sentry ----------
+      - name: restore bundle cache
+        id: cache-bundle
+        uses: actions/cache@v4
+        with:
+          path: ~/csgo-lite
+          key: csgo-lite-v1
+      - name: restore steam client cache (runtime + sentry = silent logins)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/Steam
+            ~/.steam
+          key: steam-node-v2
+
+      # ---------- system deps (each hosted run starts from a clean VM) ----------
+      - name: install system packages
+        run: |
+          set -e
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb xdotool x11-utils x11-xserver-utils xkb-data \
+            strace zstd curl jq rsync build-essential \
+            libc6:i386 libstdc++6:i386 libglib2.0-0:i386 \
+            libnss3:i386 libx11-6:i386 libgbm1:i386 libgl1:i386
+          # Steam client (official Valve repo)
+          if ! [ -x "$HOME/.local/share/Steam/steam.sh" ] && ! command -v steam >/dev/null; then
+            wget -qO- https://repo.steampowered.com/steam/archive/stable/steam.asc \
+              | gpg --dearmor | sudo tee /usr/share/keyrings/steam.gpg >/dev/null
+            echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/steam.gpg] https://repo.steampowered.com/steam/ stable steam" \
+              | sudo tee /etc/apt/sources.list.d/steam.list
+            sudo apt-get update -qq && sudo apt-get install -y -qq steam-launcher
+          fi
+
+      # ---------- bundle ----------
+      - name: fetch lite bundle if cache missed
+        if: steps.cache-bundle.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-bundle.sh "$C2B_GAME_DIR"
+      - name: make bundle tree writable
+        run: |
+          [ -d "$C2B_GAME_DIR" ] || { echo "::error::no bundle at $C2B_GAME_DIR"; exit 1; }
+          chmod -R u+rwX "$C2B_GAME_DIR"
+          du -sh "$C2B_GAME_DIR"; ls "$C2B_GAME_DIR" | head
+
+      # ---------- bridge ----------
+      - name: build bridge artifacts
+        run: |
+          mkdir -p "$C2B_NODE_HOME/bridge/lib12"
+          gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2bridge64.so" src/c2bridge.c -ldl
+          gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2b_spy64.so" src/c2b_spy.c -ldl
+          gcc -O2 -DC2B_SELFTEST -o /tmp/c2b-selftest src/c2bridge.c && /tmp/c2b-selftest
+
+      - name: stage libpng12 (bundle lib12 first, build-from-source fallback)
+        run: |
+          if compgen -G "$C2B_GAME_DIR/lib12/libpng12*" >/dev/null; then
+            cp -f "$C2B_GAME_DIR"/lib12/* "$C2B_NODE_HOME/bridge/lib12/"
+          elif compgen -G "lib12/libpng12*" >/dev/null; then
+            cp -f lib12/* "$C2B_NODE_HOME/bridge/lib12/"
+          else
+            curl -sL https://sourceforge.net/projects/libpng/files/libpng12/1.2.59/libpng-1.2.59.tar.gz \
+              | tar xz -C /tmp
+            (cd /tmp/libpng-1.2.59 && ./configure --prefix=/usr >/dev/null && make -j2 >/dev/null 2>&1 || true)
+            find /tmp/libpng-1.2.59/.libs -name 'libpng12.so.0*' \
+              -exec cp -f {} "$C2B_NODE_HOME/bridge/lib12/" \; 2>/dev/null || true
+          fi
+          ls -la "$C2B_NODE_HOME/bridge/lib12/"
+
+      # ---------- steam session ----------
+      - name: bootstrap steam client (first run downloads runtime)
+        run: |
+          if [ -x "$HOME/.local/share/Steam/steam.sh" ]; then echo "steam cached, skip bootstrap"; exit 0; fi
+          (steam --silent >/tmp/steam-bootstrap.log 2>&1 &) || true
+          for i in $(seq 1 60); do
+            [ -x "$HOME/.local/share/Steam/steam.sh" ] && sleep 20 && echo "bootstrap done (~$((i*5+20))s)" && exit 0
+            sleep 5
+          done
+          echo "::warning::steam bootstrap may be incomplete; steam-login.sh will retry"
+
+      - name: steam login (burner account)
+        run: |
+          if [ -z "$STEAM_USER" ]; then
+            echo "STEAM_USER not set — skipping login (smoke boots standalone; full mode needs the burner account)"
+            exit 0
+          fi
+          bash scripts/steam-login.sh || {
+            echo "::error::steam login failed — set STEAM_USER/STEAM_PASS, and for the"
+            echo "          very first run pass STEAM_GUARD_CODE (email code) via workflow input."
+            tail -50 /tmp/c2b-steam-login.log || true
+            exit 1
+          }
+
+      # ---------- e2e ----------
+      - name: run e2e (${{ env.MODE }})
+        run: |
+          cp -f scripts/steam-login.sh "$C2B_NODE_HOME/steam-login.sh"
+          echo "$C2B_TARGET" > "$C2B_NODE_HOME/target.conf"
+          if [ "$MODE" = "smoke" ]; then
+            C2B_SMOKE=1 bash run-test-node.sh
+          else
+            bash run-test-node.sh
+          fi
+
+      # ---------- artifacts ----------
+      - name: collect artifacts
+        if: always()
+        run: |
+          L=$(ls -t "$C2B_NODE_HOME/runs/" 2>/dev/null | head -1) || true
+          mkdir -p e2e-out
+          [ -n "$L" ] && cp -f "$C2B_NODE_HOME/runs/$L"/* e2e-out/ 2>/dev/null || true
+          echo "=== verdict ==="; cat e2e-out/verdict.txt 2>/dev/null || true
+          echo "=== harness tail ==="; tail -30 e2e-out/harness.log 2>/dev/null || true
+
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cloud-${{ env.MODE }}-${{ github.run_id }}
+          path: e2e-out/
+          retention-days: 30

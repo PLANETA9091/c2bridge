@@ -1,0 +1,42 @@
+name: ci
+
+# Builds the bridge from OUR sources only - no game files needed.
+# Runs on every push/PR: compile matrix + built-in selftest + sanitizer pass.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-selftest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        san: ["", "-fsanitize=address,undefined -fno-omit-frame-pointer"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: selftest (-DC2B_SELFTEST)
+        run: |
+          mkdir -p build
+          ${{ matrix.cc }} -O2 -Wall -Wextra ${{ matrix.san }} \
+            -DC2B_SELFTEST -o build/c2b-selftest src/c2bridge.c
+          ./build/c2b-selftest
+
+      - name: build bridge + spy .so
+        run: |
+          ${{ matrix.cc }} -O2 -shared -fPIC -o build/c2bridge64.so src/c2bridge.c
+          ${{ matrix.cc }} -O2 -shared -fPIC -o build/c2b_spy64.so   src/c2b_spy.c
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: c2bridge-${{ matrix.cc }}-${{ matrix.san != '' && 'asan' || 'plain' }}
+          path: |
+            build/c2bridge64.so
+            build/c2b_spy64.so
+          retention-days: 14

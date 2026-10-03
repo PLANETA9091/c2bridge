@@ -399,18 +399,25 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
   EXTRA_ENV=""
-  VARIANT="shim"
-  if (( ATTEMPT == 3 || ATTEMPT == 5 )); then
-    VARIANT="standalone-noclient"
-    pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
-    sleep 2; pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
-    rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-    sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-    log "attempt $ATTEMPT: steam client killed -> standalone SteamAPI path"
-  fi
-  log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}]"
-  # shellcheck disable=SC2317  # defined per-attempt, guarded at call sites
-  restore_overcommit() { :; }
+  # ALL attempts standalone (run 26): the client-up path is a PROVEN dead end
+  # while no account can log in (nick97806 = Invalid Password, x77173 = guard
+  # code unreachable - MS killed IMAP basic auth). Client killed once before
+  # the loop; each attempt clears stale singletons.
+  VARIANT="standalone-noclient"
+  pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+  pkill -u "$GAME_USER" -f steamwebhelper 2>/dev/null
+  # wait until the client process tree is REALLY gone (a dying client's
+  # singleton state poisons the in-process steamclient's pipe creation)
+  WK=0
+  while pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]|steamwebhelper' >/dev/null 2>&1 && (( WK < 10 )); do
+    sleep 1; (( WK += 1 ))
+    pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+    pkill -9 -u "$GAME_USER" -f steamwebhelper 2>/dev/null
+  done
+  rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+  sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" "$GAME_HOME/.steam/steam.pid" 2>/dev/null
+  ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
+  log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}] client=killed"
 
   # Debugger placement: attempt 1 is ALWAYS a clean launch. gdb disables ASLR
   # by default (disable-randomization on) and that ALONE kills the engine at

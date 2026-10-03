@@ -85,7 +85,7 @@ jobs:
           # The t64/non-t64 variants differ between Ubuntu releases - try both.
           sudo apt-get install -y -qq \
             xvfb xdotool x11-utils x11-xserver-utils xkb-data \
-            strace zstd curl jq rsync build-essential gdb \
+            strace zstd curl jq rsync build-essential gdb imagemagick x11-apps \
             libc6:i386 libstdc++6:i386 libglib2.0-0:i386 \
             libnss3:i386 libx11-6:i386 libgbm1:i386 libgl1:i386 \
             libcurl3-gnutls libasound2t64 libpulse0 \
@@ -96,7 +96,7 @@ jobs:
             libcups2t64 libgtk-3-0t64 libnm0 libopenal1 \
           || sudo apt-get install -y -qq \
             xvfb xdotool x11-utils x11-xserver-utils xkb-data \
-            strace zstd curl jq rsync build-essential gdb \
+            strace zstd curl jq rsync build-essential gdb imagemagick x11-apps \
             libc6:i386 libstdc++6:i386 libglib2.0-0:i386 \
             libnss3:i386 libx11-6:i386 libgbm1:i386 libgl1:i386 \
             libcurl3-gnutls libasound2 libpulse0 \
@@ -162,6 +162,31 @@ jobs:
           ls -la "$C2B_NODE_HOME/bridge/lib12/"
 
       # ---------- steam session ----------
+      - name: probe credentials (steamcmd - invalid password vs steam guard)
+        run: |
+          if [ -z "$STEAM_USER" ]; then echo "STEAM_USER not set — skip probe"; exit 0; fi
+          sudo apt-get install -y -qq lib32gcc-s1 >/dev/null 2>&1 || true
+          mkdir -p /tmp/steamcmd && cd /tmp/steamcmd
+          [ -x steamcmd.sh ] || { curl -fsSL -o sc.tar.gz https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz && tar xzf sc.tar.gz; }
+          set +e
+          timeout 90 ./steamcmd.sh +login "$STEAM_USER" "$STEAM_PASS" +quit > probe.log 2>&1
+          RC=$?
+          set -e
+          # classify WITHOUT leaking secrets
+          if grep -qiE 'Steam Guard|Two-factor|two factor|set_steam_guard_code' probe.log; then
+            echo "PROBE RESULT: STEAM_GUARD — account requires a one-time code (pass via steam_guard_code input once)"
+          elif grep -qiE 'Invalid Password|FAILED login|error code Five' probe.log; then
+            echo "PROBE RESULT: INVALID PASSWORD — fix the STEAM_PASS secret"
+          elif grep -qiE 'waiting for user to enter|confirmation code|email' probe.log; then
+            echo "PROBE RESULT: STEAM_GUARD_EMAIL — code sent to the account email"
+          elif grep -qi 'Logged in OK' probe.log; then
+            echo "PROBE RESULT: LOGGED_IN_OK — credentials valid, NO guard on account"
+          else
+            echo "PROBE RESULT: OTHER (rc=$RC) — see steamcmd-probe.log artifact"
+            tail -15 probe.log | sed 's/[A-Za-z0-9@#$%^&*()_+-]\{8,\}/[redacted]/g'
+          fi
+          cp -f probe.log "$C2B_NODE_HOME/steamcmd-probe.log" 2>/dev/null || true
+
       - name: bootstrap steam client (first run downloads runtime)
         run: |
           if [ -x "$HOME/.local/share/Steam/steam.sh" ]; then echo "steam cached, skip bootstrap"; exit 0; fi
@@ -219,6 +244,18 @@ jobs:
           cp -f ~/.local/share/Steam/config/loginusers.vdf e2e-out/loginusers.vdf 2>/dev/null || true
           cp -f /tmp/c2b-steam-login.log e2e-out/steam-login.log 2>/dev/null || true
           cp -f /tmp/c2b-steam-login-diag.txt e2e-out/steam-login-diag.txt 2>/dev/null || true
+          cp -f "$C2B_NODE_HOME/steamcmd-probe.log" e2e-out/ 2>/dev/null || true
+          # remaining client logs (connection_log etc.) + Xvfb screenshots:
+          # the login form / guard dialog text IS the answer
+          mkdir -p e2e-out/steam-logs
+          for f in ~/.steam/steam/logs/*.txt ~/.local/share/Steam/logs/*.txt; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            [ "$b" = console-linux.txt ] || tail -c 200000 "$f" > "e2e-out/steam-logs/$b"
+          done 2>/dev/null || true
+          if command -v import >/dev/null 2>&1 && pgrep -f 'Xvfb :99' >/dev/null 2>&1; then
+            DISPLAY=:99 import -window root e2e-out/xvfb-state.png 2>/dev/null || true
+          fi
           echo "=== verdict ==="; cat e2e-out/verdict.txt 2>/dev/null || true
           echo "=== harness tail ==="; tail -30 e2e-out/harness.log 2>/dev/null || true
           echo "=== login session ==="; grep -ao '"mostrecent"\s*"1"' e2e-out/loginusers.vdf 2>/dev/null || echo "NO LOGIN SESSION"

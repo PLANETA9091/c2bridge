@@ -130,6 +130,32 @@ if ! steam_client_alive; then
 else
   log "steam client already running (warm)"
 fi
+# A client left over from a CI bootstrap step may be mid-self-update: the pipe
+# file flaps and the engine's SteamAPI_Init dies with "create pipe failed"
+# (run 37127120737, steamclient.so itself loaded OK). Require the pipe to be
+# STABLE (present on two checks 6s apart) while the client process persists;
+# otherwise restart the client under our control.
+steam_client_stable() {
+  [[ -e "$GAME_HOME/.steam/steam.pipe" ]] || return 1
+  pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1 || return 1
+  sleep 6
+  [[ -e "$GAME_HOME/.steam/steam.pipe" ]] \
+    && pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1
+}
+if ! steam_client_stable; then
+  log "steam client unstable -> controlled restart"
+  pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+  sleep 3; pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+  rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+  sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
+    sh -c "nohup '$STEAM_SH' -silent >'$TMPD/steam-restart.log' 2>&1 &"
+  W=0
+  until steam_client_stable; do
+    W=$((W+5)); (( W >= 180 )) && { log "WARNING: steam still unstable after ${W}s"; break; }
+    sleep 5
+  done
+  log "steam stability wait done (~${W}s)"
+fi
 # The engine dlopens ~/.steam/sdk64/steamclient.so to talk to the local Steam
 # client; a bootstrap-only install often lacks the symlink AND the .so itself
 # (run 37125759327). Try known locations, then any 64-bit steamclient.so under

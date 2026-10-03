@@ -43,14 +43,12 @@ int posix_memalign(void **out, size_t align, size_t n)
 }
 void *aligned_alloc(size_t align, size_t n) { return __libc_memalign(align, n); }
 
-size_t malloc_usable_size(void *p)
-{
-    /* glibc: usable size of a malloc block; emulate conservatively with the
-     * malloc_trim-adjacent internal: malloc_usable_size is public in libc */
-    extern size_t __libc_malloc_usable_size(void *) __attribute__((weak));
-    if (__libc_malloc_usable_size) return __libc_malloc_usable_size(p);
-    return 0;
-}
+/* NOTE: malloc_usable_size / mallinfo / malloc_stats / valloc / pvalloc /
+ * posix_memalign are INTENTIONALLY NOT EXPORTED - glibc exports every one of
+ * them publicly and they operate on the SAME heap we forward to, so letting
+ * callers bind to libc avoids signature-mismatch bugs (struct-by-value
+ * mallinfo, weak-symbol hacks) of hand-rolled replicas.
+ */
 
 /* ---- C++ operators (bundle tcmalloc interposes new/delete) ---- */
 void *_Znwmm(size_t n, size_t pad); /* keep c89 compilers calm */
@@ -93,13 +91,10 @@ void  tc_delete_nothrow(void *p, void *x)     { (void)x; __libc_free(p); }
 void  tc_deletearray_nothrow(void *p, void *x){ (void)x; __libc_free(p); }
 void  tc_delete_sized(void *p, size_t n)      { (void)n; __libc_free(p); }
 void  tc_deletearray_sized(void *p, size_t n) { (void)n; __libc_free(p); }
-size_t tc_malloc_size(void *p)                { return malloc_usable_size(p); }
-size_t tc_mallinfo(void)                      { return 0; }
-size_t tc_mallinfo64(void)                    { return 0; }
 
 /* ---- MallocExtension / MallocHook / profiler C API: inert stubs ---- */
-int   MallocExtension_GetAllocatedSize(void *p)             { (void)p; return (int)malloc_usable_size(p); }
-int   MallocExtension_GetEstimatedAllocatedSize(void *p)    { (void)p; return (int)malloc_usable_size(p); }
+int   MallocExtension_GetAllocatedSize(void *p)             { (void)p; return 0; }
+int   MallocExtension_GetEstimatedAllocatedSize(void *p)    { (void)p; return 0; }
 int   MallocExtension_GetOwnership(void *p)                 { (void)p; return 1; }
 int   MallocExtension_GetNumericProperty(const char *s, size_t *v) { (void)s; if (v) *v = 0; return 0; }
 int   MallocExtension_SetNumericProperty(const char *s, size_t v)  { (void)s; (void)v; return 0; }
@@ -115,7 +110,7 @@ int   MallocExtension_VerifyNewMemory(void *p)              { (void)p; return 1;
 int   MallocExtension_VerifyArrayNewMemory(void *p)         { (void)p; return 1; }
 int   MallocExtension_VerifyMallocMemory(void *p)           { (void)p; return 1; }
 int   MallocExtension_MallocMemoryStats(int a, int b, int c){ (void)a; (void)b; (void)c; return 1; }
-int   MallocExtension_GetAllocatedSize_v2(void *p)          { return (int)malloc_usable_size(p); }
+int   MallocExtension_GetAllocatedSize_v2(void *p)          { (void)p; return 0; }
 int   MallocHook_AddNewHook(void *h)                        { (void)h; return 0; }
 int   MallocHook_RemoveNewHook(void *h)                     { (void)h; return 0; }
 int   MallocHook_AddDeleteHook(void *h)                     { (void)h; return 0; }

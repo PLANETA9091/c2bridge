@@ -380,37 +380,37 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  # ---- crash-bisect matrix (run 21/22/23 post-mortem) ----
-  # a1/a2/a5 baseline: deterministic SIGSEGV at protobuf RepeatedPtrFieldBase::Add
-  # inside libvideo.so ~5s in, RIGHT AFTER successful SteamAPI_Init (gdb run 22 a2).
-  # Run 23 EXONERATED the bridge: a3 bridge-passive (C2B_DISABLE_PATCH) and a4
-  # no-preload crashed identically. Remaining suspects, one per attempt:
-  #   a3 = 2013-era bundle tcmalloc_minimal REPLACED by glibc-forwarding shim
-  #        (fault addr = deterministic offset from libvideo base = allocator VA
-  #        bookkeeping signature; shim stress-tested standalone + full engine boot
-  #        locally)
-  #   a4 = vm.overcommit_memory back to 0 (workflow set =1 in 3791c9e; runs
-  #        BEFORE that setting had no protobuf crash, only mmap-ENOMEM noise)
-  EXTRA_ENV=""
+  # ---- crash fix + attempt variants (run 24 post-mortem) ----
+  # ROOT CAUSES FOUND:
+  #  (1) the bundle's 2013 libtcmalloc_minimal.so.0 -> deterministic protobuf
+  #      RepeatedPtrFieldBase::Add SEGV in libvideo.so ~5s after launch
+  #      (run 24 a3: tcmalloc shim -> ZERO crashes; runs 21/22/23/24 baseline
+  #      all crash). The shim is therefore DEFAULT for EVERY attempt.
+  #  (2) with the crash gone the REAL blocker shows: "[S_API FAIL] SteamAPI
+  #      Init() failed; connect to global user failed" - the runner's steam
+  #      client sits at the LOGIN DIALOG (nick97806 = Invalid Password per
+  #      steamcmd probe; x77173 = Steam Guard email pending). Connect-to-
+  #      global-user requires a LOGGED-IN client.
+  #  VARIANT a3/a5 = standalone: kill the client, rm the pipe -> the engine's
+  #  SteamAPI_Init takes the standalone path (steam_appid.txt is in the
+  #  bundle): steamclient.so loads in-process and creates a LOCAL user - no
+  #  login needed to reach the main menu.
   LDPREFIX=""
+  [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
-  VARIANT="baseline"
-  if (( ATTEMPT == 3 )) && [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]]; then
-    LDPREFIX="$BIN_DST/shim"
-    VARIANT="tcmalloc-shim"
-  elif (( ATTEMPT == 4 )); then
-    VARIANT="overcommit0"
-    OC_BEFORE=$(sudo -n cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo "")
-    sudo -n sysctl -w -q vm.overcommit_memory=0 >/dev/null 2>&1 \
-      || log "WARNING: cannot set overcommit_memory=0"
-    log "attempt $ATTEMPT: overcommit_memory=$(sudo -n cat /proc/sys/vm/overcommit_memory 2>/dev/null)"
+  EXTRA_ENV=""
+  VARIANT="shim"
+  if (( ATTEMPT == 3 || ATTEMPT == 5 )); then
+    VARIANT="standalone-noclient"
+    pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+    sleep 2; pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+    rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+    sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+    log "attempt $ATTEMPT: steam client killed -> standalone SteamAPI path"
   fi
   log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}]"
   # shellcheck disable=SC2317  # defined per-attempt, guarded at call sites
-  restore_overcommit() {
-    [[ -n "${OC_BEFORE:-}" ]] && sudo -n sysctl -w -q vm.overcommit_memory="$OC_BEFORE" >/dev/null 2>&1
-    OC_BEFORE=""
-  }
+  restore_overcommit() { :; }
 
   # Debugger placement: attempt 1 is ALWAYS a clean launch. gdb disables ASLR
   # by default (disable-randomization on) and that ALONE kills the engine at
@@ -477,8 +477,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     fi
     sleep 5
   done
-  (( MENU )) || { restore_overcommit; continue; }
-  restore_overcommit
+  (( MENU )) || continue
   sleep 8   # let steam auth settle
 
   # ---- smoke mode: boot proof only (menu + no preload failure) ----

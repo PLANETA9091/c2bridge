@@ -27,13 +27,14 @@ jobs:
         env:
           MEGA_USER: ${{ secrets.MEGA_USER }}
           MEGA_PASS: ${{ secrets.MEGA_PASS }}
+          MEGA_DIR: ${{ secrets.MEGA_DIR }}
           MEGA_URL: ${{ secrets.MEGA_URL }}
         run: |
           set -e
           if [[ -n "${MEGA_USER}" && -n "${MEGA_PASS}" ]]; then
             rclone config create c2bmega mega \
               user "$MEGA_USER" pass "$(rclone obscure "$MEGA_PASS")" >/dev/null
-            R="c2bmega:c2b-lite"
+            R="c2bmega:${MEGA_DIR:-csgo}"
           elif [[ -n "${MEGA_URL}" ]]; then
             R=":mega,link=${MEGA_URL}:"
           else

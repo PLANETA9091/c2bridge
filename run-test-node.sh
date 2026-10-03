@@ -187,6 +187,8 @@ if ! steam_client_stable; then
   done
   log "steam stability wait done (~${W}s)"
 fi
+# zenity --error dialogs (e.g. the userns complaint) BLOCK client startup
+pkill -f "zenity --error" 2>/dev/null || true
 # ---- steam self-update awareness ----
 # A bootstrap-only client has NO linux64/steamclient.so; the client installs
 # it when its self-update completes. Wait (bounded) for that marker, then

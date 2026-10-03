@@ -105,6 +105,10 @@ jobs:
             libxrender1 libxext6 libxfixes3 libxcomposite1 libxdamage1 \
             libudev1 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
             libcups2 libgtk-3-0 libnm0 libopenal1
+          # Ubuntu 24.04: AppArmor restricts unprivileged user namespaces and
+          # modern Steam REFUSES to start without them (zenity "Steam now
+          # requires user namespaces" -> no IPC pipe -> SteamAPI_Init fatal).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           # Steam client: official steam.deb. NOTE: the apt-repo route is dead —
           # Valve's steam.asc key URL 404s (2026-10), which killed run 37115551190.
           if ! [ -x "$HOME/.local/share/Steam/steam.sh" ] && ! command -v steam >/dev/null; then

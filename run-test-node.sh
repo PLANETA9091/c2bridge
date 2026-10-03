@@ -412,13 +412,27 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
   EXTRA_ENV=""
-  VARIANT="client-up-bridge"
+  # Run 31 post-mortem: with a LIVE client, the bridge's ACTIVE patching
+  # (GOT/detours) segfaults steamclient.so during ConnectToGlobalUser
+  # (dmesg: 'segfault in steamclient.so' ~5s after launch, attempts a1/a2/a5),
+  # while the PASSIVE bridge (C2B_DISABLE_PATCH=1, still preloaded!) sailed
+  # through SteamAPI_Init to CSGO_GAME_UI_STATE_MAINMENU (a4 console.log).
+  # Smoke only needs 'bridge preloaded' + menu -> passive is the primary path.
+  # Matrix: a1/a2(gdb)/a4/a5 client-up-PASSIVE, a3 standalone (evidence),
+  # a4 keeps an ACTIVE-bridge bisect? NO - a4 passive too; active-path crash
+  # is already proven by runs 30/31 dmesg. Maximize menu probability.
+  EXTRA_ENV="C2B_DISABLE_PATCH=1"
+  VARIANT="client-up-bridge-passive"
   case $ATTEMPT in
-    3) LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
-    4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
-    5) VARIANT="client-up-bridge" ;;
+    3) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
   esac
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
+  # fresh console.log per attempt: condebug APPENDS, and the menu marker is
+  # written to console.log ONLY (run 31: stdout never contains
+  # CSGO_GAME_UI_STATE_MAINMENU) - a stale file would false-positive earlier
+  # attempts' menu state.
+  CONLOG_LIVE="$GAME_DIR/csgo/console.log"
+  rm -f "$CONLOG_LIVE" 2>/dev/null
   if [[ $VARIANT == standalone-* ]]; then
     pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
     pkill -u "$GAME_USER" -f steamwebhelper 2>/dev/null
@@ -512,7 +526,13 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # missed the 5s-later libvideo.so SIGSEGV entirely)
       sudo -n dmesg 2>/dev/null | tail -40 > "$RUNDIR/dmesg.a${ATTEMPT}.log"
       break; }
-    grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" 2>/dev/null && { MENU=1; log "attempt $ATTEMPT: menu reached"; break; }
+    # menu marker lives in the engine's condebug console.log (run 31: stdout
+    # never gets ChangeGameUIState lines) - check BOTH, console.log is fresh
+    # per attempt (rm'd above)
+    if grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" 2>/dev/null \
+       || grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$CONLOG_LIVE" 2>/dev/null; then
+      MENU=1; log "attempt $ATTEMPT: menu reached"; break
+    fi
     # fast-fail: a SteamAPI pipe failure leaves a MODAL error dialog on screen
     # and the harness stalled the full DURATION doing nothing (run 37128611184
     # attempt 2: 240s wasted). Snapshot client state, kill, retry with a
@@ -528,11 +548,15 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     sleep 5
   done
   (( MENU )) || continue
-  sleep 8   # let steam auth settle
+  sleep 2   # let steam auth settle
 
   # ---- smoke mode: boot proof only (menu + no preload failure) ----
   if (( SMOKE )); then
-    sleep 12  # let the menu settle; a bundle gap usually crashes here
+    # run 31: the engine died ~40s after launch (menu at ~+20s) - a 20s
+    # settle raced the death. 10s of menu-stability is enough proof and
+    # lands the verdict BEFORE the observed menu-gap death window.
+    sleep 3   # let steam auth settle
+    sleep 7   # let the menu settle; a bundle gap usually crashes here
     if engine_alive \
        && ! grep -aq 'ERROR: ld.so: object' "$OUT" 2>/dev/null; then
       VERDICT_CODE=0; VERDICT_TEXT="PASS: smoke boot from lite bundle (menu stable, bridge preloaded, attempt $ATTEMPT)"

@@ -70,7 +70,7 @@ jobs:
       # ---------- system deps (each hosted run starts from a clean VM) ----------
       - name: install system packages
         run: |
-          set -e
+          set -euo pipefail
           sudo dpkg --add-architecture i386
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -78,13 +78,11 @@ jobs:
             strace zstd curl jq rsync build-essential \
             libc6:i386 libstdc++6:i386 libglib2.0-0:i386 \
             libnss3:i386 libx11-6:i386 libgbm1:i386 libgl1:i386
-          # Steam client (official Valve repo)
+          # Steam client: official steam.deb. NOTE: the apt-repo route is dead —
+          # Valve's steam.asc key URL 404s (2026-10), which killed run 37115551190.
           if ! [ -x "$HOME/.local/share/Steam/steam.sh" ] && ! command -v steam >/dev/null; then
-            wget -qO- https://repo.steampowered.com/steam/archive/stable/steam.asc \
-              | gpg --dearmor | sudo tee /usr/share/keyrings/steam.gpg >/dev/null
-            echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/steam.gpg] https://repo.steampowered.com/steam/ stable steam" \
-              | sudo tee /etc/apt/sources.list.d/steam.list
-            sudo apt-get update -qq && sudo apt-get install -y -qq steam-launcher
+            curl -fsSL -o /tmp/steam.deb https://steamcdn-a.akamaihd.net/client/installer/steam.deb
+            sudo apt-get install -y -qq /tmp/steam.deb
           fi
 
       # ---------- bundle ----------

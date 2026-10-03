@@ -24,12 +24,12 @@ if command -v apt-get >/dev/null 2>&1; then
     strace zstd unzip curl wget ca-certificates jq \
     build-essential pkg-config libc6:i386 libstdc++6:i386 \
     libglib2.0-0:i386 libgtk2.0-0:i386 libnss3:i386 libx11-6:i386 || true
-  # Steam client (official repo) — provides the full client the legacy game needs
+  # Steam client: official steam.deb. NOTE: Valve's apt-repo key steam.asc
+  # 404s since 2026-10 (repo route dead) — install the deb directly.
   if ! command -v steam >/dev/null 2>&1 && ! [[ -d "$HOME/.local/share/Steam" ]]; then
-    echo "== adding Valve steam repo =="
-    wget -qO- https://repo.steampowered.com/steam/archive/stable/steam.asc | gpg --dearmor | sudo tee /usr/share/keyrings/steam.gpg >/dev/null 2>&1 || true
-    echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/steam.gpg] https://repo.steampowered.com/steam/ stable steam" | sudo tee /etc/apt/sources.list.d/steam.list >/dev/null 2>&1 || true
-    sudo apt-get update -qq && sudo apt-get install -y -qq steam-launcher || \
+    echo "== installing steam-launcher from official steam.deb =="
+    curl -fsSL -o /tmp/steam.deb https://steamcdn-a.akamaihd.net/client/installer/steam.deb
+    sudo apt-get install -y -qq /tmp/steam.deb || \
       echo "WARNING: steam-launcher not installed — install Steam manually"
   fi
   # rclone for the MEGA bundle fetch

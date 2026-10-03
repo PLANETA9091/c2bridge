@@ -4608,8 +4608,9 @@ static i32 c2b_up_voice(const u8 *pl, u32 pln, u8 *plout, u32 cap, u32 *out_n)
         } else if (wt == 1) {
             if (pln - ip < 8) return -1;
             if (f == 2) {                               /* xuid fixed64 */
-                xuid_lo = *(const u32 *)(pl + ip);
-                xuid_hi = *(const u32 *)(pl + ip + 4);
+                u32 lo32, hi32;                         /* memcpy: pl+ip не выровнен */
+                memcpy(&lo32, pl + ip, 4); memcpy(&hi32, pl + ip + 4, 4);
+                xuid_lo = lo32; xuid_hi = hi32;
             }
             ip += 8;
         } else if (wt == 2) {
@@ -9455,14 +9456,14 @@ static i32 c2b_t_parse_block(const u8 *p, u32 n, u32 *cmd, u32 *tick, u32 *butto
                     u32 tag2; u32 c2 = c2b_read_varint(p + j, sl, &tag2); if (!c2) return -1;
                     if (tag2 != ((a + 1) << 3 | 5)) return -1;
                     j += c2;
-                    if (a == 0) *va0b = *(const u32 *)(p + j);
+                    if (a == 0) { u32 va32; memcpy(&va32, p + j, 4); *va0b = va32; } /* не выровнен */
                     j += 4;
                 }
             }
             ip += sl;
         } else if (wt == 5) {
             if (n - ip < 4) return -1;
-            u32 bits = *(const u32 *)(p + ip);
+            u32 bits; memcpy(&bits, p + ip, 4);         /* p+ip не выровнен */
             if (f == 5) *fwdb = bits;
             else if (f == 6) *sideb = bits;
             ip += 4;
@@ -10047,6 +10048,7 @@ static u8  st_cap[4096];        /* что forged WriteToBuffer записал в
 static u32 st_cap_len;
 static u32 st_orig_calls;
 static uptr st_last_msg;
+static uptr st_last_vt;   /* vtable msg, захваченная ВНУТРИ orig (msg может умереть после) */
 static u32 st_last_rel, st_last_vo;
 
 static u32 st_bytesize(uptr pb) { (void)pb; return st_pb_len; }
@@ -10077,6 +10079,7 @@ static i32 st_fake_orig(uptr chan, uptr msg, u32 rel, u32 vo)
     (void)chan;
     st_orig_calls++;
     st_last_msg = msg;
+    st_last_vt = *(uptr *)msg;   /* читаем пока lifetime валиден */
     st_last_rel = rel;
     st_last_vo = vo;
     if (*(uptr *)msg == (uptr)g_fg_vt) {
@@ -10143,7 +10146,7 @@ static void test_up_dispatch(void)
     CHECK(rv == 42, "updisp: rv=42 от orig через forged");
     CHECK(st_orig_calls == 1, "updisp: orig вызван 1 раз");
     CHECK(st_last_msg != (uptr)(void *)&fmsg, "updisp: orig получил ПОДМЕНЕННЫЙ msg");
-    CHECK(*(uptr *)st_last_msg == (uptr)g_fg_vt, "updisp: vtable forged-объекта");
+    CHECK(st_last_vt == (uptr)g_fg_vt, "updisp: vtable forged-объекта");
     CHECK(st_last_rel == 0, "updisp: rel проброшен (0)");
     CHECK(st_cap_len > 4 && st_cap[0] == 21, "updisp: выход = [varint 21 (CS2 Move)]");
     {   /* структурная сверка: [21][len'][payload=[0x1A][dn][блоки...][0x20][last]]

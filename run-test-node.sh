@@ -211,6 +211,8 @@ dump_steam_state() {
     echo "== linux64 dir =="; ls -la "$GAME_HOME/.local/share/Steam/linux64/" 2>/dev/null | head -15
     echo "== package version =="; ls "$GAME_HOME/.local/share/Steam/package/" 2>/dev/null | head -10
     echo "== steam procs =="; ps -f -u "$GAME_USER" 2>/dev/null | grep -i steam | head -10
+    echo "== engine procs =="; pgrep -af 'csgo_linux64|hl2_linux' 2>/dev/null | head -8 || echo none
+    echo "== engine locks =="; ls -la /tmp/source_engine_*.lock 2>/dev/null || echo "no lock files"
     echo "== steam.pipe =="; ls -la "$GAME_HOME/.steam/steam.pipe" 2>/dev/null; stat -c '%F %a %U' "$GAME_HOME/.steam/steam.pipe" 2>/dev/null; file "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
     echo "== pipe connect test =="; pipe_connect_ok && echo CONNECT_OK || echo CONNECT_FAIL
     echo "== bootstrap_log tail =="; tail -30 "$GAME_HOME/.local/share/Steam/logs/bootstrap_log.txt" 2>/dev/null

@@ -204,6 +204,20 @@ fi
 # restarted right after our check). Require the pipe to be CONNECTABLE and the
 # core client PID UNCHANGED on two checks 6s apart; otherwise restart the
 # client under our control.
+# client_logged_in: the client's CM session must be Logged On RIGHT NOW.
+# Run 30 lesson: the client logs ON then can log OFF again (UI login
+# transition after the cmdline -login: logon 20:37:37 -> LogOff 20:37:45 ->
+# UI re-login success 20:38:24). A pipe that connects is NOT enough - the
+# engine's ConnectToGlobalUser needs an authenticated global user, and a
+# dead engine's SteamAPI_Shutdown even LOGS THE CLIENT OFF (cascade).
+client_logged_in() {
+  local CL="$GAME_HOME/.steam/steam/logs/connection_log.txt"
+  [[ -e "$CL" ]] || CL="$GAME_HOME/.local/share/Steam/logs/connection_log.txt"
+  [[ -e "$CL" ]] || return 1
+  tail -c 200000 "$CL" 2>/dev/null | grep -aoE '\[(Logging (On|Off)|Logged (On|Off)),' \
+    | tail -1 | grep -q 'Logged On'
+}
+
 pipe_connect_ok() {
   local P="$GAME_HOME/.steam/steam.pipe" T
   [[ -e "$P" ]] || return 1
@@ -426,7 +440,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     # steam-login.sh (sentry is cached -> silent auto-login).
     if ! pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1; then
       log "attempt $ATTEMPT: client process gone -> relaunching via steam-login.sh"
-      if [[ -x "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+      if [[ -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
         STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
         C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
           bash "$NODE_HOME/steam-login.sh" \
@@ -438,7 +452,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     fi
     WK=0
     until pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \
-          && pipe_connect_ok; do
+          && pipe_connect_ok && client_logged_in; do
       (( WK += 1 ))
       (( WK >= 24 )) && { log "attempt $ATTEMPT: WARNING: client/pipe not ready after $((WK*5))s (launching anyway)"; break; }
       sleep 5

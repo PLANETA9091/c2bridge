@@ -60,7 +60,27 @@ done
 if (( SESSION )); then
   echo "[steam-login] OK: account logged in ($LUV)"
 else
+  DIAG=/tmp/c2b-steam-login-diag.txt
+  {
+    echo "== steam-login diagnostics $(date -u +%H:%M:%SZ) =="
+    echo "-- Xvfb :99 window titles (login dialogs live here) --"
+    DISPLAY=:99 xdotool search --onlyvisible --name '.*' getwindowname %@ 2>/dev/null | head -30 || echo "(xdotool failed)"
+    echo "-- dialog processes (zenity argv contains the dialog TEXT = the reason) --"
+    ps -eo user,pid,args | grep -aiE 'zenity|xmessage|kdialog|steam.*guard|Steam Guard' | grep -v grep || echo "(none)"
+    echo "-- steam client console log tail --"
+    tail -80 "$GAME_HOME/.steam/steam/logs/console-linux.txt" 2>/dev/null || echo "(no console-linux.txt)"
+    echo "-- config dir --"
+    ls -la "$GAME_HOME/.local/share/Steam/config/" 2>/dev/null | head -20
+    echo "-- sentry/session files --"
+    ls -la "$GAME_HOME/.steam/steam/config/" 2>/dev/null | grep -iE 'sentry|login|config' || echo "(no .steam/steam/config files)"
+    ss_files=$(find "$GAME_HOME/.local/share/Steam" -maxdepth 2 -name 'ssfn*' 2>/dev/null | head -5)
+    echo "ssfn files: ${ss_files:-none}"
+    echo "-- loginusers.vdf --"
+    cat "$LUV" 2>/dev/null || echo "(absent)"
+  } > "$DIAG" 2>&1
   echo "[steam-login] WARNING: client is up but no login session found ($LUV)"
   echo "[steam-login] hints: correct credentials? Steam Guard code needed once? (STEAM_GUARD_CODE=12345)"
+  echo "[steam-login] diagnostics written to $DIAG:"
+  cat "$DIAG"
   exit 2
 fi

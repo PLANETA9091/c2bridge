@@ -199,8 +199,14 @@ jobs:
           L=$(ls -t "$C2B_NODE_HOME/runs/" 2>/dev/null | head -1) || true
           mkdir -p e2e-out
           [ -n "$L" ] && cp -f "$C2B_NODE_HOME/runs/$L"/* e2e-out/ 2>/dev/null || true
+          # steam session evidence (duplicate-safe if harness already saved it)
+          cp -f ~/.steam/steam/logs/console-linux.txt e2e-out/steam-console.log 2>/dev/null || true
+          cp -f ~/.local/share/Steam/config/loginusers.vdf e2e-out/loginusers.vdf 2>/dev/null || true
+          cp -f /tmp/c2b-steam-login.log e2e-out/steam-login.log 2>/dev/null || true
+          cp -f /tmp/c2b-steam-login-diag.txt e2e-out/steam-login-diag.txt 2>/dev/null || true
           echo "=== verdict ==="; cat e2e-out/verdict.txt 2>/dev/null || true
           echo "=== harness tail ==="; tail -30 e2e-out/harness.log 2>/dev/null || true
+          echo "=== login session ==="; grep -ao '"mostrecent"\s*"1"' e2e-out/loginusers.vdf 2>/dev/null || echo "NO LOGIN SESSION"
 
       - name: upload artifacts
         if: always()

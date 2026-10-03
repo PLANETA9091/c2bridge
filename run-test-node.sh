@@ -40,16 +40,77 @@ CONLOG="$GAME_DIR/csgo/console.log"
 mkdir -p "$RUNDIR" "$NODE_HOME"
 RESULT="$RUNDIR/verdict.txt"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$RUNDIR/harness.log"; }
+
+# capture the engine's -condebug console.log into the run dir (run 12/18
+# artifacts never contained it: the fixed path may not exist in the bundle)
+save_conlog() {
+  local src=""
+  [[ -f "$CONLOG" ]] && src="$CONLOG"
+  [[ -z "$src" ]] && src=$(find "$GAME_DIR" -maxdepth 3 -name 'console.log' -newermt "-2 hours" 2>/dev/null | head -1)
+  if [[ -n "$src" ]]; then
+    sudo -n cp -f "$src" "$RUNDIR/console.log" 2>/dev/null || cp -f "$src" "$RUNDIR/console.log" 2>/dev/null || true
+    log "console.log captured from $src ($(wc -c < "$RUNDIR/console.log" 2>/dev/null || echo 0) bytes)"
+  else
+    log "WARNING: engine console.log not found under $GAME_DIR"
+  fi
+  # steam client session evidence (why login did/did not complete)
+  sudo -n cp -f "$GAME_HOME/.steam/steam/logs/console-linux.txt" "$RUNDIR/steam-console.log" 2>/dev/null \
+    || cp -f "$GAME_HOME/.steam/steam/logs/console-linux.txt" "$RUNDIR/steam-console.log" 2>/dev/null || true
+  sudo -n cp -f "$GAME_HOME/.local/share/Steam/config/loginusers.vdf" "$RUNDIR/loginusers.vdf" 2>/dev/null \
+    || cp -f "$GAME_HOME/.local/share/Steam/config/loginusers.vdf" "$RUNDIR/loginusers.vdf" 2>/dev/null || true
+  [[ -f /tmp/c2b-steam-login.log ]] && cp -f /tmp/c2b-steam-login.log "$RUNDIR/steam-login.log" 2>/dev/null || true
+  [[ -f /tmp/c2b-steam-login-diag.txt ]] && cp -f /tmp/c2b-steam-login-diag.txt "$RUNDIR/steam-login-diag.txt" 2>/dev/null || true
+}
+
 finish() { # $1 exit code, $2 verdict
   echo "$2" > "$RESULT"
   echo "$1" > "$RUNDIR/exit.code"
   log "VERDICT: $2"
   pkill -x csgo_linux64 2>/dev/null; sleep 2; pkill -9 -x csgo_linux64 2>/dev/null
   for f in "$NODE_HOME/tmp"/c2b-*.log; do [[ -f "$f" ]] && cp -f "$f" "$RUNDIR/"; done 2>/dev/null
-  sudo -n cp -f "$CONLOG" "$RUNDIR/console.log" 2>/dev/null || cp -f "$CONLOG" "$RUNDIR/console.log" 2>/dev/null || true
+  save_conlog
   exit "$1"
 }
 trap 'finish 2 "ABORTED"' INT TERM
+
+# engine-chain liveness: kill -0 on the launched sudo PID. sudo waits for the
+# whole chain (env -> sh -> exec engine), so it exists from the moment of the
+# background launch - unlike pgrep, it has NO exec-window race. Run 18
+# (37133146005): pgrep -x fired during the sudo->exec window (0-1s) and
+# declared the engine dead while it was alive -> relaunch overlapped the
+# still-running engine -> fcntl single-instance lock failures.
+ENGINE_PID=0
+engine_alive() {
+  kill -0 "$ENGINE_PID" 2>/dev/null && return 0
+  # fallback: engine process visible by name (covers gdb-wrapped launches)
+  pgrep -x csgo_linux64 >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# full cleanup between attempts: kill, then WAIT until really gone, then clear
+# stale single-instance locks. An engine that execs AFTER the pkill (mid-startup
+# sweep) must be caught by the second tap.
+cleanup_engines() {
+  local i
+  for i in 1 2 3 4 5; do
+    pkill -9 -x csgo_linux64 2>/dev/null
+    pkill -9 -x hl2_linux 2>/dev/null
+    pkill -9 -f "$GAME_DIR" 2>/dev/null
+    pgrep -f 'csgo_linux64|hl2_linux' >/dev/null 2>&1 || break
+    sleep 2
+  done
+  if pgrep -f 'csgo_linux64|hl2_linux' >/dev/null 2>&1; then
+    log "WARNING: engine processes survived cleanup: $(pgrep -a -f 'csgo_linux64|hl2_linux' | head -3 | tr '\n' ';')"
+  else
+    # stale single-instance lock: clear ONLY when no engine process survived;
+    # deleting a LIVE holder's file would let two engines race on fresh inodes
+    rm -f /tmp/source_engine_*.lock 2>/dev/null \
+      || sudo -n rm -f /tmp/source_engine_*.lock 2>/dev/null || true
+    [[ -n "$(ls /tmp/source_engine_*.lock 2>/dev/null)" ]] \
+      && log "WARNING: engine lock file still present after cleanup"
+  fi
+  rm -f "$CONLOG" 2>/dev/null
+}
 
 # ---------- 0. preconditions ----------
 command -v Xvfb >/dev/null 2>&1 || finish 3 "FAIL: Xvfb not installed (run setup-node.sh)"
@@ -301,19 +362,7 @@ CONNECTED=0
 for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   if (( ATTEMPT > 1 )); then
     log "attempt $ATTEMPT/$MAX_ATTEMPTS: relaunching"
-    pkill -9 -x csgo_linux64 2>/dev/null
-    pkill -9 -x hl2_linux 2>/dev/null
-    pkill -9 -f "$GAME_DIR" 2>/dev/null
-    sleep 2
-    # stale single-instance lock: clear ONLY when no engine process survived;
-    # deleting a LIVE holder's file would let two engines race on fresh inodes
-    if ! pgrep -f 'csgo_linux64|hl2_linux' >/dev/null 2>&1; then
-      rm -f /tmp/source_engine_*.lock 2>/dev/null \
-        || sudo -n rm -f /tmp/source_engine_*.lock 2>/dev/null || true
-      [[ -n "$(ls /tmp/source_engine_*.lock 2>/dev/null)" ]] \
-        && log "WARNING: engine lock file still present after cleanup"
-    fi
-    rm -f "$CONLOG" 2>/dev/null
+    cleanup_engines
   fi
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 
@@ -357,15 +406,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     $MODES \
     sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
     >"$OUT" 2>&1 &
-  log "attempt $ATTEMPT: client launched, waiting up to ${DURATION}s for menu"
+  ENGINE_PID=$!
+  log "attempt $ATTEMPT: client launched (launch pid $ENGINE_PID), waiting up to ${DURATION}s for menu"
 
   # wait for the main menu (modals may cover it — steam://connect still works)
   MENU=0
   END=$((SECONDS + DURATION))
   while (( SECONDS < END )); do
-    pgrep -x csgo_linux64 >/dev/null 2>&1 || {
+    engine_alive || {
       log "attempt $ATTEMPT: client died"
       dump_steam_state "$RUNDIR/steam_state_died.a${ATTEMPT}.txt"
+      save_conlog
       (( ATTEMPT == 1 )) && sudo -n dmesg 2>/dev/null | tail -60 > "$RUNDIR/dmesg.a1.log"
       break; }
     grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" 2>/dev/null && { MENU=1; log "attempt $ATTEMPT: menu reached"; break; }
@@ -376,6 +427,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     if grep -aq -e 'Failed to connect with local Steam Client' -e '\[S_API FAIL\]' "$OUT" 2>/dev/null; then
       log "attempt $ATTEMPT: SteamAPI pipe failure in game log -> fast-fail instead of ${DURATION}s modal stall"
       dump_steam_state "$RUNDIR/steam_state_fatal.a${ATTEMPT}.txt"
+      save_conlog
       pkill -9 -x csgo_linux64 2>/dev/null
       sleep 2
       break
@@ -388,7 +440,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # ---- smoke mode: boot proof only (menu + no preload failure) ----
   if (( SMOKE )); then
     sleep 12  # let the menu settle; a bundle gap usually crashes here
-    if pgrep -x csgo_linux64 >/dev/null 2>&1 \
+    if engine_alive \
        && ! grep -aq 'ERROR: ld.so: object' "$OUT" 2>/dev/null; then
       VERDICT_CODE=0; VERDICT_TEXT="PASS: smoke boot from lite bundle (menu stable, bridge preloaded, attempt $ATTEMPT)"
       break
@@ -404,7 +456,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
 
   END=$((SECONDS + DURATION))
   while (( SECONDS < END )); do
-    pgrep -x csgo_linux64 >/dev/null 2>&1 || { log "attempt $ATTEMPT: client died during connect"; break; }
+    engine_alive || { log "attempt $ATTEMPT: client died during connect"; save_conlog; break; }
     if grep -aqiE 'Connected\(|Signing up to server|Connected to' "$OUT" 2>/dev/null \
        || sudo -n grep -aqiE 'Connected\(|Signing up to server|Connected to' "$CONLOG" 2>/dev/null; then
       CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"; break

@@ -1,5 +1,9 @@
 # c2bridge
 
+[![CI](https://github.com/PLANETA9091/c2bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/PLANETA9091/c2bridge/actions/workflows/ci.yml)
+[![bundle-smoke](https://github.com/PLANETA9091/c2bridge/actions/workflows/bundle-smoke.yml/badge.svg)](https://github.com/PLANETA9091/c2bridge/actions/workflows/bundle-smoke.yml)
+[![e2e-cloud](https://github.com/PLANETA9091/c2bridge/actions/workflows/e2e-cloud.yml/badge.svg)](https://github.com/PLANETA9091/c2bridge/actions/workflows/e2e-cloud.yml)
+
 CS:GO legacy client (Source 1) -> c2bridge network translator -> CS2 community
 servers (Source 2). Mod code, test harness and CI - the only things that live
 here.
@@ -47,8 +51,9 @@ tools/pack-bundle.sh     manifest -> c2b-lite-<date>.tar.zst
    ```
    bash tools/pack-bundle.sh --game-dir "<csgo legacy>" --manifest lite-manifest-v2.txt
    ```
-3. Upload `c2b-lite-<date>.tar.zst` to a **private MEGA folder** (`c2b-lite`),
-   set the `MEGA_URL` (or `MEGA_USER`/`MEGA_PASS`) repo secret.
+3. Upload `c2b-lite-<date>.tar.zst` to a **private MEGA folder** (`csgo`),
+   set the `MEGA_USER`/`MEGA_PASS` (recommended) or `MEGA_URL` repo secret;
+   folder name is overridable via `MEGA_DIR`.
 4. Re-pack when the bridge learns new phases (e.g. after the connect handshake
    lands -> map chunks): feed old + new strace logs together.
 
@@ -68,7 +73,8 @@ GitHub hosted runner (free) ── apt: xvfb/steam/i386 libs
   ├─ cache: steam client + login sentry  -> Steam Guard code needed ONLY on the
   │   very first run (cached sentry = "same device" afterwards)
   ├─ build bridge (gcc) + selftest
-  ├─ steam-login.sh (burner account)     -> Xvfb session
+  ├─ steam-login.sh (burner account)     -> Xvfb session (skipped in smoke
+  │   when STEAM_USER is unset: the bundle boots standalone)
   ├─ run-test-node.sh                    -> steam://connect trigger (no UI bots)
   └─ artifacts: verdict.txt, harness.log, console.log, c2b logs
 ```
@@ -77,9 +83,12 @@ Secrets for `e2e-cloud.yml`:
 
 | secret             | what                                                    |
 |--------------------|---------------------------------------------------------|
-| `STEAM_USER`       | burner Steam account name (owns CS:GO, free)            |
+| `MEGA_USER`        | MEGA account email (recommended auth for fetch-bundle)  |
+| `MEGA_PASS`        | its password                                            |
+| `MEGA_DIR`         | optional: MEGA folder holding the bundle (default `csgo`)|
+| `MEGA_URL`         | alternative: private MEGA folder link `.../folder/ID#KEY`|
+| `STEAM_USER`       | burner Steam account name (owns CS:GO, free; full mode) |
 | `STEAM_PASS`       | its password                                            |
-| `MEGA_URL`         | private MEGA folder link `https://mega.nz/folder/ID#KEY`|
 | `STEAM_GUARD_CODE` | optional: pre-set first-run email code                  |
 
 Steam Guard reality check: the first hosted run is a new "device" -> pass the

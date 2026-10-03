@@ -159,10 +159,15 @@ jobs:
             exit 0
           fi
           bash scripts/steam-login.sh || {
-            echo "::error::steam login failed — set STEAM_USER/STEAM_PASS, and for the"
-            echo "          very first run pass STEAM_GUARD_CODE (email code) via workflow input."
-            tail -50 /tmp/c2b-steam-login.log || true
-            exit 1
+            if [ "$MODE" = "smoke" ]; then
+              echo "::warning::steam login failed — continuing (smoke boots standalone; a Steam Guard code may be needed once)"
+              tail -50 /tmp/c2b-steam-login.log || true
+            else
+              echo "::error::steam login failed — set STEAM_USER/STEAM_PASS, and for the"
+              echo "          very first run pass STEAM_GUARD_CODE (email code) via workflow input."
+              tail -50 /tmp/c2b-steam-login.log || true
+              exit 1
+            fi
           }
 
       # ---------- e2e ----------

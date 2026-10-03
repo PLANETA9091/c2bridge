@@ -44,10 +44,20 @@ for i in $(seq 1 48); do
 done
 (( OK )) || { echo "[steam-login] TIMEOUT — check $LOG (first login may need STEAM_GUARD_CODE)"; exit 1; }
 
-# verify an actual account is logged in (loginusers.vdf: mostrecent=1 and not a stub)
+# the -login handshake continues AFTER the client is up (and on a new device it
+# blocks on Steam Guard until the code is entered) - poll for the session
 LUV="$GAME_HOME/.steam/steam/config/loginusers.vdf"
 [[ -e "$LUV" ]] || LUV="$GAME_HOME/.local/share/Steam/config/loginusers.vdf"
-if [[ -e "$LUV" ]] && grep -aq '"mostrecent"\s*"1"' "$LUV"; then
+SESSION=0
+for i in $(seq 1 36); do
+  if [[ -e "$LUV" ]] && grep -aq '"mostrecent"\s*"1"' "$LUV"; then
+    SESSION=1; echo "[steam-login] session detected after ~$((i*5))s"; break
+  fi
+  sleep 5
+done
+
+# verify an actual account is logged in (loginusers.vdf: mostrecent=1 and not a stub)
+if (( SESSION )); then
   echo "[steam-login] OK: account logged in ($LUV)"
 else
   echo "[steam-login] WARNING: client is up but no login session found ($LUV)"

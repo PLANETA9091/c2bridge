@@ -322,14 +322,21 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  # Diagnostic on attempt 1: gdb batch INSIDE sudo as the game user - catches
-  # SIGSEGV with a full backtrace and the engine Error() int3 path (strace
-  # only showed WHO died; setuid sudo can't be ptraced from outside, run
-  # 37122969873).
+  # Debugger placement: attempt 1 is ALWAYS a clean launch. gdb disables ASLR
+  # by default (disable-randomization on) and that ALONE kills the engine at
+  # the panoramauiclient_client.so dlopen: protobuf static-init SIGSEGV with
+  # an identical pinned panorama base 0xd0c00000 in runs 37130411599/37131635254
+  # a1, while the only clean launch (run 37128611184 a2, ASLR on, base
+  # 0x99200000) sailed past the same dlopen to D3D9 device creation.
+  # gdb now runs on attempt 2 WITH ASLR RESTORED
+  # (set disable-randomization off), so if the clean attempt dies we still
+  # get a full backtrace from an address-space that matches real conditions.
   DBG_INNER=""
-  if (( ATTEMPT == 1 )) && command -v gdb >/dev/null 2>&1; then
+  DBG_ATTEMPT="${DBG_ATTEMPT:-2}"
+  if (( ATTEMPT == DBG_ATTEMPT )) && command -v gdb >/dev/null 2>&1; then
     DBG_INNER="exec gdb -batch -return-child-result \
       -ex 'set confirm off' \
+      -ex 'set disable-randomization off' \
       -ex 'handle SIGPIPE nostop noprint' \
       -ex 'handle SIGHUP nostop noprint' \
       -ex 'handle SIGUSR1 nostop noprint' \
@@ -339,8 +346,8 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       -ex run \
       -ex 'thread apply all bt' \
       --args ./csgo_linux64"
-  elif (( ATTEMPT == 1 )) && command -v strace >/dev/null 2>&1; then
-    DBG_INNER="exec strace -f -qq -e trace=execve,execveat,kill,tgkill,mprotect,prctl -o $RUNDIR/strace_game.a1.log ./csgo_linux64"
+  elif (( ATTEMPT == DBG_ATTEMPT )) && command -v strace >/dev/null 2>&1; then
+    DBG_INNER="exec strace -f -qq -e trace=execve,execveat,kill,tgkill,mprotect,prctl -o $RUNDIR/strace_game.a${DBG_ATTEMPT}.log ./csgo_linux64"
   fi
 
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \

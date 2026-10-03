@@ -151,12 +151,26 @@ if [[ ! -e "$GAME_HOME/.steam/sdk64/steamclient.so" ]]; then
     done < <(find "$GAME_HOME/.local/share/Steam" -maxdepth 5 -name steamclient.so 2>/dev/null)
   fi
   if [[ -z "$SC" ]]; then
-    log "steamclient.so not installed - fetching full client (steam_client_ubuntu12)"
-    if curl -fsSL -o "$TMPD/steam_client.tar.xz" https://media.steampowered.com/client/steam_client_ubuntu12; then
-      mkdir -p "$TMPD/steamclient-extract"
-      tar -xJf "$TMPD/steam_client.tar.xz" -C "$TMPD/steamclient-extract" \
-        --wildcards '*linux64/steamclient.so' 2>/dev/null || true
-      SC=$(find "$TMPD/steamclient-extract" -name steamclient.so 2>/dev/null | head -1)
+    # steamclient.so ships in the Steam client's bins_sdk package: fetch the
+    # update manifest, pull bins_sdk_ubuntu12.zip.<hash>, extract only
+    # linux64/steamclient.so (never touches the live client's files).
+    log "steamclient.so not installed - fetching from Steam CDN (bins_sdk)"
+    MF="$TMPD/steam_client_manifest.vdf"
+    if curl -fsSL -o "$MF" https://media.steampowered.com/client/steam_client_ubuntu12; then
+      PKG=$(sed -n 's/.*"file"[[:space:]]*"\(bins_sdk_ubuntu12\.zip\.[0-9a-f]*\)".*/\1/p' "$MF" | head -1)
+      if [[ -n "$PKG" ]] && curl -fsSL -o "$TMPD/bins_sdk.zip" \
+           "https://media.steampowered.com/client/$PKG"; then
+        mkdir -p "$TMPD/sdk-extract"
+        if command -v unzip >/dev/null 2>&1; then
+          unzip -o -q "$TMPD/bins_sdk.zip" -d "$TMPD/sdk-extract" '*linux64/*' 2>/dev/null || true
+        else
+          python3 - "$TMPD/bins_sdk.zip" "$TMPD/sdk-extract" <<'PYEOF' 2>/dev/null || true
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+PYEOF
+        fi
+        SC=$(find "$TMPD/sdk-extract" -path '*linux64/*' 2>/dev/null | head -1)
+      fi
     fi
   fi
   if [[ -n "$SC" && -e "$SC" ]]; then

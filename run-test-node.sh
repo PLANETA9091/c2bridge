@@ -131,22 +131,39 @@ else
   log "steam client already running (warm)"
 fi
 # The engine dlopens ~/.steam/sdk64/steamclient.so to talk to the local Steam
-# client; a bootstrap-only install often lacks the symlink (run 37125126789:
-# "Failed to connect with local Steam Client process!" -> clean exit after
-# D3D9/GL init). Create it if missing/broken.
+# client; a bootstrap-only install often lacks the symlink AND the .so itself
+# (run 37125759327). Try known locations, then any 64-bit steamclient.so under
+# .local/share/Steam, then the official full-client tarball (extract ONLY
+# steamclient.so - do not touch the live client's files).
 if [[ ! -e "$GAME_HOME/.steam/sdk64/steamclient.so" ]]; then
   mkdir -p "$GAME_HOME/.steam"
   SC=""
-  if [[ -e "$GAME_HOME/.steam/root" ]]; then
-    SC="$GAME_HOME/.steam/root/linux64/steamclient.so"
+  for CAND in \
+    "$GAME_HOME/.steam/root/linux64/steamclient.so" \
+    "$GAME_HOME/.local/share/Steam/linux64/steamclient.so" \
+    "$GAME_HOME/.local/share/Steam/ubuntu12_64/steamclient.so" \
+    /usr/lib/steam/linux64/steamclient.so ; do
+    [[ -e "$CAND" ]] && { SC="$CAND"; break; }
+  done
+  if [[ -z "$SC" ]] && command -v file >/dev/null 2>&1; then
+    while IFS= read -r f; do
+      file -b "$f" 2>/dev/null | grep -q 'x86-64' && { SC="$f"; break; }
+    done < <(find "$GAME_HOME/.local/share/Steam" -maxdepth 5 -name steamclient.so 2>/dev/null)
   fi
-  [[ -e "$SC" ]] || SC=$(find "$GAME_HOME/.local/share/Steam" -maxdepth 4 \
-      -path '*linux64/steamclient.so' 2>/dev/null | head -1)
+  if [[ -z "$SC" ]]; then
+    log "steamclient.so not installed - fetching full client (steam_client_ubuntu12)"
+    if curl -fsSL -o "$TMPD/steam_client.tar.xz" https://media.steampowered.com/client/steam_client_ubuntu12; then
+      mkdir -p "$TMPD/steamclient-extract"
+      tar -xJf "$TMPD/steam_client.tar.xz" -C "$TMPD/steamclient-extract" \
+        --wildcards '*linux64/steamclient.so' 2>/dev/null || true
+      SC=$(find "$TMPD/steamclient-extract" -name steamclient.so 2>/dev/null | head -1)
+    fi
+  fi
   if [[ -n "$SC" && -e "$SC" ]]; then
     ln -sfn "$(dirname "$SC")" "$GAME_HOME/.steam/sdk64"
     log "created ~/.steam/sdk64 -> $(dirname "$SC")"
   else
-    log "WARNING: steamclient.so (sdk64) not found; Steam-API init will fail"
+    log "WARNING: steamclient.so unavailable; Steam-API init will fail"
   fi
 fi
 # hide steam's own UI windows (no WM on the node: they overlap the game)

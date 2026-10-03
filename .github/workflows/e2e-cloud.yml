@@ -59,6 +59,7 @@ jobs:
         with:
           path: ~/csgo-lite
           key: csgo-lite-v1
+          save-always: true
       - name: restore steam client cache (runtime + sentry = silent logins)
         uses: actions/cache@v4
         with:
@@ -66,6 +67,7 @@ jobs:
             ~/.local/share/Steam
             ~/.steam
           key: steam-node-v2
+          save-always: true
 
       # ---------- system deps (each hosted run starts from a clean VM) ----------
       - name: install system packages

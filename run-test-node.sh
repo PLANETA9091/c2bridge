@@ -57,6 +57,16 @@ command -v xdotool >/dev/null 2>&1 || finish 3 "FAIL: xdotool not installed"
 [[ -x "$GAME_DIR/csgo_linux64" ]] || finish 3 "FAIL: $GAME_DIR/csgo_linux64 not found (bad bundle?)"
 ls "$BRIDGE_DIR"/c2b_spy64.so >/dev/null 2>&1 || finish 3 "FAIL: bridge binaries missing in $BRIDGE_DIR"
 
+# ---------- 0b. dependency audit (dlopen of engine modules fails silently
+# when a NEEDED lib is missing: the engine only prints the 32-bit probe's
+# wrong-ELF-class error, see run 37123582445) ----------
+if command -v ldd >/dev/null 2>&1; then
+  M="$RUNDIR/ldd_missing.txt"
+  { ldd "$GAME_DIR"/bin/linux64/*.so 2>/dev/null; ldd "$GAME_DIR"/bin/*.so 2>/dev/null; } \
+    | awk '/not found/{print $1}' | sort -u > "$M" 2>/dev/null || true
+  [[ -s "$M" ]] && log "MISSING LIBS (dlopen will fail): $(tr '\n' ' ' < "$M")"
+fi
+
 TARGET="${C2B_TARGET:-}"
 if (( ! SMOKE )); then
   if [[ -z "$TARGET" && -f "$NODE_HOME/target.conf" ]]; then

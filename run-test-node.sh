@@ -156,6 +156,29 @@ if ! steam_client_stable; then
   done
   log "steam stability wait done (~${W}s)"
 fi
+# ---- steam self-update awareness ----
+# A bootstrap-only client has NO linux64/steamclient.so; the client installs
+# it when its self-update completes. Wait (bounded) for that marker, then
+# prefer the client's OWN copy for ~/.steam/sdk64 (perfect version match).
+SW=0
+while (( SW < 240 )); do
+  [[ -e "$GAME_HOME/.local/share/Steam/linux64/steamclient.so" ]] && {
+    log "steam self-update marker present after ~${SW}s"; break; }
+  pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1 || {
+    log "steam client gone during update wait (~${SW}s)"; break; }
+  sleep 5; (( SW += 5 ))
+done
+(( SW >= 240 )) && log "WARNING: self-update marker not seen in ${SW}s"
+# dump steam client state for the artifact (diag for pipe/version issues)
+{
+  echo "== .local/share/Steam top =="; ls -la "$GAME_HOME/.local/share/Steam/" 2>/dev/null | head -25
+  echo "== package version =="; ls "$GAME_HOME/.local/share/Steam/package/" 2>/dev/null | head -10
+  echo "== steam procs =="; ps -f -u "$GAME_USER" 2>/dev/null | grep -i steam | head -10
+  echo "== steam.pipe =="; ls -la "$GAME_HOME/.steam/steam.pipe" 2>/dev/null; file "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+  echo "== bootstrap_log tail =="; tail -30 "$GAME_HOME/.local/share/Steam/logs/bootstrap_log.txt" 2>/dev/null
+  echo "== console_linux tail =="; tail -20 "$GAME_HOME/.local/share/Steam/logs/console_linux.txt" 2>/dev/null
+} > "$RUNDIR/steam_state.txt" 2>/dev/null || true
+
 # The engine dlopens ~/.steam/sdk64/steamclient.so to talk to the local Steam
 # client; a bootstrap-only install often lacks the symlink AND the .so itself
 # (run 37125759327). Try known locations, then any 64-bit steamclient.so under

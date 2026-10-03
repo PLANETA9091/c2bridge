@@ -6597,6 +6597,19 @@ static void c2b_got_tick(void) {}
 static void *c2b_poll_thread(void *arg)
 {
     (void)arg;
+    {   /* t43v1: crash-bisect gate — C2B_DISABLE_PATCH=1 makes the bridge a
+         * PASSIVE preload (no GOT-patch, no detours, no vtable swap, no GC).
+         * e2e-cloud smoke matrix (run 21/22 post-mortem): observe mode still
+         * armed ContextInit GOT-patch + ProcessMessages/SendNetMsg detours;
+         * the engine then SEGVs at protobuf RepeatedPtrFieldBase::Add inside
+         * libvideo.so right after a SUCCESSFUL SteamAPI_Init. Attempt-level
+         * env bisect: a3 = patch disabled, a4 = no preload at all. */
+        const char *np = getenv("C2B_DISABLE_PATCH");
+        if (np && np[0] == '1') {
+            C2B_LOGS("[c2b] C2B_DISABLE_PATCH=1 -> passive preload (no GOT-patch/detours/vt/GC)\n");
+            return 0;
+        }
+    }
     for (int i = 0; i < 600; i++) {               /* до ~5 минут */
         /* t42v6: на 20-й секунде — разовый дамп модулей из /proc/self/maps */
         if (i == 40) {

@@ -374,6 +374,27 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
+  # ---- crash-bisect matrix (run 21/22 post-mortem) ----
+  # Every attempt segfaults at protobuf RepeatedPtrFieldBase::Add inside
+  # libvideo.so RIGHT AFTER a successful SteamAPI_Init (gdb run 22 a2),
+  # ~5s in, deterministic. The known-since-run-16 culprit class is the
+  # bridge's binary patching (GOT/detour) interacting with the runner's
+  # glibc; observe mode did NOT disable ContextInit GOT-patch + detours.
+  # Bisect across attempts: a3 = bridge passive (no patch), a4 = engine
+  # alone (no preload). If a3/a4 reach the menu the smoke verdict passes
+  # and the culprit is pinned for the full-mode fix.
+  EXTRA_ENV=""
+  LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
+  VARIANT="baseline"
+  if (( ATTEMPT == 3 )); then
+    EXTRA_ENV="C2B_DISABLE_PATCH=1"
+    VARIANT="bridge-passive"
+  elif (( ATTEMPT == 4 )); then
+    LDPRELOAD=""
+    VARIANT="no-preload"
+  fi
+  log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}]"
+
   # Debugger placement: attempt 1 is ALWAYS a clean launch. gdb disables ASLR
   # by default (disable-randomization on) and that ALONE kills the engine at
   # the panoramauiclient_client.so dlopen: protobuf static-init SIGSEGV with
@@ -405,8 +426,8 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
     LD_LIBRARY_PATH="$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
     SDL_AUDIODRIVER=dummy \
-    LD_PRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO" \
-    $MODES \
+    LD_PRELOAD="$LDPRELOAD" \
+    $MODES $EXTRA_ENV \
     sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
     >"$OUT" 2>&1 &
   ENGINE_PID=$!
@@ -420,7 +441,9 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       log "attempt $ATTEMPT: client died"
       dump_steam_state "$RUNDIR/steam_state_died.a${ATTEMPT}.txt"
       save_conlog
-      (( ATTEMPT == 1 )) && sudo -n dmesg 2>/dev/null | tail -60 > "$RUNDIR/dmesg.a1.log"
+      # segfault IP/module evidence for EVERY attempt (run 18's a1-only capture
+      # missed the 5s-later libvideo.so SIGSEGV entirely)
+      sudo -n dmesg 2>/dev/null | tail -40 > "$RUNDIR/dmesg.a${ATTEMPT}.log"
       break; }
     grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" 2>/dev/null && { MENU=1; log "attempt $ATTEMPT: menu reached"; break; }
     # fast-fail: a SteamAPI pipe failure leaves a MODAL error dialog on screen

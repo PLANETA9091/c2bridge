@@ -66,6 +66,7 @@ finish() { # $1 exit code, $2 verdict
   echo "$2" > "$RESULT"
   echo "$1" > "$RUNDIR/exit.code"
   log "VERDICT: $2"
+  declare -F restore_overcommit >/dev/null 2>&1 && restore_overcommit
   pkill -x csgo_linux64 2>/dev/null; sleep 2; pkill -9 -x csgo_linux64 2>/dev/null
   for f in "$NODE_HOME/tmp"/c2b-*.log; do [[ -f "$f" ]] && cp -f "$f" "$RUNDIR/"; done 2>/dev/null
   save_conlog
@@ -143,7 +144,12 @@ BIN_DST="$TMPD"
 
 # ---------- 1. stage bridge + libs (world-readable; the game user must read them) ----------
 mkdir -p "$BIN_DST/libs"
+mkdir -p "$BIN_DST/shim"
 cp -f "$BRIDGE_DIR"/*.so "$BIN_DST/" || finish 3 "FAIL: cannot stage bridge .so"
+# tcmalloc shim (bisect run 21/22/23): neutralizes the bundle's 2013-era
+# libtcmalloc_minimal.so.0 with a pure-glibc forwarder
+[[ -f "$BRIDGE_DIR/tcmalloc_shim.so" ]] && \
+  cp -f "$BRIDGE_DIR/tcmalloc_shim.so" "$BIN_DST/shim/libtcmalloc_minimal.so.0"
 cp -f "$BRIDGE_DIR"/lib12/* "$BIN_DST/libs/" 2>/dev/null || true
 cp -f "$BRIDGE_DIR"/lib/*   "$BIN_DST/libs/" 2>/dev/null || true
 chmod 755 "$BIN_DST" "$BIN_DST/libs" 2>/dev/null; chmod 644 "$BIN_DST"/*.so "$BIN_DST"/libs/* 2>/dev/null
@@ -374,26 +380,37 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  # ---- crash-bisect matrix (run 21/22 post-mortem) ----
-  # Every attempt segfaults at protobuf RepeatedPtrFieldBase::Add inside
-  # libvideo.so RIGHT AFTER a successful SteamAPI_Init (gdb run 22 a2),
-  # ~5s in, deterministic. The known-since-run-16 culprit class is the
-  # bridge's binary patching (GOT/detour) interacting with the runner's
-  # glibc; observe mode did NOT disable ContextInit GOT-patch + detours.
-  # Bisect across attempts: a3 = bridge passive (no patch), a4 = engine
-  # alone (no preload). If a3/a4 reach the menu the smoke verdict passes
-  # and the culprit is pinned for the full-mode fix.
+  # ---- crash-bisect matrix (run 21/22/23 post-mortem) ----
+  # a1/a2/a5 baseline: deterministic SIGSEGV at protobuf RepeatedPtrFieldBase::Add
+  # inside libvideo.so ~5s in, RIGHT AFTER successful SteamAPI_Init (gdb run 22 a2).
+  # Run 23 EXONERATED the bridge: a3 bridge-passive (C2B_DISABLE_PATCH) and a4
+  # no-preload crashed identically. Remaining suspects, one per attempt:
+  #   a3 = 2013-era bundle tcmalloc_minimal REPLACED by glibc-forwarding shim
+  #        (fault addr = deterministic offset from libvideo base = allocator VA
+  #        bookkeeping signature; shim stress-tested standalone + full engine boot
+  #        locally)
+  #   a4 = vm.overcommit_memory back to 0 (workflow set =1 in 3791c9e; runs
+  #        BEFORE that setting had no protobuf crash, only mmap-ENOMEM noise)
   EXTRA_ENV=""
+  LDPREFIX=""
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
   VARIANT="baseline"
-  if (( ATTEMPT == 3 )); then
-    EXTRA_ENV="C2B_DISABLE_PATCH=1"
-    VARIANT="bridge-passive"
+  if (( ATTEMPT == 3 )) && [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]]; then
+    LDPREFIX="$BIN_DST/shim"
+    VARIANT="tcmalloc-shim"
   elif (( ATTEMPT == 4 )); then
-    LDPRELOAD=""
-    VARIANT="no-preload"
+    VARIANT="overcommit0"
+    OC_BEFORE=$(sudo -n cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo "")
+    sudo -n sysctl -w -q vm.overcommit_memory=0 >/dev/null 2>&1 \
+      || log "WARNING: cannot set overcommit_memory=0"
+    log "attempt $ATTEMPT: overcommit_memory=$(sudo -n cat /proc/sys/vm/overcommit_memory 2>/dev/null)"
   fi
-  log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}]"
+  log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}]"
+  # shellcheck disable=SC2317  # defined per-attempt, guarded at call sites
+  restore_overcommit() {
+    [[ -n "${OC_BEFORE:-}" ]] && sudo -n sysctl -w -q vm.overcommit_memory="$OC_BEFORE" >/dev/null 2>&1
+    OC_BEFORE=""
+  }
 
   # Debugger placement: attempt 1 is ALWAYS a clean launch. gdb disables ASLR
   # by default (disable-randomization on) and that ALONE kills the engine at
@@ -424,7 +441,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   fi
 
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
-    LD_LIBRARY_PATH="$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
+    LD_LIBRARY_PATH="${LDPREFIX:+$LDPREFIX:}$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
     SDL_AUDIODRIVER=dummy \
     LD_PRELOAD="$LDPRELOAD" \
     $MODES $EXTRA_ENV \
@@ -460,7 +477,8 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     fi
     sleep 5
   done
-  (( MENU )) || continue
+  (( MENU )) || { restore_overcommit; continue; }
+  restore_overcommit
   sleep 8   # let steam auth settle
 
   # ---- smoke mode: boot proof only (menu + no preload failure) ----

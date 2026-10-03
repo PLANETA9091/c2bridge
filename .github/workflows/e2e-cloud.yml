@@ -144,6 +144,9 @@ jobs:
           mkdir -p "$C2B_NODE_HOME/bridge/lib12"
           gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2bridge64.so" src/c2bridge.c -ldl
           gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2b_spy64.so" src/c2b_spy.c -ldl
+          # tcmalloc shim: crash-bisect variant of the bundle's 2013 tcmalloc
+          # (pure glibc forwarder; run 21/22/23 deterministic protobuf SEGV)
+          gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/tcmalloc_shim.so" src/tcmalloc_shim.c
           gcc -O2 -DC2B_SELFTEST -o /tmp/c2b-selftest src/c2bridge.c && /tmp/c2b-selftest
 
       - name: stage libpng12 (bundle lib12 first, build-from-source fallback)

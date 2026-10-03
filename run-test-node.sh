@@ -132,15 +132,46 @@ else
 fi
 # A client left over from a CI bootstrap step may be mid-self-update: the pipe
 # file flaps and the engine's SteamAPI_Init dies with "create pipe failed"
-# (run 37127120737, steamclient.so itself loaded OK). Require the pipe to be
-# STABLE (present on two checks 6s apart) while the client process persists;
-# otherwise restart the client under our control.
+# (run 37127120737, steamclient.so itself loaded OK; run 37128611184 showed the
+# SAME failure ~90s AFTER a 6s-stable client — the cache-restored client
+# restarted right after our check). Require the pipe to be CONNECTABLE and the
+# core client PID UNCHANGED on two checks 6s apart; otherwise restart the
+# client under our control.
+pipe_connect_ok() {
+  local P="$GAME_HOME/.steam/steam.pipe" T
+  [[ -e "$P" ]] || return 1
+  T=$(stat -c %F "$P" 2>/dev/null)
+  if [[ "$T" == "socket" ]]; then
+    python3 - "$P" <<'PYEOF' 2>/dev/null || return 1
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(sys.argv[1])
+s.close()
+PYEOF
+  elif [[ "$T" == "fifo" ]]; then
+    python3 - "$P" <<'PYEOF' 2>/dev/null || return 1
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+os.close(fd)
+PYEOF
+  else
+    return 0  # regular file / symlink: presence is all we can verify
+  fi
+}
+# core client only: "ubuntu12_32/steam" followed by space or EOL — this does
+# NOT match steamwebhelper (ubuntu12_32/steamwebhelper), whose churn would
+# break PID-stability detection
+CORE_STEAM_RE='ubuntu12_32/steam( |$)'
 steam_client_stable() {
-  [[ -e "$GAME_HOME/.steam/steam.pipe" ]] || return 1
-  pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1 || return 1
+  local P1 P2
+  pipe_connect_ok || return 1
+  P1=$(pgrep -u "$GAME_USER" -f "$CORE_STEAM_RE" 2>/dev/null | head -1)
+  [[ -n "$P1" ]] || return 1
   sleep 6
-  [[ -e "$GAME_HOME/.steam/steam.pipe" ]] \
-    && pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1
+  pipe_connect_ok || return 1
+  P2=$(pgrep -u "$GAME_USER" -f "$CORE_STEAM_RE" 2>/dev/null | head -1)
+  [[ -n "$P2" && "$P1" == "$P2" ]]
 }
 if ! steam_client_stable; then
   log "steam client unstable -> controlled restart"
@@ -169,15 +200,22 @@ while (( SW < 240 )); do
   sleep 5; (( SW += 5 ))
 done
 (( SW >= 240 )) && log "WARNING: self-update marker not seen in ${SW}s"
-# dump steam client state for the artifact (diag for pipe/version issues)
-{
-  echo "== .local/share/Steam top =="; ls -la "$GAME_HOME/.local/share/Steam/" 2>/dev/null | head -25
-  echo "== package version =="; ls "$GAME_HOME/.local/share/Steam/package/" 2>/dev/null | head -10
-  echo "== steam procs =="; ps -f -u "$GAME_USER" 2>/dev/null | grep -i steam | head -10
-  echo "== steam.pipe =="; ls -la "$GAME_HOME/.steam/steam.pipe" 2>/dev/null; file "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-  echo "== bootstrap_log tail =="; tail -30 "$GAME_HOME/.local/share/Steam/logs/bootstrap_log.txt" 2>/dev/null
-  echo "== console_linux tail =="; tail -20 "$GAME_HOME/.local/share/Steam/logs/console_linux.txt" 2>/dev/null
-} > "$RUNDIR/steam_state.txt" 2>/dev/null || true
+# dump steam client state (diag for pipe/version issues) — reusable so we can
+# snapshot the client's state at the EXACT moment of a SteamAPI failure
+dump_steam_state() {
+  {
+    echo "== snapshot at $(date +%H:%M:%S) =="
+    echo "== .local/share/Steam top =="; ls -la "$GAME_HOME/.local/share/Steam/" 2>/dev/null | head -25
+    echo "== linux64 dir =="; ls -la "$GAME_HOME/.local/share/Steam/linux64/" 2>/dev/null | head -15
+    echo "== package version =="; ls "$GAME_HOME/.local/share/Steam/package/" 2>/dev/null | head -10
+    echo "== steam procs =="; ps -f -u "$GAME_USER" 2>/dev/null | grep -i steam | head -10
+    echo "== steam.pipe =="; ls -la "$GAME_HOME/.steam/steam.pipe" 2>/dev/null; stat -c '%F %a %U' "$GAME_HOME/.steam/steam.pipe" 2>/dev/null; file "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+    echo "== pipe connect test =="; pipe_connect_ok && echo CONNECT_OK || echo CONNECT_FAIL
+    echo "== bootstrap_log tail =="; tail -30 "$GAME_HOME/.local/share/Steam/logs/bootstrap_log.txt" 2>/dev/null
+    echo "== console_linux tail =="; tail -20 "$GAME_HOME/.local/share/Steam/logs/console_linux.txt" 2>/dev/null
+  } > "$1" 2>/dev/null || true
+}
+dump_steam_state "$RUNDIR/steam_state.txt"
 
 # The engine dlopens ~/.steam/sdk64/steamclient.so to talk to the local Steam
 # client; a bootstrap-only install often lacks the symlink AND the .so itself
@@ -242,12 +280,36 @@ for W in $(XD search --name 'Steam' 2>/dev/null; XD search --name 'steam' 2>/dev
 done
 
 # ---------- 3. launch + trigger loop ----------
+# T-0 pipe sanity: run 12 proved the pipe can die in the ~90s between our
+# stability check and the engine's SteamAPI_Init. Re-verify RIGHT NOW.
+if ! pipe_connect_ok; then
+  log "WARNING: pipe not connectable at T-0 -> waiting up to 120s for recovery"
+  W=0
+  until pipe_connect_ok; do
+    W=$((W+5)); (( W >= 120 )) && { log "WARNING: pipe still down after ${W}s (launching anyway)"; break; }
+    sleep 5
+  done
+  (( W < 120 )) && log "pipe recovered after ~${W}s"
+fi
+
 VERDICT_CODE=1; VERDICT_TEXT="FAIL: no verdict"
 CONNECTED=0
 for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   if (( ATTEMPT > 1 )); then
     log "attempt $ATTEMPT/$MAX_ATTEMPTS: relaunching"
-    pkill -9 -x csgo_linux64 2>/dev/null; sleep 2; rm -f "$CONLOG" 2>/dev/null
+    pkill -9 -x csgo_linux64 2>/dev/null
+    pkill -9 -x hl2_linux 2>/dev/null
+    pkill -9 -f "$GAME_DIR" 2>/dev/null
+    sleep 2
+    # stale single-instance lock: clear ONLY when no engine process survived;
+    # deleting a LIVE holder's file would let two engines race on fresh inodes
+    if ! pgrep -f 'csgo_linux64|hl2_linux' >/dev/null 2>&1; then
+      rm -f /tmp/source_engine_*.lock 2>/dev/null \
+        || sudo -n rm -f /tmp/source_engine_*.lock 2>/dev/null || true
+      [[ -n "$(ls /tmp/source_engine_*.lock 2>/dev/null)" ]] \
+        && log "WARNING: engine lock file still present after cleanup"
+    fi
+    rm -f "$CONLOG" 2>/dev/null
   fi
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 
@@ -290,8 +352,23 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   MENU=0
   END=$((SECONDS + DURATION))
   while (( SECONDS < END )); do
-    pgrep -x csgo_linux64 >/dev/null 2>&1 || { log "attempt $ATTEMPT: client died"; (( ATTEMPT == 1 )) && sudo -n dmesg 2>/dev/null | tail -60 > "$RUNDIR/dmesg.a1.log"; break; }
+    pgrep -x csgo_linux64 >/dev/null 2>&1 || {
+      log "attempt $ATTEMPT: client died"
+      dump_steam_state "$RUNDIR/steam_state_died.a${ATTEMPT}.txt"
+      (( ATTEMPT == 1 )) && sudo -n dmesg 2>/dev/null | tail -60 > "$RUNDIR/dmesg.a1.log"
+      break; }
     grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" 2>/dev/null && { MENU=1; log "attempt $ATTEMPT: menu reached"; break; }
+    # fast-fail: a SteamAPI pipe failure leaves a MODAL error dialog on screen
+    # and the harness stalled the full DURATION doing nothing (run 37128611184
+    # attempt 2: 240s wasted). Snapshot client state, kill, retry with a
+    # settled client instead.
+    if grep -aq -e 'Failed to connect with local Steam Client' -e '\[S_API FAIL\]' "$OUT" 2>/dev/null; then
+      log "attempt $ATTEMPT: SteamAPI pipe failure in game log -> fast-fail instead of ${DURATION}s modal stall"
+      dump_steam_state "$RUNDIR/steam_state_fatal.a${ATTEMPT}.txt"
+      pkill -9 -x csgo_linux64 2>/dev/null
+      sleep 2
+      break
+    fi
     sleep 5
   done
   (( MENU )) || continue

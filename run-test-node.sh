@@ -399,11 +399,15 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
   EXTRA_ENV=""
-  # ALL attempts standalone (run 26): the client-up path is a PROVEN dead end
-  # while no account can log in (nick97806 = Invalid Password, x77173 = guard
-  # code unreachable - MS killed IMAP basic auth). Client killed once before
-  # the loop; each attempt clears stale singletons.
-  VARIANT="standalone-noclient"
+  # ALL attempts standalone (runs 26/27): the client-up path is a PROVEN dead
+  # end while no account can log in. 'create pipe failed' persists with the
+  # bridge preloaded (run 26) - a3/a5 test standalone with NO preload at all,
+  # a4 with the bridge passive (C2B_DISABLE_PATCH=1): full preload bisect.
+  VARIANT="standalone-bridge"
+  case $ATTEMPT in
+    3|5) LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
+    4)   EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="standalone-bridge-passive" ;;
+  esac
   pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
   pkill -u "$GAME_USER" -f steamwebhelper 2>/dev/null
   # wait until the client process tree is REALLY gone (a dying client's

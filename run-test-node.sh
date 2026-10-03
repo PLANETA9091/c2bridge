@@ -380,48 +380,73 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  # ---- crash fix + attempt variants (run 24 post-mortem) ----
-  # ROOT CAUSES FOUND:
-  #  (1) the bundle's 2013 libtcmalloc_minimal.so.0 -> deterministic protobuf
-  #      RepeatedPtrFieldBase::Add SEGV in libvideo.so ~5s after launch
-  #      (run 24 a3: tcmalloc shim -> ZERO crashes; runs 21/22/23/24 baseline
-  #      all crash). The shim is therefore DEFAULT for EVERY attempt.
-  #  (2) with the crash gone the REAL blocker shows: "[S_API FAIL] SteamAPI
-  #      Init() failed; connect to global user failed" - the runner's steam
-  #      client sits at the LOGIN DIALOG (nick97806 = Invalid Password per
-  #      steamcmd probe; x77173 = Steam Guard email pending). Connect-to-
-  #      global-user requires a LOGGED-IN client.
-  #  VARIANT a3/a5 = standalone: kill the client, rm the pipe -> the engine's
-  #  SteamAPI_Init takes the standalone path (steam_appid.txt is in the
-  #  bundle): steamclient.so loads in-process and creates a LOCAL user - no
-  #  login needed to reach the main menu.
+  # ---- crash fix + attempt variants (run 29 post-mortem) ----
+  # ROOT CAUSES FOUND (chronology):
+  #  (1) 2013 libtcmalloc_minimal.so.0 -> deterministic protobuf SEGV; tcmalloc
+  #      shim = DEFAULT for every attempt (run 24/25: ZERO crashes since).
+  #  (2) runs 18-28: "[S_API FAIL] connect to global user failed" - the client
+  #      sat at the LOGIN DIALOG (x77173/nick97806 = guard/invalid password).
+  #  (3) run 29: tim109401 LOGS IN OK (Steam Guard OFF on the account; probe:
+  #      "Logging in user 'tim109401' to Steam Public...OK"; login step green,
+  #      loginusers.vdf written, warm client running). The 26/27 all-standalone
+  #      bisect is OBSOLETE -> PRIMARY PATH IS CLIENT-UP AGAIN.
+  #  Attempt matrix:
+  #   a1/a2/a5 client-up + preload + shim  (the real path; a2 under gdb)
+  #   a3       standalone no-preload        (bisect fallback evidence)
+  #   a4       client-up, bridge passive    (C2B_DISABLE_PATCH=1 bisect)
   LDPREFIX=""
   [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
   EXTRA_ENV=""
-  # ALL attempts standalone (runs 26/27): the client-up path is a PROVEN dead
-  # end while no account can log in. 'create pipe failed' persists with the
-  # bridge preloaded (run 26) - a3/a5 test standalone with NO preload at all,
-  # a4 with the bridge passive (C2B_DISABLE_PATCH=1): full preload bisect.
-  VARIANT="standalone-bridge"
+  VARIANT="client-up-bridge"
   case $ATTEMPT in
-    3|5) LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
-    4)   EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="standalone-bridge-passive" ;;
+    3) LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
+    4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
+    5) VARIANT="client-up-bridge" ;;
   esac
-  pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
-  pkill -u "$GAME_USER" -f steamwebhelper 2>/dev/null
-  # wait until the client process tree is REALLY gone (a dying client's
-  # singleton state poisons the in-process steamclient's pipe creation)
-  WK=0
-  while pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]|steamwebhelper' >/dev/null 2>&1 && (( WK < 10 )); do
-    sleep 1; (( WK += 1 ))
-    pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
-    pkill -9 -u "$GAME_USER" -f steamwebhelper 2>/dev/null
-  done
-  rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-  sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" "$GAME_HOME/.steam/steam.pid" 2>/dev/null
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
-  log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}] client=killed"
+  if [[ $VARIANT == standalone-* ]]; then
+    pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+    pkill -u "$GAME_USER" -f steamwebhelper 2>/dev/null
+    # wait until the client process tree is REALLY gone (a dying client's
+    # singleton state poisons the in-process steamclient's pipe creation)
+    WK=0
+    while pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]|steamwebhelper' >/dev/null 2>&1 && (( WK < 10 )); do
+      sleep 1; (( WK += 1 ))
+      pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+      pkill -9 -u "$GAME_USER" -f steamwebhelper 2>/dev/null
+    done
+    rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+    sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" "$GAME_HOME/.steam/steam.pid" 2>/dev/null
+    log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}] client=killed"
+  else
+    # CLIENT-UP: the login step left a LOGGED-IN client running. Re-verify
+    # per attempt: the previous engine's exit can momentarily disturb the
+    # client/pipe. If the client process is gone, relaunch it via
+    # steam-login.sh (sentry is cached -> silent auto-login).
+    if ! pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1; then
+      log "attempt $ATTEMPT: client process gone -> relaunching via steam-login.sh"
+      if [[ -x "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+        STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+        C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+          bash "$NODE_HOME/steam-login.sh" \
+          >>"$RUNDIR/steam-relaunch.a${ATTEMPT}.log" 2>&1 || \
+          log "attempt $ATTEMPT: WARNING: steam-login.sh relaunch rc=$?"
+      else
+        log "attempt $ATTEMPT: WARNING: steam-login.sh/creds unavailable, cannot relaunch client"
+      fi
+    fi
+    WK=0
+    until pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \
+          && pipe_connect_ok; do
+      (( WK += 1 ))
+      (( WK >= 24 )) && { log "attempt $ATTEMPT: WARNING: client/pipe not ready after $((WK*5))s (launching anyway)"; break; }
+      sleep 5
+    done
+    pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \
+      && log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}] client=up pipe=$(pipe_connect_ok && echo ok || echo BAD)" \
+      || log "attempt $ATTEMPT: variant=$VARIANT preload=[${LDPRELOAD:+set}] shim=[${LDPREFIX:+set}] client=MISSING"
+  fi
 
   # Debugger placement: attempt 1 is ALWAYS a clean launch. gdb disables ASLR
   # by default (disable-randomization on) and that ALONE kills the engine at

@@ -130,6 +130,25 @@ if ! steam_client_alive; then
 else
   log "steam client already running (warm)"
 fi
+# The engine dlopens ~/.steam/sdk64/steamclient.so to talk to the local Steam
+# client; a bootstrap-only install often lacks the symlink (run 37125126789:
+# "Failed to connect with local Steam Client process!" -> clean exit after
+# D3D9/GL init). Create it if missing/broken.
+if [[ ! -e "$GAME_HOME/.steam/sdk64/steamclient.so" ]]; then
+  mkdir -p "$GAME_HOME/.steam"
+  SC=""
+  if [[ -e "$GAME_HOME/.steam/root" ]]; then
+    SC="$GAME_HOME/.steam/root/linux64/steamclient.so"
+  fi
+  [[ -e "$SC" ]] || SC=$(find "$GAME_HOME/.local/share/Steam" -maxdepth 4 \
+      -path '*linux64/steamclient.so' 2>/dev/null | head -1)
+  if [[ -n "$SC" && -e "$SC" ]]; then
+    ln -sfn "$(dirname "$SC")" "$GAME_HOME/.steam/sdk64"
+    log "created ~/.steam/sdk64 -> $(dirname "$SC")"
+  else
+    log "WARNING: steamclient.so (sdk64) not found; Steam-API init will fail"
+  fi
+fi
 # hide steam's own UI windows (no WM on the node: they overlap the game)
 XD() { sudo -n -u "$GAME_USER" env DISPLAY=:99 xdotool "$@"; }
 for W in $(XD search --name 'Steam' 2>/dev/null; XD search --name 'steam' 2>/dev/null); do

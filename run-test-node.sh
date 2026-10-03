@@ -233,12 +233,25 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  # Diagnostic on attempt 1: strace INSIDE sudo (setuid sudo can't be ptraced
-  # from outside — run 37122969873) as the game user + dmesg dump on death
-  # (catches kernel OOM killer evidence).
-  STRACE_INNER=""
-  if (( ATTEMPT == 1 )) && command -v strace >/dev/null 2>&1; then
-    STRACE_INNER="exec strace -f -qq -e trace=execve,execveat,kill,tgkill,mprotect,prctl -o $RUNDIR/strace_game.a1.log ./csgo_linux64"
+  # Diagnostic on attempt 1: gdb batch INSIDE sudo as the game user - catches
+  # SIGSEGV with a full backtrace and the engine Error() int3 path (strace
+  # only showed WHO died; setuid sudo can't be ptraced from outside, run
+  # 37122969873).
+  DBG_INNER=""
+  if (( ATTEMPT == 1 )) && command -v gdb >/dev/null 2>&1; then
+    DBG_INNER="exec gdb -batch -return-child-result \
+      -ex 'set confirm off' \
+      -ex 'handle SIGPIPE nostop noprint' \
+      -ex 'handle SIGHUP nostop noprint' \
+      -ex 'handle SIGUSR1 nostop noprint' \
+      -ex 'handle SIGUSR2 nostop noprint' \
+      -ex 'handle SIGALRM nostop noprint' \
+      -ex 'handle SIGCONT nostop noprint' \
+      -ex run \
+      -ex 'thread apply all bt' \
+      --args ./csgo_linux64"
+  elif (( ATTEMPT == 1 )) && command -v strace >/dev/null 2>&1; then
+    DBG_INNER="exec strace -f -qq -e trace=execve,execveat,kill,tgkill,mprotect,prctl -o $RUNDIR/strace_game.a1.log ./csgo_linux64"
   fi
 
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
@@ -246,7 +259,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     SDL_AUDIODRIVER=dummy \
     LD_PRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO" \
     $MODES \
-    sh -c "cd '$GAME_DIR' && ${STRACE_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
+    sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
     >"$OUT" 2>&1 &
   log "attempt $ATTEMPT: client launched, waiting up to ${DURATION}s for menu"
 

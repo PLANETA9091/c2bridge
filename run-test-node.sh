@@ -147,7 +147,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
+  # strace attempt 1 (if available): the exec chain + WHO sends kill signals
+  # (diagnoses the hosted-runner SIGKILL seen in run 37122124400)
+  STRACE_PFX=""
+  if (( ATTEMPT == 1 )) && command -v strace >/dev/null 2>&1; then
+    STRACE_PFX="strace -f -qq -e trace=execve,execveat,kill,tgkill,rt_sigqueueinfo,mprotect,ptrace -o $RUNDIR/strace.a${ATTEMPT}.log"
+  fi
+
+  $STRACE_PFX sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
     LD_LIBRARY_PATH="$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
     SDL_AUDIODRIVER=dummy \
     LD_PRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO" \
@@ -200,5 +207,5 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   (( CONNECTED )) && { VERDICT_CODE=0; VERDICT_TEXT="PASS: connected to $TARGET (attempt $ATTEMPT)"; break; }
 done
 
-(( VERDICT_CODE -ne 0 )) && VERDICT_TEXT="FAIL: no connection to ${TARGET:-<smoke>} (menu=$MENU, logs: $RUNDIR)"
+(( VERDICT_CODE != 0 )) && VERDICT_TEXT="FAIL: no connection to ${TARGET:-<smoke>} (menu=$MENU, logs: $RUNDIR)"
 finish "$VERDICT_CODE" "$VERDICT_TEXT"

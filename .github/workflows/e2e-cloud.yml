@@ -53,21 +53,25 @@ jobs:
       - uses: actions/checkout@v4
 
       # ---------- caches: bundle + steam client/sentry ----------
+      # NOTE: actions/cache@v4 combined form is unusable here — its save-always
+      # input is deprecated AND broken ("does not work as intended"): on a failed
+      # job the post-save is skipped, so NO run ever populated the cache and every
+      # run re-fetched 1.29 GiB from MEGA (run 12 log: "Cache not found for input
+      # keys: csgo-lite-v1"). Explicit restore + save-always() pair instead.
       - name: restore bundle cache
         id: cache-bundle
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/csgo-lite
           key: csgo-lite-v1
-          save-always: true
       - name: restore steam client cache (runtime + sentry = silent logins)
-        uses: actions/cache@v4
+        id: cache-steam
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.local/share/Steam
             ~/.steam
           key: steam-node-v2
-          save-always: true
 
       # ---------- system deps (each hosted run starts from a clean VM) ----------
       - name: install system packages
@@ -198,3 +202,19 @@ jobs:
           name: e2e-cloud-${{ env.MODE }}-${{ github.run_id }}
           path: e2e-out/
           retention-days: 30
+
+      # ---------- cache save (explicit, survives failed e2e verdicts) ----------
+      - name: save bundle cache
+        if: always() && steps.cache-bundle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/csgo-lite
+          key: csgo-lite-v1
+      - name: save steam client cache
+        if: always() && steps.cache-steam.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.local/share/Steam
+            ~/.steam
+          key: steam-node-v2

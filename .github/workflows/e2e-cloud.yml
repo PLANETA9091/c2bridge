@@ -109,6 +109,18 @@ jobs:
           # modern Steam REFUSES to start without them (zenity "Steam now
           # requires user namespaces" -> no IPC pipe -> SteamAPI_Init fatal).
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # Memory headroom (run 37135148290): steam client logged 102x
+          # "mmap() failed: Cannot allocate memory" at startup and every
+          # engine launch died in a protobuf static-init SEGV; the only run
+          # with a HEALTHY client (37128611184 a2) sailed to D3D9. Give the
+          # runner swap + permissive overcommit + a large map budget.
+          if ! swapon --show 2>/dev/null | grep -q .; then
+            sudo fallocate -l 8G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+            sudo chmod 600 /swapfile && sudo mkswap -q /swapfile && sudo swapon /swapfile \
+              && echo "swap enabled: $(swapon --show --noheadings)" || echo "WARNING: swap setup failed"
+          fi
+          sudo sysctl -w vm.overcommit_memory=1 || true
+          sudo sysctl -w vm.max_map_count=1048576 || true
           # Steam client: official steam.deb. NOTE: the apt-repo route is dead —
           # Valve's steam.asc key URL 404s (2026-10), which killed run 37115551190.
           if ! [ -x "$HOME/.local/share/Steam/steam.sh" ] && ! command -v steam >/dev/null; then
@@ -187,7 +199,10 @@ jobs:
             # observe mode: bridge preloaded but NOT patching (the translate
             # GOT-patch crashes protobuf init on the runner's glibc - run 16
             # gdb backtrace). Smoke only needs menu + preload evidence.
-            C2B_SMOKE=1 C2B_TRANSLATE=0 bash run-test-node.sh
+            # 5 attempts: the protobuf static-init SEGV is nondeterministic
+            # (survived in 37128611184 a2, died in 37135148290 a1-a3) - retry
+            # through it; a dead attempt costs ~15s since the liveness fix.
+            C2B_SMOKE=1 C2B_TRANSLATE=0 C2B_ATTEMPTS=5 bash run-test-node.sh
           else
             bash run-test-node.sh
           fi

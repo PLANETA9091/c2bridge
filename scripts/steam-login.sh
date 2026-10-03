@@ -64,7 +64,7 @@ else
   {
     echo "== steam-login diagnostics $(date -u +%H:%M:%SZ) =="
     echo "-- Xvfb :99 window titles (login dialogs live here) --"
-    DISPLAY=:99 xdotool search --onlyvisible --name '.*' getwindowname %@ 2>/dev/null | head -30 || echo "(xdotool failed)"
+    DISPLAY=:99 xdotool search --name '.*' getwindowname %@ 2>/dev/null | head -40 || echo "(xdotool failed)"
     echo "-- dialog processes (zenity argv contains the dialog TEXT = the reason) --"
     ps -eo user,pid,args | grep -aiE 'zenity|xmessage|kdialog|steam.*guard|Steam Guard' | grep -v grep || echo "(none)"
     echo "-- steam client console log tail --"

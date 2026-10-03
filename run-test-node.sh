@@ -268,6 +268,9 @@ done
 dump_steam_state() {
   {
     echo "== snapshot at $(date +%H:%M:%S) =="
+    echo "== memory (run 19: 102x client mmap-fail + engine protobuf SEGV correlate) =="
+    free -m 2>/dev/null; swapon --show 2>/dev/null || true
+    echo "-- top RSS procs --"; ps -eo pid,rss,comm,args --sort=-rss 2>/dev/null | head -8
     echo "== .local/share/Steam top =="; ls -la "$GAME_HOME/.local/share/Steam/" 2>/dev/null | head -25
     echo "== linux64 dir =="; ls -la "$GAME_HOME/.local/share/Steam/linux64/" 2>/dev/null | head -15
     echo "== package version =="; ls "$GAME_HOME/.local/share/Steam/package/" 2>/dev/null | head -10

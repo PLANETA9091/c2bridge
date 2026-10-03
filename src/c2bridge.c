@@ -10654,6 +10654,18 @@ static void test_cl(void)
 #undef CL_N
 }
 
+/* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
+   инструментированная пролог-часть (stolen bytes) невалидна вне родного фрейма
+   (clang+ASan: SIGSEGV). Логика детура покрыта test_up_dispatch без патчей. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
+#  define C2B_ST_NO_DETOUR 1
+#endif
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#    define C2B_ST_NO_DETOUR 1
+#  endif
+#endif
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -10685,8 +10697,12 @@ int main(void)
     test_gc_hello();    /* t42v10: автомат ClientHello-pump на дублях */
     test_cl();          /* 41e-a: connectionless v1 (классификация/фильтр) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
+#ifndef C2B_ST_NO_DETOUR
     test_detour();
     test_detour2();
+#else
+    printf("[i] detour/detour2 skipped: self-modifying code under sanitizers\n");
+#endif
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "PASSED", fails);
     return fails ? 1 : 0;
 }

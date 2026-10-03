@@ -25,9 +25,13 @@ if [[ -d "$DEST" && -n "$(ls -A "$DEST" 2>/dev/null)" ]]; then
   exit 0
 fi
 
-command -v rclone >/dev/null 2>&1 || {
-  sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-}
+# rclone with the MEGA backend: distro builds (Ubuntu 24.04 = rclone 1.60.1)
+# ship WITHOUT mega ("couldn't find backend for type mega") — install the
+# official current build when the backend is missing.
+if ! command -v rclone >/dev/null 2>&1 || ! rclone help backends 2>/dev/null | grep -qw mega; then
+  curl -fsSL -o /tmp/rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+  sudo apt-get install -y -qq /tmp/rclone.deb
+fi
 
 if [[ -n "${MEGA_USER:-}" && -n "${MEGA_PASS:-}" ]]; then
   MEGA_DIR="${MEGA_DIR:-csgo}"   # user's MEGA folder created 20261003

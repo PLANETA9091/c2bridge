@@ -20,8 +20,14 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: install rclone
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: install rclone (official build — distro rclone lacks the mega backend)
+        run: |
+          set -euo pipefail
+          if ! command -v rclone >/dev/null || ! rclone help backends 2>/dev/null | grep -qw mega; then
+            curl -fsSL -o /tmp/rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+            sudo apt-get install -y -qq /tmp/rclone.deb
+          fi
+          rclone help backends 2>/dev/null | grep -qw mega || { echo "::error::rclone has no mega backend"; exit 1; }
 
       - name: verify bundle reachable
         env:

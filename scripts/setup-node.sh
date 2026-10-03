@@ -32,8 +32,11 @@ if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get install -y -qq /tmp/steam.deb || \
       echo "WARNING: steam-launcher not installed — install Steam manually"
   fi
-  # rclone for the MEGA bundle fetch
-  command -v rclone >/dev/null 2>&1 || { sudo apt-get install -y -qq rclone || true; }
+  # rclone for the MEGA bundle fetch (official build: distro rclone lacks mega backend)
+  if ! command -v rclone >/dev/null 2>&1 || ! rclone help backends 2>/dev/null | grep -qw mega; then
+    curl -fsSL -o /tmp/rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+    sudo apt-get install -y -qq /tmp/rclone.deb || true
+  fi
 elif command -v pacman >/dev/null 2>&1; then
   echo "== Arch: installing packages =="
   sudo pacman -S --noconfirm --needed \

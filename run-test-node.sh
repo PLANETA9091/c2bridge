@@ -147,19 +147,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
-  # strace attempt 1 (if available): the exec chain + WHO sends kill signals
-  # (diagnoses the hosted-runner SIGKILL seen in run 37122124400)
-  STRACE_PFX=""
+  # Diagnostic on attempt 1: strace INSIDE sudo (setuid sudo can't be ptraced
+  # from outside — run 37122969873) as the game user + dmesg dump on death
+  # (catches kernel OOM killer evidence).
+  STRACE_INNER=""
   if (( ATTEMPT == 1 )) && command -v strace >/dev/null 2>&1; then
-    STRACE_PFX="strace -f -qq -e trace=execve,execveat,kill,tgkill,rt_sigqueueinfo,mprotect,ptrace -o $RUNDIR/strace.a${ATTEMPT}.log"
+    STRACE_INNER="exec strace -f -qq -e trace=execve,execveat,kill,tgkill,mprotect,prctl -o $RUNDIR/strace_game.a1.log ./csgo_linux64"
   fi
 
-  $STRACE_PFX sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
+  sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
     LD_LIBRARY_PATH="$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
     SDL_AUDIODRIVER=dummy \
     LD_PRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO" \
     $MODES \
-    sh -c "cd '$GAME_DIR' && exec ./csgo_linux64 -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
+    sh -c "cd '$GAME_DIR' && ${STRACE_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
     >"$OUT" 2>&1 &
   log "attempt $ATTEMPT: client launched, waiting up to ${DURATION}s for menu"
 
@@ -167,7 +168,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   MENU=0
   END=$((SECONDS + DURATION))
   while (( SECONDS < END )); do
-    pgrep -x csgo_linux64 >/dev/null 2>&1 || { log "attempt $ATTEMPT: client died"; break; }
+    pgrep -x csgo_linux64 >/dev/null 2>&1 || { log "attempt $ATTEMPT: client died"; (( ATTEMPT == 1 )) && sudo -n dmesg 2>/dev/null | tail -60 > "$RUNDIR/dmesg.a1.log"; break; }
     grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" 2>/dev/null && { MENU=1; log "attempt $ATTEMPT: menu reached"; break; }
     sleep 5
   done

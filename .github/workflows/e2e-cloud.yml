@@ -184,7 +184,10 @@ jobs:
           cp -f scripts/steam-login.sh "$C2B_NODE_HOME/steam-login.sh"
           echo "$C2B_TARGET" > "$C2B_NODE_HOME/target.conf"
           if [ "$MODE" = "smoke" ]; then
-            C2B_SMOKE=1 bash run-test-node.sh
+            # observe mode: bridge preloaded but NOT patching (the translate
+            # GOT-patch crashes protobuf init on the runner's glibc - run 16
+            # gdb backtrace). Smoke only needs menu + preload evidence.
+            C2B_SMOKE=1 C2B_TRANSLATE=0 bash run-test-node.sh
           else
             bash run-test-node.sh
           fi

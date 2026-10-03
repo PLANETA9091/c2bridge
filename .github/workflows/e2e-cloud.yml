@@ -164,6 +164,9 @@ jobs:
       # ---------- steam session ----------
       - name: probe credentials (steamcmd - invalid password vs steam guard)
         run: |
+          # SKIP when a guard code is provided: a bare login attempt would
+          # trigger a NEW guard email and invalidate the user's fresh code
+          if [ -n "$STEAM_GUARD_CODE" ]; then echo "guard code provided — skip probe (avoid code invalidation)"; exit 0; fi
           if [ -z "$STEAM_USER" ]; then echo "STEAM_USER not set — skip probe"; exit 0; fi
           sudo apt-get install -y -qq lib32gcc-s1 >/dev/null 2>&1 || true
           mkdir -p /tmp/steamcmd && cd /tmp/steamcmd

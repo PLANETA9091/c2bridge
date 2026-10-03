@@ -24,10 +24,45 @@ pgrep -f "Xvfb :99" >/dev/null 2>&1 || {
 }
 
 LOG=/tmp/c2b-steam-login.log
+
+# ---------- Steam Guard: approve THIS device once via steamcmd ----------
+# steamcmd's own output confirms the flow: "You can also enter this code at
+# any time using 'set_steam_guard_code'". After a code-approved login steamcmd
+# stores the approved-device token (ssfn*) in ~/Steam/config - copy it into
+# the client's config so the client's -login passes without a prompt. Both
+# read the same ssfn format; this is the standard headless bootstrap path.
 if [[ -n "${STEAM_GUARD_CODE:-}" ]]; then
-  echo "[steam-login] login WITH guard code"
+  echo "[steam-login] guard code provided -> approving device via steamcmd"
+  SCMD=/tmp/c2b-steamcmd
+  if [[ ! -x "$SCMD/steamcmd.sh" ]]; then
+    mkdir -p "$SCMD"
+    curl -fsSL -o "$SCMD/sc.tar.gz" https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
+      && tar xzf "$SCMD/sc.tar.gz" -C "$SCMD" || echo "[steam-login] WARNING: steamcmd download failed"
+  fi
+  if [[ -x "$SCMD/steamcmd.sh" ]]; then
+    sudo apt-get install -y -qq lib32gcc-s1 >/dev/null 2>&1 || true
+    ( cd "$SCMD" && timeout 120 ./steamcmd.sh +login "$STEAM_USER" "$STEAM_PASS" \
+        +set_steam_guard_code "$STEAM_GUARD_CODE" +quit >"$LOG" 2>&1 )
+    if grep -q "Logged in OK" "$LOG"; then
+      echo "[steam-login] steamcmd: device approved (guard accepted)"
+    else
+      echo "[steam-login] WARNING: steamcmd guard login did not confirm OK:"
+      grep -aiE "guard|error|denied|failed" "$LOG" | head -5
+    fi
+    # ssfn* = approved-device token; also copy the whole login state
+    for SF in "$HOME/Steam/config/"ssfn* "$SCMD/Steam/config/"ssfn*; do
+      [[ -f "$SF" ]] || continue
+      cp -f "$SF" "$GAME_HOME/.local/share/Steam/config/" 2>/dev/null || true
+      cp -f "$SF" "$GAME_HOME/.steam/steam/config/" 2>/dev/null || true
+      echo "[steam-login] copied $(basename "$SF") into client config"
+    done
+  fi
+fi
+
+if [[ -n "${STEAM_GUARD_CODE:-}" ]]; then
+  echo "[steam-login] login WITH guard code (approved device expected)"
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
-    "$STEAM_SH" -login "$STEAM_USER" "$STEAM_PASS" -set_steam_guard_code "$STEAM_GUARD_CODE" -silent >"$LOG" 2>&1 &
+    "$STEAM_SH" -login "$STEAM_USER" "$STEAM_PASS" -silent >"$LOG" 2>&1 &
 else
   echo "[steam-login] login (no code; ok if a sentry already exists on this node)"
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \

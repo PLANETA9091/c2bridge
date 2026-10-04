@@ -11137,15 +11137,15 @@ static void test_cl(void)
                 CHECK(al == 9 && ar[4] == 'A' && ar[5] == 0xd7 && ar[8] == 0xb0,
                       "clv2: fmt0 = 41+le32");
                 al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 1, 0, 0xB0AA4BD7u);
-                CHECK(al == 14, "clv2: fmt1 = ascii0x длина 14");
-                CHECK(ar[4]=='A' && ar[5]=='0' && ar[6]=='x' && ar[13] == 0,
+                CHECK(al == 16, "clv2: fmt1 = ascii0x длина 16");
+                CHECK(ar[4]=='A' && ar[5]=='0' && ar[6]=='x' && ar[15] == 0,
                       "clv2: fmt1 = '0x' + hex + NUL");
                 al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 2, 0, 0xB0AA4BD7u);
                 CHECK(al == 13 && ar[9] == 17, "clv2: fmt2 = le32+le32(17)");
                 al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 3, 7u, 0xB0AA4BD7u);
                 CHECK(al == 13 && ar[5] == 7, "clv2: fmt3 = echo(qc)+le32");
                 al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 4, 0, 0xB0AA4BD7u);
-                CHECK(al == 18 && ar[13] == 0 && ar[14] == 17,
+                CHECK(al == 20 && ar[15] == 0 && ar[16] == 17,
                       "clv2: fmt4 = ascii + le32(17)");
                 CHECK(c2b_clv2_build_chalreply(ar, 8, 0, 0, 1) == 0,
                       "clv2: крошечный буфер -> 0");

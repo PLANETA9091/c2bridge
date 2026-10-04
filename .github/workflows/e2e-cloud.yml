@@ -31,6 +31,11 @@ on:
       steam_guard_code:
         description: "Steam Guard code (ONLY for the very first run / new device)"
         required: false
+      run_all:
+        description: "smoke: run ALL attempts despite early PASS (max evidence)"
+        default: "1"
+        type: choice
+        options: ["1", "0"]
   schedule:
     - cron: "0 4 * * *"   # daily 04:00 UTC smoke
 
@@ -233,7 +238,8 @@ jobs:
             # 5 attempts: the protobuf static-init SEGV is nondeterministic
             # (survived in 37128611184 a2, died in 37135148290 a1-a3) - retry
             # through it; a dead attempt costs ~15s since the liveness fix.
-            C2B_SMOKE=1 C2B_TRANSLATE=0 C2B_ATTEMPTS=5 bash run-test-node.sh
+            C2B_SMOKE=1 C2B_TRANSLATE=0 C2B_ATTEMPTS=5 \
+              C2B_RUN_ALL="${{ inputs.run_all || '1' }}" bash run-test-node.sh
           else
             bash run-test-node.sh
           fi

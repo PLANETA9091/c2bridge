@@ -381,6 +381,7 @@ if ! pipe_connect_ok; then
 fi
 
 VERDICT_CODE=1; VERDICT_TEXT="FAIL: no verdict"
+PASSED_LIST=""   # C2B_RUN_ALL: номера попыток, прошедших smoke-check
 CONNECTED=0
 for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   if (( ATTEMPT > 1 )); then
@@ -419,18 +420,23 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # no this at all -> SIGSEGV at 0x100000000). Fixed in c2bridge.c + selftest
   # now validates self delivery. Run 33 (PASS, all-active): no crash, GC
   # armed, but the queue returned 16 zero entries (mt=0/rsz=0) which blocked
-  # ClientHello -> new-steamclient slot layout suspect. Run 34 plan:
-  #   a1/a2(gdb) client-up-bridge ACTIVE + GCDIAG vtable dump (no hello),
-  #   a3 standalone no-preload (bisect evidence),
-  #   a4 client-up-bridge-passive (control: must still reach menu),
-  #   a5 client-up-bridge-hello (C2B_HELLO=1: real ClientHello gamble under
-  #      evidence; a1/a2/a3/a4 keep the run green whatever happens).
+  # ClientHello -> new-steamclient slot layout suspect. Run 34 (PASS):
+  # GCDIAG decoded - slots [2]/[3] are REAL methods (endbr64 prologs; [3]
+  # saves rdx+esi+ecx = SendMessage(this,type,data,size) arg pattern),
+  # [0]/[1] are thunks into an inner object, [4]/[6] point at version
+  # strings -> the 2/3 RE-fact layout likely CORRECT; zero-queue-entries
+  # are a separate phenomenon. Decision: hello experiment runs FIRST
+  # (a1/a2-gdb), controls follow; C2B_RUN_ALL=1 (workflow default) runs
+  # ALL attempts despite an early PASS so every attempt yields evidence.
+  #   a1/a2: hello (a2 under gdb), a3: plain active, a4: passive control,
+  #   a5: standalone evidence.
   EXTRA_ENV=""
   VARIANT="client-up-bridge"
   case $ATTEMPT in
-    3) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
+    1) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello" ;;
+    2) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello-gdb" ;;
     4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
-    5) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello" ;;
+    5) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
   esac
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
   # fresh console.log per attempt: condebug APPENDS, and the menu marker is
@@ -565,7 +571,18 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     sleep 7   # let the menu settle; a bundle gap usually crashes here
     if engine_alive \
        && ! grep -aq 'ERROR: ld.so: object' "$OUT" 2>/dev/null; then
-      VERDICT_CODE=0; VERDICT_TEXT="PASS: smoke boot from lite bundle (menu stable, bridge preloaded, attempt $ATTEMPT)"
+      PASSED_LIST="$PASSED_LIST $ATTEMPT"
+      VERDICT_CODE=0
+      VERDICT_TEXT="PASS: smoke boot from lite bundle (menu stable, bridge preloaded, attempts PASS:${PASSED_LIST})"
+      if [[ "${C2B_RUN_ALL:-0}" == "1" ]]; then
+        # run 35+: each attempt carries its own experiment (hello/gdb/diag);
+        # an early PASS must not starve the remaining evidence. Record,
+        # kill the client, keep the verdict from the last PASS record.
+        log "attempt $ATTEMPT: PASS recorded (C2B_RUN_ALL=1) -> next attempt"
+        pkill -9 -x csgo_linux64 2>/dev/null
+        sleep 2
+        continue
+      fi
       break
     fi
     log "attempt $ATTEMPT: smoke check failed (died or preload error)"

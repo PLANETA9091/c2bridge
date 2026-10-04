@@ -100,9 +100,9 @@ for t, ends in sorted(hits.items()):
 seen = []
 for t, ends in sorted(hits.items()):
     for endva in ends:
-        lo = max(text['addr'], endva - 192)
-        hi = min(text['addr'] + text['size'], endva + 192)
-        key = lo // 96
+        lo = max(text['addr'], endva - 4608)
+        hi = min(text['addr'] + text['size'], endva + 320)
+        key = lo // 2048
         if key in seen:
             continue
         seen.append(key)

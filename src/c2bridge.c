@@ -6237,6 +6237,25 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         out[n++] = 'r'; out[n++] = 'v'; out[n++] = 'e'; out[n++] = 0;
         break;
     }
+    case 8: {                              /* 41e-g: N-агностик — хвост = (reserve)*9 NUL */
+        /* Любой суффикс повторного "reserve" содержит целое "reserve"
+         * (период 7 = длина слова), поэтому ReadString, начавшись с ЛЮБОГО
+         * смещения (11+N для любого N), находит strstr("reserve").
+         * flag-байт при N≠4 ненулевой -> идёт через гейт 482410
+         * (CommandLine: !-insecure !-tools && VAC-флаг = true на раннере)
+         * -> тот же string-флоу (25c8dd -> 25ab88). */
+        u32 i;
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        out[n++] = 3; out[n++] = 0; out[n++] = 0; out[n++] = 0;   /* authproto=3 */
+        out[n++] = 0; out[n++] = 0;                               /* keysize=0 */
+        for (i = 0; i < 9 * 7; i++) {                             /* (reserve)*9 */
+            static const char w[] = "reserve";
+            out[n++] = (u8)w[i % 7];
+        }
+        out[n++] = 0;
+        break;
+    }
     default:                               /* 0: le32 challenge (run 45 baseline) */
         out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
         out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
@@ -11201,19 +11220,20 @@ static void test_cl(void)
                       "clv2: fmt4 = ascii + le32(17)");
                 CHECK(c2b_clv2_build_chalreply(ar, 8, 0, 0, 1) == 0,
                       "clv2: крошечный буфер -> 0");
-                /* 41e-f: fmt7 — k-поиск смещения строки */
+                /* 41e-g: fmt8 — N-агностик (хвост = (reserve)*9 NUL) */
                 {
-                    static const char want[] = "reserve";
                     u32 i;
-                    g_clv2_k = 3;
-                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 7, 0, 0x11223344u);
-                    CHECK(al == 26, "clv2: fmt7(k=3) = 26 байт");
-                    for (i = 0; i < 7; i++)
-                        CHECK(ar[18 + i] == (u8)want[i], "clv2: fmt7 строка 'reserve'");
-                    g_clv2_k = 0;
-                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 7, 0, 0x11223344u);
-                    CHECK(al == 23, "clv2: fmt7(k=0) = 23 байта");
-                    g_clv2_k = 4;
+                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 8, 0, 0x11223344u);
+                    CHECK(al == 79, "clv2: fmt8 = 79 байт");
+                    CHECK(ar[9] == 3 && ar[13] == 0 && ar[14] == 0, "clv2: fmt8 заголовок");
+                    {
+                        static const char w[] = "reserve";
+                        u32 ok = 1;
+                        for (i = 0; i < 63; i++)
+                            if (ar[15 + i] != (u8)w[i % 7]) ok = 0;
+                        CHECK(ok, "clv2: fmt8 хвост = (reserve)*9");
+                    }
+                    CHECK(ar[78] == 0, "clv2: fmt8 NUL");
                 }
             }
         }

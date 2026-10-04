@@ -417,13 +417,16 @@ PASSED_LIST=""   # C2B_RUN_ALL: номера попыток, прошедших 
 CONNECTED=0
 for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   if (( ATTEMPT > 1 )); then
+    # capture the PREVIOUS attempt's console.log before the next launch
+    # truncates it (the CLV2 'A'-reply verdict lines live here)
+    [[ -f "$CONLOG" ]] && cp -f "$CONLOG" "$RUNDIR/console.a$(( ATTEMPT - 1 )).log" 2>/dev/null || true
     log "attempt $ATTEMPT/$MAX_ATTEMPTS: relaunching"
     cleanup_engines
   fi
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 
   MODES=""
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=7 C2B_CLV2_K=$(( ATTEMPT + 1 ))"
+  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=8"
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 

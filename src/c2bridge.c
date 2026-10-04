@@ -6067,6 +6067,8 @@ static i32 g_clv2_fd = -1;       /* fd, с которым связан обме�
 static u64 g_clv2_ch64;          /* challenge сервера */
 static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
 static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
+static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
+static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
 static u32 c2b_clv2_rand32(void)
@@ -6145,6 +6147,61 @@ static i32 c2b_clv2_parse_chalreply(const u8 *p, u32 n, u32 expect_cid, u64 *ch)
     return 1;
 }
 
+/* ---------- 41e-d: формат 'A'-ответа движку — МАТРИЦА ЭКСПЕРИМЕНТОВ ----------
+ * Run 45: наш 9Б ответ (41+le32) движок отверг («Invalid challenge packet.»,
+ * req=1 — движок перестаёт qconnect-ить после невалидного 'A'). Голый 41
+ * тоже невалиден (Valve issue 1436). Движок живёт ОДНУ попытку → формат
+ * выбирается env C2B_CLV2_FMT и харнесс гоняет 5 вариантов на 5 попыток:
+ *   0: 41 le32(ch32)                       — бинарный (базовый, run 45)
+ *   1: 41 "0x%08X" NUL                     — ASCII, симметрично qconnect0x…
+ *   2: 41 le32(ch32) le32(17)              — бинарный + int protocol
+ *   3: 41 le32(qc_echo) le32(ch32)         — эхо значения из qconnect + challenge
+ *   4: 41 "0x%08X" le32(17)                — ASCII + int protocol
+ * Успех = движок продолжил: либо снова qconnect с новым значением, либо
+ * S1 connect (капчерится CLV2-интерпозером, cn-счётчик). */
+static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 ch32)
+{
+    u32 n = 0;
+    if (cap < 24) return 0;
+    out[n++] = 0xff; out[n++] = 0xff; out[n++] = 0xff; out[n++] = 0xff;
+    out[n++] = 'A';
+    switch (fmt) {
+    case 1: {                              /* ASCII "0x%08X" */
+        static const char hx[] = "0123456789ABCDEF";
+        u32 i;
+        out[n++] = '0'; out[n++] = 'x';
+        for (i = 0; i < 8; i++) out[n++] = hx[(ch32 >> (28 - 4 * i)) & 15];
+        out[n++] = 0;
+        break;
+    }
+    case 2:                                /* le32 challenge + le32 protocol(17) */
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        out[n++] = 17; out[n++] = 0; out[n++] = 0; out[n++] = 0;
+        break;
+    case 3:                                /* le32 echo(qc) + le32 challenge */
+        out[n++] = (u8)(qc_val); out[n++] = (u8)(qc_val >> 8);
+        out[n++] = (u8)(qc_val >> 16); out[n++] = (u8)(qc_val >> 24);
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        break;
+    case 4: {                              /* ASCII + le32 protocol(17) */
+        static const char hx[] = "0123456789ABCDEF";
+        u32 i;
+        out[n++] = '0'; out[n++] = 'x';
+        for (i = 0; i < 8; i++) out[n++] = hx[(ch32 >> (28 - 4 * i)) & 15];
+        out[n++] = 0;
+        out[n++] = 17; out[n++] = 0; out[n++] = 0; out[n++] = 0;
+        break;
+    }
+    default:                               /* 0: le32 challenge (run 45 baseline) */
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        break;
+    }
+    return n;
+}
+
 #define C2B_CL_RTLD_NEXT ((void *)-1L)
 
 /* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
@@ -6181,14 +6238,30 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             i32 cls = c2b_cl_class_up(p, (u32)len);
             if (g_clv2_enable && cls == C2B_CLQ_QCONNECT) {
                 /* CLV2 phase A: qconnect -> S2 ChallengeRequest (тот же fd:
-                 * challenge привязан к источнику и живёт ~4s) */
+                 * challenge привязан к источнику и живёт ~4s).
+                 * Хвост "qconnect0x%08X" — текущее значение challenge движка
+                 * (эхо-кандидат для fmt3); парсим hex после "qconnect0x". */
                 u8 out[512];
+                u32 hv = 0;
+                u32 k;
+                for (k = 12; k + 8 <= (u32)len; k++) {      /* после "qconnect0x" */
+                    u8 c = p[k];
+                    u32 d;
+                    if (c >= '0' && c <= '9') d = (u32)(c - '0');
+                    else if (c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+                    else if (c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+                    else break;
+                    hv = (hv << 4) | d;
+                }
+                g_clv2_qc_val = hv;
                 (void)c2b_clv2_build_chalreq(out);
                 g_clv2_fd = fd;
                 g_clv2_sent_req++;
                 C2B_LOGS("[c2b] CLV2 qconnect->S2 ChallengeRequest #");
                 C2B_LOGN(g_clv2_sent_req);
                 C2B_LOGS(" cid="); C2B_LOGH(g_clv2_conn_id);
+                C2B_LOGS(" qc="); C2B_LOGH(g_clv2_qc_val);
+                C2B_LOGS(" fmt="); C2B_LOGN(g_clv2_fmt);
                 C2B_LOGS("\n");
                 ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, addr, addrlen);
                 return (ssize_t)len;               /* движку обычный rc */
@@ -6237,21 +6310,20 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             u64 ch = 0;
             if (c2b_clv2_parse_chalreply(p, (u32)r, g_clv2_conn_id, &ch)) {
                 u8 *q = (u8 *)buf;
+                u32 rl;
                 g_clv2_ch64 = ch;
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
-                q[0] = q[1] = q[2] = q[3] = 0xff;
-                q[4] = 'A';
-                q[5] = (u8)(g_clv2_ch32);
-                q[6] = (u8)(g_clv2_ch32 >> 8);
-                q[7] = (u8)(g_clv2_ch32 >> 16);
-                q[8] = (u8)(g_clv2_ch32 >> 24);
+                rl = c2b_clv2_build_chalreply(q, (u32)len, g_clv2_fmt,
+                                              g_clv2_qc_val, g_clv2_ch32);
+                if (!rl) return r;                 /* не хватило буфера — отдаём как есть */
                 C2B_LOGS("[c2b] CLV2 S2 ChallengeReply #");
                 C2B_LOGN(g_clv2_got_ch);
                 C2B_LOGS(" ch64="); C2B_LOGH((u32)(ch >> 32)); C2B_LOGH((u32)ch);
-                C2B_LOGS("-> engine 'A' "); C2B_LOGH(g_clv2_ch32);
+                C2B_LOGS("-> engine 'A' fmt="); C2B_LOGN(g_clv2_fmt);
+                C2B_LOGS(" len="); C2B_LOGN(rl);
                 C2B_LOGS("\n");
-                return 9;
+                return (ssize_t)rl;
             }
             g_clv2_badreply++;
         }
@@ -7093,6 +7165,12 @@ i32 c2b_main(void)
         if (e && e[0] == '1') {
             g_clv2_enable = 1;
             C2B_LOGS("[c2b] clv2=1 (qconnect->S2 ChallengeRequest, 'A'+challenge -> engine)\n");
+            e = getenv("C2B_CLV2_FMT");
+            if (e && e[0] >= '0' && e[0] <= '9') {
+                g_clv2_fmt = (u32)(e[0] - '0');
+                C2B_LOGS("[c2b] clv2 fmt="); C2B_LOGN(g_clv2_fmt);
+                C2B_LOGS(" (0=le32 1=ascii0x 2=le32+proto 3=echo+le32 4=ascii+proto)\n");
+            }
         }
     }
     i32 r = c2b_try_install();
@@ -11051,6 +11129,26 @@ static void test_cl(void)
                 static const u8 rb[] = { 0x20, 0x0d, 0x01 };
                 CHECK(c2b_clv2_parse_chalreply(rb, (u32)sizeof(rb), 0xd0da5e01u, &ch) == 0,
                       "clv2: не-0x21 отвергнут");
+            }
+            /* 41e-d: форматы 'A'-ответа движку (матрица C2B_CLV2_FMT) */
+            {
+                u8 ar[32]; u32 al;
+                al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 0, 0, 0xB0AA4BD7u);
+                CHECK(al == 9 && ar[4] == 'A' && ar[5] == 0xd7 && ar[8] == 0xb0,
+                      "clv2: fmt0 = 41+le32");
+                al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 1, 0, 0xB0AA4BD7u);
+                CHECK(al == 14, "clv2: fmt1 = ascii0x длина 14");
+                CHECK(ar[4]=='A' && ar[5]=='0' && ar[6]=='x' && ar[13] == 0,
+                      "clv2: fmt1 = '0x' + hex + NUL");
+                al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 2, 0, 0xB0AA4BD7u);
+                CHECK(al == 13 && ar[9] == 17, "clv2: fmt2 = le32+le32(17)");
+                al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 3, 7u, 0xB0AA4BD7u);
+                CHECK(al == 13 && ar[5] == 7, "clv2: fmt3 = echo(qc)+le32");
+                al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 4, 0, 0xB0AA4BD7u);
+                CHECK(al == 18 && ar[13] == 0 && ar[14] == 17,
+                      "clv2: fmt4 = ascii + le32(17)");
+                CHECK(c2b_clv2_build_chalreply(ar, 8, 0, 0, 1) == 0,
+                      "clv2: крошечный буфер -> 0");
             }
         }
     }

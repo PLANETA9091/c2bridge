@@ -11203,7 +11203,7 @@ static void test_cl(void)
             }
             /* 41e-d: форматы 'A'-ответа движку (матрица C2B_CLV2_FMT) */
             {
-                u8 ar[32]; u32 al;
+                u8 ar[128]; u32 al;
                 al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 0, 0, 0xB0AA4BD7u);
                 CHECK(al == 9 && ar[4] == 'A' && ar[5] == 0xd7 && ar[8] == 0xb0,
                       "clv2: fmt0 = 41+le32");

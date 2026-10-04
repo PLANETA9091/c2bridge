@@ -25,6 +25,30 @@ pgrep -f "Xvfb :99" >/dev/null 2>&1 || {
 
 LOG=/tmp/c2b-steam-login.log
 
+# ---------- run40: harvest the device token (ssfn) ALWAYS ----------
+# The steamcmd credential probe (workflow step, /tmp/steamcmd) logs in
+# BEFORE us and receives the approved-device token (ssfn*) into ITS data
+# dir. Without that token the GUI client counts as a NEW device, waits on
+# a confirmation dialog and never writes loginusers.vdf (run 39/40: three
+# retries all stalled at the login form). Previously the copy ran only in
+# the STEAM_GUARD_CODE branch - do it unconditionally now.
+echo "[steam-login] harvesting ssfn device tokens (steamcmd probe data)"
+SSFN_COPIED=0
+for SRC_DIR in \
+    "$HOME/Steam/config" \
+    "/tmp/steamcmd/Steam/config" \
+    "/tmp/c2b-steamcmd/Steam/config" \
+    "$GAME_HOME/Steam/config"; do
+  for SF in "$SRC_DIR/"ssfn*; do
+    [[ -f "$SF" ]] || continue
+    cp -f "$SF" "$GAME_HOME/.local/share/Steam/config/" 2>/dev/null || true
+    cp -f "$SF" "$GAME_HOME/.steam/steam/config/" 2>/dev/null || true
+    echo "[steam-login] copied $(basename "$SF") from $SRC_DIR"
+    SSFN_COPIED=1
+  done
+done
+(( SSFN_COPIED )) || echo "[steam-login] no ssfn found in probe data (fresh device; may need STEAM_GUARD_CODE once)"
+
 # ---------- Steam Guard: approve THIS device once via steamcmd ----------
 # steamcmd's own output confirms the flow: "You can also enter this code at
 # any time using 'set_steam_guard_code'". After a code-approved login steamcmd

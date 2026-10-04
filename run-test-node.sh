@@ -417,15 +417,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # (virtual methods SendMessage/RetrieveMessage take this in rdi; the
   # typedefs had no self -> every arg shifted, pump called originals with
   # no this at all -> SIGSEGV at 0x100000000). Fixed in c2bridge.c + selftest
-  # now validates self delivery. ACTIVE path is back as PRIMARY:
-  #   a1/a2(gdb)/a5 client-up-bridge ACTIVE (GC observe + hello pump),
+  # now validates self delivery. Run 33 (PASS, all-active): no crash, GC
+  # armed, but the queue returned 16 zero entries (mt=0/rsz=0) which blocked
+  # ClientHello -> new-steamclient slot layout suspect. Run 34 plan:
+  #   a1/a2(gdb) client-up-bridge ACTIVE + GCDIAG vtable dump (no hello),
   #   a3 standalone no-preload (bisect evidence),
-  #   a4 client-up-bridge-passive (control: must still reach menu).
+  #   a4 client-up-bridge-passive (control: must still reach menu),
+  #   a5 client-up-bridge-hello (C2B_HELLO=1: real ClientHello gamble under
+  #      evidence; a1/a2/a3/a4 keep the run green whatever happens).
   EXTRA_ENV=""
   VARIANT="client-up-bridge"
   case $ATTEMPT in
     3) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
     4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
+    5) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello" ;;
   esac
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
   # fresh console.log per attempt: condebug APPENDS, and the menu marker is

@@ -4902,6 +4902,15 @@ static c2b_gc_send_t g_gc_orig_send = 0;
 static c2b_gc_retr_t g_gc_orig_retr = 0;
 static u32 g_gc_up_n, g_gc_up_b, g_gc_dn_n, g_gc_dn_b;
 static u32 g_gc_dn_drop;        /* t42v9: сообщений S2NEW отфильтровано на даунлинке */
+static u32 g_gc_dn_zero;        /* run33: пустые записи очереди (mt=0/rsz=0) — аномалия */
+static u8  g_gc_zero_once;      /* run33: разовый лог пустой записи */
+/* run33: слоты GC-объекта. RE-факт t42v2 ([2]=retr, [3]=send) снят на
+ * steam_api.so 2013 года; современный steamclient.so хостед-раннера дал
+ * 16 пустых dn → раскладка под вопросом. Диаг-дамп даст фактическую,
+ * env позволяет перевернуть слоты без пересборки. */
+static u32 g_gc_slot_send = 3;  /* C2B_GC_SEND_SLOT */
+static u32 g_gc_slot_retr = 2;  /* C2B_GC_RETR_SLOT */
+static u8  g_gc_diag = 1;       /* run33: дамп vtable при арме; C2B_GC_DIAG=0 выключает */
 static u32 g_gc_uniq_n = 0;
 #define C2B_GC_UNIQ 24
 static struct { u32 id; u32 up; u32 dn; u8 act; } g_gc_uniq[C2B_GC_UNIQ];
@@ -5055,6 +5064,34 @@ static i32 c2b_gc_retr_h(void *self, u32 *msgtype, void *dest, u32 destsz,
     return 2;                     /* k_EGCResultNoMessage после 8 дропов */
 }
 
+/* ---------- run33: диагностический дамп vtable GC-объекта ----------
+ * В run 33 (hosted runner, СОВРЕМЕННЫЙ steamclient.so) drain сразу выдал
+ * 16 сообщений id=0/sz=0 и заблокировал ClientHello. Похоже, слоты
+ * [2]/[3] на этом билде НЕ RetrieveMessage/SendMessage (RE-факт t42v2
+ * снят на steam_api.so 2013 года). Дамп (fp + первые 24 байта кода
+ * каждого слота 0..7) позволяет офлайн-сверить фактическую раскладку. */
+static void c2b_gc_vt_diag(void *obj)
+{
+    if (!g_gc_diag || !obj) return;
+    uptr vt = *(uptr *)obj;
+    C2B_LOGS("[c2b] GCDIAG obj="); C2B_LOGH((u32)(uptr)obj);
+    C2B_LOGS("vt="); C2B_LOGH((u32)vt); C2B_LOGS("\n");
+    if (vt < 0x10000u) return;
+    for (u32 k = 0; k < 8; k++) {
+        uptr fp = ((uptr *)vt)[k];
+        C2B_LOGS("[c2b] GCDIAG s"); C2B_LOGN(k);
+        C2B_LOGS("fp="); C2B_LOGH((u32)fp);
+        if (fp < 0x10000u) { C2B_LOGS("(nil)\n"); continue; }
+        const volatile u8 *p = (const volatile u8 *)fp;
+        for (u32 w = 0; w < 6; w++) {   /* 24 байта = 6 u32 (LE, побайтово) */
+            u32 word = (u32)p[w * 4] | ((u32)p[w * 4 + 1] << 8) |
+                       ((u32)p[w * 4 + 2] << 16) | ((u32)p[w * 4 + 3] << 24);
+            C2B_LOGS("w"); C2B_LOGN(w); C2B_LOGH(word);
+        }
+        C2B_LOGS("\n");
+    }
+}
+
 /* возвращает 0 = swap сделан; <0 = причина (лог в caller) */
 __attribute__((unused)) static i32 c2b_gc_try_install(void)
 {
@@ -5086,6 +5123,7 @@ __attribute__((unused)) static i32 c2b_gc_try_install(void)
     C2B_LOGS("slots send="); C2B_LOGN((u32)sslot);
     C2B_LOGS("retr="); C2B_LOGN((u32)rslot);
     C2B_LOGS("\n");
+    c2b_gc_vt_diag(obj);   /* run33: фактическая раскладка слотов в лог */
     return 0;
 }
 
@@ -5108,20 +5146,25 @@ static i32 c2b_gc_arm(void *obj)
     if (!obj) { g_gc_last_fail = 12; return -12; }
     uptr vt = *(uptr *)obj;
     if (!vt) { g_gc_last_fail = 15; return -15; }
-    c2b_gc_retr_t oretr = (c2b_gc_retr_t)((uptr *)vt)[2];
-    c2b_gc_send_t osend = (c2b_gc_send_t)((uptr *)vt)[3];
+    c2b_gc_retr_t oretr = (c2b_gc_retr_t)((uptr *)vt)[g_gc_slot_retr];
+    c2b_gc_send_t osend = (c2b_gc_send_t)((uptr *)vt)[g_gc_slot_send];
     if (!osend || !oretr) { g_gc_last_fail = 16; return -16; }
     memcpy(g_gc_vt_copy, (const void *)vt, sizeof(g_gc_vt_copy));
     g_gc_orig_send = osend;
     g_gc_orig_retr = oretr;
     /* publication barrier: содержимое копии ВИДИМО до свопа vptr */
-    __atomic_store_n(&g_gc_vt_copy[3], (uptr)c2b_gc_send_h, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&g_gc_vt_copy[2], (uptr)c2b_gc_retr_h, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_gc_vt_copy[g_gc_slot_send], (uptr)c2b_gc_send_h,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_gc_vt_copy[g_gc_slot_retr], (uptr)c2b_gc_retr_h,
+                     __ATOMIC_SEQ_CST);
     *(volatile uptr *)obj = (uptr)g_gc_vt_copy;   /* публикация — одним стором */
     g_gc_obj = obj;
     __atomic_store_n(&g_gc_state, 1u, __ATOMIC_SEQ_CST);
     C2B_LOGS("[c2b] GC-ARMED obj="); C2B_LOGH((u32)(uptr)obj);
-    C2B_LOGS("slots send=3 retr=2\n");
+    C2B_LOGS("slots send="); C2B_LOGN(g_gc_slot_send);
+    C2B_LOGS("retr="); C2B_LOGN(g_gc_slot_retr);
+    C2B_LOGS("\n");
+    c2b_gc_vt_diag(obj);   /* run33: фактическая раскладка слотов в лог */
     return 0;
 }
 
@@ -5138,7 +5181,9 @@ static i32 c2b_gc_arm(void *obj)
  * Ожидаемый ответ: id=4004 CMsgClientWelcome — первый dn>0 = транзит жив.
  * Счётчики ведём сами (зовём оригиналы, не хуки) теми же атомарками, что и
  * хуки, — GCFINI/uniq-таблица увидят наш трафик как родной. */
-static u8 g_hello_mode = 1;            /* C2B_HELLO=0 выключает */
+static u8 g_hello_mode = 0;            /* C2B_HELLO=1 включает (run33: слоты GC
+                                        * под вопросом — слать только по явному флагу,
+                                        * пока GCDIAG не подтвердит раскладку) */
 static volatile u32 g_hello_state = 0; /* 0=idle 1=tries 2=dn-received 3=exhausted */
 static volatile u32 g_hello_sends = 0;
 
@@ -5156,9 +5201,11 @@ __attribute__((unused)) static void c2b_gc_hello_pump(void)
     u32 st = __atomic_load_n(&g_gc_state, __ATOMIC_SEQ_CST);
     /* run31-фикс: + гейты g_state (t39: движок не встал — GC не трогаем) и
      * g_gc_obj (self для прямых вызовов оригиналов — без него прежний код
-     * звал методы без this → SIGSEGV в steamclient.so). */
+     * звал методы без this → SIGSEGV в steamclient.so). run33: слоты
+     * send/retr не должны схлопнуться (защита от кривого env). */
     if (!g_hello_mode || !st || !g_state || !g_gc_obj ||
-        !g_gc_orig_send || !g_gc_orig_retr) return;
+        !g_gc_orig_send || !g_gc_orig_retr ||
+        (uptr)g_gc_orig_send == (uptr)g_gc_orig_retr) return;
 
     static const u8 hello_body[2] = { 0x08, 0x01 };   /* CMsgClientHello{engine=1} */
     const u32 hello_type = 0x80000000u | C2B_HELLO_MSGID;
@@ -5174,6 +5221,20 @@ __attribute__((unused)) static void c2b_gc_hello_pump(void)
                                     &rsz);
             if (rc != 1) break;                       /* 2=NoMessage и др. */
             u32 raw = mt & 0x7FFFFFFFu;
+            if (!raw || !rsz) {
+                /* run33: «пустые» записи (mt=0/rsz=0) — на новом steamclient
+                 * очередь отдала 16 штук подряд. Это НЕ dn-сообщения: счёт
+                 * их как dn навсегда блокировал ClientHello (dn>0 → state=2).
+                 * Считаем отдельно, разово логируем, дренаж-тик прекращаем. */
+                __atomic_fetch_add(&g_gc_dn_zero, 1u, __ATOMIC_RELAXED);
+                if (!g_gc_zero_once) {
+                    g_gc_zero_once = 1;
+                    C2B_LOGS("[c2b] GC dn ZERO mt="); C2B_LOGH(mt);
+                    C2B_LOGS("rsz="); C2B_LOGN(rsz);
+                    C2B_LOGS("(не считаем dn — run33-аномалия)\n");
+                }
+                break;
+            }
             __atomic_fetch_add(&g_gc_dn_n, 1u, __ATOMIC_RELAXED);
             __atomic_fetch_add(&g_gc_dn_b, rsz, __ATOMIC_RELAXED);
             c2b_gc_note(0, raw, rsz);
@@ -5243,6 +5304,7 @@ static void c2b_print_gcfini(void)
     C2B_LOGS(" uniq="); C2B_LOGD(g_gc_uniq_n);
     C2B_LOGS(" t="); C2B_LOGN(g_gc_t_mode);
     C2B_LOGS(" dn_drop="); C2B_LOGD(__atomic_load_n(&g_gc_dn_drop, __ATOMIC_RELAXED));
+    C2B_LOGS(" zero="); C2B_LOGD(__atomic_load_n(&g_gc_dn_zero, __ATOMIC_RELAXED));
     /* t42v8: итог ClientHello-craft (state 2 = dn-ответ получен) */
     C2B_LOGS(" hello="); C2B_LOGD(__atomic_load_n(&g_hello_state, __ATOMIC_RELAXED));
     C2B_LOGS("/"); C2B_LOGN(__atomic_load_n(&g_hello_sends, __ATOMIC_RELAXED));
@@ -6740,13 +6802,31 @@ i32 c2b_main(void)
             C2B_LOGS("[c2b] gc translate=observe\n");
         }
     }
-    {   /* t42v8: ClientHello-craft; C2B_HELLO=0 выключает */
+    {   /* t42v8: ClientHello-craft; run33: только по явному C2B_HELLO=1
+         * (слоты GC на новом steamclient не подтверждены — см. GCDIAG) */
         const char *e = getenv("C2B_HELLO");
-        if (e && e[0] == '0') {
-            g_hello_mode = 0;
-            C2B_LOGS("[c2b] hello mode=off\n");
+        if (e && e[0] == '1') {
+            g_hello_mode = 1;
+            C2B_LOGS("[c2b] hello mode=craft (env)\n");
         } else {
-            C2B_LOGS("[c2b] hello mode=craft\n");
+            C2B_LOGS("[c2b] hello mode=off\n");
+        }
+    }
+    {   /* run33: оверрайд слотов GC-объекта (одна цифра 0..7) */
+        const char *e = getenv("C2B_GC_SEND_SLOT");
+        if (e && e[0] >= '0' && e[0] <= '7' && e[1] == 0) {
+            g_gc_slot_send = (u32)(e[0] - '0');
+            C2B_LOGS("[c2b] gc send slot="); C2B_LOGN(g_gc_slot_send); C2B_LOGS("\n");
+        }
+        e = getenv("C2B_GC_RETR_SLOT");
+        if (e && e[0] >= '0' && e[0] <= '7' && e[1] == 0) {
+            g_gc_slot_retr = (u32)(e[0] - '0');
+            C2B_LOGS("[c2b] gc retr slot="); C2B_LOGN(g_gc_slot_retr); C2B_LOGS("\n");
+        }
+        e = getenv("C2B_GC_DIAG");
+        if (e && e[0] == '0') {
+            g_gc_diag = 0;
+            C2B_LOGS("[c2b] gc diag=off\n");
         }
     }
     {   /* R37: протокол в S1 ServerInfo (дефолт 13762; под конкретный бинарь клиента — env) */

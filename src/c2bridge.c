@@ -6194,6 +6194,25 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         out[n++] = 17; out[n++] = 0; out[n++] = 0; out[n++] = 0;
         break;
     }
+    case 5: {                              /* 41e-e: RE-derived из engine_client.so */
+        /* Парсер кейса 'A' (0x25a9e8, xref на "Invalid challenge packet."):
+         *   le32 challenge -> le32 authproto (3 = Steam; keysize u16 должен
+         *   быть 0, иначе "Invalid Steam key size") -> u64 value -> u8 flag
+         *   -> ReadString -> strstr(str,"reserve") обязателен (иначе пакет
+         *   игнорируется) -> успех = vtable+0x200(this, challenge).
+         *   "Invalid challenge packet." = overflow bitbuf (ответ слишком
+         *   короткий — наш run 45/47 фейл). */
+        u32 i;
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        out[n++] = 3; out[n++] = 0; out[n++] = 0; out[n++] = 0;   /* authproto=3 */
+        out[n++] = 0; out[n++] = 0;                               /* keysize=0 */
+        for (i = 0; i < 8; i++) out[n++] = 0;                     /* u64 value */
+        out[n++] = 0;                                             /* flag */
+        out[n++] = 'r'; out[n++] = 'e'; out[n++] = 's'; out[n++] = 'e';
+        out[n++] = 'r'; out[n++] = 'v'; out[n++] = 'e'; out[n++] = 0;
+        break;
+    }
     default:                               /* 0: le32 challenge (run 45 baseline) */
         out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
         out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
@@ -7169,7 +7188,7 @@ i32 c2b_main(void)
             if (e && e[0] >= '0' && e[0] <= '9') {
                 g_clv2_fmt = (u32)(e[0] - '0');
                 C2B_LOGS("[c2b] clv2 fmt="); C2B_LOGN(g_clv2_fmt);
-                C2B_LOGS(" (0=le32 1=ascii0x 2=le32+proto 3=echo+le32 4=ascii+proto)\n");
+                C2B_LOGS(" (0=le32 1=ascii0x 2=le32+proto 3=echo+le32 4=ascii+proto 5=RE-derived)\n");
             }
         }
     }
@@ -11149,6 +11168,19 @@ static void test_cl(void)
                       "clv2: fmt4 = ascii + le32(17)");
                 CHECK(c2b_clv2_build_chalreply(ar, 8, 0, 0, 1) == 0,
                       "clv2: крошечный буфер -> 0");
+                /* 41e-e: fmt5 — RE-derived полный формат */
+                {
+                    static const char want[] = "reserve";
+                    u32 i;
+                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 5, 0, 0x11223344u);
+                    CHECK(al == 32, "clv2: fmt5 = 32 байта");
+                    CHECK(ar[4] == 'A', "clv2: fmt5 'A'");
+                    CHECK(ar[9] == 3, "clv2: fmt5 authproto=3");
+                    CHECK(ar[13] == 0 && ar[14] == 0, "clv2: fmt5 keysize=0");
+                    for (i = 0; i < 7; i++)
+                        CHECK(ar[24 + i] == (u8)want[i], "clv2: fmt5 строка 'reserve'");
+                    CHECK(ar[31] == 0, "clv2: fmt5 NUL строки");
+                }
             }
         }
     }

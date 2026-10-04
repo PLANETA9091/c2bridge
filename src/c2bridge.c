@@ -6038,6 +6038,113 @@ static void c2b_cl_trace(i32 up, const u8 *p, u32 n, i32 act)
 
 extern i32 *__errno_location(void);   /* libc TLS-errno; errno.h не тянем */
 
+/* ---------- 41e-c: CL v2 phase A — S1 qconnect -> S2 GNS challenge ----------
+ * Эмпирика 2026-10-04 против ЖИВОГО CS2 152.233.19.133:28022 (CYBERSHOKE 5x5):
+ *   сервер игнорирует S1 qconnect/getchallenge (S1-поток ему нечем понять),
+ *   но ОТВЕЧАЕТ по GNS-проводу (GameNetworkingSockets, Valve — совпадает
+ *   байт-в-байт, k_nCurrentProtocolVersion=13):
+ *     ChallengeRequest = 0x20 [u16 pb_len][pb][pad] >= 512Б, pb =
+ *       CMsgSteamSockets_UDP_ChallengeRequest {1: fixed32 connection_id (!=0),
+ *        3: fixed64 my_timestamp, 4: varint protocol_version=13}
+ *     ChallengeReply   = 0x21 [pb] {1: fixed32 connection_id (эхо),
+ *       2: fixed64 challenge, 3: fixed64 your_timestamp (эхо), 4: varint 13}
+ *   (проверено живьём из песочницы: 0x21 с нашим conn_id/ts и challenge
+ *   0xe22fccfec1f5470c и др.)
+ *   ConnectRequest = 0x22 [pb] БЕЗ crypt/cert сервер МОЛЧА роняет (проверено
+ *   3 варианта: с length-заголовком, чистый, с crypt-без-подписи) — фаза B
+ *   (x25519 + cert + auth ticket) вне scope phase A.
+ *   Challenge привязан к адресу источника (SipHash) и живёт ~4s -> шлём
+ *   ChallengeRequest С ТОГО ЖЕ fd, ответ принимаем только на нём же.
+ * Перевод phase A (kill-switch C2B_CL_V2=1, по умолчанию OFF):
+ *   uplink   qconnect0x…    -> подавить, послать S2 ChallengeRequest (тот fd)
+ *   downlink 0x21 (на fd)   -> движку S1 S2C_CHALLENGE: ff ff ff ff 'A'+le32
+ *   uplink   connect <ch>…  -> капчер (hexdump + счётчик) и ДРОП (фаза B
+ *                              построит из него ConnectRequest с crypt)
+ */
+static u32 g_clv2_enable;        /* C2B_CL_V2=1 */
+static u32 g_clv2_conn_id;       /* cid последнего ChallengeRequest */
+static i32 g_clv2_fd = -1;       /* fd, с которым связан обмен */
+static u64 g_clv2_ch64;          /* challenge сервера */
+static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
+static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
+
+/* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
+static u32 c2b_clv2_rand32(void)
+{
+    static u32 s;
+    if (!s) {
+        s = (u32)(uptr)(void *)&s ^ 0xC2B1E3D9u;
+        if (!s) s = 0xA5F00D42u;
+    }
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    return s;
+}
+
+/* S2 ChallengeRequest: [0x20][u16 pb_len][pb][pad] = ровно 512 байт */
+static u32 c2b_clv2_build_chalreq(u8 *out)
+{
+    u8 pb[32]; u32 n = 0, i;
+    u32 cid = c2b_clv2_rand32() | 1u;          /* cid=0 сервер отвергает */
+    u64 ts;
+    g_clv2_conn_id = cid;
+    pb[n++] = 0x0d;                            /* f1 fixed32 connection_id */
+    pb[n++] = (u8)(cid); pb[n++] = (u8)(cid >> 8);
+    pb[n++] = (u8)(cid >> 16); pb[n++] = (u8)(cid >> 24);
+    pb[n++] = 0x19;                            /* f3 fixed64 my_timestamp */
+    ts = ((u64)c2b_clv2_rand32() << 32) ^ (u64)c2b_clv2_rand32();
+    for (i = 0; i < 8; i++) pb[n++] = (u8)(ts >> (8 * i));
+    pb[n++] = 0x20; pb[n++] = 0x0d;            /* f4 varint protocol_version=13 */
+    out[0] = 0x20;                             /* k_ESteamNetworkingUDPMsg_ChallengeRequest */
+    out[1] = (u8)n; out[2] = (u8)(n >> 8);
+    for (i = 0; i < n; i++) out[3 + i] = pb[i];
+    for (i = 3 + n; i < 512; i++) out[i] = 0;  /* GNS min padded packet 512 */
+    return 512;
+}
+
+/* 0x21 ChallengeReply -> challenge64; требует эхо connection_id == expect */
+static i32 c2b_clv2_parse_chalreply(const u8 *p, u32 n, u32 expect_cid, u64 *ch)
+{
+    u32 i = 1;                                 /* p[0] == 0x21 */
+    i32 got = 0;
+    u64 v = 0;
+    if (n < 9 || p[0] != 0x21) return 0;
+    while (i < n) {
+        u8 tag = p[i++];
+        u32 f = (u32)(tag >> 3), wt = tag & 7;
+        if (wt == 1) {
+            u64 x = 0; i32 k;
+            if (i + 8 > n) return 0;
+            for (k = 7; k >= 0; k--) x = (x << 8) | (u64)p[i + k];
+            if (f == 2) { v = x; got = 1; }
+            i += 8;
+        } else if (wt == 5) {
+            if (i + 4 > n) return 0;
+            if (f == 1) {
+                u32 cid = (u32)p[i] | ((u32)p[i+1] << 8) |
+                          ((u32)p[i+2] << 16) | ((u32)p[i+3] << 24);
+                if (cid != expect_cid) return 0;   /* не наш обмен */
+            }
+            i += 4;
+        } else if (wt == 0) {
+            while (i < n && p[i] & 0x80) i++;
+            i++;
+        } else if (wt == 2) {
+            u32 ln = 0, sh = 0;
+            while (i < n) {
+                u8 b = p[i++]; ln |= (u32)(b & 0x7f) << sh;
+                if (!(b & 0x80)) break;
+                sh += 7;
+            }
+            i += ln;
+        } else {
+            return 0;
+        }
+    }
+    if (!got) return 0;
+    *ch = v;
+    return 1;
+}
+
 #define C2B_CL_RTLD_NEXT ((void *)-1L)
 
 /* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
@@ -6071,6 +6178,33 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
         const u8 *p = (const u8 *)buf;
         if (c2b_cl_is_connless(p, (u32)len)) {
             g_cl_s_cl++;
+            i32 cls = c2b_cl_class_up(p, (u32)len);
+            if (g_clv2_enable && cls == C2B_CLQ_QCONNECT) {
+                /* CLV2 phase A: qconnect -> S2 ChallengeRequest (тот же fd:
+                 * challenge привязан к источнику и живёт ~4s) */
+                u8 out[512];
+                (void)c2b_clv2_build_chalreq(out);
+                g_clv2_fd = fd;
+                g_clv2_sent_req++;
+                C2B_LOGS("[c2b] CLV2 qconnect->S2 ChallengeRequest #");
+                C2B_LOGN(g_clv2_sent_req);
+                C2B_LOGS(" cid="); C2B_LOGH(g_clv2_conn_id);
+                C2B_LOGS("\n");
+                ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, addr, addrlen);
+                return (ssize_t)len;               /* движку обычный rc */
+            }
+            if (g_clv2_enable && cls == C2B_CLQ_CONNECT) {
+                /* CLV2 phase A: S1 connect капчерим и ДРОПАЕМ (без перевода
+                 * его нельзя слать в CS2; фаза B построит ConnectRequest) */
+                char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
+                c2b_cl_hexline(p, (u32)len, ln, (u32)sizeof(ln));
+                g_clv2_cap_connect++;
+                C2B_LOGS("[c2b] CLV2 S1 connect captured #");
+                C2B_LOGN(g_clv2_cap_connect);
+                C2B_LOGS(" len="); C2B_LOGN((u32)len);
+                C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
+                return (ssize_t)len;               /* дроп без отправки */
+            }
             i32 act = c2b_cl_filter_uplink(p, (u32)len);
             c2b_cl_trace(1, p, (u32)len, act);
             if (act == C2B_CL_DROP) return (ssize_t)len;   /* v2: дроп без отправки */
@@ -6098,6 +6232,29 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
         const u8 *p = (const u8 *)buf;
+        if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 9 && p[0] == 0x21) {
+            /* CLV2 phase A: S2 ChallengeReply -> движку S1 'A'+challenge32 */
+            u64 ch = 0;
+            if (c2b_clv2_parse_chalreply(p, (u32)r, g_clv2_conn_id, &ch)) {
+                u8 *q = (u8 *)buf;
+                g_clv2_ch64 = ch;
+                g_clv2_ch32 = (u32)ch;
+                g_clv2_got_ch++;
+                q[0] = q[1] = q[2] = q[3] = 0xff;
+                q[4] = 'A';
+                q[5] = (u8)(g_clv2_ch32);
+                q[6] = (u8)(g_clv2_ch32 >> 8);
+                q[7] = (u8)(g_clv2_ch32 >> 16);
+                q[8] = (u8)(g_clv2_ch32 >> 24);
+                C2B_LOGS("[c2b] CLV2 S2 ChallengeReply #");
+                C2B_LOGN(g_clv2_got_ch);
+                C2B_LOGS(" ch64="); C2B_LOGH((u32)(ch >> 32)); C2B_LOGH((u32)ch);
+                C2B_LOGS("-> engine 'A' "); C2B_LOGH(g_clv2_ch32);
+                C2B_LOGS("\n");
+                return 9;
+            }
+            g_clv2_badreply++;
+        }
         if (c2b_cl_is_connless(p, (u32)r)) {
             g_cl_r_cl++;
             i32 act = c2b_cl_filter_downlink(p, (u32)r);
@@ -6931,6 +7088,13 @@ i32 c2b_main(void)
             C2B_LOGS("[c2b] cl mode=passthrough (first 32 dumped)\n");
         }
     }
+    {   /* 41e-c: CL v2 phase A — S2 GNS challenge-обмен (full-харнесс) */
+        const char *e = getenv("C2B_CL_V2");
+        if (e && e[0] == '1') {
+            g_clv2_enable = 1;
+            C2B_LOGS("[c2b] clv2=1 (qconnect->S2 ChallengeRequest, 'A'+challenge -> engine)\n");
+        }
+    }
     i32 r = c2b_try_install();
     if (r == 0) {
         C2B_LOGS("[c2b] ARMED: detours in place\n");
@@ -7002,6 +7166,10 @@ static void c2b_print_fini(void)
     C2B_LOGS(" in=");      C2B_LOGN(g_cl_r_in);
     C2B_LOGS(" ot=");      C2B_LOGN(g_cl_r_ot);
     C2B_LOGS(" dr=");      C2B_LOGN(g_cl_r_drop);
+    C2B_LOGS("} clv2{req="); C2B_LOGN(g_clv2_sent_req);   /* 41e-c: S2 challenge */
+    C2B_LOGS(" ch=");      C2B_LOGN(g_clv2_got_ch);
+    C2B_LOGS(" cn=");      C2B_LOGN(g_clv2_cap_connect);
+    C2B_LOGS(" bad=");     C2B_LOGN(g_clv2_badreply);
     C2B_LOGS("}\n");
 }
 
@@ -10848,6 +11016,44 @@ static void test_cl(void)
     g_cl_log_n = 0;                      /* трассировка: печать без краха, счётчики классов */
     c2b_cl_trace(1, p_gc, CL_N(p_gc), C2B_CL_PASSTHROUGH);
     c2b_cl_trace(0, p_ch, CL_N(p_ch), C2B_CL_PASSTHROUGH);
+    /* 41e-c: CL v2 phase A — S2 GNS challenge-обмен (чистые функции, без сети) */
+    {
+        u8 req[512];
+        u32 rl = c2b_clv2_build_chalreq(req);
+        CHECK(rl == 512, "clv2: ChallengeRequest = 512 байт (GNS min padded)");
+        CHECK(req[0] == 0x20, "clv2: msgid 0x20");
+        u32 pl = (u32)req[1] | ((u32)req[2] << 8);
+        CHECK(pl == 16, "clv2: pb-длина = 16 (f1+cid, f3+ts, f4+ver)");
+        CHECK(req[3] == 0x0d, "clv2: f1 connection_id fixed32 tag");
+        {
+            u32 cid = (u32)req[4] | ((u32)req[5] << 8) |
+                      ((u32)req[6] << 16) | ((u32)req[7] << 24);
+            CHECK(cid != 0, "clv2: connection_id != 0 (сервер роняет cid=0)");
+            CHECK(req[3 + pl - 2] == 0x20 && req[3 + pl - 1] == 0x0d,
+                  "clv2: f4 protocol_version=13");
+            /* канонический ответ сервера (песочница 20261004, challenge живой) */
+            static const u8 rp[] = {
+                0x21,
+                0x0d, 0x01, 0x5e, 0xda, 0xd0,                  /* f1 cid=0xd0da5e01 */
+                0x11, 0x17, 0x48, 0x33, 0x59, 0xa5, 0xe7, 0xfe, 0xe5, /* f2 challenge 0xe5fee7a559334817 */
+                0x19, 0x21, 0x5b, 0x8b, 0x07, 0xa1, 0x01, 0x00, 0x00, /* f3 your_ts */
+                0x20, 0x0d                                     /* f4 varint 13 */
+            };
+            u64 ch = 0;
+            CHECK(c2b_clv2_parse_chalreply(rp, (u32)sizeof(rp), 0xd0da5e01u, &ch) == 1,
+                  "clv2: ChallengeReply парсится");
+            CHECK(ch == 0xe5fee7a559334817ull, "clv2: challenge64 извлечён");
+            CHECK(c2b_clv2_parse_chalreply(rp, (u32)sizeof(rp), 0xdeadbeefu, &ch) == 0,
+                  "clv2: чужой connection_id отвергнут");
+            CHECK(c2b_clv2_parse_chalreply(rp, 8, 0xd0da5e01u, &ch) == 0,
+                  "clv2: усечённый ответ отвергнут");
+            {
+                static const u8 rb[] = { 0x20, 0x0d, 0x01 };
+                CHECK(c2b_clv2_parse_chalreply(rb, (u32)sizeof(rb), 0xd0da5e01u, &ch) == 0,
+                      "clv2: не-0x21 отвергнут");
+            }
+        }
+    }
     CHECK(g_cl_log_n == 2, "cl: trace считает пакеты (первые 32 всегда)");
     CHECK(g_cl_s_gc >= 1 && g_cl_r_ch >= 1, "cl: счётчики классов инкрементируются");
 #undef CL_N

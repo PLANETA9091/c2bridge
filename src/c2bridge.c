@@ -6069,6 +6069,7 @@ static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
 static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
+static u32 g_clv2_k;             /* C2B_CLV2_K: длина филлера перед строкой (поиск N) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
 static u32 c2b_clv2_rand32(void)
@@ -6223,6 +6224,19 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         out[n++] = 'r'; out[n++] = 'v'; out[n++] = 'e'; out[n++] = 0;
         break;
     }
+    case 7: {                              /* 41e-f: поиск смещения строки (C2B_CLV2_K) */
+        /* движок читает: chal32 proto32 keysize16 [645be0: N байт] flag8 string.
+         * Успех = строка начинается ровно на 'r' => k == N+1. Перебираем k. */
+        u32 i;
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        out[n++] = 3; out[n++] = 0; out[n++] = 0; out[n++] = 0;
+        out[n++] = 0; out[n++] = 0;
+        for (i = 0; i < g_clv2_k; i++) out[n++] = 0;              /* филлер k */
+        out[n++] = 'r'; out[n++] = 'e'; out[n++] = 's'; out[n++] = 'e';
+        out[n++] = 'r'; out[n++] = 'v'; out[n++] = 'e'; out[n++] = 0;
+        break;
+    }
     default:                               /* 0: le32 challenge (run 45 baseline) */
         out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
         out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
@@ -6343,6 +6357,10 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 g_clv2_ch64 = ch;
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
+                /* fmt7: k-поиск — каждое чтение следующего челленджа
+                 * получает следующий сдвиг строки; рабочий k = тот, после
+                 * которого движок перестал qconnect-ить (см. лог). */
+                if (g_clv2_fmt == 7) g_clv2_k = (g_clv2_got_ch - 1) % 9;
                 rl = c2b_clv2_build_chalreply(q, (u32)len, g_clv2_fmt,
                                               g_clv2_qc_val, g_clv2_ch32);
                 if (!rl) return r;                 /* не хватило буфера — отдаём как есть */
@@ -6350,6 +6368,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 C2B_LOGN(g_clv2_got_ch);
                 C2B_LOGS(" ch64="); C2B_LOGH((u32)(ch >> 32)); C2B_LOGH((u32)ch);
                 C2B_LOGS("-> engine 'A' fmt="); C2B_LOGN(g_clv2_fmt);
+                C2B_LOGS(" k="); C2B_LOGN(g_clv2_k);
                 C2B_LOGS(" len="); C2B_LOGN(rl);
                 C2B_LOGS("\n");
                 return (ssize_t)rl;
@@ -7198,7 +7217,13 @@ i32 c2b_main(void)
             if (e && e[0] >= '0' && e[0] <= '9') {
                 g_clv2_fmt = (u32)(e[0] - '0');
                 C2B_LOGS("[c2b] clv2 fmt="); C2B_LOGN(g_clv2_fmt);
-                C2B_LOGS(" (0=le32 1=ascii0x 2=le32+proto 3=echo+le32 4=ascii+proto 5=RE-derived)\n");
+                C2B_LOGS(" (0=le32 1=ascii0x 2=le32+proto 3=echo+le32 4=ascii+proto 5=RE-u32 6=RE-u64 7=K-search)\n");
+            }
+            e = getenv("C2B_CLV2_K");
+            if (e && e[0] >= '0' && e[0] <= '9') {
+                g_clv2_k = (u32)(e[0] - '0');
+                C2B_LOGS("[c2b] clv2 K="); C2B_LOGN(g_clv2_k);
+                C2B_LOGS("\n");
             }
         }
     }
@@ -11178,21 +11203,19 @@ static void test_cl(void)
                       "clv2: fmt4 = ascii + le32(17)");
                 CHECK(c2b_clv2_build_chalreply(ar, 8, 0, 0, 1) == 0,
                       "clv2: крошечный буфер -> 0");
-                /* 41e-e: fmt5/fmt6 — RE-derived, A/B по размеру value-поля */
+                /* 41e-f: fmt7 — k-поиск смещения строки */
                 {
                     static const char want[] = "reserve";
                     u32 i;
-                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 5, 0, 0x11223344u);
-                    CHECK(al == 28, "clv2: fmt5 = 28 байт (u32 value)");
-                    CHECK(ar[4] == 'A' && ar[9] == 3 && ar[13] == 0 && ar[14] == 0,
-                          "clv2: fmt5 заголовок");
+                    g_clv2_k = 3;
+                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 7, 0, 0x11223344u);
+                    CHECK(al == 26, "clv2: fmt7(k=3) = 26 байт");
                     for (i = 0; i < 7; i++)
-                        CHECK(ar[20 + i] == (u8)want[i], "clv2: fmt5 строка 'reserve'");
-                    CHECK(ar[27] == 0, "clv2: fmt5 NUL");
-                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 6, 0, 0x11223344u);
-                    CHECK(al == 32, "clv2: fmt6 = 32 байта (u64 value)");
-                    for (i = 0; i < 7; i++)
-                        CHECK(ar[24 + i] == (u8)want[i], "clv2: fmt6 строка 'reserve'");
+                        CHECK(ar[18 + i] == (u8)want[i], "clv2: fmt7 строка 'reserve'");
+                    g_clv2_k = 0;
+                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 7, 0, 0x11223344u);
+                    CHECK(al == 23, "clv2: fmt7(k=0) = 23 байта");
+                    g_clv2_k = 4;
                 }
             }
         }

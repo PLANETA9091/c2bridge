@@ -214,7 +214,19 @@ jobs:
             echo "STEAM_USER not set — skipping login (smoke boots standalone; full mode needs the burner account)"
             exit 0
           fi
-          bash scripts/steam-login.sh || {
+          # run 39: a memory-starved client (mmap() failed x17 during boot on a
+          # flaky runner VM) fails the logged-in check. Retry the login up to 3
+          # times, killing the client between attempts.
+          ok=0
+          for i in 1 2 3; do
+            if bash scripts/steam-login.sh; then ok=1; break; fi
+            echo "::warning::steam login attempt $i failed"
+            tail -30 /tmp/c2b-steam-login.log || true
+            pkill -9 -f 'ubuntu12_32/steam' 2>/dev/null || true
+            pkill -9 -f steamwebhelper 2>/dev/null || true
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then
             if [ "$MODE" = "smoke" ]; then
               echo "::warning::steam login failed — continuing (smoke boots standalone; a Steam Guard code may be needed once)"
               tail -50 /tmp/c2b-steam-login.log || true
@@ -224,7 +236,7 @@ jobs:
               tail -50 /tmp/c2b-steam-login.log || true
               exit 1
             fi
-          }
+          fi
 
       # ---------- e2e ----------
       - name: run e2e (${{ env.MODE }})
@@ -287,6 +299,9 @@ jobs:
         with:
           path: ~/csgo-lite
           key: csgo-lite-v1
+      - name: ensure cache dirs exist
+        if: always()
+        run: mkdir -p ~/.local/share/Steam ~/.steam
       - name: save steam client cache
         if: always() && steps.cache-steam.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -294,4 +309,7 @@ jobs:
           path: |
             ~/.local/share/Steam
             ~/.steam
-          key: steam-node-v2
+          key: steam-node-v3
+        # run 39: "Path Validation Error" killed every save -> the sentry
+        # cache never populated -> fresh VMs hit Steam Guard / degraded
+        # logins. Ensure BOTH dirs exist before the save runs.

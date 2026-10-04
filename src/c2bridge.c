@@ -4920,6 +4920,7 @@ static u8  g_gc_diag = 1;       /* run33: дамп vtable при арме; C2B_G
  * игры) теперь opt-in: C2B_GC_SWAP=1 И ПОЛНАЯ перезапись vtable — позже.
  * Pump'у своп не нужен: он зовёт оригиналы напрямую через g_gc_obj. */
 static u8  g_gc_swap = 0;       /* C2B_GC_SWAP=1 включает своп vptr (хуки) */
+static u8  g_gc_probe = 0;      /* run37: C2B_GC_PROBE=1 - старая проба GC (битые объекты) */
 static u32 g_gc_uniq_n = 0;
 #define C2B_GC_UNIQ 24
 static struct { u32 id; u32 up; u32 dn; u8 act; } g_gc_uniq[C2B_GC_UNIQ];
@@ -5101,17 +5102,47 @@ static void c2b_gc_vt_diag(void *obj)
     }
 }
 
-/* возвращает 0 = swap сделан; <0 = причина (лог в caller) */
+/* возвращает 0 = swap сделан; <0 = причина (лог в caller)
+ * run37: dlsym(0) не видит libsteam_api.so (движок грузит её RTLD_LOCAL),
+ * поэтому аксессоров нет и арм уходил в ПРОБУ с угаданными хэндлами
+ * (u=1,p=1) — GetISteamGenericInterface возвращал БИТЫЙ CAdapter:
+ * RetrieveMessage отдавал 16 zero-записей (run 33/34), SendMessage прыгал
+ * в RTTI-данные (SIGSEGV ip==fault==...e3f848, run 35/37 a1). Фикс:
+ * dlopen libsteam_api.so сами и берём ИГРОВЫЕ flat-аксессоры — объект
+ * от них построен на реальных хэндлах игры. */
+static void *g_gc_apih;
+extern void *dlopen(const char *, i32);   /* run37: объявление до try_install */
+#ifndef C2B_RTLD_NOW
+#define C2B_RTLD_NOW    2
+#define C2B_RTLD_GLOBAL 0x100
+#endif
 __attribute__((unused)) static i32 c2b_gc_try_install(void)
 {
     if (g_gc_state) return 0;
     if (!g_gc_mode) return -100;
     void *(*acc)(void) = (void *(*)(void))dlsym(0, "SteamAPI_ISteamGameCoordinator");
-    if (!acc) return -1;
+    if (!acc) {
+        if (!g_gc_apih) {
+            static const char *const cands[] = {
+                "libsteam_api.so", "steam_api.so", "steam_api64.so" };
+            for (u32 i = 0; i < 3 && !g_gc_apih; i++)
+                g_gc_apih = dlopen(cands[i], C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+            if (g_gc_apih)
+                C2B_LOGS("[c2b] gc libsteam_api dlopen OK\n");
+        }
+        if (g_gc_apih)
+            acc = (void *(*)(void))dlsym(g_gc_apih,
+                                         "SteamAPI_ISteamGameCoordinator");
+        if (!acc) return -1;
+    }
     void *obj = acc();
     if (!obj) return -2;                        /* SteamAPI_Init ещё не был */
     void *fs = dlsym(0, "SteamAPI_ISteamGameCoordinator_SendMessage");
     void *fr = dlsym(0, "SteamAPI_ISteamGameCoordinator_RetrieveMessage");
+    if ((!fs || !fr) && g_gc_apih) {
+        fs = dlsym(g_gc_apih, "SteamAPI_ISteamGameCoordinator_SendMessage");
+        fr = dlsym(g_gc_apih, "SteamAPI_ISteamGameCoordinator_RetrieveMessage");
+    }
     if (!fs || !fr) return -3;
     i32 sslot = c2b_gc_slot_of(fs), rslot = c2b_gc_slot_of(fr);
     if (sslot < 0 || rslot < 0 || sslot > 7 || rslot > 7) return -4;
@@ -6495,7 +6526,13 @@ static void c2b_vt_tick(void)
      * Игровой объект — синглтон на (user,версию): свап слотов [2]/[3] ловит
      * и игровой RetrieveMessage/SendMessage. Хэндлы — РЕАЛЬНЫЕ (через
      * захваченные SteamAPI_GetHSteamUser/Pipe), фолбэк — ctx[2]/[3]. */
-    if (!g_gc_state && g_gislot_orig) {
+    if (!g_gc_state && g_gislot_orig && g_gc_probe) {
+        /* run37: ПРОБА ВЫКЛЮЧЕНА ПО УМОЛЧАНИЮ. Вызов GetISteamGenericInterface
+         * с угаданными (u,p) создаёт БИТЫЙ CAdapter: retr -> 16 zero-записей,
+         * send -> SIGSEGV в RTTI (run 35/37). Арм теперь только через
+         * игровые flat-аксессоры (c2b_gc_try_install) или через выдачу
+         * интерфейса САМОЙ игре (интерпозеры ниже). C2B_GC_PROBE=1 —
+         * вернуть старое поведение для отладки. */
         static const char *const gvers[] = {
             "STEAMGAMECOORDINATOR_INTERFACE_VERSION001",
             "STEAMGAMECOORDINATOR_INTERFACE_VERSION002",
@@ -6851,6 +6888,13 @@ i32 c2b_main(void)
             C2B_LOGS("[c2b] gc swap=on (hooks; ОПАСНО — усечённая vt_copy, run35)\n");
         } else {
             C2B_LOGS("[c2b] gc swap=off (pump зовёт оригиналы напрямую)\n");
+        }
+        e = getenv("C2B_GC_PROBE");
+        if (e && e[0] == '1') {
+            g_gc_probe = 1;
+            C2B_LOGS("[c2b] gc probe=on (ОПАСНО — битые CAdapter, run37)\n");
+        } else {
+            C2B_LOGS("[c2b] gc probe=off (арм только через flat-аксессоры игры)\n");
         }
     }
     {   /* R37: протокол в S1 ServerInfo (дефолт 13762; под конкретный бинарь клиента — env) */

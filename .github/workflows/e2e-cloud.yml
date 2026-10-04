@@ -263,7 +263,9 @@ jobs:
             C2B_SMOKE=1 C2B_TRANSLATE=0 C2B_ATTEMPTS=5 \
               C2B_RUN_ALL="${{ inputs.run_all || '1' }}" bash run-test-node.sh
           else
-            bash run-test-node.sh
+            # 5 attempts in full mode: the CLV2 'A'-reply format matrix
+            # (C2B_CLV2_FMT = (attempt-1) % 5) needs all five slots.
+            C2B_ATTEMPTS=5 bash run-test-node.sh
           fi
 
       # ---------- artifacts ----------

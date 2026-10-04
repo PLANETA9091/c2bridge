@@ -1,0 +1,73 @@
+name: engine-re
+
+# One-shot RE diagnostics: locate the CS:GO engine's challenge-reply parser
+# ("Invalid challenge packet." string) in the bundle's engine binary and dump
+# the disassembly around every RIP-relative xref (tools/engine_challenge_xref.py).
+# Answers: which fields does the client expect in an S2C_CHALLENGE ('A') reply?
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  re:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      C2B_GAME_DIR: ${{ github.workspace }}/csgo-lite
+      MEGA_URL: ${{ secrets.MEGA_URL }}
+      MEGA_USER: ${{ secrets.MEGA_USER }}
+      MEGA_PASS: ${{ secrets.MEGA_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: restore bundle cache
+        id: cache-bundle
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/csgo-lite
+          key: csgo-lite-v1
+
+      - name: fetch lite bundle if cache missed
+        if: steps.cache-bundle.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-bundle.sh "$C2B_GAME_DIR"
+      - name: make bundle tree writable
+        run: |
+          [ -d "$C2B_GAME_DIR" ] || { echo "::error::no bundle at $C2B_GAME_DIR"; exit 1; }
+          chmod -R u+rwX "$C2B_GAME_DIR"
+
+      - name: find engine binary
+        id: find
+        run: |
+          set -u
+          mkdir -p re-out
+          E=""
+          for f in $(find "$C2B_GAME_DIR" -name '*.so' 2>/dev/null); do
+            if grep -aq 'Invalid challenge packet' "$f" 2>/dev/null; then
+              E="$f"; echo "FOUND: $f"; break
+            fi
+          done
+          if [ -z "$E" ]; then
+            echo "::error::no engine binary with challenge string found"
+            grep -rl 'Invalid challenge packet' "$C2B_GAME_DIR" 2>/dev/null | head
+            exit 1
+          fi
+          echo "engine=$E" >> "$GITHUB_OUTPUT"
+          strings -t x "$E" | grep -aiE 'qconnect|Invalid challenge|getchallenge|Connecting to public' \
+            | head -40 > re-out/strings.txt
+          cat re-out/strings.txt
+
+      - name: xref disassembly
+        run: |
+          set -u
+          export ENGINE="${{ steps.find.outputs.engine }}"
+          python3 tools/engine_challenge_xref.py > re-out/xrefs.txt 2>&1
+          wc -l re-out/xrefs.txt
+          grep -c '=====' re-out/xrefs.txt || true
+
+      - name: upload RE artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-re
+          path: re-out/
+          retention-days: 30

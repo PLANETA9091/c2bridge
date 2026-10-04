@@ -4911,6 +4911,15 @@ static u8  g_gc_zero_once;      /* run33: разовый лог пустой з�
 static u32 g_gc_slot_send = 3;  /* C2B_GC_SEND_SLOT */
 static u32 g_gc_slot_retr = 2;  /* C2B_GC_RETR_SLOT */
 static u8  g_gc_diag = 1;       /* run33: дамп vtable при арме; C2B_GC_DIAG=0 выключает */
+/* run35: СВОП vptr выключен по умолчанию. Обоснование: реальный класс GC
+ * имеет БОЛЬШЕ 8 виртуальных слотов (g_gc_vt_copy[8] их усекает) — после
+ * свопа внутренний виртуальный вызов слота >=8 читает за границей массива
+ * и прыгает в данные (run 35 a1: SIGSEGV ip==fault==pointer-table адрес
+ * внутри steamclient.so, затем каскад отравления тёплого клиента: a2-a4
+ * пали на abort libopenal при аудио-init). Хуки игры (перехват GC-вызовов
+ * игры) теперь opt-in: C2B_GC_SWAP=1 И ПОЛНАЯ перезапись vtable — позже.
+ * Pump'у своп не нужен: он зовёт оригиналы напрямую через g_gc_obj. */
+static u8  g_gc_swap = 0;       /* C2B_GC_SWAP=1 включает своп vptr (хуки) */
 static u32 g_gc_uniq_n = 0;
 #define C2B_GC_UNIQ 24
 static struct { u32 id; u32 up; u32 dn; u8 act; } g_gc_uniq[C2B_GC_UNIQ];
@@ -5116,7 +5125,9 @@ __attribute__((unused)) static i32 c2b_gc_try_install(void)
     g_gc_orig_retr = oretr;
     g_gc_vt_copy[sslot] = (uptr)c2b_gc_send_h;
     g_gc_vt_copy[rslot] = (uptr)c2b_gc_retr_h;
-    *(volatile uptr *)obj = (uptr)g_gc_vt_copy;   /* атомарный swap vptr */
+    if (g_gc_swap) {
+        *(volatile uptr *)obj = (uptr)g_gc_vt_copy;   /* атомарный swap vptr */
+    }
     g_gc_obj = obj;
     g_gc_state = 1;
     C2B_LOGS("[c2b] GC-ARMED obj="); C2B_LOGH((u32)(uptr)obj);
@@ -5149,20 +5160,26 @@ static i32 c2b_gc_arm(void *obj)
     c2b_gc_retr_t oretr = (c2b_gc_retr_t)((uptr *)vt)[g_gc_slot_retr];
     c2b_gc_send_t osend = (c2b_gc_send_t)((uptr *)vt)[g_gc_slot_send];
     if (!osend || !oretr) { g_gc_last_fail = 16; return -16; }
-    memcpy(g_gc_vt_copy, (const void *)vt, sizeof(g_gc_vt_copy));
     g_gc_orig_send = osend;
     g_gc_orig_retr = oretr;
-    /* publication barrier: содержимое копии ВИДИМО до свопа vptr */
-    __atomic_store_n(&g_gc_vt_copy[g_gc_slot_send], (uptr)c2b_gc_send_h,
-                     __ATOMIC_SEQ_CST);
-    __atomic_store_n(&g_gc_vt_copy[g_gc_slot_retr], (uptr)c2b_gc_retr_h,
-                     __ATOMIC_SEQ_CST);
-    *(volatile uptr *)obj = (uptr)g_gc_vt_copy;   /* публикация — одним стором */
+    if (g_gc_swap) {
+        /* Opt-in (C2B_GC_SWAP=1): перехват GC-вызовов игры. Требует
+         * vtable-копию ПОЛНОГО размера (см. run35-комментарий у g_gc_swap) —
+         * с текущей усечённой копией[8] включать НЕЛЬЗЯ. */
+        memcpy(g_gc_vt_copy, (const void *)vt, sizeof(g_gc_vt_copy));
+        /* publication barrier: содержимое копии ВИДИМО до свопа vptr */
+        __atomic_store_n(&g_gc_vt_copy[g_gc_slot_send], (uptr)c2b_gc_send_h,
+                         __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_gc_vt_copy[g_gc_slot_retr], (uptr)c2b_gc_retr_h,
+                         __ATOMIC_SEQ_CST);
+        *(volatile uptr *)obj = (uptr)g_gc_vt_copy;   /* публикация — одним стором */
+    }
     g_gc_obj = obj;
     __atomic_store_n(&g_gc_state, 1u, __ATOMIC_SEQ_CST);
     C2B_LOGS("[c2b] GC-ARMED obj="); C2B_LOGH((u32)(uptr)obj);
     C2B_LOGS("slots send="); C2B_LOGN(g_gc_slot_send);
     C2B_LOGS("retr="); C2B_LOGN(g_gc_slot_retr);
+    C2B_LOGS(" swap="); C2B_LOGN(g_gc_swap);
     C2B_LOGS("\n");
     c2b_gc_vt_diag(obj);   /* run33: фактическая раскладка слотов в лог */
     return 0;
@@ -6827,6 +6844,13 @@ i32 c2b_main(void)
         if (e && e[0] == '0') {
             g_gc_diag = 0;
             C2B_LOGS("[c2b] gc diag=off\n");
+        }
+        e = getenv("C2B_GC_SWAP");
+        if (e && e[0] == '1') {
+            g_gc_swap = 1;
+            C2B_LOGS("[c2b] gc swap=on (hooks; ОПАСНО — усечённая vt_copy, run35)\n");
+        } else {
+            C2B_LOGS("[c2b] gc swap=off (pump зовёт оригиналы напрямую)\n");
         }
     }
     {   /* R37: протокол в S1 ServerInfo (дефолт 13762; под конкретный бинарь клиента — env) */

@@ -380,6 +380,19 @@ if ! pipe_connect_ok; then
   (( W < 120 )) && log "pipe recovered after ~${W}s"
 fi
 
+# run 35: the system libopenal THROWS a C++ exception from alcOpenDevice when
+# ALSA has no sound card (the throw escapes the C boundary -> std::terminate
+# -> SIGABRT; attempts a2-a4 died exactly there, right after the ALSA
+# "Unknown PCM default" lines). Route the ALSA default PCM to the null device
+# so audio init always succeeds deterministically on the runner.
+if ! sudo -n grep -aq "type null" /etc/asound.conf 2>/dev/null; then
+  printf 'pcm.!default {\n  type null\n}\n' \
+    | sudo -n tee /etc/asound.conf >/dev/null 2>&1 || true
+  log "ALSA default PCM -> null (/etc/asound.conf)"
+fi
+[[ -f "$GAME_HOME/.asoundrc" ]] || \
+  printf 'pcm.!default {\n  type null\n}\n' > "$GAME_HOME/.asoundrc" 2>/dev/null || true
+
 VERDICT_CODE=1; VERDICT_TEXT="FAIL: no verdict"
 PASSED_LIST=""   # C2B_RUN_ALL: номера попыток, прошедших smoke-check
 CONNECTED=0

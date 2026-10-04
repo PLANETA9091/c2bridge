@@ -39,6 +39,19 @@ pgrep -f "Xvfb :99" >/dev/null 2>&1 || {
 
 LOG=/tmp/c2b-steam-login.log
 
+# run 44: RELIABLE session criterion. Artifacts of runs 42/43 prove the
+# -login handshake COMPLETES every time (steamui_login.txt:
+# "Received logon success response" -> "SetLoginState: Success") while
+# loginusers.vdf never gains a mostrecent key (the new client writes it
+# only for remembered logins). We were rejecting healthy logins for three
+# runs. Watch steamui_login.txt from the position recorded BEFORE launch
+# so a Success from a previous attempt cannot be counted.
+LUI="$GAME_HOME/.steam/steam/logs/steamui_login.txt"
+[[ -e "$LUI" ]] || LUI="$GAME_HOME/.local/share/Steam/logs/steamui_login.txt"
+LUI_POS=0
+[[ -f "$LUI" ]] && LUI_POS=$(stat -c %s "$LUI" 2>/dev/null || echo 0)
+echo "[steam-login] watching $LUI from offset $LUI_POS"
+
 # ---------- run40/43: harvest the device token (ssfn) ALWAYS ----------
 # The steamcmd credential probe logs in BEFORE us and receives the
 # approved-device token (ssfn*) into ITS data dir. Modern steamcmd puts that
@@ -184,14 +197,25 @@ for i in $(seq 1 48); do
 done
 (( OK )) || { echo "[steam-login] TIMEOUT — check $LOG (first login may need STEAM_GUARD_CODE)"; exit 1; }
 
-# the -login handshake continues AFTER the client is up - poll for the session,
-# with xdotool assists at ~45s and ~75s if the session hasn't appeared
+# the -login handshake continues AFTER the client is up - poll for the session
+# via steamui_login.txt Success (primary) / loginusers.vdf mostrecent (fallback),
+# with xdotool assists at ~45s and ~75s in case a dialog ever shows
 LUV="$GAME_HOME/.steam/steam/config/loginusers.vdf"
 [[ -e "$LUV" ]] || LUV="$GAME_HOME/.local/share/Steam/config/loginusers.vdf"
 SESSION=0
 for i in $(seq 1 36); do
-  if [[ -e "$LUV" ]] && grep -aq '"mostrecent"\s*"1"' "$LUV"; then
-    SESSION=1; echo "[steam-login] session detected after ~$((i*5))s"; break
+  if [[ -f "$LUI" ]]; then
+    CUR=$(stat -c %s "$LUI" 2>/dev/null || echo 0)
+    if (( CUR > LUI_POS )); then
+      if tail -c $(( CUR - LUI_POS )) "$LUI" 2>/dev/null | grep -aq 'SetLoginState: Success'; then
+        SESSION=1
+        echo "[steam-login] login SUCCESS detected (steamui_login.txt) after ~$((i*5))s"
+        break
+      fi
+    fi
+  fi
+  if [[ -e "$LUV" ]] && grep -aqi '"mostrecent"\s*"1"' "$LUV"; then
+    SESSION=1; echo "[steam-login] session detected (loginusers.vdf mostrecent) after ~$((i*5))s"; break
   fi
   if (( i == 9 )); then  xdotool_login_assist userfirst || true; fi
   if (( i == 15 )); then xdotool_login_assist passfirst || true; fi
@@ -218,6 +242,8 @@ else
     grep -av 'mmap() failed' "$GAME_HOME/.steam/steam/logs/console-linux.txt" 2>/dev/null | tail -60 || echo "(no console-linux.txt)"
     echo "-- mmap() failed count in last 4KB (memory-starvation evidence) --"
     tail -c 4000 "$GAME_HOME/.steam/steam/logs/console-linux.txt" 2>/dev/null | grep -ac 'mmap() failed' || true
+    echo "-- steamui_login.txt tail (login state machine = the verdict) --"
+    tail -30 "$LUI" 2>/dev/null || echo "(no steamui_login.txt)"
     echo "-- config dir --"
     ls -la "$GAME_HOME/.local/share/Steam/config/" 2>/dev/null | head -20
     echo "-- sentry/session files --"

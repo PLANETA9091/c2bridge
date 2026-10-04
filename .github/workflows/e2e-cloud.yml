@@ -76,7 +76,12 @@ jobs:
           path: |
             ~/.local/share/Steam
             ~/.steam
-          key: steam-node-v2
+          key: steam-node-v4
+          # v4 = client + VALID login session (saved only after a successful
+          # login). v3/v2 = client-only fallback so we skip the bootstrap.
+          restore-keys: |
+            steam-node-v3
+            steam-node-v2
 
       # ---------- system deps (each hosted run starts from a clean VM) ----------
       - name: install system packages
@@ -209,6 +214,7 @@ jobs:
           echo "::warning::steam bootstrap may be incomplete; steam-login.sh will retry"
 
       - name: steam login (burner account)
+        id: login
         run: |
           if [ -z "$STEAM_USER" ]; then
             echo "STEAM_USER not set — skipping login (smoke boots standalone; full mode needs the burner account)"
@@ -237,6 +243,10 @@ jobs:
               exit 1
             fi
           fi
+          # v4 steam cache is saved ONLY from runs with a real login session
+          # (a session cached from a failed login is worthless and would
+          # poison the immutable key).
+          echo "login_ok=$ok" >> "$GITHUB_OUTPUT"
 
       # ---------- e2e ----------
       - name: run e2e (${{ env.MODE }})
@@ -268,6 +278,7 @@ jobs:
           cp -f ~/.local/share/Steam/config/loginusers.vdf e2e-out/loginusers.vdf 2>/dev/null || true
           cp -f /tmp/c2b-steam-login.log e2e-out/steam-login.log 2>/dev/null || true
           cp -f /tmp/c2b-steam-login-diag.txt e2e-out/steam-login-diag.txt 2>/dev/null || true
+          cp -f /tmp/c2b-login-screen.png e2e-out/xvfb-login.png 2>/dev/null || true
           cp -f "$C2B_NODE_HOME/steamcmd-probe.log" e2e-out/ 2>/dev/null || true
           # remaining client logs (connection_log etc.) + Xvfb screenshots:
           # the login form / guard dialog text IS the answer
@@ -303,13 +314,16 @@ jobs:
         if: always()
         run: mkdir -p ~/.local/share/Steam ~/.steam
       - name: save steam client cache
-        if: always() && steps.cache-steam.outputs.cache-hit != 'true'
+        if: always() && steps.login.outputs.login_ok == '1'
         uses: actions/cache/save@v4
         with:
           path: |
             ~/.local/share/Steam
             ~/.steam
-          key: steam-node-v3
+          key: steam-node-v4
         # run 39: "Path Validation Error" killed every save -> the sentry
         # cache never populated -> fresh VMs hit Steam Guard / degraded
         # logins. Ensure BOTH dirs exist before the save runs.
+        # run 43: gated on a REAL login session; immutable v4 key then
+        # carries a working sentry to every future VM (restore-keys above
+        # fall back to v3/v2 client-only on miss).

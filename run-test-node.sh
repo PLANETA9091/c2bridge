@@ -412,19 +412,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
   EXTRA_ENV=""
-  # Run 31 post-mortem: with a LIVE client, the bridge's ACTIVE patching
-  # (GOT/detours) segfaults steamclient.so during ConnectToGlobalUser
-  # (dmesg: 'segfault in steamclient.so' ~5s after launch, attempts a1/a2/a5),
-  # while the PASSIVE bridge (C2B_DISABLE_PATCH=1, still preloaded!) sailed
-  # through SteamAPI_Init to CSGO_GAME_UI_STATE_MAINMENU (a4 console.log).
-  # Smoke only needs 'bridge preloaded' + menu -> passive is the primary path.
-  # Matrix: a1/a2(gdb)/a4/a5 client-up-PASSIVE, a3 standalone (evidence),
-  # a4 keeps an ACTIVE-bridge bisect? NO - a4 passive too; active-path crash
-  # is already proven by runs 30/31 dmesg. Maximize menu probability.
-  EXTRA_ENV="C2B_DISABLE_PATCH=1"
-  VARIANT="client-up-bridge-passive"
+  # Run 31 post-mortem + ABI fix: the ~5s segfault in steamclient.so called
+  # from c2b_poll_thread was a MISSING-this in the GC slot hooks/pump
+  # (virtual methods SendMessage/RetrieveMessage take this in rdi; the
+  # typedefs had no self -> every arg shifted, pump called originals with
+  # no this at all -> SIGSEGV at 0x100000000). Fixed in c2bridge.c + selftest
+  # now validates self delivery. ACTIVE path is back as PRIMARY:
+  #   a1/a2(gdb)/a5 client-up-bridge ACTIVE (GC observe + hello pump),
+  #   a3 standalone no-preload (bisect evidence),
+  #   a4 client-up-bridge-passive (control: must still reach menu).
+  EXTRA_ENV=""
+  VARIANT="client-up-bridge"
   case $ATTEMPT in
     3) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
+    4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
   esac
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
   # fresh console.log per attempt: condebug APPENDS, and the menu marker is

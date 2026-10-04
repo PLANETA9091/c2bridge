@@ -4883,8 +4883,15 @@ __attribute__((unused)) static void c2b_uninstall2(void)
  * Поведение не меняется: все вызовы уходят в оригиналы (OBSERVER, как v0-хук). */
 extern void *dlsym(void *handle, const char *symbol);   /* RTLD_DEFAULT = 0 */
 
-typedef i32 (*c2b_gc_send_t)(u32 msgtype, const void *data, u32 size);
-typedef i32 (*c2b_gc_retr_t)(u32 *msgtype, void *dest, u32 destsz, u32 *retsz);
+/* run31-ABI-фикс: слоты GC — ВИРТУАЛЬНЫЕ МЕТОДЫ ISteamGameCoordinator:
+ *   [3] EGCResults SendMessage(this, unMsgType, pubData, cubData)
+ *   [2] EGCResults RetrieveMessage(this, &punMsgType, pubDest, cubDest, &pcubMsgSize)
+ * rdi = this. Прежние typedef'ы без self сдвигали ВСЕ аргументы (у pump
+ * this вообще отсутствовал) → внутри steamclient.so дерейференс мусорного
+ * this → SIGSEGV at 0x100000000 в c2b_poll_thread (run 31, a1/a2/a5). */
+typedef i32 (*c2b_gc_send_t)(void *self, u32 msgtype, const void *data, u32 size);
+typedef i32 (*c2b_gc_retr_t)(void *self, u32 *msgtype, void *dest, u32 destsz,
+                            u32 *retsz);
 
 static u8 g_gc_mode = 1;        /* C2B_GC=0 выключает; дефолт observe */
 static u8 g_gc_t_mode = 0;      /* t42v9: C2B_GC_T=1 -> даунлинк-фильтр S2NEW (audit_t38) */
@@ -5014,7 +5021,7 @@ static void c2b_gc_note(u32 dir, u32 rawid, u32 sz)
     }
 }
 
-static i32 c2b_gc_send_h(u32 msgtype, const void *data, u32 size)
+static i32 c2b_gc_send_h(void *self, u32 msgtype, const void *data, u32 size)
 {
     u32 raw = msgtype & 0x7FFFFFFFu;
     /* t42v2: счётчики атомарные — хуки зовутся из чужих потоков (GC-транзит
@@ -5022,16 +5029,17 @@ static i32 c2b_gc_send_h(u32 msgtype, const void *data, u32 size)
     __atomic_fetch_add(&g_gc_up_n, 1u, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_gc_up_b, size, __ATOMIC_RELAXED);
     c2b_gc_note(1, raw, size);
-    return g_gc_orig_send(msgtype, data, size);
+    return g_gc_orig_send(self, msgtype, data, size);
 }
 
-static i32 c2b_gc_retr_h(u32 *msgtype, void *dest, u32 destsz, u32 *retsz)
+static i32 c2b_gc_retr_h(void *self, u32 *msgtype, void *dest, u32 destsz,
+                         u32 *retsz)
 {
     /* t42v9: цикл с фильтром S2NEW — отфильтрованное сообщение игра НЕ видит,
      * очередь дренируется дальше (guard 8: аномально длинную серию дропов
      * честно возвращаем как NoMessage). */
     for (u32 guard = 0; guard < 8; guard++) {
-        i32 rv = g_gc_orig_retr(msgtype, dest, destsz, retsz);
+        i32 rv = g_gc_orig_retr(self, msgtype, dest, destsz, retsz);
         if (rv != 1 || !msgtype || !retsz) return rv;   /* 2=NoMessage и др. */
         u32 raw = (*msgtype) & 0x7FFFFFFFu;
         if (g_gc_t_mode && c2b_gc_dn_drop(raw)) {
@@ -5146,7 +5154,11 @@ static u32 g_hello_tick_us = 500000; /* тик цикла; selftest ускоря
 __attribute__((unused)) static void c2b_gc_hello_pump(void)
 {
     u32 st = __atomic_load_n(&g_gc_state, __ATOMIC_SEQ_CST);
-    if (!g_hello_mode || !st || !g_gc_orig_send || !g_gc_orig_retr) return;
+    /* run31-фикс: + гейты g_state (t39: движок не встал — GC не трогаем) и
+     * g_gc_obj (self для прямых вызовов оригиналов — без него прежний код
+     * звал методы без this → SIGSEGV в steamclient.so). */
+    if (!g_hello_mode || !st || !g_state || !g_gc_obj ||
+        !g_gc_orig_send || !g_gc_orig_retr) return;
 
     static const u8 hello_body[2] = { 0x08, 0x01 };   /* CMsgClientHello{engine=1} */
     const u32 hello_type = 0x80000000u | C2B_HELLO_MSGID;
@@ -5158,7 +5170,8 @@ __attribute__((unused)) static void c2b_gc_hello_pump(void)
         /* 1) дренаж даунлинка — и до, и после посылок */
         for (u32 d = 0; d < 8; d++) {
             u32 mt = 0, rsz = 0;
-            i32 rc = g_gc_orig_retr(&mt, dnbuf, (u32)sizeof(dnbuf), &rsz);
+            i32 rc = g_gc_orig_retr(g_gc_obj, &mt, dnbuf, (u32)sizeof(dnbuf),
+                                    &rsz);
             if (rc != 1) break;                       /* 2=NoMessage и др. */
             u32 raw = mt & 0x7FFFFFFFu;
             __atomic_fetch_add(&g_gc_dn_n, 1u, __ATOMIC_RELAXED);
@@ -5185,7 +5198,8 @@ __attribute__((unused)) static void c2b_gc_hello_pump(void)
             sent++;
             __atomic_store_n(&g_hello_sends, sent, __ATOMIC_RELAXED);
             __atomic_store_n(&g_hello_state, 1u, __ATOMIC_SEQ_CST);
-            i32 rc = g_gc_orig_send(hello_type, hello_body, (u32)sizeof(hello_body));
+            i32 rc = g_gc_orig_send(g_gc_obj, hello_type, hello_body,
+                                    (u32)sizeof(hello_body));
             if (rc == 1) {            /* k_EGCResultOK — учтём аплинк сами */
                 __atomic_fetch_add(&g_gc_up_n, 1u, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_gc_up_b, (u32)sizeof(hello_body), __ATOMIC_RELAXED);
@@ -10546,13 +10560,15 @@ static void test_gc_policy(void)
  * A) GC молчит: все попытки исчерпаны -> state=exhausted, дренаж работал;
  * B) GC отвечает 4004 ClientWelcome: state=dn-received, dn/uniq учтены. */
 static u32 t_hl_sends, t_hl_retr_n, t_hl_reply_at;
-static i32 t_hl_fake_send(u32 mt, const void *d, u32 sz)
-{ (void)mt; (void)d; (void)sz; t_hl_sends++; return 1; }
-static i32 t_hl_retr_empty(u32 *mt, void *d, u32 dsz, u32 *rsz)
-{ (void)mt; (void)d; (void)dsz; (void)rsz; t_hl_retr_n++; return 2; }
-static i32 t_hl_retr_welcome(u32 *mt, void *d, u32 dsz, u32 *rsz)
+static void *t_hl_last_self;      /* run31-ABI-фикс: self обязан доходить */
+static i32 t_hl_fake_send(void *self, u32 mt, const void *d, u32 sz)
+{ (void)mt; (void)d; (void)sz; t_hl_sends++; t_hl_last_self = self; return 1; }
+static i32 t_hl_retr_empty(void *self, u32 *mt, void *d, u32 dsz, u32 *rsz)
+{ (void)mt; (void)d; (void)dsz; (void)rsz; t_hl_retr_n++; t_hl_last_self = self;
+  return 2; }
+static i32 t_hl_retr_welcome(void *self, u32 *mt, void *d, u32 dsz, u32 *rsz)
 {
-    t_hl_retr_n++;
+    t_hl_retr_n++; t_hl_last_self = self;
     if (t_hl_reply_at && t_hl_retr_n >= t_hl_reply_at) {
         static const u8 body[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
         *mt = 0x80000000u | 4004u;            /* CMsgClientWelcome */
@@ -10575,7 +10591,13 @@ static void test_gc_hello(void)
     u32 sv_state = g_hello_state, sv_sends = g_hello_sends;
     u8 sv_mode = g_hello_mode, sv_tmode = g_gc_t_mode;
     u32 sv_upn = g_gc_up_n, sv_dnn = g_gc_dn_n, sv_uniqn = g_gc_uniq_n;
+    u8 sv_estate = g_state;
+    void *sv_obj = g_gc_obj;
+    static u8 t_hl_obj_anchor;       /* сентинел-объект для ABI-чека */
     g_hello_mode = 1; g_gc_t_mode = 0; g_hello_tick_us = 1000;
+    g_state = 1;                     /* pump гейтится на ARMED движка */
+    g_gc_obj = (void *)&t_hl_obj_anchor;
+    t_hl_last_self = 0;
 
     /* A: GC молчит (pre=1, every=2, iters=12 -> 6 попыток укладываются) */
     g_hello_every = 2; g_hello_pre = 1; g_hello_tail = 2; g_hello_iters = 12;
@@ -10586,10 +10608,12 @@ static void test_gc_hello(void)
     CHECK(t_hl_sends == C2B_HELLO_TRIES, "hello: A — все 6 попыток сделаны");
     CHECK(g_hello_state == 3, "hello: A — state=exhausted после тишины");
     CHECK(t_hl_retr_n > t_hl_sends, "hello: A — дренаж очереди работал");
+    CHECK(t_hl_last_self == (void *)&t_hl_obj_anchor,
+          "hello: ABI — self (this) доходит до оригинала (run31-фикс)");
 
     /* B: GC отвечает 4004 на 5-м вызове retr — ранний выход по tail */
     g_gc_orig_send = t_hl_fake_send; g_gc_orig_retr = t_hl_retr_welcome;
-    t_hl_sends = 0; t_hl_retr_n = 0; t_hl_reply_at = 5;
+    t_hl_sends = 0; t_hl_retr_n = 0; t_hl_reply_at = 5; t_hl_last_self = 0;
     g_hello_state = 0; g_hello_sends = 0; g_gc_dn_n = 0; g_gc_uniq_n = 0;
     c2b_gc_hello_pump();
     CHECK(g_hello_state == 2, "hello: B — state=dn-received");
@@ -10610,6 +10634,7 @@ static void test_gc_hello(void)
     g_hello_state = sv_state; g_hello_sends = sv_sends;
     g_hello_mode = sv_mode; g_gc_t_mode = sv_tmode;
     g_gc_up_n = sv_upn; g_gc_dn_n = sv_dnn; g_gc_uniq_n = sv_uniqn;
+    g_state = sv_estate; g_gc_obj = sv_obj;
     __atomic_store_n(&g_gc_state, 0u, __ATOMIC_SEQ_CST);
     printf("  OK   gc hello-pump: silence->exhausted, welcome->dn-received\n");
 }

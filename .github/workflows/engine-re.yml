@@ -64,6 +64,14 @@ jobs:
           wc -l re-out/xrefs.txt
           grep -c '=====' re-out/xrefs.txt || true
 
+      - name: upload the engine binary itself (12MB, for local deep RE)
+        if: always()
+        run: |
+          set -u
+          E="${{ steps.find.outputs.engine }}"
+          cp -f "$E" re-out/engine_client.so
+          sha256sum re-out/engine_client.so > re-out/engine.sha256
+
       - name: upload RE artifact
         if: always()
         uses: actions/upload-artifact@v4

@@ -370,11 +370,30 @@ done
 # ---------- 3. launch + trigger loop ----------
 # T-0 pipe sanity: run 12 proved the pipe can die in the ~90s between our
 # stability check and the engine's SteamAPI_Init. Re-verify RIGHT NOW.
+# Run 36: a memory-starved client (mmap() failed: Cannot allocate memory
+# during boot, before our harness) never serves the pipe -> waiting 120s
+# five times just burns the job. If the pipe stays down, RESTART the
+# client once via steam-login.sh before falling back to launching anyway.
 if ! pipe_connect_ok; then
   log "WARNING: pipe not connectable at T-0 -> waiting up to 120s for recovery"
   W=0
   until pipe_connect_ok; do
-    W=$((W+5)); (( W >= 120 )) && { log "WARNING: pipe still down after ${W}s (launching anyway)"; break; }
+    W=$((W+5))
+    if (( W >= 60 && ! ${T0_RELAUNCH_DONE:-0} )); then
+      T0_RELAUNCH_DONE=1
+      log "pipe still down at ~${W}s -> restarting steam client once"
+      pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea]' 2>/dev/null; sleep 3
+      if [[ -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+        STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+        C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+          bash "$NODE_HOME/steam-login.sh" \
+          >"$RUNDIR/steam-relaunch.t0.log" 2>&1 </dev/null || \
+          log "WARNING: steam-login.sh T-0 relaunch rc=$?"
+      else
+        log "WARNING: steam-login.sh/creds unavailable, cannot relaunch client at T-0"
+      fi
+    fi
+    (( W >= 120 )) && { log "WARNING: pipe still down after ${W}s (launching anyway)"; break; }
     sleep 5
   done
   (( W < 120 )) && log "pipe recovered after ~${W}s"

@@ -6194,19 +6194,29 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         out[n++] = 17; out[n++] = 0; out[n++] = 0; out[n++] = 0;
         break;
     }
-    case 5: {                              /* 41e-e: RE-derived из engine_client.so */
-        /* Парсер кейса 'A' (0x25a9e8, xref на "Invalid challenge packet."):
-         *   le32 challenge -> le32 authproto (3 = Steam; keysize u16 должен
-         *   быть 0, иначе "Invalid Steam key size") -> u64 value -> u8 flag
-         *   -> ReadString -> strstr(str,"reserve") обязателен (иначе пакет
-         *   игнорируется) -> успех = vtable+0x200(this, challenge).
-         *   "Invalid challenge packet." = overflow bitbuf (ответ слишком
-         *   короткий — наш run 45/47 фейл). */
+    case 5: {                              /* 41e-e: RE-derived, value=32 бита */
+        /* Парсер кейса 'A' (0x25a9e8): le32 challenge -> le32 authproto=3
+         * (keysize u16=0) -> 32-битное значение (645be0) -> u8 flag ->
+         * ReadString -> strstr(str,"reserve") обязателен -> успех =
+         * vtable+0x200(this, challenge). Run 48: 64-битный fill дал
+         * пустую строку (readString стартовал на нуле) => read = 32 бита. */
         u32 i;
         out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
         out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
         out[n++] = 3; out[n++] = 0; out[n++] = 0; out[n++] = 0;   /* authproto=3 */
         out[n++] = 0; out[n++] = 0;                               /* keysize=0 */
+        for (i = 0; i < 4; i++) out[n++] = 0;                     /* u32 value */
+        out[n++] = 0;                                             /* flag */
+        out[n++] = 'r'; out[n++] = 'e'; out[n++] = 's'; out[n++] = 'e';
+        out[n++] = 'r'; out[n++] = 'v'; out[n++] = 'e'; out[n++] = 0;
+        break;
+    }
+    case 6: {                              /* вариант с 64-битным значением (A/B) */
+        u32 i;
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        out[n++] = 3; out[n++] = 0; out[n++] = 0; out[n++] = 0;
+        out[n++] = 0; out[n++] = 0;
         for (i = 0; i < 8; i++) out[n++] = 0;                     /* u64 value */
         out[n++] = 0;                                             /* flag */
         out[n++] = 'r'; out[n++] = 'e'; out[n++] = 's'; out[n++] = 'e';
@@ -11168,18 +11178,21 @@ static void test_cl(void)
                       "clv2: fmt4 = ascii + le32(17)");
                 CHECK(c2b_clv2_build_chalreply(ar, 8, 0, 0, 1) == 0,
                       "clv2: крошечный буфер -> 0");
-                /* 41e-e: fmt5 — RE-derived полный формат */
+                /* 41e-e: fmt5/fmt6 — RE-derived, A/B по размеру value-поля */
                 {
                     static const char want[] = "reserve";
                     u32 i;
                     al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 5, 0, 0x11223344u);
-                    CHECK(al == 32, "clv2: fmt5 = 32 байта");
-                    CHECK(ar[4] == 'A', "clv2: fmt5 'A'");
-                    CHECK(ar[9] == 3, "clv2: fmt5 authproto=3");
-                    CHECK(ar[13] == 0 && ar[14] == 0, "clv2: fmt5 keysize=0");
+                    CHECK(al == 28, "clv2: fmt5 = 28 байт (u32 value)");
+                    CHECK(ar[4] == 'A' && ar[9] == 3 && ar[13] == 0 && ar[14] == 0,
+                          "clv2: fmt5 заголовок");
                     for (i = 0; i < 7; i++)
-                        CHECK(ar[24 + i] == (u8)want[i], "clv2: fmt5 строка 'reserve'");
-                    CHECK(ar[31] == 0, "clv2: fmt5 NUL строки");
+                        CHECK(ar[20 + i] == (u8)want[i], "clv2: fmt5 строка 'reserve'");
+                    CHECK(ar[27] == 0, "clv2: fmt5 NUL");
+                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 6, 0, 0x11223344u);
+                    CHECK(al == 32, "clv2: fmt6 = 32 байта (u64 value)");
+                    for (i = 0; i < 7; i++)
+                        CHECK(ar[24 + i] == (u8)want[i], "clv2: fmt6 строка 'reserve'");
                 }
             }
         }

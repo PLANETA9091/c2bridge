@@ -6357,10 +6357,8 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 g_clv2_ch64 = ch;
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
-                /* fmt7: k-поиск — каждое чтение следующего челленджа
-                 * получает следующий сдвиг строки; рабочий k = тот, после
-                 * которого движок перестал qconnect-ить (см. лог). */
-                if (g_clv2_fmt == 7) g_clv2_k = (g_clv2_got_ch - 1) % 9;
+                /* fmt7: k задаётся env (по попытке) — счётчики не живут
+                 * между попытками (каждая = новый процесс движка). */
                 rl = c2b_clv2_build_chalreply(q, (u32)len, g_clv2_fmt,
                                               g_clv2_qc_val, g_clv2_ch32);
                 if (!rl) return r;                 /* не хватило буфера — отдаём как есть */

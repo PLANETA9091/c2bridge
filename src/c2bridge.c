@@ -5111,6 +5111,7 @@ static void c2b_gc_vt_diag(void *obj)
  * dlopen libsteam_api.so сами и берём ИГРОВЫЕ flat-аксессоры — объект
  * от них построен на реальных хэндлах игры. */
 static void *g_gc_apih;
+static u8  g_gc_objfail_once;
 extern void *dlopen(const char *, i32);   /* run37: объявление до try_install */
 #ifndef C2B_RTLD_NOW
 #define C2B_RTLD_NOW    2
@@ -5130,13 +5131,25 @@ __attribute__((unused)) static i32 c2b_gc_try_install(void)
             if (g_gc_apih)
                 C2B_LOGS("[c2b] gc libsteam_api dlopen OK\n");
         }
-        if (g_gc_apih)
+        if (g_gc_apih) {
             acc = (void *(*)(void))dlsym(g_gc_apih,
                                          "SteamAPI_ISteamGameCoordinator");
+            /* run38: dlopen OK, но арм не случился — логируем каждый шаг */
+            C2B_LOGS("[c2b] gc acc dlsym=");
+            C2B_LOGS(acc ? "hit" : "MISS");
+            C2B_LOGS("\n");
+        }
         if (!acc) return -1;
     }
     void *obj = acc();
-    if (!obj) return -2;                        /* SteamAPI_Init ещё не был */
+    if (!obj) {
+        if (!g_gc_objfail_once) {
+            g_gc_objfail_once = 1;
+            C2B_LOGS("[c2b] gc acc()=NULL (SteamAPI_Init не завершён или "
+                     "адаптер не создаётся)\n");
+        }
+        return -2;                              /* SteamAPI_Init ещё не был */
+    }
     void *fs = dlsym(0, "SteamAPI_ISteamGameCoordinator_SendMessage");
     void *fr = dlsym(0, "SteamAPI_ISteamGameCoordinator_RetrieveMessage");
     if ((!fs || !fr) && g_gc_apih) {

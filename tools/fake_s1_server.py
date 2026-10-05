@@ -55,6 +55,21 @@ RES = b"reserve\x00"
 RES9 = b"reserve" * 9 + b"\x00"          # fmt8 N-agnostic tail
 CONNSTR = b"connect 127.0.0.1:29016\x00"  # 'A'-parser redirect flow
 
+# EXACT A2S_INFO 'I' reply captured from the REAL CS2 server (CYBERSHOKE
+# 152.233.19.133:28022, 2026-10-05): run 57 showed the legacy client receives
+# the farm's 'I' reply and then the engine sits in "Retrying public(...)"
+# WITHOUT ever sending qconnect — the hand-built blob (no EDF) is the suspect.
+# This verbatim real reply (EDF 0xb1 = game port + steamid + spectators +
+# keywords) is the authenticity baseline; if qconnect still does not start,
+# the gate is elsewhere (client-side IPC state, not serverinfo).
+REAL_INFO = bytes.fromhex(
+    "ffffffff491143533220355835207c203576352023323837205b42525d20e28094204359"
+    "42455253484f4b452e4e45540064655f6d6972616765006373676f00436f756e7465722d"
+    "537472696b65203200da02004000646c0001312e34312e382e3800b1766d070aee000000"
+    "3001656d7074792c3576352c357673352c3578352c62742c63796265722c6379626572"
+    "73686f6b652c64655f6d69726167652c64726f702c6475656c2c656e2c6700da020000"
+    "00000000")
+
 
 class Ctx(object):
     """Per-run mutable context for builders (chal counter + last qc echo)."""
@@ -250,10 +265,10 @@ class Farm(object):
         # connect target; no valid 'I' reply = the engine never qconnects) ----
         if payload[:1] == b"T":
             self.stats["a2s"] += 1
-            self.log("  -> A2S_INFO request %r -> replying 'I' serverinfo "
-                     "(%dB)" % (payload[:24], 1 + len(sinfo_blob())))
+            self.log("  -> A2S_INFO request %r -> replying REAL server 'I' "
+                     "blob (%dB)" % (payload[:24], len(REAL_INFO)))
             try:
-                sock.sendto(b"\xff\xff\xff\xffI" + sinfo_blob(), addr)
+                sock.sendto(REAL_INFO, addr)
                 self.a2s_answered_at = now
                 # give the engine a chance to start qconnecting; if it does,
                 # qc arming below is immediate; else arm after a grace period

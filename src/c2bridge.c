@@ -7041,6 +7041,13 @@ static void *c2b_poll_thread(void *arg)
          * the engine then SEGVs at protobuf RepeatedPtrFieldBase::Add inside
          * libvideo.so right after a SUCCESSFUL SteamAPI_Init. Attempt-level
          * env bisect: a3 = patch disabled, a4 = no preload at all. */
+        /* run-57 fix: CL_VERBOSE must be read BEFORE the passive return —
+         * passive farm mode needs the unlimited connless trace too. */
+        const char *ve = getenv("C2B_CL_VERBOSE");
+        if (ve && ve[0] == '1') {
+            g_cl_verbose = 1;
+            C2B_LOGS("[c2b] cl verbose=1 (passive; dump ALL connless)\n");
+        }
         const char *np = getenv("C2B_DISABLE_PATCH");
         if (np && np[0] == '1') {
             C2B_LOGS("[c2b] C2B_DISABLE_PATCH=1 -> passive preload (no GOT-patch/detours/vt/GC)\n");

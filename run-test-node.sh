@@ -508,8 +508,10 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   if (( FARM )); then
     # all attempts = client-up + passive bridge (steam://connect IPC needs the
     # client; passive keeps the engine netstack vanilla). No gdb: the farm
-    # experiment observes behavior, not crashes.
-    EXTRA_ENV="C2B_DISABLE_PATCH=1"
+    # experiment observes behavior, not crashes. CL_VERBOSE: the default
+    # 32-packet trace quota is consumed by LanSearch broadcasts within seconds
+    # (run 57) — verbose keeps qconnect/reaction classes visible all run.
+    EXTRA_ENV="C2B_DISABLE_PATCH=1 C2B_CL_VERBOSE=1"
     VARIANT="farm-passive"
   else
     case $ATTEMPT in

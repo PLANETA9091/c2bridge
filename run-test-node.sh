@@ -18,6 +18,12 @@
 #   C2B_TRANSLATE    1 = bridge translate modes ON (default 1: C2B_UPLINK/DOWNLINK=1)
 #   C2B_SMOKE        1 = boot-only mode: menu + bridge preload sanity, NO connect
 #                    (daily free-tier smoke; no target needed)
+#   C2B_FARM         1 = fake-S1-server response-matrix mode (tools/fake_s1_server.py):
+#                    the engine connects to C2B_FARM_TARGET (default 127.0.0.1:29015)
+#                    and the farm PUSHES the next matrix entry every ~2s, logging
+#                    every engine packet; CONNECT_*.bin markers = engine sent its
+#                    connect packet (the CL v2 phase-B capture prize). Bridge stays
+#                    passive so the engine's netstack is vanilla.
 #   C2B_STEAM_USER / C2B_STEAM_PASS / C2B_STEAM_GUARD_CODE
 #                    if set and the steam client is not logged in, steam-login.sh is invoked
 # Results: $C2B_NODE_HOME/runs/<TS>/  (verdict.txt, harness.log, console.log, c2b logs)
@@ -35,6 +41,11 @@ DURATION="${C2B_DURATION:-240}"
 MAX_ATTEMPTS="${C2B_ATTEMPTS:-3}"
 TRANSLATE="${C2B_TRANSLATE:-1}"
 SMOKE="${C2B_SMOKE:-0}"
+FARM="${C2B_FARM:-0}"
+FARM_TARGET="${C2B_FARM_TARGET:-127.0.0.1:29015}"
+FARM_PID=""
+FARM_DIR=""
+FARM_HIT=""
 CONLOG="$GAME_DIR/csgo/console.log"
 
 mkdir -p "$RUNDIR" "$NODE_HOME"
@@ -68,6 +79,7 @@ finish() { # $1 exit code, $2 verdict
   log "VERDICT: $2"
   declare -F restore_overcommit >/dev/null 2>&1 && restore_overcommit
   pkill -x csgo_linux64 2>/dev/null; sleep 2; pkill -9 -x csgo_linux64 2>/dev/null
+  [[ -n "$FARM_PID" ]] && kill "$FARM_PID" 2>/dev/null
   for f in "$NODE_HOME/tmp"/c2b-*.log; do [[ -f "$f" ]] && cp -f "$f" "$RUNDIR/"; done 2>/dev/null
   save_conlog
   exit "$1"
@@ -130,13 +142,37 @@ if command -v ldd >/dev/null 2>&1; then
 fi
 
 TARGET="${C2B_TARGET:-}"
+(( FARM )) && TARGET="$FARM_TARGET"
 if (( ! SMOKE )); then
   if [[ -z "$TARGET" && -f "$NODE_HOME/target.conf" ]]; then
     TARGET=$(grep -vE '^\s*(#|$)' "$NODE_HOME/target.conf" | head -1 | awk '{print $1}')
   fi
   [[ -n "$TARGET" ]] || finish 3 "FAIL: no target (set C2B_TARGET or $NODE_HOME/target.conf)"
 fi
-log "node e2e: mode=$([[ $SMOKE -eq 1 ]] && echo smoke || echo full) target=${TARGET:-none} game=$GAME_DIR bridge=$BRIDGE_DIR translate=$TRANSLATE"
+log "node e2e: mode=$([[ $FARM -eq 1 ]] && echo farm || ([[ $SMOKE -eq 1 ]] && echo smoke || echo full)) target=${TARGET:-none} game=$GAME_DIR bridge=$BRIDGE_DIR translate=$TRANSLATE"
+
+# ---------- 0e. fake-S1-server farm (C2B_FARM=1) ----------
+# Push-mode response matrix vs the engine (tools/fake_s1_server.py): the engine
+# connects to the loopback target, the farm serves the next matrix entry every
+# ~2s (its source == the connect target, so the strict 'B' source validation
+# passes), logs every engine packet, and drops CONNECT_*.bin markers when the
+# engine sends its connect packet (the phase-B prize). Retries are logged, not
+# answered: push cadence is deterministic and consume-class entries pause the
+# matrix so a developing reaction is not clobbered by the next response.
+if (( FARM )); then
+  command -v python3 >/dev/null 2>&1 || finish 3 "FAIL: python3 not found (farm mode)"
+  FARM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tools/fake_s1_server.py"
+  [[ -f "$FARM_PY" ]] || finish 3 "FAIL: $FARM_PY missing (farm mode)"
+  FARM_DIR="$RUNDIR/farm"
+  mkdir -p "$FARM_DIR"
+  python3 "$FARM_PY" --bind "${FARM_TARGET%%:*}" --port "${FARM_TARGET##*:}" \
+    --log "$FARM_DIR" >"$RUNDIR/farm-server.log" 2>&1 &
+  FARM_PID=$!
+  sleep 1
+  kill -0 "$FARM_PID" 2>/dev/null \
+    || finish 3 "FAIL: farm server died instantly (see farm-server.log)"
+  log "farm: fake S1 server pid=$FARM_PID target=$FARM_TARGET dir=$FARM_DIR"
+fi
 
 TMPD="$NODE_HOME/tmp"
 mkdir -p "$TMPD"
@@ -427,6 +463,8 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
 
   MODES=""
   [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=8"
+  # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
+  # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
   [[ -f "$BRIDGE_SO" ]] || BRIDGE_SO="$BIN_DST/c2bridge64.so"
 
@@ -467,12 +505,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   #   a5: standalone evidence.
   EXTRA_ENV=""
   VARIANT="client-up-bridge"
-  case $ATTEMPT in
-    1) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello" ;;
-    2) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello-gdb" ;;
-    4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
-    5) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
-  esac
+  if (( FARM )); then
+    # all attempts = client-up + passive bridge (steam://connect IPC needs the
+    # client; passive keeps the engine netstack vanilla). No gdb: the farm
+    # experiment observes behavior, not crashes.
+    EXTRA_ENV="C2B_DISABLE_PATCH=1"
+    VARIANT="farm-passive"
+  else
+    case $ATTEMPT in
+      1) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello" ;;
+      2) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello-gdb" ;;
+      4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
+      5) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
+    esac
+  fi
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
   # fresh console.log per attempt: condebug APPENDS, and the menu marker is
   # written to console.log ONLY (run 31: stdout never contains
@@ -534,6 +580,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # get a full backtrace from an address-space that matches real conditions.
   DBG_INNER=""
   DBG_ATTEMPT="${DBG_ATTEMPT:-2}"
+  (( FARM )) && DBG_ATTEMPT=9999
   if (( ATTEMPT == DBG_ATTEMPT )) && command -v gdb >/dev/null 2>&1; then
     DBG_INNER="exec gdb -batch -return-child-result \
       -ex 'set confirm off' \
@@ -640,10 +687,24 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     if grep -aqE 'up #0x[0-9a-f]+  len=0x[0-9a-f]{3,}' "$OUT" 2>/dev/null; then
       log "attempt $ATTEMPT: bridge is passing real traffic (uplink len>255)"
     fi
+    # farm capture: engine sent its connect packet to the fake server. Log once
+    # and keep waiting (followup packets are evidence too; verdict is final).
+    if (( FARM )) && [[ -z "$FARM_HIT" ]] && ls "$FARM_DIR"/CONNECT_*.bin >/dev/null 2>&1; then
+      FARM_HIT=1
+      log "attempt $ATTEMPT: FARM CAPTURED engine connect packet(s)"
+    fi
     sleep 5
   done
   (( CONNECTED )) && { VERDICT_CODE=0; VERDICT_TEXT="PASS: connected to $TARGET (attempt $ATTEMPT)"; break; }
 done
 
 (( VERDICT_CODE != 0 )) && VERDICT_TEXT="FAIL: no connection to ${TARGET:-<smoke>} (menu=$MENU, logs: $RUNDIR)"
+if (( FARM )); then
+  if ls "$FARM_DIR"/CONNECT_*.bin >/dev/null 2>&1; then
+    VERDICT_CODE=0
+    VERDICT_TEXT="PASS: farm captured engine connect packet(s) (farm dir: $FARM_DIR)"
+  elif (( VERDICT_CODE != 0 )); then
+    VERDICT_TEXT="FAIL: farm matrix exhausted, no engine connect (farm dir: $FARM_DIR)"
+  fi
+fi
 finish "$VERDICT_CODE" "$VERDICT_TEXT"

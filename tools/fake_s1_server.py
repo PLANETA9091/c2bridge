@@ -232,9 +232,9 @@ def binascii_hex(b):
 
 
 class Farm(object):
-    def __init__(self, bind, port, logdir, interval, consume_gap, silent_rx_gap):
+    def __init__(self, bind, ports, logdir, interval, consume_gap, silent_rx_gap):
         self.bind = bind
-        self.port = port
+        self.ports = ports          # list: primary query/game port + alt game ports + redirect
         self.logdir = logdir
         self.interval = interval
         self.consume_gap = consume_gap
@@ -243,6 +243,7 @@ class Farm(object):
         self.chal = Ctx()
         self.idx = 0
         self.last_addr = None
+        self.last_sock = None       # pushes go out where the last qconnect came in
         self.stats = {"rx": 0, "qc": 0, "connect": 0, "other": 0, "push": 0,
                       "redir": 0, "a2s": 0}
         self.a2s_answered_at = 0.0
@@ -265,35 +266,34 @@ class Farm(object):
             f.write(data)
         return path
 
-    def handle_rx(self, sock, redir=False):
+    def handle_rx(self, sock):
         data, addr = sock.recvfrom(65535)
         self.stats["rx"] += 1
         now = time.time()
-        tag = "REDIR" if redir else "RX"
-        self.log("%s %dB src=%s:%d hex=%s" % (tag, len(data), addr[0], addr[1],
-                                              hexd(data)))
-        if redir:
-            self.stats["redir"] += 1
-            self.dump("redir_rx", data)
-            return
+        port = sock.getsockname()[1]
+        self.log("RX :%d %dB src=%s:%d hex=%s" % (port, len(data), addr[0],
+                                                  addr[1], hexd(data)))
         # ANY packet reveals the client's socket; remember it so pushes/A2S
         # replies always have a target (run 54: only qconnect set last_addr ->
         # the A2S_INFO phase never got a reply and pushes never armed).
         self.last_addr = addr
+        if port != self.ports[0]:
+            self.log("  *** packet on ALT port %d (default-port theory / "
+                     "redirect) ***" % port)
         payload = data[4:] if data[:4] == b"\xff\xff\xff\xff" else None
         if payload is None:
             self.stats["other"] += 1
             self.dump("nonoob", data)
             self.silent_until = now + self.silent_rx_gap
             return
-        # ---- A2S queries (runs 54/57/58: the client's serverinfo reply gates
-        # the engine handoff AND the engine's game port) ----
+        # ---- A2S queries (runs 54/57/58/59: serverinfo gates the handoff) ----
+        # NO-EDF legacy blob (run 57 EXACT): handoff fired there. EDF presence
+        # (runs 58/59) put the client into a 10s re-poll loop with NO handoff.
         if payload[:1] == b"T":
             self.stats["a2s"] += 1
-            blob = hybrid_info(self.port)
-            self.log("  -> A2S_INFO request %r -> replying HYBRID 'I' blob "
-                     "(%dB, game_port=%d)" % (payload[:24], len(blob),
-                                              self.port))
+            blob = b"\xff\xff\xff\xffI" + sinfo_blob()
+            self.log("  -> A2S_INFO request %r -> replying NO-EDF legacy "
+                     "'I' blob (%dB)" % (payload[:24], len(blob)))
             try:
                 sock.sendto(blob, addr)
                 self.a2s_answered_at = now
@@ -314,8 +314,9 @@ class Farm(object):
             except ValueError:
                 self.ctx["qc_val"] = 0
             self.push_armed = True
+            self.last_sock = sock      # answer from the same port the engine chose
             self.next_push = min(self.next_push, max(now + 0.5, now))
-            self.log("  -> qconnect qc_val=0x%08X (pushes ARMED)"
+            self.log("  -> qconnect qc_val=0x%08X (pushes ARMED on this socket)"
                      % self.ctx["qc_val"])
             return
         if payload.startswith(b"getchallenge"):
@@ -368,33 +369,34 @@ class Farm(object):
         self.next_push = max(now + gap, self.silent_until)
 
     def run(self):
-        main = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        main.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        main.bind((self.bind, self.port))
-        redir = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        redir.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        redir.bind((self.bind, self.port + 1))
-        self.log("FARM UP bind=%s:%d (redirect-catch :%d) entries=%d "
+        socks = []
+        for port in self.ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.bind, port))
+            socks.append(s)
+        self.log("FARM UP bind=%s ports=%s (all full peers; matrix served from "
+                 "whichever port the engine uses) entries=%d "
                  "interval=%.1fs consume_gap=%.1fs"
-                 % (self.bind, self.port, self.port + 1, len(MATRIX),
+                 % (self.bind, self.ports, len(MATRIX),
                     self.interval, self.consume_gap))
         for i, (name, cls, _) in enumerate(MATRIX):
             self.log("  matrix[%02d] %-14s %s" % (i, name, cls))
         while True:
             try:
-                self.loop_once(main, redir)
+                self.loop_once(socks)
             except Exception:  # the farm must NEVER die (run 54: heartbeat
                 self.log(log_exc("LOOP-ERROR (continuing)"))  # format crash)
                 time.sleep(0.5)
 
-    def loop_once(self, main, redir):
+    def loop_once(self, socks):
         now = time.time()
         timeout = 0.5
         if self.push_armed and self.last_addr is not None:
             timeout = max(0.05, min(timeout, self.next_push - now))
-        r, _, _ = select_select([main, redir], [], [], timeout)
+        r, _, _ = select_select(socks, [], [], timeout)
         for s in r:
-            self.handle_rx(s, redir=(s is redir))
+            self.handle_rx(s)
         now = time.time()
         # A2S grace: if the client asked for serverinfo but no qconnect ever
         # came, still arm pushes 20s later (matrix evidence must not starve)
@@ -404,7 +406,8 @@ class Farm(object):
             self.log("PUSHES ARMED via A2S grace (no qconnect in 20s)")
         if (self.push_armed and self.last_addr is not None
                 and now >= self.next_push and now >= self.silent_until):
-            self.push_next(main)
+            self.push_next(self.last_sock if self.last_sock is not None
+                           else socks[0])
         if time.time() >= self.hb:
             self.log("HEARTBEAT rx=%(rx)d qc=%(qc)d a2s=%(a2s)d "
                      "connect=%(connect)d other=%(other)d push=%(push)d "
@@ -424,6 +427,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=29015)
+    ap.add_argument("--alt-ports", default="27015,29016",
+                    help="extra full-peer game ports (default CS:GO 27015 + "
+                         "redirect catch port+1)")
     ap.add_argument("--log", default="/tmp/c2b-farm")
     ap.add_argument("--push-interval", type=float, default=2.0)
     ap.add_argument("--consume-gap", type=float, default=10.0)
@@ -436,7 +442,9 @@ def main():
             print("%02d %-14s %s" % (i, name, cls))
         return 0
     os.makedirs(args.log, exist_ok=True)
-    Farm(args.bind, args.port, args.log, args.push_interval, args.consume_gap,
+    ports = [args.port] + [int(p) for p in args.alt_ports.split(",")
+                           if int(p) != args.port]
+    Farm(args.bind, ports, args.log, args.push_interval, args.consume_gap,
          args.silent_rx_gap).run()
     return 0
 

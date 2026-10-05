@@ -582,8 +582,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # get a full backtrace from an address-space that matches real conditions.
   DBG_INNER=""
   DBG_ATTEMPT="${DBG_ATTEMPT:-2}"
-  (( FARM )) && DBG_ATTEMPT=9999
-  if (( ATTEMPT == DBG_ATTEMPT )) && command -v gdb >/dev/null 2>&1; then
+  if (( FARM )); then
+    # FARM GROUND TRUTH (runs 57-60: handoff fires, engine 'Retrying public'
+    # for 240s, ZERO packets leave via sendto on ANY port). Trace the engine's
+    # ENTIRE network syscall surface during the retry window: if qconnect is
+    # sent via sendmsg/write-on-connected-socket, or the socket connect()s
+    # elsewhere, strace shows it.
+    if (( ATTEMPT == 2 )) && command -v strace >/dev/null 2>&1; then
+      DBG_INNER="exec strace -f -qq -e trace=network -o $RUNDIR/strace_game.a${ATTEMPT}.log ./csgo_linux64"
+    fi
+  elif (( ATTEMPT == DBG_ATTEMPT )) && command -v gdb >/dev/null 2>&1; then
     DBG_INNER="exec gdb -batch -return-child-result \
       -ex 'set confirm off' \
       -ex 'set disable-randomization off' \

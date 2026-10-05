@@ -56,12 +56,7 @@ RES9 = b"reserve" * 9 + b"\x00"          # fmt8 N-agnostic tail
 CONNSTR = b"connect 127.0.0.1:29016\x00"  # 'A'-parser redirect flow
 
 # EXACT A2S_INFO 'I' reply captured from the REAL CS2 server (CYBERSHOKE
-# 152.233.19.133:28022, 2026-10-05): run 57 showed the legacy client receives
-# the farm's 'I' reply and then the engine sits in "Retrying public(...)"
-# WITHOUT ever sending qconnect — the hand-built blob (no EDF) is the suspect.
-# This verbatim real reply (EDF 0xb1 = game port + steamid + spectators +
-# keywords) is the authenticity baseline; if qconnect still does not start,
-# the gate is elsewhere (client-side IPC state, not serverinfo).
+# 152.233.19.133:28022, 2026-10-05): kept for reference/verification.
 REAL_INFO = bytes.fromhex(
     "ffffffff491143533220355835207c203576352023323837205b42525d20e28094204359"
     "42455253484f4b452e4e45540064655f6d6972616765006373676f00436f756e7465722d"
@@ -69,6 +64,36 @@ REAL_INFO = bytes.fromhex(
     "3001656d7074792c3576352c357673352c3578352c62742c63796265722c6379626572"
     "73686f6b652c64655f6d69726167652c64726f702c6475656c2c656e2c6700da020000"
     "00000000")
+
+
+def hybrid_info(game_port):
+    """RUN 58/57 POST-MORTEM BLOB — two variables isolated across runs:
+    - run 57 (game='Counter-Strike: Global Offensive', NO EDF): client handed
+      the connect to the engine ('Connecting to public(...)'), but the engine
+      sat in 'Retrying public(...)' without ever sending qconnect — plausibly
+      because the serverinfo carried no game port (EDF 0x80).
+    - run 58 (REAL CS2 blob, EDF 0xb1): client NEVER handed off (zero
+      'Connecting' lines) and polled A2S_INFO every 10s — the identity fields
+      say 'Counter-Strike 2' / ver 1.41.8.8, which the legacy client refuses.
+    Hybrid: legacy identity (accepted in 57) + full EDF 0xb1 structure with
+    OUR game port (the address the engine should qconnect)."""
+    edf = (b"\xb1"
+           + le16(game_port)                       # 0x80 game port
+           + b"\x07\x0a\xee\x00\x00\x00\x30\x01"   # 0x10 steamid (real echo)
+           + le16(game_port + 1)                   # 0x20 spectator port
+           + b"c2b,farm\x00")                      # 0x01 keywords
+    return (b"\xff\xff\xff\xffI"
+            + b"\x11"                              # protocol 17
+            + b"c2b-farm\x00"
+            + b"de_dust2\x00"
+            + b"csgo\x00"
+            + b"Counter-Strike: Global Offensive\x00"
+            + le16(730)                            # appid
+            + b"\x00\x18\x00"                      # 0 players, 24 max, 0 bots
+            + b"dl"                                # dedicated, linux
+            + b"\x00\x00"                          # public, VAC off
+            + b"1.38.0.4\x00"                      # legacy version
+            + edf)
 
 
 class Ctx(object):
@@ -261,14 +286,16 @@ class Farm(object):
             self.dump("nonoob", data)
             self.silent_until = now + self.silent_rx_gap
             return
-        # ---- A2S queries (run 54 GOLD: the client sends A2S_INFO to the
-        # connect target; no valid 'I' reply = the engine never qconnects) ----
+        # ---- A2S queries (runs 54/57/58: the client's serverinfo reply gates
+        # the engine handoff AND the engine's game port) ----
         if payload[:1] == b"T":
             self.stats["a2s"] += 1
-            self.log("  -> A2S_INFO request %r -> replying REAL server 'I' "
-                     "blob (%dB)" % (payload[:24], len(REAL_INFO)))
+            blob = hybrid_info(self.port)
+            self.log("  -> A2S_INFO request %r -> replying HYBRID 'I' blob "
+                     "(%dB, game_port=%d)" % (payload[:24], len(blob),
+                                              self.port))
             try:
-                sock.sendto(REAL_INFO, addr)
+                sock.sendto(blob, addr)
                 self.a2s_answered_at = now
                 # give the engine a chance to start qconnecting; if it does,
                 # qc arming below is immediate; else arm after a grace period

@@ -683,9 +683,10 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
        || sudo -n grep -aqiE 'Connected\(|Signing up to server|Connected to' "$CONLOG" 2>/dev/null; then
       CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"; break
     fi
-    # bridge-side evidence also counts: translated uplink traffic to the target
-    if grep -aqE 'up #0x[0-9a-f]+  len=0x[0-9a-f]{3,}' "$OUT" 2>/dev/null; then
-      log "attempt $ATTEMPT: bridge is passing real traffic (uplink len>255)"
+    # bridge-side evidence: engine QCONNECTS the target (class name in the CL
+    # trace line; run 54 lesson: "other" class = LanSearch broadcast noise)
+    if grep -aqE 'CL up #[0-9a-fx]+ +len=[0-9a-fx]+ +qconnect' "$OUT" 2>/dev/null; then
+      log "attempt $ATTEMPT: engine is qconnecting (bridge CL trace)"
     fi
     # farm capture: engine sent its connect packet to the fake server. Log once
     # and keep waiting (followup packets are evidence too; verdict is final).

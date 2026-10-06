@@ -367,7 +367,16 @@ class Farm(object):
                     i = p.index(b"\x00", i) + 1
                 i += 2 + 7                   # appid u16 + players/max/bots/type/env/vis/vac
                 i = p.index(b"\x00", i) + 1  # version string
-                self.ref["info_i_noedf"] = d[:5] + p[:i]
+                blob = bytearray(d[:5] + p[:i])
+                # RUN 71: the real legacy server reports appid=0 in the u16
+                # field — the client refuses to hand off (it must match the
+                # game's appid 730; the synthetic replies with 730 DID hand
+                # off). Patch it.
+                apid = 5 + 1
+                for _ in range(4):            # name, map, folder, game
+                    apid = blob.index(b"\x00", apid) + 1
+                blob[apid:apid + 2] = le16(730)
+                self.ref["info_i_noedf"] = bytes(blob)
             except ValueError:
                 pass
         # JOIN flow state: after the engine answers our 'i' prompt with

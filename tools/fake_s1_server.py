@@ -79,6 +79,19 @@ REAL_STEAMID = bytes.fromhex("070aee0000003001")
 # The string contains "connect" -> per the engine RE this drives the
 # REDIRECT/CONNECT flow (not the MM-reserve no-op) -> the engine should
 # finally SEND its connect packet (the phase-B capture prize).
+REAL_A_VARIANTS = [
+    # (value, mystery4) — rotate per qconnect; the engine sends ONE qconnect
+    # per attempt (run 72: the reply consumes the retry), so each harness
+    # attempt tests one variant.
+    (0x00F2CC9B, b"\x00\x30\x01\x01"),   # v0: run-72 baseline (steamid-low)
+    (0x00F2CC9B, b"\x00\x00\x30\x01"),   # v1: mystery = steamid-high32 LE
+    (0x00000000, b"\x00\x00\x30\x01"),   # v2: zero value + steamid-high
+    (0x00F2CC9B, b"\x01\x00\x30\x01"),   # v3: alt high
+    (0x00000000, b"\x00\x30\x01\x01"),   # v4: zero value, baseline mystery
+]
+_real_a_vi = [0]
+
+
 def real_legacy_A(chal, qc_val, value=0x00F2CC9B):
     """Byte-exact reconstruction of the live legacy-server reply (all three
     captured servers share the structure):
@@ -475,13 +488,22 @@ class Farm(object):
             # THE REAL FLOW (live legacy servers, byte-exact structure):
             # answer with 'A' + challenge + "connect0x<echo of the engine's
             # qconnect token>" -> engine takes the redirect/connect path.
+            # v17: rotate the (value, mystery4) pair per qconnect — the
+            # auth path needs a valid server steamid and the exact field
+            # mapping is unknown; one variant per harness attempt.
+            vi = _real_a_vi[0] % len(REAL_A_VARIANTS)
+            _real_a_vi[0] += 1
+            val, mys = REAL_A_VARIANTS[vi]
             try:
-                pkt = real_legacy_A(self.ctx["chal"], self.ctx["qc_val"])
+                pkt = real_legacy_A(self.ctx["chal"], self.ctx["qc_val"],
+                                    value=val)
+                pkt = pkt[:16] + mys + pkt[20:]   # splice the variant mystery
                 sock.sendto(b"\xff\xff\xff\xff" + pkt, addr)
                 self.stats["push"] += 1
-                self.log("  -> REAL-LEGACY-A %dB chal=0x%08X qc=0x%08X hex=%s"
-                         % (len(pkt), self.ctx["chal"], self.ctx["qc_val"],
-                            hexd(pkt)))
+                self.log("  -> REAL-LEGACY-A[v%d] %dB val=0x%08X mys=%s "
+                         "chal=0x%08X qc=0x%08X hex=%s"
+                         % (vi, len(pkt), val, mys.hex(), self.ctx["chal"],
+                            self.ctx["qc_val"], hexd(pkt)))
             except OSError as e:
                 self.log(log_exc("real-A reply failed"))
             return

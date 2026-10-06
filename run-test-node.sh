@@ -741,6 +741,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       FARM_HIT=1
       log "attempt $ATTEMPT: FARM CAPTURED engine connect packet(s)"
     fi
+    # farm fast-cycle: the engine bounces LOADING->INGAME->MAINMENU when the
+    # connect attempt aborts (run 72) — relaunch immediately so the next
+    # attempt serves the NEXT real-A variant instead of idling 200s.
+    if (( FARM )) && grep -aq "CSGO_GAME_UI_STATE_INGAME" "$CONLOG_LIVE" 2>/dev/null; then
+      sleep 6   # give the bounce (and any followup packets) time to land
+      if grep -aq "CSGO_GAME_UI_STATE_MAINMENU" "$CONLOG_LIVE" 2>/dev/null; then
+        log "attempt $ATTEMPT: INGAME->MAINMENU bounce detected -> fast-cycle to next variant"
+        break
+      fi
+    fi
     sleep 5
   done
   (( CONNECTED )) && { VERDICT_CODE=0; VERDICT_TEXT="PASS: connected to $TARGET (attempt $ATTEMPT)"; break; }

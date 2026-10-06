@@ -7198,24 +7198,6 @@ static void *c2b_poll_thread(void *arg)
         c2b_got_tick();                           /* t42v5: GOT-патчер */
         if (c2b_try_install() == 0) break;
         usleep(500000);
-        {   /* CLV2 фаза 2: через ~1.5s после доставки 'A' — второй
-             * ChallengeRequest; его ChallengeReply подменяется на 'i'. */
-            if (g_clv2_enable && g_clv2_phase == 1 && i >= 3 &&
-                g_clv2_fd >= 0 && g_clv2_dstlen) {
-                u8 out2[512];
-                g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0001u) | 1u;
-                (void)c2b_clv2_build_chalreq(out2);
-                if (g_clp_sendto && (uptr)g_clp_sendto != 1) {
-                    ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, out2, 512, 0,
-                                                  (struct sockaddr *)g_clv2_dst,
-                                                  g_clv2_dstlen);
-                }
-                g_clv2_phase = 2;
-                C2B_LOGS("[c2b] CLV2 phase2: 2nd ChallengeRequest sent (cid=");
-                C2B_LOGH(g_clv2_conn_id);
-                C2B_LOGS(")\n");
-            }
-        }
     }
     /* t42v5/v7: тик до пропатчивания GOT И установки vtable-слота */
     {
@@ -7229,6 +7211,31 @@ static void *c2b_poll_thread(void *arg)
         C2B_LOGS("[c2b] GOT total="); C2B_LOGN(g_got_patch_n);
         C2B_LOGS(" vt="); C2B_LOGN(g_vt_done);
         C2B_LOGS("\n");
+    }
+    {   /* CLV2 фаза 2: ждём доставки 'A' (recvfrom-хук ставит phase=1),
+         * затем через 1.5с стреляем вторым ChallengeRequest — его reply
+         * подменяется на 'i'-промпт (bait для 'j' движка). */
+        int i;
+        for (i = 0; i < 1200; i++) {              /* до 10 мин */
+            if (g_clv2_phase == 1 && i >= 3) {
+                u8 out2[512];
+                g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0001u) | 1u;
+                (void)c2b_clv2_build_chalreq(out2);
+                if (g_clv2_fd >= 0 && g_clv2_dstlen &&
+                    g_clp_sendto && (uptr)g_clp_sendto != 1) {
+                    ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, out2, 512, 0,
+                                                  (struct sockaddr *)g_clv2_dst,
+                                                  g_clv2_dstlen);
+                }
+                g_clv2_phase = 2;
+                C2B_LOGS("[c2b] CLV2 phase2: 2nd ChallengeRequest sent (cid=");
+                C2B_LOGH(g_clv2_conn_id);
+                C2B_LOGS(")\n");
+                break;
+            }
+            if (g_clv2_phase >= 2) break;         /* уже за фазой 2/3/4/5 */
+            usleep(500000);
+        }
     }
     /* t39-фикс: GC-опрос ТОЛЬКО после ARMED движка (ProcessMessages уже
      * идёт = SteamAPI_Init главного потока давно завершён). Прежде GC-цикл

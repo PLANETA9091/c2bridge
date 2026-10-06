@@ -6078,6 +6078,8 @@ static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
 static u32 g_clv2_phase;         /* 0=idle 1='A' доставлен 2=ждём reply для 'i' 3='i' доставлен */
 static u64 g_clv2_phase_ms;      /* мгновение смены фазы (ms монотонные) */
+static u8 g_clv2_dst[16];        /* адрес CS2-цели (из qconnect), сырые байты */
+static socklen_t g_clv2_dstlen;
 static u32 g_clv2_k;             /* C2B_CLV2_K: длина филлера перед строкой (поиск N) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
@@ -6358,6 +6360,13 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 }
                 g_clv2_qc_val = hv;
                 g_clv2_phase = 0;               /* новая попытка — фаза с нуля */
+                if (addr && addrlen && addrlen <= 16) {
+                    u8 *d = (u8 *)&g_clv2_dst;
+                    u32 i2;
+                    const u8 *s2 = (const u8 *)addr;
+                    for (i2 = 0; i2 < (u32)addrlen; i2++) d[i2] = s2[i2];
+                    g_clv2_dstlen = addrlen;
+                }
                 (void)c2b_clv2_build_chalreq(out);
                 g_clv2_fd = fd;
                 g_clv2_sent_req++;
@@ -7102,9 +7111,11 @@ static void *c2b_poll_thread(void *arg)
                 u8 out[512];
                 g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0001u) | 1u;
                 (void)c2b_clv2_build_chalreq(out);
-                if (g_clv2_fd >= 0 && g_clp_sendto && (uptr)g_clp_sendto != 1) {
+                if (g_clv2_fd >= 0 && g_clv2_dstlen &&
+                    g_clp_sendto && (uptr)g_clp_sendto != 1) {
                     ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, out, 512, 0,
-                                                  (void *)0, 0);
+                                                  (struct sockaddr *)&g_clv2_dst,
+                                                  g_clv2_dstlen);
                 }
                 g_clv2_phase = 2;
                 C2B_LOGS("[c2b] CLV2 phase2: 2nd ChallengeRequest sent (cid=");

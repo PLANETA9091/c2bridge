@@ -352,6 +352,24 @@ class Farm(object):
                 self.ref["meta"] = json.load(open(rj))
         except Exception:
             pass
+        # RUN 70 LESSON: the REAL info_i (with EDF 0xb1) re-creates the
+        # client's 10s re-poll loop and the handoff NEVER fires (0 qconnect).
+        # Runs 57/60/68 proved the handoff needs a NO-EDF serverinfo, and the
+        # auth path gets the server identity from the 'A'-reply's value field
+        # (= the server steamid low-32 bits) — the EDF steamid is redundant.
+        # So: replay the real identity strings but STRIP the EDF tail.
+        if "info_i" in self.ref:
+            d = self.ref["info_i"]
+            try:
+                p = d[5:]
+                i = 1
+                for _ in range(4):          # name, map, folder, game
+                    i = p.index(b"\x00", i) + 1
+                i += 2 + 7                   # appid u16 + players/max/bots/type/env/vis/vac
+                i = p.index(b"\x00", i) + 1  # version string
+                self.ref["info_i_noedf"] = d[:5] + p[:i]
+            except ValueError:
+                pass
         # JOIN flow state: after the engine answers our 'i' prompt with
         # 'j'+token (run 65: 3/3 causal), the reservation exists client-side
         # -> serve the reserve-'A' sequence instead of the raw matrix.
@@ -415,7 +433,9 @@ class Farm(object):
                     return
                 # challenge-carrying query -> the 'I' reply (REAL server
                 # bytes when the legacy ref was captured)
-                if "info_i" in self.ref:
+                if "info_i_noedf" in self.ref:
+                    blob, vname = self.ref["info_i_noedf"], "REAL-NOEDF-REPLAY"
+                elif "info_i" in self.ref:
                     blob, vname = self.ref["info_i"], "REAL-LEGACY-REPLAY"
                 else:
                     blob, vname = serverinfo(self.ports[0], now - self.t0,

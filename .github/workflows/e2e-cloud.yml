@@ -275,6 +275,11 @@ jobs:
             mkdir -p "$C2B_NODE_HOME/farm/legacy_ref"
             timeout 300 python3 tools/capture_legacy_ref.py \
               "$C2B_NODE_HOME/farm/legacy_ref" || echo "::warning::legacy ref capture failed (farm continues synthetic)"
+            # seed the repo's LIVE-CAPTURED legacy reference (46.174.52.230
+            # info_i: real EDF 0xb1 steamid 0x130000000f2cc9b, ver 1.38.8.1)
+            # unless the runner-side capture produced its own
+            [ -f "$C2B_NODE_HOME/farm/legacy_ref/info_i.bin" ] || \
+              cp -f legacy_ref/info_i.bin "$C2B_NODE_HOME/farm/legacy_ref/info_i.bin" 2>/dev/null || true
             ls -la "$C2B_NODE_HOME/farm/legacy_ref/" || true
             docker run -d --name c2bfarm --rm \
               -v "$GITHUB_WORKSPACE/tools":/tools:ro \

@@ -72,13 +72,14 @@ REAL_STEAMID = bytes.fromhex("070aee0000003001")
 # ---- THE REAL 'A' REPLY (2026-10-06, live CS:GO-legacy servers
 # 191.96.94.111:27015 / 46.174.52.230:27015 / 46.174.55.194:27015 — all three
 # answered our qconnect0x00000000 with the IDENTICAL 59-byte structure):
-#   'A' + le32(challenge) + le32(3) + u16(0) + le32(value) + u8(0)
+#   'A' + le32(challenge) + le32(3) + u16(0) + le32(value=SERVER STEAMID
+#   LOW-32!) + u8(0)
 #   + "connect0x00000000\0" (THE ECHO OF OUR qconnect TOKEN — NOT "reserve"!)
 #   + "96\0" + NUL padding to 59 bytes.
 # The string contains "connect" -> per the engine RE this drives the
 # REDIRECT/CONNECT flow (not the MM-reserve no-op) -> the engine should
 # finally SEND its connect packet (the phase-B capture prize).
-def real_legacy_A(chal, qc_val, value=0x00F2D235):
+def real_legacy_A(chal, qc_val, value=0x00F2CC9B):
     """Byte-exact reconstruction of the live legacy-server reply (all three
     captured servers share the structure):
       'A' + le32(chal) + le32(3) + u16(0) + le32(value) + u8(0)

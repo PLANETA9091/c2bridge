@@ -6076,6 +6076,8 @@ static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
 static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
+static u32 g_clv2_phase;         /* 0=idle 1='A' доставлен 2=ждём reply для 'i' 3='i' доставлен */
+static u64 g_clv2_phase_ms;      /* мгновение смены фазы (ms монотонные) */
 static u32 g_clv2_k;             /* C2B_CLV2_K: длина филлера перед строкой (поиск N) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
@@ -6355,6 +6357,7 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                     hv = (hv << 4) | d;
                 }
                 g_clv2_qc_val = hv;
+                g_clv2_phase = 0;               /* новая попытка — фаза с нуля */
                 (void)c2b_clv2_build_chalreq(out);
                 g_clv2_fd = fd;
                 g_clv2_sent_req++;
@@ -6415,6 +6418,21 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 g_clv2_ch64 = ch;
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
+                if (g_clv2_phase == 2) {
+                    /* фаза 2: второй ChallengeReply подменяем на 'i'-промпт
+                     * (ферма run 65: 'i'+8A -> движок отвечает 'j'+token 3/3) */
+                    if ((u32)len >= 13) {
+                        q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
+                        q[4] = 'i';
+                        q[5] = 'A'; q[6] = 'A'; q[7] = 'A'; q[8] = 'A';
+                        q[9] = 'A'; q[10] = 'A'; q[11] = 'A'; q[12] = 'A';
+                        g_clv2_phase = 3;
+                        C2B_LOGS("[c2b] CLV2 phase2: ChallengeReply -> 'i' prompt (join bait)\n");
+                        return 13;
+                    }
+                    return r;
+                }
+                g_clv2_phase = 1;
                 /* fmt7: k задаётся env (по попытке) — счётчики не живут
                  * между попытками (каждая = новый процесс движка). */
                 rl = c2b_clv2_build_chalreply(q, (u32)len, g_clv2_fmt,
@@ -7073,6 +7091,30 @@ static void c2b_got_tick(void) {}
 static void *c2b_poll_thread(void *arg)
 {
     (void)arg;
+    {   /* CLV2 фаза 2: через ~1.5s после доставки 'A' — второй
+         * ChallengeRequest; его ChallengeReply recvfrom-хук подменит на
+         * 'i'-промпт (bait для 'j' движка). */
+        u32 waited = 0;
+        while (waited < 60) {                     /* до 30с по 0.5с */
+            usleep(500000);
+            waited++;
+            if (g_clv2_phase == 1 && waited >= 3) {
+                u8 out[512];
+                g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0001u) | 1u;
+                (void)c2b_clv2_build_chalreq(out);
+                if (g_clv2_fd >= 0 && g_clp_sendto && (uptr)g_clp_sendto != 1) {
+                    ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, out, 512, 0,
+                                                  (void *)0, 0);
+                }
+                g_clv2_phase = 2;
+                C2B_LOGS("[c2b] CLV2 phase2: 2nd ChallengeRequest sent (cid=");
+                C2B_LOGH(g_clv2_conn_id);
+                C2B_LOGS(")\n");
+                break;
+            }
+            if (g_clv2_phase != 0 && g_clv2_phase != 1) break;
+        }
+    }
     {   /* t43v1: crash-bisect gate — C2B_DISABLE_PATCH=1 makes the bridge a
          * PASSIVE preload (no GOT-patch, no detours, no vtable swap, no GC).
          * e2e-cloud smoke matrix (run 21/22 post-mortem): observe mode still

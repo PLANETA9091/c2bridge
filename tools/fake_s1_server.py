@@ -69,6 +69,43 @@ REAL_INFO = bytes.fromhex(
 # REAL steamid captured from the CYBERSHOKE server's EDF 0x10 field
 REAL_STEAMID = bytes.fromhex("070aee0000003001")
 
+# ---- THE REAL 'A' REPLY (2026-10-06, live CS:GO-legacy servers
+# 191.96.94.111:27015 / 46.174.52.230:27015 / 46.174.55.194:27015 — all three
+# answered our qconnect0x00000000 with the IDENTICAL 59-byte structure):
+#   'A' + le32(challenge) + le32(3) + u16(0) + le32(value) + u8(0)
+#   + "connect0x00000000\0" (THE ECHO OF OUR qconnect TOKEN — NOT "reserve"!)
+#   + "96\0" + NUL padding to 59 bytes.
+# The string contains "connect" -> per the engine RE this drives the
+# REDIRECT/CONNECT flow (not the MM-reserve no-op) -> the engine should
+# finally SEND its connect packet (the phase-B capture prize).
+def real_legacy_A(chal, qc_val, value=0x00F2D235):
+    """Byte-exact reconstruction of the live legacy-server reply (all three
+    captured servers share the structure):
+      'A' + le32(chal) + le32(3) + u16(0) + le32(value) + u8(0)
+      + b'\x00\x30\x01\x01'   <- four bytes the static RE missed (constant
+                                   across servers, sits between flag and the
+                                   string; parser consumes them somehow)
+      + "connect0x<ECHO of the engine's qconnect token>\0" + "96\0"
+      + NUL padding to 55 bytes payload (59 with the ffff prefix)."""
+    pkt = (b"A"
+           + le32(chal)
+           + le32(3)          # authproto = Steam
+           + le16(0)          # keysize = 0
+           + le32(value)
+           + b"\x00"          # flag = 0
+           + b"\x00\x30\x01\x01"
+           + b"connect0x" + ("%.8X" % (qc_val & 0xFFFFFFFF)).encode()
+           + b"\x00"
+           + b"96\x00")
+    return pkt + b"\x00" * (55 - len(pkt))
+
+
+def build_join_sequence():
+    """DEPRECATED by the real-capture flow: the real legacy servers never
+    replied to bare 'j' - the join path belongs to the MM-reserve flow we do
+    NOT need. The engine's qconnect now gets the REAL 'A' reply immediately."""
+    return []
+
 
 def edf_variant(flags, game_port):
     """EDF section builder. flags = which optional fields to include.
@@ -178,6 +215,10 @@ def build_matrix():
     add("silent", "silent", lambda ctx: None)
 
     # ---- group A reserve (proven parseable layout, fmt5/fmt8 family) ----
+    add("real_A", "consume",
+        lambda ctx: real_legacy_A(ctx["chal"], ctx["qc_val"]))
+    add("real_A_v0", "consume",
+        lambda ctx: real_legacy_A(ctx["chal"], ctx["qc_val"], value=0))
     add("a_res_qc", "consume",
         lambda ctx: a_reserve(ctx))                            # value = qc echo
     add("a_res_v0", "consume",
@@ -401,13 +442,18 @@ class Farm(object):
             self.next_push = min(self.next_push, max(now + 0.5, now))
             self.log("  -> qconnect qc_val=0x%08X (pushes ARMED on this socket)"
                      % self.ctx["qc_val"])
-            if "chal_A" in self.ref:
-                try:
-                    sock.sendto(self.ref["chal_A"], addr)
-                    self.log("  -> REPLAYED real chal_A %dB"
-                             % len(self.ref["chal_A"]))
-                except OSError as e:
-                    self.log(log_exc("chal_A replay failed"))
+            # THE REAL FLOW (live legacy servers, byte-exact structure):
+            # answer with 'A' + challenge + "connect0x<echo of the engine's
+            # qconnect token>" -> engine takes the redirect/connect path.
+            try:
+                pkt = real_legacy_A(self.ctx["chal"], self.ctx["qc_val"])
+                sock.sendto(b"\xff\xff\xff\xff" + pkt, addr)
+                self.stats["push"] += 1
+                self.log("  -> REAL-LEGACY-A %dB chal=0x%08X qc=0x%08X hex=%s"
+                         % (len(pkt), self.ctx["chal"], self.ctx["qc_val"],
+                            hexd(pkt)))
+            except OSError as e:
+                self.log(log_exc("real-A reply failed"))
             return
         if payload.startswith(b"getchallenge"):
             self.push_armed = True

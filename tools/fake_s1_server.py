@@ -244,6 +244,24 @@ def build_matrix():
 MATRIX = build_matrix()
 
 
+def build_join_sequence():
+    """After the engine's 'j' (join request), the reservation exists
+    client-side. Sequence mirrors the MM reserve flow: reserve-'A' challenge
+    (multiple formats, repeated like a real server), then 'B' accept."""
+    seq = []
+    for _ in range(2):
+        seq.append(("a_res_qc", a_reserve))
+        seq.append(("a_res_v0", lambda c: a_reserve(c, value=0)))
+    seq.append(("a_res_bigstr", lambda c: a_reserve(c, value=0, s=RES9)))
+    seq.append(("b_dot8A", lambda c: b"B." + b"A" * 8))
+    seq.append(("b_dot0", lambda c: b"B." + b"\x00" * 8))
+    seq.append(("b_dotle0", lambda c: b"B." + le32(0) + le32(0)))
+    return seq
+
+
+JOIN_SEQUENCE = build_join_sequence()
+
+
 def hexd(b, maxb=96):
     s = binascii_hex(b[:maxb])
     if len(b) > maxb:
@@ -269,13 +287,18 @@ class Farm(object):
         self.last_addr = None
         self.last_sock = None       # pushes go out where the last qconnect came in
         self.stats = {"rx": 0, "qc": 0, "connect": 0, "other": 0, "push": 0,
-                      "redir": 0, "a2s": 0}
+                      "redir": 0, "a2s": 0, "join": 0}
         self.a2s_answered_at = 0.0
         self.push_armed = False
         self.version = "1.38.0.4"
         self.engine_ports_file = None
         self.engine_ports = []
         self.push_host = "127.0.0.1"
+        # JOIN flow state: after the engine answers our 'i' prompt with
+        # 'j'+token (run 65: 3/3 causal), the reservation exists client-side
+        # -> serve the reserve-'A' sequence instead of the raw matrix.
+        self.join_seq = []          # pending (name, builder) responses
+        self.join_last = 0.0
         self.dump_dir = os.path.join(logdir, "dump")
         os.makedirs(self.dump_dir, exist_ok=True)
         self.plog = open(os.path.join(logdir, "packets.log"), "a", buffering=1)
@@ -377,13 +400,47 @@ class Farm(object):
                         % (addr[0], addr[1], len(data), path, hexd(data, 4096)))
             self.silent_until = now + self.silent_rx_gap  # do not clobber
             return
+        # ---- 'j' JOIN REQUEST (run 65 JACKPOT: our 'i' prompt makes the
+        # engine send 'j'+14-zeros; NOW the pending reserve exists -> the
+        # reserve-'A' sequence must follow IMMEDIATELY) ----
+        if payload[:1] == b"j":
+            self.stats["join"] += 1
+            self.log("*** JOIN REQUEST #%d: %r ***" % (self.stats["join"],
+                                                       payload[:20]))
+            self.dump("join_rx", data)
+            self.join_seq = JOIN_SEQUENCE
+            self.join_last = now
+            self.silent_until = 0.0
+            self.next_push = now + 0.3   # fire the first reserve reply fast
+            self.push_armed = True
+            return
+        # ---- A2S_PLAYER 'U': challenge dance -> 'D' empty player list ----
+        if payload[:1] == b"U":
+            self.stats["a2s"] += 1
+            try:
+                if len(payload) <= 5:
+                    self.log("  -> A2S_PLAYER bare -> 0x41 challenge")
+                    self.ctx["chal2"] = (self.ctx.get("chal2", 0x5EED0000)
+                                         + 1) & 0xFFFFFFFF
+                    sock.sendto(b"\xff\xff\xff\xffA"
+                                + le32(self.ctx["chal2"]), addr)
+                else:
+                    self.log("  -> A2S_PLAYER+chal -> 'D' empty list")
+                    sock.sendto(b"\xff\xff\xff\xffD\x00", addr)
+            except OSError as e:
+                self.log(log_exc("A2S_PLAYER reply failed"))
+            return
         self.stats["other"] += 1
         self.dump("other_rx", data)
         self.silent_until = now + self.silent_rx_gap
 
     def push_next(self, sock):  # sock = primary (connect-target source)
-        name, cls, fn = MATRIX[self.idx % len(MATRIX)]
-        self.idx += 1
+        if self.join_seq:
+            name, fn = self.join_seq.pop(0)
+            cls = "join"
+        else:
+            name, cls, fn = MATRIX[self.idx % len(MATRIX)]
+            self.idx += 1
         self.ctx["chal"] = self.chal.next_chal()
         now = time.time()
         try:
@@ -418,7 +475,12 @@ class Farm(object):
             if not targets:
                 self.log("PUSH idx=%d name=%s DROPPED (no target yet)"
                          % (self.idx, name))
-        gap = self.interval if cls in ("ignore", "silent") else self.consume_gap
+        if cls == "join":
+            gap = 1.2
+        elif cls in ("ignore", "silent"):
+            gap = self.interval
+        else:
+            gap = self.consume_gap
         self.next_push = max(now + gap, self.silent_until)
 
     def run(self):

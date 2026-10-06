@@ -294,6 +294,22 @@ class Farm(object):
         self.engine_ports_file = None
         self.engine_ports = []
         self.push_host = "127.0.0.1"
+        # REAL-SERVER REPLAY (run 66+: tools/capture_legacy_ref.py captures a
+        # real CS:GO-legacy server's exact bytes; replay them verbatim)
+        self.ref = {}
+        try:
+            refdir = os.path.join(self.logdir, "legacy_ref")
+            for tag, fn in (("info_i", "info_i.bin"), ("chal_A", "chal_A.bin"),
+                            ("join_reply", "join_reply.bin"),
+                            ("player_d", "player_d.bin")):
+                p = os.path.join(refdir, fn)
+                if os.path.exists(p):
+                    self.ref[tag] = open(p, "rb").read()
+            rj = os.path.join(refdir, "ref.json")
+            if os.path.exists(rj):
+                self.ref["meta"] = json.load(open(rj))
+        except Exception:
+            pass
         # JOIN flow state: after the engine answers our 'i' prompt with
         # 'j'+token (run 65: 3/3 causal), the reservation exists client-side
         # -> serve the reserve-'A' sequence instead of the raw matrix.
@@ -355,9 +371,13 @@ class Farm(object):
                     sock.sendto(b"\xff\xff\xff\xffA"
                                 + le32(self.ctx["chal2"]), addr)
                     return
-                # challenge-carrying query -> the real 'I' reply
-                blob, vname = serverinfo(self.ports[0], now - self.t0,
-                                         self.version)
+                # challenge-carrying query -> the 'I' reply (REAL server
+                # bytes when the legacy ref was captured)
+                if "info_i" in self.ref:
+                    blob, vname = self.ref["info_i"], "REAL-LEGACY-REPLAY"
+                else:
+                    blob, vname = serverinfo(self.ports[0], now - self.t0,
+                                             self.version)
                 self.log("  -> A2S_INFO+chal %dB -> EDF variant '%s' blob "
                          "%dB" % (len(payload), vname, len(blob)))
                 sock.sendto(blob, addr)
@@ -381,6 +401,13 @@ class Farm(object):
             self.next_push = min(self.next_push, max(now + 0.5, now))
             self.log("  -> qconnect qc_val=0x%08X (pushes ARMED on this socket)"
                      % self.ctx["qc_val"])
+            if "chal_A" in self.ref:
+                try:
+                    sock.sendto(self.ref["chal_A"], addr)
+                    self.log("  -> REPLAYED real chal_A %dB"
+                             % len(self.ref["chal_A"]))
+                except OSError as e:
+                    self.log(log_exc("chal_A replay failed"))
             return
         if payload.startswith(b"getchallenge"):
             self.push_armed = True
@@ -413,6 +440,13 @@ class Farm(object):
             self.silent_until = 0.0
             self.next_push = now + 0.3   # fire the first reserve reply fast
             self.push_armed = True
+            if "join_reply" in self.ref:
+                try:
+                    sock.sendto(self.ref["join_reply"], addr)
+                    self.log("  -> REPLAYED real join_reply %dB"
+                             % len(self.ref["join_reply"]))
+                except OSError as e:
+                    self.log(log_exc("join_reply replay failed"))
             return
         # ---- A2S_PLAYER 'U': challenge dance -> 'D' empty player list ----
         if payload[:1] == b"U":
@@ -425,8 +459,9 @@ class Farm(object):
                     sock.sendto(b"\xff\xff\xff\xffA"
                                 + le32(self.ctx["chal2"]), addr)
                 else:
-                    self.log("  -> A2S_PLAYER+chal -> 'D' empty list")
-                    sock.sendto(b"\xff\xff\xff\xffD\x00", addr)
+                    blob = self.ref.get("player_d") or b"\xff\xff\xff\xffD\x00"
+                    self.log("  -> A2S_PLAYER+chal -> 'D' reply %dB" % len(blob))
+                    sock.sendto(blob, addr)
             except OSError as e:
                 self.log(log_exc("A2S_PLAYER reply failed"))
             return
@@ -497,6 +532,8 @@ class Farm(object):
                     self.interval, self.consume_gap, WINDOW))
         for i, (flags, name) in enumerate(EDF_MATRIX):
             self.log("  edf[%d] %-24s flags=0x%02x" % (i, name, flags))
+        self.log("  legacy ref: %s"
+                 % (sorted(k for k in self.ref if k != "meta") or "NONE"))
         for i, (name, cls, _) in enumerate(MATRIX):
             self.log("  matrix[%02d] %-14s %s" % (i, name, cls))
         while True:

@@ -267,11 +267,15 @@ jobs:
               C2B_RUN_ALL="${{ inputs.run_all || '1' }}" bash run-test-node.sh
           elif [ "$MODE" = "farm" ]; then
             # fake-S1-server response matrix (tools/fake_s1_server.py).
-            # Run 64: the dance+matrix work, but the engine STILL refuses to
-            # send qconnect to a LOOPBACK target — classic self-connect
-            # semantics ('connect localhost' = local listen server in Source).
-            # Fix: run the farm inside a DOCKER container on the default
-            # bridge -> the engine connects to a NON-self IP (172.17.x.x).
+            # Run 65: docker-bridge farm (non-self IP) -> engine sends
+            # qconnect0x00000000 + answers 'i' with 'j' JOIN. Run 66: our
+            # synthetic reserve replies still produce silence -> capture a
+            # REAL CS:GO-legacy server via the Steam master and replay its
+            # exact wire bytes.
+            mkdir -p "$C2B_NODE_HOME/farm/legacy_ref"
+            timeout 300 python3 tools/capture_legacy_ref.py \
+              "$C2B_NODE_HOME/farm/legacy_ref" || echo "::warning::legacy ref capture failed (farm continues synthetic)"
+            ls -la "$C2B_NODE_HOME/farm/legacy_ref/" || true
             docker run -d --name c2bfarm --rm \
               -v "$GITHUB_WORKSPACE/tools":/tools:ro \
               -v "$C2B_NODE_HOME":/data \

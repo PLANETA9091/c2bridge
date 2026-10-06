@@ -6444,6 +6444,18 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 g_clv2_ch64 = ch;
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
+                if (g_clv2_phase == 6) {
+                    /* фаза 6: четвёртый ChallengeReply -> 'B'+'.+8A (accept) */
+                    if ((u32)len >= 14) {
+                        q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
+                        q[4] = 'B'; q[5] = '.';
+                        q[6] = 'A'; q[7] = 'A'; q[8] = 'A'; q[9] = 'A';
+                        q[10] = 'A'; q[11] = 'A'; q[12] = 'A'; q[13] = 'A';
+                        C2B_LOGS("[c2b] CLV2 phase6: ChallengeReply -> 'B' accept\n");
+                        return 14;
+                    }
+                    return r;
+                }
                 if (g_clv2_phase == 4) {
                     /* фаза 4: третий ChallengeReply -> RESERVE-'A' (fmt5):
                      * 'A' + chal + proto3 + ks0 + value(steamid-low) + flag0 +
@@ -7235,6 +7247,34 @@ static void *c2b_poll_thread(void *arg)
             }
             if (g_clv2_phase >= 2) break;         /* уже за фазой 2/3/4/5 */
             usleep(500000);
+        }
+    }
+    {   /* CLV2 фаза 6: после reserve-'A' (фаза 5) — четвёртый challenge,
+         * reply подменяем на 'B'+'.+8A (connection accept). Если движок
+         * примет — пошлёт 'k'-connect (капчур в sendto-хуке!). */
+        int i;
+        u8 got5 = 0;
+        for (i = 0; i < 120; i++) {               /* до 60с */
+            if (g_clv2_phase == 5) { got5 = 1; break; }
+            usleep(500000);
+        }
+        if (got5) {
+            for (i = 0; i < 6; i++) {             /* ждём фазу 5 установку */
+                if (g_clv2_phase == 5) break;
+                usleep(500000);
+            }
+            usleep(3000000);                      /* 3с на OnReserveAccepted */
+            u8 out3[512];
+            g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0003u) | 1u;
+            (void)c2b_clv2_build_chalreq(out3);
+            if (g_clv2_fd >= 0 && g_clv2_dstlen &&
+                g_clp_sendto && (uptr)g_clp_sendto != 1) {
+                ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, out3, 512, 0,
+                                              (struct sockaddr *)g_clv2_dst,
+                                              g_clv2_dstlen);
+            }
+            g_clv2_phase = 6;
+            C2B_LOGS("[c2b] CLV2 phase6: 4th ChallengeRequest (B-accept bait)\n");
         }
     }
     /* t39-фикс: GC-опрос ТОЛЬКО после ARMED движка (ProcessMessages уже

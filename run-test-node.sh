@@ -160,18 +160,27 @@ log "node e2e: mode=$([[ $FARM -eq 1 ]] && echo farm || ([[ $SMOKE -eq 1 ]] && e
 # answered: push cadence is deterministic and consume-class entries pause the
 # matrix so a developing reaction is not clobbered by the next response.
 if (( FARM )); then
-  command -v python3 >/dev/null 2>&1 || finish 3 "FAIL: python3 not found (farm mode)"
-  FARM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tools/fake_s1_server.py"
-  [[ -f "$FARM_PY" ]] || finish 3 "FAIL: $FARM_PY missing (farm mode)"
   FARM_DIR="$RUNDIR/farm"
-  mkdir -p "$FARM_DIR"
+  if [[ -n "${C2B_FARM_EXTERNAL:-}" ]]; then
+    # the workflow runs the farm in a docker container logging to
+    # $NODE_HOME/farm (the container mounts /data=$NODE_HOME); this run only
+    # reads it and includes it in the artifacts
+    FARM_DIR="$NODE_HOME/farm"
+    mkdir -p "$FARM_DIR"
+    log "farm: EXTERNAL (docker container) target=$FARM_TARGET dir=$FARM_DIR"
+  else
+    command -v python3 >/dev/null 2>&1 || finish 3 "FAIL: python3 not found (farm mode)"
+    FARM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tools/fake_s1_server.py"
+    [[ -f "$FARM_PY" ]] || finish 3 "FAIL: $FARM_PY missing (farm mode)"
+    mkdir -p "$FARM_DIR"
+  fi
   # The engine compares its version against the serverinfo version string
   # ('Failed to connect to a gameserver, client version %d, server version
   # %d' - engine_client.so). Guessing it wrong = silent retry loop. Read the
   # REAL version from the bundle's steam.inf and feed it to the farm.
   FARM_ARGS=(--bind "${FARM_TARGET%%:*}" --port "${FARM_TARGET##*:}" --log "$FARM_DIR" \
     --engine-ports-file "$FARM_DIR/engine_ports.txt")
-  STEAM_INF=$(find "$GAME_DIR" -maxdepth 3 -name steam.inf 2>/dev/null | head -1)
+  STEAM_INF=$(find "$GAME_DIR" -name steam.inf 2>/dev/null | head -1)
   if [[ -n "$STEAM_INF" ]]; then
     VER=$(grep -aoE '^Version=[0-9.]+' "$STEAM_INF" | head -1 | cut -d= -f2)
     if [[ -n "$VER" ]]; then
@@ -181,12 +190,14 @@ if (( FARM )); then
   else
     log "WARNING: no steam.inf under $GAME_DIR - farm uses default version"
   fi
-  python3 "$FARM_PY" "${FARM_ARGS[@]}" >"$RUNDIR/farm-server.log" 2>&1 &
-  FARM_PID=$!
-  sleep 1
-  kill -0 "$FARM_PID" 2>/dev/null \
-    || finish 3 "FAIL: farm server died instantly (see farm-server.log)"
-  log "farm: fake S1 server pid=$FARM_PID target=$FARM_TARGET dir=$FARM_DIR"
+  if [[ -z "${C2B_FARM_EXTERNAL:-}" ]]; then
+    python3 "$FARM_PY" "${FARM_ARGS[@]}" >"$RUNDIR/farm-server.log" 2>&1 &
+    FARM_PID=$!
+    sleep 1
+    kill -0 "$FARM_PID" 2>/dev/null \
+      || finish 3 "FAIL: farm server died instantly (see farm-server.log)"
+    log "farm: fake S1 server pid=$FARM_PID target=$FARM_TARGET dir=$FARM_DIR"
+  fi
 fi
 
 TMPD="$NODE_HOME/tmp"

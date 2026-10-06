@@ -275,6 +275,7 @@ class Farm(object):
         self.version = "1.38.0.4"
         self.engine_ports_file = None
         self.engine_ports = []
+        self.push_host = "127.0.0.1"
         self.dump_dir = os.path.join(logdir, "dump")
         os.makedirs(self.dump_dir, exist_ok=True)
         self.plog = open(os.path.join(logdir, "packets.log"), "a", buffering=1)
@@ -398,7 +399,7 @@ class Farm(object):
             if self.engine_ports:
                 # INTO the engine's sockets (source = connect target 29015,
                 # so the strict 'B' source validation passes)
-                targets = [(self.primary_sock, ("127.0.0.1", p))
+                targets = [(self.primary_sock, (self.push_host, p))
                            for p in self.engine_ports]
             elif self.last_addr is not None:
                 targets = [(sock, self.last_addr)]
@@ -510,6 +511,9 @@ def main():
                     help="serverinfo version string (must match the client!)")
     ap.add_argument("--engine-ports-file", default=None,
                     help="file the harness updates with the engine's UDP ports")
+    ap.add_argument("--push-host", default="127.0.0.1",
+                    help="host portion of engine-port push targets (docker "
+                         "gateway when running in a container)")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -523,6 +527,7 @@ def main():
                 args.consume_gap, args.silent_rx_gap)
     farm.version = args.version
     farm.engine_ports_file = args.engine_ports_file
+    farm.push_host = args.push_host
     farm.run()
     return 0
 

@@ -266,12 +266,32 @@ jobs:
             C2B_SMOKE=1 C2B_TRANSLATE=0 C2B_ATTEMPTS=5 \
               C2B_RUN_ALL="${{ inputs.run_all || '1' }}" bash run-test-node.sh
           elif [ "$MODE" = "farm" ]; then
-            # fake-S1-server response matrix (tools/fake_s1_server.py): the
-            # engine connects to 127.0.0.1:29015, the farm pushes the matrix
-            # every ~2s; evidence = farm/CONNECT_*.bin + per-reaction console
-            # logs. Bridge passive, engine netstack vanilla. 5 attempts x 240s
-            # cover the whole 36-entry matrix several times over.
-            C2B_FARM=1 C2B_TRANSLATE=0 C2B_ATTEMPTS=5 bash run-test-node.sh
+            # fake-S1-server response matrix (tools/fake_s1_server.py).
+            # Run 64: the dance+matrix work, but the engine STILL refuses to
+            # send qconnect to a LOOPBACK target — classic self-connect
+            # semantics ('connect localhost' = local listen server in Source).
+            # Fix: run the farm inside a DOCKER container on the default
+            # bridge -> the engine connects to a NON-self IP (172.17.x.x).
+            docker run -d --name c2bfarm --rm \
+              -v "$GITHUB_WORKSPACE/tools":/tools:ro \
+              -v "$C2B_NODE_HOME":/data \
+              python:3-slim \
+              python3 /tools/fake_s1_server.py --bind 0.0.0.0 --port 29015 \
+                --log /data/farm \
+                --engine-ports-file /data/farm/engine_ports.txt \
+                --push-host "$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+            FARM_IP=""
+            for i in $(seq 1 15); do
+              FARM_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' c2bfarm 2>/dev/null || true)
+              [ -n "$FARM_IP" ] && break
+              sleep 1
+            done
+            [ -n "$FARM_IP" ] || { echo "::error::docker farm failed to start"; docker logs c2bfarm 2>&1 | tail -20; exit 1; }
+            echo "FARM_IP=$FARM_IP" >> "$GITHUB_ENV"
+            echo "farm container up at $FARM_IP:29015"
+            # 5 attempts x 240s cover the whole 36-entry matrix several times.
+            C2B_FARM=1 C2B_FARM_EXTERNAL=1 C2B_FARM_TARGET="$FARM_IP:29015" \
+              C2B_TRANSLATE=0 C2B_ATTEMPTS=5 bash run-test-node.sh
           else
             # 5 attempts in full mode: the CLV2 'A'-reply format matrix
             # (C2B_CLV2_FMT = (attempt-1) % 5) needs all five slots.
@@ -286,8 +306,9 @@ jobs:
           mkdir -p e2e-out
           [ -n "$L" ] && cp -f "$C2B_NODE_HOME/runs/$L"/* e2e-out/ 2>/dev/null || true
           # farm subdir (packets.log, dumps, CONNECT markers) - flat copy above
-          # skips directories
+          # skips directories; docker-external farm logs to NODE_HOME/farm
           [ -n "$L" ] && cp -rf "$C2B_NODE_HOME/runs/$L/farm" e2e-out/ 2>/dev/null || true
+          [ -d "$C2B_NODE_HOME/farm" ] && cp -rf "$C2B_NODE_HOME/farm" e2e-out/farm-external 2>/dev/null || true
           # steam session evidence (duplicate-safe if harness already saved it)
           cp -f ~/.steam/steam/logs/console-linux.txt e2e-out/steam-console.log 2>/dev/null || true
           cp -f ~/.local/share/Steam/config/loginusers.vdf e2e-out/loginusers.vdf 2>/dev/null || true

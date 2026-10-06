@@ -6076,7 +6076,8 @@ static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
 static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
-static u32 g_clv2_phase;         /* 0=idle 1='A' доставлен 2=ждём reply для 'i' 3='i' доставлен */
+static u32 g_clv2_phase;         /* 0=idle 1='A' 2=ждём reply для 'i' 3='i' доставлен
+                                  * 4=ждём reply для reserve-'A' 5=reserve-'A' доставлен */
 static u64 g_clv2_phase_ms;      /* мгновение смены фазы (ms монотонные) */
 static u8 g_clv2_dst[16];        /* адрес CS2-цели (из qconnect), сырые байты */
 static socklen_t g_clv2_dstlen;
@@ -6379,6 +6380,22 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, addr, addrlen);
                 return (ssize_t)len;               /* движку обычный rc */
             }
+            if (g_clv2_enable && cls == C2B_CLQ_JOIN && g_clv2_phase == 3) {
+                /* фаза 4: движок прислал 'j' (JOIN, pending reserve set?) ->
+                 * третий ChallengeRequest; его reply подменяем на RESERVE-'A'
+                 * (fmt5-структура: строка "reserve") -> OnReserveAccepted с
+                 * pending-резервом должен выпустить reserve-confirm ('n'). */
+                u8 out2[512];
+                g_clv2_phase = 4;
+                g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0002u) | 1u;
+                (void)c2b_clv2_build_chalreq(out2);
+                C2B_LOGS("[c2b] CLV2 phase4: JOIN seen -> 3rd ChallengeRequest (cid=");
+                C2B_LOGH(g_clv2_conn_id);
+                C2B_LOGS(")\n");
+                ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, out2, 512, flags,
+                                              addr, addrlen);
+                return (ssize_t)len;
+            }
             if (g_clv2_enable && cls == C2B_CLQ_CONNECT) {
                 /* CLV2 phase A: S1 connect капчерим и ДРОПАЕМ (без перевода
                  * его нельзя слать в CS2; фаза B построит ConnectRequest) */
@@ -6427,6 +6444,33 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 g_clv2_ch64 = ch;
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
+                if (g_clv2_phase == 4) {
+                    /* фаза 4: третий ChallengeReply -> RESERVE-'A' (fmt5):
+                     * 'A' + chal + proto3 + ks0 + value(steamid-low) + flag0 +
+                     * "reserve\0" — строка содержит "reserve" ->
+                     * OnReserveAccepted; с pending-резервом (после 'j')
+                     * должен выйти reserve-confirm. */
+                    if ((u32)len >= 32) {
+                        u32 i3;
+                        u8 mys[4] = {0x07, 0x0a, 0xee, 0x00}; /* steamid-low */
+                        q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
+                        q[4] = 'A';
+                        q[5] = (u8)(g_clv2_ch32); q[6] = (u8)(g_clv2_ch32 >> 8);
+                        q[7] = (u8)(g_clv2_ch32 >> 16); q[8] = (u8)(g_clv2_ch32 >> 24);
+                        q[9] = 3; q[10] = 0; q[11] = 0; q[12] = 0;   /* proto=3 */
+                        q[13] = 0; q[14] = 0;                        /* keysize=0 */
+                        for (i3 = 0; i3 < 4; i3++) q[15 + i3] = mys[i3];
+                        q[19] = 0;                                    /* flag */
+                        /* строка "reserve\0" с 20-го байта */
+                        q[20] = 'r'; q[21] = 'e'; q[22] = 's'; q[23] = 'e';
+                        q[24] = 'r'; q[25] = 'v'; q[26] = 'e'; q[27] = 0;
+                        for (i3 = 28; i3 < 40; i3++) q[i3] = 0;
+                        g_clv2_phase = 5;
+                        C2B_LOGS("[c2b] CLV2 phase4: ChallengeReply -> RESERVE-'A' (OnReserveAccepted bait)\n");
+                        return 40;
+                    }
+                    return r;
+                }
                 if (g_clv2_phase == 2) {
                     /* фаза 2: второй ChallengeReply подменяем на 'i'-промпт
                      * (ферма run 65: 'i'+8A -> движок отвечает 'j'+token 3/3) */

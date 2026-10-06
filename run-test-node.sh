@@ -165,8 +165,23 @@ if (( FARM )); then
   [[ -f "$FARM_PY" ]] || finish 3 "FAIL: $FARM_PY missing (farm mode)"
   FARM_DIR="$RUNDIR/farm"
   mkdir -p "$FARM_DIR"
-  python3 "$FARM_PY" --bind "${FARM_TARGET%%:*}" --port "${FARM_TARGET##*:}" \
-    --log "$FARM_DIR" >"$RUNDIR/farm-server.log" 2>&1 &
+  # The engine compares its version against the serverinfo version string
+  # ('Failed to connect to a gameserver, client version %d, server version
+  # %d' - engine_client.so). Guessing it wrong = silent retry loop. Read the
+  # REAL version from the bundle's steam.inf and feed it to the farm.
+  FARM_ARGS=(--bind "${FARM_TARGET%%:*}" --port "${FARM_TARGET##*:}" --log "$FARM_DIR" \
+    --engine-ports-file "$FARM_DIR/engine_ports.txt")
+  STEAM_INF=$(find "$GAME_DIR" -maxdepth 3 -name steam.inf 2>/dev/null | head -1)
+  if [[ -n "$STEAM_INF" ]]; then
+    VER=$(grep -aoE '^Version=[0-9.]+' "$STEAM_INF" | head -1 | cut -d= -f2)
+    if [[ -n "$VER" ]]; then
+      FARM_ARGS+=(--version "$VER")
+      log "farm: using bundle version $VER (from $STEAM_INF)"
+    fi
+  else
+    log "WARNING: no steam.inf under $GAME_DIR - farm uses default version"
+  fi
+  python3 "$FARM_PY" "${FARM_ARGS[@]}" >"$RUNDIR/farm-server.log" 2>&1 &
   FARM_PID=$!
   sleep 1
   kill -0 "$FARM_PID" 2>/dev/null \
@@ -682,6 +697,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   fi
 
   # ---- THE TRIGGER: steam://connect (engine-level IPC, no UI automation) ----
+  if (( FARM )); then
+    # publish the engine's REAL UDP ports so the farm pushes matrix entries
+    # into the ENGINE's connectionless dispatcher (27005 client socket + the
+    # 27015/16xx listen socket), not just the steam client's A2S query socket
+    # (runs 57-62: the A2S query comes from a steam-client-side socket; every
+    # matrix push went THERE and the engine never received a single one).
+    sudo -n ss -ulnp 2>/dev/null | grep -a csgo_linux64 \
+      | grep -oE ':[0-9]+ ' | tr -d ': ' | sort -un \
+      > "$FARM_DIR/engine_ports.txt" 2>/dev/null || true
+    log "attempt $ATTEMPT: engine UDP ports: $(tr '\n' ' ' < "$FARM_DIR/engine_ports.txt" 2>/dev/null)"
+  fi
   log "attempt $ATTEMPT: firing steam://connect/$TARGET"
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
     "$STEAM_SH" "steam://connect/$TARGET" >"$TMPD/steam-connect.a${ATTEMPT}.log" 2>&1 &

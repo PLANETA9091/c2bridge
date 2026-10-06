@@ -100,7 +100,7 @@ EDF_MATRIX = [
 WINDOW = 260.0  # seconds per variant (~one harness attempt)
 
 
-def serverinfo(game_port, t_abs):
+def serverinfo(game_port, t_abs, version="1.38.0.4"):
     """Legacy identity base + time-windowed EDF variant."""
     idx = int(t_abs / WINDOW) % len(EDF_MATRIX)
     flags, name = EDF_MATRIX[idx]
@@ -113,7 +113,7 @@ def serverinfo(game_port, t_abs):
             + b"\x00\x18\x00"                # 0 players, 24 max, 0 bots
             + b"dl"                          # dedicated, linux
             + b"\x00\x00"                    # public, VAC off
-            + b"1.38.0.4\x00")               # legacy version
+            + version.encode() + b"\x00")    # REAL bundle version
     edf = edf_variant(flags, game_port)
     if edf:
         body += bytes([flags]) + edf
@@ -272,6 +272,9 @@ class Farm(object):
                       "redir": 0, "a2s": 0}
         self.a2s_answered_at = 0.0
         self.push_armed = False
+        self.version = "1.38.0.4"
+        self.engine_ports_file = None
+        self.engine_ports = []
         self.dump_dir = os.path.join(logdir, "dump")
         os.makedirs(self.dump_dir, exist_ok=True)
         self.plog = open(os.path.join(logdir, "packets.log"), "a", buffering=1)
@@ -315,7 +318,8 @@ class Farm(object):
         # loop. The steamid (0x10) is the suspected auth-ticket prerequisite.) ----
         if payload[:1] == b"T":
             self.stats["a2s"] += 1
-            blob, vname = serverinfo(self.ports[0], now - self.t0)
+            blob, vname = serverinfo(self.ports[0], now - self.t0,
+                                     self.version)
             self.log("  -> A2S_INFO %r -> EDF variant '%s' blob %dB"
                      % (payload[:24], vname, len(blob)))
             try:
@@ -363,7 +367,7 @@ class Farm(object):
         self.dump("other_rx", data)
         self.silent_until = now + self.silent_rx_gap
 
-    def push_next(self, sock):
+    def push_next(self, sock):  # sock = primary (connect-target source)
         name, cls, fn = MATRIX[self.idx % len(MATRIX)]
         self.idx += 1
         self.ctx["chal"] = self.chal.next_chal()
@@ -377,16 +381,29 @@ class Farm(object):
             self.log("PUSH idx=%d name=%s (silent)" % (self.idx, name))
         else:
             data = b"\xff\xff\xff\xff" + payload
-            try:
-                sock.sendto(data, self.last_addr)
-                self.stats["push"] += 1
-                self.log("PUSH idx=%d name=%s cls=%s %dB dst=%s:%d chal=0x%08X "
-                         "qc=0x%08X hex=%s"
-                         % (self.idx, name, cls, len(data), self.last_addr[0],
-                            self.last_addr[1], self.ctx["chal"],
-                            self.ctx["qc_val"], hexd(data)))
-            except OSError as e:
-                self.log("PUSH idx=%d name=%s SEND-ERROR %s" % (self.idx, name, e))
+            targets = []
+            if self.engine_ports:
+                # INTO the engine's sockets (source = connect target 29015,
+                # so the strict 'B' source validation passes)
+                targets = [(socks[0], ("127.0.0.1", p))
+                           for p in self.engine_ports]
+            elif self.last_addr is not None:
+                targets = [(sock, self.last_addr)]
+            for s, dst in targets:
+                try:
+                    s.sendto(data, dst)
+                    self.stats["push"] += 1
+                    self.log("PUSH idx=%d name=%s cls=%s %dB dst=%s:%d "
+                             "chal=0x%08X qc=0x%08X hex=%s"
+                             % (self.idx, name, cls, len(data), dst[0],
+                                dst[1], self.ctx["chal"],
+                                self.ctx["qc_val"], hexd(data)))
+                except OSError as e:
+                    self.log("PUSH idx=%d name=%s SEND-ERROR %s"
+                             % (self.idx, name, e))
+            if not targets:
+                self.log("PUSH idx=%d name=%s DROPPED (no target yet)"
+                         % (self.idx, name))
         gap = self.interval if cls in ("ignore", "silent") else self.consume_gap
         self.next_push = max(now + gap, self.silent_until)
 
@@ -412,10 +429,28 @@ class Farm(object):
                 self.log(log_exc("LOOP-ERROR (continuing)"))  # format crash)
                 time.sleep(0.5)
 
+    def load_engine_ports(self):
+        """Harness writes the engine's REAL UDP ports (ss -ulnp) per attempt;
+        matrix pushes must reach the ENGINE's connectionless dispatcher, not
+        the steam client's A2S query socket (runs 57-62 bug)."""
+        if not self.engine_ports_file:
+            return
+        try:
+            txt = open(self.engine_ports_file).read().split()
+            ports = sorted({int(p) for p in txt if p.isdigit()
+                            and 1024 < int(p) < 65536})[:8]
+            if ports and ports != self.engine_ports:
+                self.log("engine ports updated: %s" % ports)
+                self.engine_ports = ports
+        except OSError:
+            pass
+
     def loop_once(self, socks):
         now = time.time()
+        self.load_engine_ports()
         timeout = 0.5
-        if self.push_armed and self.last_addr is not None:
+        if (self.push_armed and self.last_addr is not None) \
+                or self.engine_ports:
             timeout = max(0.05, min(timeout, self.next_push - now))
         r, _, _ = select_select(socks, [], [], timeout)
         for s in r:
@@ -427,10 +462,9 @@ class Farm(object):
                 and now - self.a2s_answered_at >= 20.0):
             self.push_armed = True
             self.log("PUSHES ARMED via A2S grace (no qconnect in 20s)")
-        if (self.push_armed and self.last_addr is not None
+        if ((self.push_armed or self.engine_ports)
                 and now >= self.next_push and now >= self.silent_until):
-            self.push_next(self.last_sock if self.last_sock is not None
-                           else socks[0])
+            self.push_next(socks[0])
         if time.time() >= self.hb:
             self.log("HEARTBEAT rx=%(rx)d qc=%(qc)d a2s=%(a2s)d "
                      "connect=%(connect)d other=%(other)d push=%(push)d "
@@ -458,6 +492,10 @@ def main():
     ap.add_argument("--consume-gap", type=float, default=10.0)
     ap.add_argument("--silent-rx-gap", type=float, default=12.0,
                     help="push pause after any non-qconnect RX")
+    ap.add_argument("--version", default="1.38.0.4",
+                    help="serverinfo version string (must match the client!)")
+    ap.add_argument("--engine-ports-file", default=None,
+                    help="file the harness updates with the engine's UDP ports")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -467,8 +505,11 @@ def main():
     os.makedirs(args.log, exist_ok=True)
     ports = [args.port] + [int(p) for p in args.alt_ports.split(",")
                            if int(p) != args.port]
-    Farm(args.bind, ports, args.log, args.push_interval, args.consume_gap,
-         args.silent_rx_gap).run()
+    farm = Farm(args.bind, ports, args.log, args.push_interval,
+                args.consume_gap, args.silent_rx_gap)
+    farm.version = args.version
+    farm.engine_ports_file = args.engine_ports_file
+    farm.run()
     return 0
 
 

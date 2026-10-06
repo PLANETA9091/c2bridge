@@ -66,34 +66,58 @@ REAL_INFO = bytes.fromhex(
     "00000000")
 
 
-def hybrid_info(game_port):
-    """RUN 58/57 POST-MORTEM BLOB — two variables isolated across runs:
-    - run 57 (game='Counter-Strike: Global Offensive', NO EDF): client handed
-      the connect to the engine ('Connecting to public(...)'), but the engine
-      sat in 'Retrying public(...)' without ever sending qconnect — plausibly
-      because the serverinfo carried no game port (EDF 0x80).
-    - run 58 (REAL CS2 blob, EDF 0xb1): client NEVER handed off (zero
-      'Connecting' lines) and polled A2S_INFO every 10s — the identity fields
-      say 'Counter-Strike 2' / ver 1.41.8.8, which the legacy client refuses.
-    Hybrid: legacy identity (accepted in 57) + full EDF 0xb1 structure with
-    OUR game port (the address the engine should qconnect)."""
-    edf = (b"\xb1"
-           + le16(game_port)                       # 0x80 game port
-           + b"\x07\x0a\xee\x00\x00\x00\x30\x01"   # 0x10 steamid (real echo)
-           + le16(game_port + 1)                   # 0x20 spectator port
-           + b"c2b,farm\x00")                      # 0x01 keywords
-    return (b"\xff\xff\xff\xffI"
-            + b"\x11"                              # protocol 17
+# REAL steamid captured from the CYBERSHOKE server's EDF 0x10 field
+REAL_STEAMID = bytes.fromhex("070aee0000003001")
+
+
+def edf_variant(flags, game_port):
+    """EDF section builder. flags = which optional fields to include.
+    RUN 62 MATRIX (per-time-window): the engine sends NOTHING during the whole
+    connect window (run 61 strace ground truth) - the CS:GO-era connect needs
+    the server's steamid (EDF 0x10) to request a Steam auth session ticket
+    for the connect packet. Variants isolate: port-only, steamid-only, both,
+    full (58/59 bad), none (57/60 handoff control)."""
+    out = b""
+    if flags & 0x80:
+        out += le16(game_port)
+    if flags & 0x10:
+        out += REAL_STEAMID
+    if flags & 0x20:
+        out += le16(game_port + 1)
+    if flags & 0x01:
+        out += b"c2b,farm\x00"
+    return out
+
+
+# EDF variant matrix, served per time window (~attempt length)
+EDF_MATRIX = [
+    (0x80, "port-only"),
+    (0x80 | 0x10, "port+steamid"),
+    (0x10, "steamid-only"),
+    (0x00, "none (57/60 control)"),
+    (0x80 | 0x10 | 0x20 | 0x01, "full (58/59 control)"),
+]
+WINDOW = 260.0  # seconds per variant (~one harness attempt)
+
+
+def serverinfo(game_port, t_abs):
+    """Legacy identity base + time-windowed EDF variant."""
+    idx = int(t_abs / WINDOW) % len(EDF_MATRIX)
+    flags, name = EDF_MATRIX[idx]
+    body = (b"\x11"                          # protocol 17
             + b"c2b-farm\x00"
             + b"de_dust2\x00"
             + b"csgo\x00"
             + b"Counter-Strike: Global Offensive\x00"
-            + le16(730)                            # appid
-            + b"\x00\x18\x00"                      # 0 players, 24 max, 0 bots
-            + b"dl"                                # dedicated, linux
-            + b"\x00\x00"                          # public, VAC off
-            + b"1.38.0.4\x00"                      # legacy version
-            + edf)
+            + le16(730)                      # appid
+            + b"\x00\x18\x00"                # 0 players, 24 max, 0 bots
+            + b"dl"                          # dedicated, linux
+            + b"\x00\x00"                    # public, VAC off
+            + b"1.38.0.4\x00")               # legacy version
+    edf = edf_variant(flags, game_port)
+    if edf:
+        body += bytes([flags]) + edf
+    return b"\xff\xff\xff\xffI" + body, name
 
 
 class Ctx(object):
@@ -286,19 +310,17 @@ class Farm(object):
             self.dump("nonoob", data)
             self.silent_until = now + self.silent_rx_gap
             return
-        # ---- A2S queries (runs 54/57/58/59: serverinfo gates the handoff) ----
-        # NO-EDF legacy blob (run 57 EXACT): handoff fired there. EDF presence
-        # (runs 58/59) put the client into a 10s re-poll loop with NO handoff.
+        # ---- A2S queries: serverinfo EDF-variant matrix (runs 57-61 chain:
+        # no-EDF = handoff but engine sends nothing; EDF 0xb1 = client re-poll
+        # loop. The steamid (0x10) is the suspected auth-ticket prerequisite.) ----
         if payload[:1] == b"T":
             self.stats["a2s"] += 1
-            blob = b"\xff\xff\xff\xffI" + sinfo_blob()
-            self.log("  -> A2S_INFO request %r -> replying NO-EDF legacy "
-                     "'I' blob (%dB)" % (payload[:24], len(blob)))
+            blob, vname = serverinfo(self.ports[0], now - self.t0)
+            self.log("  -> A2S_INFO %r -> EDF variant '%s' blob %dB"
+                     % (payload[:24], vname, len(blob)))
             try:
                 sock.sendto(blob, addr)
                 self.a2s_answered_at = now
-                # give the engine a chance to start qconnecting; if it does,
-                # qc arming below is immediate; else arm after a grace period
                 if not self.push_armed:
                     self.next_push = min(
                         self.next_push,
@@ -375,11 +397,12 @@ class Farm(object):
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.bind, port))
             socks.append(s)
-        self.log("FARM UP bind=%s ports=%s (all full peers; matrix served from "
-                 "whichever port the engine uses) entries=%d "
-                 "interval=%.1fs consume_gap=%.1fs"
+        self.log("FARM UP bind=%s ports=%s entries=%d interval=%.1fs "
+                 "consume_gap=%.1fs window=%.0fs"
                  % (self.bind, self.ports, len(MATRIX),
-                    self.interval, self.consume_gap))
+                    self.interval, self.consume_gap, WINDOW))
+        for i, (flags, name) in enumerate(EDF_MATRIX):
+            self.log("  edf[%d] %-24s flags=0x%02x" % (i, name, flags))
         for i, (name, cls, _) in enumerate(MATRIX):
             self.log("  matrix[%02d] %-14s %s" % (i, name, cls))
         while True:
@@ -427,9 +450,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=29015)
-    ap.add_argument("--alt-ports", default="27015,29016",
-                    help="extra full-peer game ports (default CS:GO 27015 + "
-                         "redirect catch port+1)")
+    ap.add_argument("--alt-ports", default="29016",
+                    help="extra full-peer ports (redirect catch; 27015 is "
+                         "deliberately NOT bound - the engine needs it)")
     ap.add_argument("--log", default="/tmp/c2b-farm")
     ap.add_argument("--push-interval", type=float, default=2.0)
     ap.add_argument("--consume-gap", type=float, default=10.0)

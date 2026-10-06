@@ -39,7 +39,12 @@ if [[ -n "${MEGA_USER:-}" && -n "${MEGA_PASS:-}" ]]; then
     user "$MEGA_USER" pass "$(rclone obscure "$MEGA_PASS")" >/dev/null
   REMOTE="c2bmega:$MEGA_DIR"
 elif [[ -n "${MEGA_URL:-}" ]]; then
-  REMOTE=":mega,link=${MEGA_URL}:"
+  # run 69: the connection-string form ":mega,link=URL:" breaks when the
+  # folder key starts with '-' (rclone parses it as a CLI flag). Env-based
+  # remote config bypasses connection-string parsing entirely.
+  export RCLONE_CONFIG_C2BMEGA_TYPE=mega
+  export RCLONE_CONFIG_C2BMEGA_LINK="$MEGA_URL"
+  REMOTE="c2bmega:"
 else
   echo "ERROR: set MEGA_USER/MEGA_PASS or MEGA_URL (repo secret)" >&2
   exit 1

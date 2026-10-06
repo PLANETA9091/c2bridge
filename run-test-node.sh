@@ -488,7 +488,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 
   MODES=""
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=8"
+  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9"
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"

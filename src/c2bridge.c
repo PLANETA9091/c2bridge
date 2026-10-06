@@ -5870,6 +5870,8 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 #define C2B_CLQ_QCONNECT   5   /* "qconnect0x%08X" — запрос челленджа S1 CS:GO legacy
                                 * (41e-b: строка @0x937239, CL_SendConnectPacket @0x24aa20;
                                 * классического "getchallenge" в бинаре НЕТ) */
+#define C2B_CLQ_JOIN       6   /* 'j'+14-символов: JOIN-запрос (ферма run 65: движок
+                                * шлёт 'j' после real-'A' с "connect0x"-строкой) */
 
 /* классы downlink (по первому байту payload; грубая таблица Source) */
 #define C2B_CLR_NONE       0   /* не connless */
@@ -5886,6 +5888,7 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 
 /* счётчики (FINI: clu{...} clr{...}) */
 static u32 g_cl_s_total, g_cl_s_cl, g_cl_s_gc, g_cl_s_qc, g_cl_s_cn, g_cl_s_rc, g_cl_s_ot, g_cl_s_drop;
+static u32 g_cl_s_jn;
 static u32 g_cl_r_total, g_cl_r_cl, g_cl_r_ch, g_cl_r_rj, g_cl_r_si, g_cl_r_in, g_cl_r_ot, g_cl_r_drop;
 static u32 g_cl_log_n;         /* сколько connless уже прошло через trace (1-based) */
 static u32 g_cl_verbose;       /* C2B_CL_VERBOSE=1 (читается в c2b_main) */
@@ -5912,6 +5915,8 @@ static i32 c2b_cl_class_up(const u8 *p, u32 n)
     p += 4; n -= 4;
     if (c2b_cl_pfx(p, n, "getchallenge")) return C2B_CLQ_CHALLENGE;
     if (c2b_cl_pfx(p, n, "qconnect0x"))   return C2B_CLQ_QCONNECT;
+    if (n >= 1 && p[0] == 'k')            return C2B_CLQ_CONNECT;  /* CS:GO 'k'-connect! */
+    if (n >= 1 && p[0] == 'j')            return C2B_CLQ_JOIN;     /* 'j'+token join */
     if (c2b_cl_pfx(p, n, "connect"))      return C2B_CLQ_CONNECT;
     if (c2b_cl_pfx(p, n, "rcon"))         return C2B_CLQ_RCON;
     return C2B_CLQ_OTHER;
@@ -5937,6 +5942,7 @@ static const char *c2b_cl_up_name(i32 c)
     switch (c) {
     case C2B_CLQ_CHALLENGE: return "getchallenge";
     case C2B_CLQ_QCONNECT:  return "qconnect";
+    case C2B_CLQ_JOIN:      return "join";
     case C2B_CLQ_CONNECT:   return "connect";
     case C2B_CLQ_RCON:      return "rcon";
     case C2B_CLQ_OTHER:     return "other";
@@ -6013,6 +6019,7 @@ static void c2b_cl_trace(i32 up, const u8 *p, u32 n, i32 act)
         cls = c2b_cl_class_up(p, n);
         if (cls == C2B_CLQ_CHALLENGE)      g_cl_s_gc++;
         else if (cls == C2B_CLQ_QCONNECT)  g_cl_s_qc++;
+        else if (cls == C2B_CLQ_JOIN)      g_cl_s_jn++;
         else if (cls == C2B_CLQ_CONNECT)   g_cl_s_cn++;
         else if (cls == C2B_CLQ_RCON)      g_cl_s_rc++;
         else                               g_cl_s_ot++;
@@ -6235,6 +6242,38 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         for (i = 0; i < g_clv2_k; i++) out[n++] = 0;              /* филлер k */
         out[n++] = 'r'; out[n++] = 'e'; out[n++] = 's'; out[n++] = 'e';
         out[n++] = 'r'; out[n++] = 'v'; out[n++] = 'e'; out[n++] = 0;
+        break;
+    }
+    case 9: {                              /* 41e-h: REAL-legacy 'A' (ферма run 65-73!) */
+        /* Байт-в-байт структура живого CS:GO-legacy сервера (46.174.52.230 и
+         * др., снято 2026-10-06): 'A' + le32(chal) + le32(3) + u16(0) +
+         * le32(value=STEAMID-LOW32 ЦЕЛИ!) + u8(0) + 00 30 01 01 +
+         * "connect0x<ЭХО qc_val>\0" + "96\0" + нулевой паддинг до 55.
+         * Строка содержит "connect" -> движок идёт в connect-ветку
+         * (+0x4c0=1, +0x8dc4="96\0\0"), доходит до LOADING->INGAME и шлёт
+         * 'j' (join) — ферма это доказала живьём (run 68/72). */
+        static const u8 CS2_SID_LOW[4] = {0x07, 0x0a, 0xee, 0x00}; /* 0x00ee0a07 */
+        static const u8 MYSTERY[4] = {0x00, 0x30, 0x01, 0x01};
+        u32 i;
+        if (cap < 60) return 0;
+        out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
+        out[n++] = (u8)(ch32 >> 16); out[n++] = (u8)(ch32 >> 24);
+        out[n++] = 3; out[n++] = 0; out[n++] = 0; out[n++] = 0;   /* authproto=3 */
+        out[n++] = 0; out[n++] = 0;                               /* keysize=0 */
+        for (i = 0; i < 4; i++) out[n++] = CS2_SID_LOW[i];        /* value */
+        out[n++] = 0;                                             /* flag */
+        for (i = 0; i < 4; i++) out[n++] = MYSTERY[i];
+        /* строка: "connect0x%08X\0" — ЭХО токена из qconnect движка */
+        {
+            static const char pfx[] = "connect0x";
+            static const char hx[] = "0123456789ABCDEF";
+            u32 v = g_clv2_qc_val, j;
+            for (j = 0; j < 9; j++) out[n++] = (u8)pfx[j];
+            for (j = 0; j < 8; j++) out[n++] = (u8)hx[(v >> (28 - 4 * j)) & 15];
+            out[n++] = 0;
+        }
+        out[n++] = '9'; out[n++] = '6'; out[n++] = 0;  /* "96\0" */
+        while (n < 55) out[n++] = 0;                   /* паддинг до 55 */
         break;
     }
     case 8: {                              /* 41e-g: N-агностик — хвост = (reserve)*9 NUL */

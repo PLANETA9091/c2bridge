@@ -313,16 +313,29 @@ class Farm(object):
             self.dump("nonoob", data)
             self.silent_until = now + self.silent_rx_gap
             return
-        # ---- A2S queries: serverinfo EDF-variant matrix (runs 57-61 chain:
-        # no-EDF = handoff but engine sends nothing; EDF 0xb1 = client re-poll
-        # loop. The steamid (0x10) is the suspected auth-ticket prerequisite.) ----
+        # ---- A2S queries: the REAL server (and every modern Steam server)
+        # answers a bare 'T' with a 0x41 CHALLENGE; the client re-sends with
+        # the challenge and only then gets the 'I' (sandbox forensics vs
+        # CYBERSHOKE: bare T -> 41 + le32). Runs 57-62 always replied 'I'
+        # directly - the steam client's query lib likely treats that as
+        # invalid -> engine never receives serverinfo -> retry loop. ----
         if payload[:1] == b"T":
             self.stats["a2s"] += 1
-            blob, vname = serverinfo(self.ports[0], now - self.t0,
-                                     self.version)
-            self.log("  -> A2S_INFO %r -> EDF variant '%s' blob %dB"
-                     % (payload[:24], vname, len(blob)))
             try:
+                if len(payload) <= 21:
+                    # bare "TSource Engine Query\0" -> challenge step
+                    self.ctx["chal2"] = (self.ctx.get("chal2", 0x5EED0000)
+                                         + 1) & 0xFFFFFFFF
+                    self.log("  -> A2S_INFO bare -> 0x41 challenge "
+                             "0x%08X" % self.ctx["chal2"])
+                    sock.sendto(b"\xff\xff\xff\xffA"
+                                + le32(self.ctx["chal2"]), addr)
+                    return
+                # challenge-carrying query -> the real 'I' reply
+                blob, vname = serverinfo(self.ports[0], now - self.t0,
+                                         self.version)
+                self.log("  -> A2S_INFO+chal %dB -> EDF variant '%s' blob "
+                         "%dB" % (len(payload), vname, len(blob)))
                 sock.sendto(blob, addr)
                 self.a2s_answered_at = now
                 if not self.push_armed:
@@ -385,7 +398,7 @@ class Farm(object):
             if self.engine_ports:
                 # INTO the engine's sockets (source = connect target 29015,
                 # so the strict 'B' source validation passes)
-                targets = [(socks[0], ("127.0.0.1", p))
+                targets = [(self.primary_sock, ("127.0.0.1", p))
                            for p in self.engine_ports]
             elif self.last_addr is not None:
                 targets = [(sock, self.last_addr)]
@@ -414,6 +427,7 @@ class Farm(object):
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.bind, port))
             socks.append(s)
+        self.primary_sock = socks[0]  # source = connect target (29015)
         self.log("FARM UP bind=%s ports=%s entries=%d interval=%.1fs "
                  "consume_gap=%.1fs window=%.0fs"
                  % (self.bind, self.ports, len(MATRIX),

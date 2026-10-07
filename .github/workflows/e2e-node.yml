@@ -44,6 +44,7 @@ jobs:
 
       - name: fetch lite bundle (cached; MEGA hit only on cache miss)
         uses: actions/cache@v4
+        id: cache
         with:
           path: ~/csgo-lite
           key: csgo-lite-v1

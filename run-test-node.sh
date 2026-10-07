@@ -80,6 +80,13 @@ finish() { # $1 exit code, $2 verdict
   declare -F restore_overcommit >/dev/null 2>&1 && restore_overcommit
   pkill -x csgo_linux64 2>/dev/null; sleep 2; pkill -9 -x csgo_linux64 2>/dev/null
   [[ -n "$FARM_PID" ]] && kill "$FARM_PID" 2>/dev/null
+  # 41e-l teardown: A2S-релей + DNAT (best-effort)
+  if [[ -n "$A2S_DNAT_SET" ]]; then
+    sudo -n iptables -t nat -D OUTPUT -p udp -d "${TARGET%%:*}" --dport "${TARGET##*:}" \
+      -m owner ! --uid-owner 0 -j DNAT --to-destination "$A2S_DNAT_DST" 2>/dev/null || true
+    sudo -n pkill -f a2s_relay.py 2>/dev/null || true
+    log "A2S relay torn down (DNAT removed)"
+  fi
   for f in "$NODE_HOME/tmp"/c2b-*.log; do [[ -f "$f" ]] && cp -f "$f" "$RUNDIR/"; done 2>/dev/null
   save_conlog
   exit "$1"
@@ -330,22 +337,59 @@ if ! steam_client_stable; then
   done
   log "steam stability wait done (~${W}s)"
 fi
-# 41e-k: A2S-шим в STEAM-КЛИЕНТЕ (TRANSLATE=1). A2S_INFO в connect-флоу
-# делает КЛИЕНТ (SteamMatchMakingServers проксирует UDP через клиентский
-# процесс) — движковый мост этот трафик НЕ видит (run 85: ноль 'T' в хуках
-# движка). Контролируемый рестарт клиента с LD_PRELOAD шима: срезает EDF,
-# патчит appid=730, подставляет версию бандла в 'I'-ответ (run 70/71 lessons).
+# 41e-l/A2S_VER: версия бандла (нужна И релею, И шиму, И мосту) — до их блоков
 A2S_VER="1.38.0.4"
 STEAM_INF=$(find "$GAME_DIR" -name steam.inf 2>/dev/null | head -1)
 if [[ -n "$STEAM_INF" ]]; then
   VINF=$(grep -aoE '^Version=[0-9.]+' "$STEAM_INF" | head -1 | cut -d= -f2)
   if [[ -n "$VINF" ]]; then
     A2S_VER="$VINF"
-    log "A2S shim: using bundle version $A2S_VER (from $STEAM_INF)"
+    log "A2S transform: using bundle version $A2S_VER (from $STEAM_INF)"
   fi
 else
-  log "WARNING: no steam.inf under $GAME_DIR - A2S shim uses default $A2S_VER"
+  log "WARNING: no steam.inf under $GAME_DIR - A2S uses default $A2S_VER"
 fi
+# 41e-l: A2S-РЕЛЕЙ (сетевой уровень). Run 85/86 доказали: A2S_INFO в
+# connect-флоу не виден НИ движковым хукам, НИ LD_PRELOAD-шиму клиента
+# (Valve-код ходит мимо interposition). DNAT весь пользовательский UDP на
+# цель сюда; релей транзитит с трансформом 'I' и спуфом источника
+# (IP_TRANSPARENT bind на TIP:TPORT — валидация источника проходит).
+# owner-match (! --uid-owner 0) исключает самого релея (root) из DNAT.
+A2S_DNAT_SET=""
+if [[ $TRANSLATE -eq 1 && -n "${TARGET:-}" && -x "$(dirname "$0")/tools/a2s_relay.py" ]]; then
+  A2S_TIP="${TARGET%%:*}"; A2S_TPORT="${TARGET##*:}"
+  A2S_LIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  A2S_RPORT=29115
+  if [[ -n "$A2S_LIP" ]] && ! sudo -n ss -uln 2>/dev/null | grep -q ":$A2S_RPORT "; then
+    sudo -n iptables -t nat -D OUTPUT -p udp -d "$A2S_TIP" --dport "$A2S_TPORT" \
+      -m owner ! --uid-owner 0 -j DNAT --to-destination "$A2S_LIP:$A2S_RPORT" 2>/dev/null || true
+    sudo -n pkill -f a2s_relay.py 2>/dev/null || true
+    # строгий rp_filter на lo дропнул бы спуфнутые ответы; ослабляем
+    sudo -n sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+    sudo -n sysctl -w net.ipv4.conf.lo.rp_filter=0 >/dev/null 2>&1 || true
+    A2S_DNAT_DST="$A2S_LIP:$A2S_RPORT"
+    sudo -n python3 "$(dirname "$0")/tools/a2s_relay.py" \
+      --target "$A2S_TIP:$A2S_TPORT" --listen "0.0.0.0:$A2S_RPORT" \
+      --version "$A2S_VER" --log "$RUNDIR/a2s_relay.log" \
+      >"$RUNDIR/a2s_relay.out" 2>&1 &
+    sleep 1
+    if sudo -n iptables -t nat -I OUTPUT 1 -p udp -d "$A2S_TIP" --dport "$A2S_TPORT" \
+        -m owner ! --uid-owner 0 -j DNAT --to-destination "$A2S_LIP:$A2S_RPORT" 2>/dev/null; then
+      A2S_DNAT_SET=1
+      log "A2S relay UP: $A2S_TIP:$A2S_TPORT -> $A2S_LIP:$A2S_RPORT (transform I, spoof src)"
+    else
+      log "WARNING: A2S relay DNAT failed (no iptables?) — продолжаем без релея"
+      sudo -n pkill -f a2s_relay.py 2>/dev/null || true
+    fi
+  else
+    log "WARNING: A2S relay skipped (no local ip or port $A2S_RPORT busy)"
+  fi
+fi
+# 41e-k: A2S-шим в STEAM-КЛИЕНТЕ (TRANSLATE=1). A2S_INFO в connect-флоу
+# делает КЛИЕНТ (SteamMatchMakingServers проксирует UDP через клиентский
+# процесс) — движковый мост этот трафик НЕ видит (run 85: ноль 'T' в хуках
+# движка). Контролируемый рестарт клиента с LD_PRELOAD шима: срезает EDF,
+# патчит appid=730, подставляет версию бандла в 'I'-ответ (run 70/71 lessons).
 A2S_SHIM="$BIN_DST/c2b_a2s_shim.so"   # staged + world-readable (см. выше)
 if [[ $TRANSLATE -eq 1 && -f "$A2S_SHIM" ]]; then
   log "A2S shim: restarting steam client shimmed (version=$A2S_VER)"

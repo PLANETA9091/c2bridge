@@ -349,67 +349,6 @@ if [[ -n "$STEAM_INF" ]]; then
 else
   log "WARNING: no steam.inf under $GAME_DIR - A2S uses default $A2S_VER"
 fi
-# 41e-l: A2S-РЕЛЕЙ (сетевой уровень). Run 85/86 доказали: A2S_INFO в
-# connect-флоу не виден НИ движковым хукам, НИ LD_PRELOAD-шиму клиента
-# (Valve-код ходит мимо interposition). DNAT весь пользовательский UDP на
-# цель сюда; релей транзитит с трансформом 'I' и спуфом источника
-# (IP_TRANSPARENT bind на TIP:TPORT — валидация источника проходит).
-# owner-match (! --uid-owner 0) исключает самого релея (root) из DNAT.
-A2S_DNAT_SET=""
-if [[ $TRANSLATE -eq 1 && -n "${TARGET:-}" && -f "$(dirname "$0")/tools/a2s_relay.py" ]]; then
-  A2S_TIP="${TARGET%%:*}"; A2S_TPORT="${TARGET##*:}"
-  A2S_LIP=$(hostname -I 2>/dev/null | awk '{print $1}')
-  A2S_RPORT=29115
-  if [[ -n "$A2S_LIP" ]] && ! sudo -n ss -uln 2>/dev/null | grep -q ":$A2S_RPORT "; then
-    sudo -n iptables -t nat -D OUTPUT -p udp -d "$A2S_TIP" --dport "$A2S_TPORT" \
-      -m owner ! --uid-owner 0 -j DNAT --to-destination "$A2S_LIP:$A2S_RPORT" 2>/dev/null || true
-    sudo -n pkill -f a2s_relay.py 2>/dev/null || true
-    # строгий rp_filter на lo дропнул бы спуфнутые ответы; ослабляем
-    sudo -n sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
-    sudo -n sysctl -w net.ipv4.conf.lo.rp_filter=0 >/dev/null 2>&1 || true
-    A2S_DNAT_DST="$A2S_LIP:$A2S_RPORT"
-    sudo -n python3 "$(dirname "$0")/tools/a2s_relay.py" \
-      --target "$A2S_TIP:$A2S_TPORT" --listen "0.0.0.0:$A2S_RPORT" \
-      --version "$A2S_VER" --log "$RUNDIR/a2s_relay.log" \
-      >"$RUNDIR/a2s_relay.out" 2>&1 &
-    sleep 1
-    if sudo -n iptables -t nat -I OUTPUT 1 -p udp -d "$A2S_TIP" --dport "$A2S_TPORT" \
-        -m owner ! --uid-owner 0 -j DNAT --to-destination "$A2S_LIP:$A2S_RPORT" 2>/dev/null; then
-      A2S_DNAT_SET=1
-      log "A2S relay UP: $A2S_TIP:$A2S_TPORT -> $A2S_LIP:$A2S_RPORT (transform I, spoof src)"
-    else
-      log "WARNING: A2S relay DNAT failed (no iptables?) — продолжаем без релея"
-      sudo -n pkill -f a2s_relay.py 2>/dev/null || true
-    fi
-  else
-    log "WARNING: A2S relay skipped (no local ip or port $A2S_RPORT busy)"
-  fi
-fi
-# 41e-k: A2S-шим в STEAM-КЛИЕНТЕ (TRANSLATE=1). A2S_INFO в connect-флоу
-# делает КЛИЕНТ (SteamMatchMakingServers проксирует UDP через клиентский
-# процесс) — движковый мост этот трафик НЕ видит (run 85: ноль 'T' в хуках
-# движка). Контролируемый рестарт клиента с LD_PRELOAD шима: срезает EDF,
-# патчит appid=730, подставляет версию бандла в 'I'-ответ (run 70/71 lessons).
-A2S_SHIM="$BIN_DST/c2b_a2s_shim.so"   # staged + world-readable (см. выше)
-if [[ $TRANSLATE -eq 1 && -f "$A2S_SHIM" ]]; then
-  log "A2S shim: restarting steam client shimmed (version=$A2S_VER)"
-  pkill -u "$GAME_USER" -f "$CORE_STEAM_RE" 2>/dev/null
-  sleep 3; pkill -9 -u "$GAME_USER" -f "$CORE_STEAM_RE" 2>/dev/null
-  rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-  sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-  sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
-    LD_PRELOAD="$A2S_SHIM" C2B_A2S_VERSION="$A2S_VER" \
-    C2B_A2S_LOG="$RUNDIR/a2s_shim.log" \
-    sh -c "nohup '$STEAM_SH' -silent >'$TMPD/steam-shimstart.log' 2>&1 &"
-  W=0
-  until steam_client_stable; do
-    W=$((W+5)); (( W >= 180 )) && { log "WARNING: shimmed steam not stable after ${W}s"; break; }
-    sleep 5
-  done
-  log "shimmed steam stable after ~${W}s"
-elif [[ $TRANSLATE -eq 1 ]]; then
-  log "WARNING: A2S shim missing ($A2S_SHIM) - steam client NOT shimmed"
-fi
 # zenity --error dialogs (e.g. the userns complaint) BLOCK client startup
 pkill -f "zenity --error" 2>/dev/null || true
 # ---- steam self-update awareness ----

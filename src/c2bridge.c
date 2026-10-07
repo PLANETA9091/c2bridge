@@ -46,6 +46,7 @@ typedef unsigned int   uptr;
 #include <sys/mman.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 static void c2b_segv(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)uc;
@@ -70,6 +71,7 @@ extern i32   usleep(u32 usec);
 extern i32   pthread_create(void *t, const void *a, void *(*fn)(void *), void *arg);
 extern char *getenv(const char *name);
 extern i32   strcmp(const char *a, const char *b);   /* t39: GC policy lookup */
+extern i32   clock_gettime(i32 clk, void *ts);   /* 41e-m: monotonic ms для темпа INFO-PUSH */
 
 static int g_logfd = 2;
 
@@ -6088,6 +6090,15 @@ static u32 g_clv2_baits;         /* C2B_CLV2_BAITS=1: фазы 2/4/6 ('i'/reserv
                                   * развивающуюся реакцию движка (ферма между
                                   * пушами всегда держит consume_gap) */
 static char g_a2s_ver[24] = "1.38.0.4"; /* C2B_A2S_VERSION — версия бандла */
+/* 41e-m: INFO-PUSH — ферма пушит 'I'-блоб в сокеты движка UNSOLICITED и
+ * движок ЕГО ПОТРЕБЛЯЕТ (run 72: CL dn #f4-8 «info» = ACK в консоли +
+ * прогресс флоу). Движок сам A2S НЕ шлёт (ни в ферме, ни в мосту),
+ * клиент на цель UDP не ходит (run 90: relay q=0) — значит мост обязан
+ * сам доставить info в recvfrom движка. */
+static u8 g_ipush_buf[160];      /* собранный 'I'-блоб */
+static u32 g_ipush_len;          /* 0 = не собран */
+static u32 g_ipush_left;         /* сколько раз осталось вытолкнуть */
+static u64 g_ipush_last_ms;      /* темп: не чаще 2с */
 static u8 g_a2s_peer[16];        /* sockaddr, куда движок послал A2S 'T' */
 static socklen_t g_a2s_peerlen;
 static u32 g_a2s_seen_t;         /* 'T' замечен — peer валиден */
@@ -6322,6 +6333,51 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
 
 #define C2B_CL_RTLD_NEXT ((void *)-1L)
 
+/* 41e-m: monotonic ms (CLOCK_MONOTONIC=1) — темп INFO-PUSH */
+static u64 c2b_mono_ms(void)
+{
+#ifdef C2B_SELFTEST
+    struct timespec ts;                  /* selftest: <time.h> */
+    if (clock_gettime(1, &ts) != 0) return 0;
+    return (u64)ts.tv_sec * 1000ull + (u64)ts.tv_nsec / 1000000ull;
+#else
+    /* .so без time.h: ABI timespec = {i64 sec; i64 nsec} (x86_64) */
+    struct { i64 sec; i64 nsec; } ts;
+    if (clock_gettime(1, &ts) != 0) return 0;
+    return (u64)ts.sec * 1000ull + (u64)ts.nsec / 1000000ull;
+#endif
+}
+
+/* 41e-m: собрать ферма-формата 'I'-блоб (byte-паритет с fake_s1_server.py
+ * sinfo_blob; run 72 CL dn #f4-8: движок ПОТРЕБЛЯЕТ unsolicited 'I'):
+ * 'I' prot(0x11) "c2b-bridge\0" "de_dust2\0" "csgo\0"
+ * "Counter-Strike: Global Offensive\0" le16(730) 0/24/0 'd' 'l' 0 0
+ * <версия бандла>\0 — БЕЗ EDF. Hostname = маркер попадания: ACK в консоли
+ * должен напечатать c2b-bridge. */
+static u32 c2b_clv2_build_infoblob(u8 *out, u32 cap)
+{
+    static const char HOST[] = "c2b-bridge";
+    static const char MAP[]  = "de_dust2";
+    static const char DIR[]  = "csgo";
+    static const char GAME[] = "Counter-Strike: Global Offensive";
+    u32 n = 0, i;
+    if (cap < 128) return 0;
+    out[n++] = 0xff; out[n++] = 0xff; out[n++] = 0xff; out[n++] = 0xff;
+    out[n++] = 'I';
+    out[n++] = 0x11;                                     /* protocol 17 */
+    for (i = 0; i < sizeof(HOST); i++) out[n++] = (u8)HOST[i];
+    for (i = 0; i < sizeof(MAP); i++)  out[n++] = (u8)MAP[i];
+    for (i = 0; i < sizeof(DIR); i++)  out[n++] = (u8)DIR[i];
+    for (i = 0; i < sizeof(GAME); i++) out[n++] = (u8)GAME[i];
+    out[n++] = 0xda; out[n++] = 0x02;                    /* appid 730 */
+    out[n++] = 0;    out[n++] = 24;   out[n++] = 0;      /* players/max/bots */
+    out[n++] = 'd';  out[n++] = 'l';                     /* dedicated/linux */
+    out[n++] = 0;    out[n++] = 0;                       /* public/VAC off */
+    for (i = 0; g_a2s_ver[i] != 0; i++) out[n++] = (u8)g_a2s_ver[i];
+    out[n++] = 0;                                        /* версия\0 */
+    return n;
+}
+
 /* ---------- 41e-j: трансформ A2S_INFO 'I'-ответа цели для движка ----------
  * RUN 70/71 lessons фермы (fake_s1_server.py): продолжение connect-потока
  * требует serverinfo БЕЗ EDF-хвоста, с appid u16=730 (appid владельца
@@ -6441,6 +6497,13 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 }
                 g_clv2_qc_val = hv;
                 g_clv2_phase = 0;               /* новая попытка — фаза с нуля */
+                /* 41e-m: arm INFO-PUSH — после доставки 'A' мост начнёт
+                 * выталкивать ферма-блоб 'I' в recvfrom движка (run 72:
+                 * движок потребляет unsolicited info) */
+                if (!g_ipush_len)
+                    g_ipush_len = c2b_clv2_build_infoblob(
+                        g_ipush_buf, (u32)sizeof(g_ipush_buf));
+                g_ipush_left = 10;
                 if (addr && addrlen && addrlen <= 16) {
                     u8 *d = (u8 *)&g_clv2_dst;
                     u32 i2;
@@ -6520,6 +6583,34 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
     }
     /* реальный приём ПЕРВЫМ: v1 — чистый наблюдатель, движку всё отдаётся */
     ssize_t r = ((c2b_recvfrom_fn)g_clp_recvfrom)(fd, buf, len, flags, addr, addrlen);
+    /* 41e-m: INFO-PUSH — на EAGAIN любого UDP-сокета движка выталкиваем
+     * ферма-блоб 'I' (source = цель qconnect). Ферма пушила info во ВСЕ
+     * порты движка и движок потреблял (run 72); A2S-запроса движок не
+     * делает, клиент UDP на цель не шлёт (run 90 relay q=0) — другой
+     * путь доставки info не существует. */
+    if (r < 0 && g_clv2_enable && g_ipush_len && g_ipush_left &&
+        *__errno_location() == 11 /* EAGAIN */ && buf && addr && addrlen &&
+        *addrlen >= g_clv2_dstlen && g_clv2_dstlen &&
+        (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
+        u64 now_ms = c2b_mono_ms();
+        if (g_clv2_phase >= 1 && now_ms - g_ipush_last_ms >= 2000) {
+            u32 i4;
+            u8 *q = (u8 *)buf;
+            u8 *d = (u8 *)addr;
+            const u8 *s2 = (const u8 *)&g_clv2_dst[0];
+            for (i4 = 0; i4 < g_ipush_len; i4++) q[i4] = g_ipush_buf[i4];
+            for (i4 = 0; i4 < g_clv2_dstlen; i4++) d[i4] = s2[i4];
+            *addrlen = g_clv2_dstlen;
+            g_ipush_last_ms = now_ms;
+            g_ipush_left--;
+            C2B_LOGS("[c2b] INFO pushed to engine (left=");
+            C2B_LOGN(g_ipush_left);
+            C2B_LOGS(" len="); C2B_LOGN(g_ipush_len);
+            C2B_LOGS(" ver="); C2B_LOGS(g_a2s_ver);
+            C2B_LOGS("\n");
+            return (ssize_t)g_ipush_len;
+        }
+    }
     if (r > 0 && addr &&
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
@@ -11618,6 +11709,46 @@ static void test_cl(void)
                     CHECK(c2b_a2s_transform_i(rin, 30, rout2,
                                               (u32)sizeof(rout2)) == 0,
                           "a2s: слишком короткий -> 0");
+                }
+                /* 41e-m: INFO-PUSH блоб — ферма-формат, движок потребляет
+                 * unsolicited 'I' (run 72 CL dn #f4-8) */
+                {
+                    u8 ib[160];
+                    u32 il = c2b_clv2_build_infoblob(ib, (u32)sizeof(ib));
+                    CHECK(il > 60 && il < 128, "ipush: блоб собран");
+                    CHECK(ib[4] == 'I' && ib[5] == 0x11,
+                          "ipush: 'I' + protocol 17");
+                    {
+                        static const char h9[] = "c2b-bridge\0de_dust2\0"
+                                                 "csgo\0";
+                        u32 q9, ok9 = 1;
+                        for (q9 = 0; q9 < sizeof(h9) - 1; q9++)
+                            if (ib[6 + q9] != (u8)h9[q9]) ok9 = 0;
+                        CHECK(ok9, "ipush: hostname/map/folder");
+                    }
+                    {
+                        u32 q9 = 6, w9;
+                        for (w9 = 0; w9 < 4; w9++) {
+                            while (q9 < il && ib[q9] != 0) q9++;
+                            q9++;
+                        }
+                        CHECK(ib[q9] == 0xda && ib[q9 + 1] == 0x02,
+                              "ipush: appid=730");
+                        CHECK(ib[q9 + 2] == 0 && ib[q9 + 3] == 24 &&
+                              ib[q9 + 4] == 0, "ipush: 0/24/0");
+                        CHECK(ib[q9 + 5] == 'd' && ib[q9 + 6] == 'l',
+                              "ipush: dedicated/linux");
+                        CHECK(ib[q9 + 7] == 0 && ib[q9 + 8] == 0,
+                              "ipush: public/VAC off");
+                        {
+                            static const char ve[] = "1.38.0.4";
+                            u32 vs9 = q9 + 9, e9, okv9 = 1;
+                            for (e9 = 0; e9 < 8; e9++)
+                                if (ib[vs9 + e9] != (u8)ve[e9]) okv9 = 0;
+                            CHECK(okv9 && ib[vs9 + 8] == 0 && vs9 + 9 == il,
+                                  "ipush: версия бандла + конец (без EDF)");
+                        }
+                    }
                 }
             }
         }

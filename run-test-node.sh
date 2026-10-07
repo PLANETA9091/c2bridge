@@ -330,6 +330,42 @@ if ! steam_client_stable; then
   done
   log "steam stability wait done (~${W}s)"
 fi
+# 41e-k: A2S-шим в STEAM-КЛИЕНТЕ (TRANSLATE=1). A2S_INFO в connect-флоу
+# делает КЛИЕНТ (SteamMatchMakingServers проксирует UDP через клиентский
+# процесс) — движковый мост этот трафик НЕ видит (run 85: ноль 'T' в хуках
+# движка). Контролируемый рестарт клиента с LD_PRELOAD шима: срезает EDF,
+# патчит appid=730, подставляет версию бандла в 'I'-ответ (run 70/71 lessons).
+A2S_VER="1.38.0.4"
+STEAM_INF=$(find "$GAME_DIR" -name steam.inf 2>/dev/null | head -1)
+if [[ -n "$STEAM_INF" ]]; then
+  VINF=$(grep -aoE '^Version=[0-9.]+' "$STEAM_INF" | head -1 | cut -d= -f2)
+  if [[ -n "$VINF" ]]; then
+    A2S_VER="$VINF"
+    log "A2S shim: using bundle version $A2S_VER (from $STEAM_INF)"
+  fi
+else
+  log "WARNING: no steam.inf under $GAME_DIR - A2S shim uses default $A2S_VER"
+fi
+A2S_SHIM="$BIN_DST/c2b_a2s_shim.so"   # staged + world-readable (см. выше)
+if [[ $TRANSLATE -eq 1 && -f "$A2S_SHIM" ]]; then
+  log "A2S shim: restarting steam client shimmed (version=$A2S_VER)"
+  pkill -u "$GAME_USER" -f "$CORE_STEAM_RE" 2>/dev/null
+  sleep 3; pkill -9 -u "$GAME_USER" -f "$CORE_STEAM_RE" 2>/dev/null
+  rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+  sudo -n rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+  sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
+    LD_PRELOAD="$A2S_SHIM" C2B_A2S_VERSION="$A2S_VER" \
+    C2B_A2S_LOG="$RUNDIR/a2s_shim.log" \
+    sh -c "nohup '$STEAM_SH' -silent >'$TMPD/steam-shimstart.log' 2>&1 &"
+  W=0
+  until steam_client_stable; do
+    W=$((W+5)); (( W >= 180 )) && { log "WARNING: shimmed steam not stable after ${W}s"; break; }
+    sleep 5
+  done
+  log "shimmed steam stable after ~${W}s"
+elif [[ $TRANSLATE -eq 1 ]]; then
+  log "WARNING: A2S shim missing ($A2S_SHIM) - steam client NOT shimmed"
+fi
 # zenity --error dialogs (e.g. the userns complaint) BLOCK client startup
 pkill -f "zenity --error" 2>/dev/null || true
 # ---- steam self-update awareness ----
@@ -488,20 +524,8 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 
   MODES=""
-  # 41e-j: версия бандла для трансформа A2S 'I' в мосту (run 70/71 lessons:
-  # движок требует no-EDF serverinfo с appid=730 и СВОЕЙ версией, иначе
-  # тихий abort на INGAME->MAINMENU — run 83)
-  A2S_VER="1.38.0.4"
-  STEAM_INF=$(find "$GAME_DIR" -name steam.inf 2>/dev/null | head -1)
-  if [[ -n "$STEAM_INF" ]]; then
-    VINF=$(grep -aoE '^Version=[0-9.]+' "$STEAM_INF" | head -1 | cut -d= -f2)
-    if [[ -n "$VINF" ]]; then
-      A2S_VER="$VINF"
-      log "bridge A2S transform: using bundle version $A2S_VER (from $STEAM_INF)"
-    fi
-  else
-    log "WARNING: no steam.inf under $GAME_DIR - A2S transform uses default $A2S_VER"
-  fi
+  # 41e-j: версия бандла для трансформа A2S 'I' (извлекается РАНЬШЕ, перед
+  # рестартом клиента с шимом — см. блок 41e-k выше; здесь просто прокидываем)
   [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER"
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1

@@ -157,6 +157,9 @@ jobs:
           mkdir -p "$C2B_NODE_HOME/bridge/lib12"
           gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2bridge64.so" src/c2bridge.c -ldl
           gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2b_spy64.so" src/c2b_spy.c -ldl
+          # 41e-k: A2S shim for the STEAM CLIENT process (the A2S_INFO query
+          # in the connect flow is done by the client, not the engine — run 85)
+          gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/c2b_a2s_shim.so" src/c2b_a2s_shim.c -ldl
           # tcmalloc shim: crash-bisect variant of the bundle's 2013 tcmalloc
           # (pure glibc forwarder; run 21/22/23 deterministic protobuf SEGV)
           gcc -O2 -shared -fPIC -o "$C2B_NODE_HOME/bridge/tcmalloc_shim.so" src/tcmalloc_shim.c

@@ -6099,6 +6099,7 @@ static u8 g_ipush_buf[160];      /* собранный 'I'-блоб */
 static u32 g_ipush_len;          /* 0 = не собран */
 static u32 g_ipush_left;         /* сколько раз осталось вытолкнуть */
 static u64 g_ipush_last_ms;      /* темп: не чаще 2с */
+static u8 g_ipush_abuf[128];     /* 41e-o: буфер fmt9-'A' для чередования A/I */
 static u8 g_a2s_peer[16];        /* sockaddr, куда движок послал A2S 'T' */
 static socklen_t g_a2s_peerlen;
 static u32 g_a2s_seen_t;         /* 'T' замечен — peer валиден */
@@ -6598,17 +6599,34 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             u8 *q = (u8 *)buf;
             u8 *d = (u8 *)addr;
             const u8 *s2 = (const u8 *)&g_clv2_dst[0];
-            for (i4 = 0; i4 < g_ipush_len; i4++) q[i4] = g_ipush_buf[i4];
+            /* 41e-o: ЧЕРЕДОВАНИЕ A/I — ферма пушит 'A' МНОГОКРАТНО (run 72:
+             * CL dn #1-7 = 7 'A' ответов в одной попытке, каждые 2-10с),
+             * движок потребляет каждый и заново проходит connect-ветку;
+             * мост до сих пор отдавал 'A' один раз. Чётный ход = 'I'-блоб,
+             * нечётный = свежий fmt9-'A' с ТЕМ ЖЕ ch32/qc_val. */
+            u8 *blob = g_ipush_buf;
+            u32 blen = g_ipush_len;
+            if ((g_ipush_left & 1u) == 0u) {           /* нечётный ход: 'A' */
+                blen = c2b_clv2_build_chalreply(g_ipush_abuf,
+                                                (u32)sizeof(g_ipush_abuf),
+                                                g_clv2_fmt, g_clv2_qc_val,
+                                                g_clv2_ch32);
+                if (!blen) blen = g_ipush_len;         /* буфер мал — info */
+                else blob = g_ipush_abuf;
+            }
+            for (i4 = 0; i4 < blen; i4++) q[i4] = blob[i4];
             for (i4 = 0; i4 < g_clv2_dstlen; i4++) d[i4] = s2[i4];
             *addrlen = g_clv2_dstlen;
             g_ipush_last_ms = now_ms;
             g_ipush_left--;
-            C2B_LOGS("[c2b] INFO pushed to engine (left=");
+            C2B_LOGS("[c2b] ");
+            C2B_LOGS(blob == g_ipush_abuf ? "A pushed to engine (left=" :
+                                            "INFO pushed to engine (left=");
             C2B_LOGN(g_ipush_left);
-            C2B_LOGS(" len="); C2B_LOGN(g_ipush_len);
-            C2B_LOGS(" ver="); C2B_LOGS(g_a2s_ver);
+            C2B_LOGS(" len="); C2B_LOGN(blen);
+            if (blob != g_ipush_abuf) { C2B_LOGS(" ver="); C2B_LOGS(g_a2s_ver); }
             C2B_LOGS("\n");
-            return (ssize_t)g_ipush_len;
+            return (ssize_t)blen;
         }
     }
     if (r > 0 && addr &&

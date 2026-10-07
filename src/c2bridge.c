@@ -6082,6 +6082,11 @@ static u64 g_clv2_phase_ms;      /* мгновение смены фазы (ms �
 static u8 g_clv2_dst[16];        /* адрес CS2-цели (из qconnect), сырые байты */
 static socklen_t g_clv2_dstlen;
 static u32 g_clv2_k;             /* C2B_CLV2_K: длина филлера перед строкой (поиск N) */
+static u32 g_clv2_baits;         /* C2B_CLV2_BAITS=1: фазы 2/4/6 ('i'/reserve-'A'/'B').
+                                  * ПО УМОЛЧАНИЮ ВЫКЛ: run 80 показал, что байты,
+                                  * посланные через 1.5с после fmt9-'A', клоббят
+                                  * развивающуюся реакцию движка (ферма между
+                                  * пушами всегда держит consume_gap) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
 static u32 c2b_clv2_rand32(void)
@@ -6253,7 +6258,10 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         /* Байт-в-байт структура живого CS:GO-legacy сервера (46.174.52.230 и
          * др., снято 2026-10-06): 'A' + le32(chal) + le32(3) + u16(0) +
          * le32(value=STEAMID-LOW32 ЦЕЛИ!) + u8(0) + 00 30 01 01 +
-         * "connect0x<ЭХО qc_val>\0" + "96\0" + нулевой паддинг до 55.
+         * "connect0x<ЭХО qc_val>\0" + "96\0" + нулевой паддинг:
+         * ПОЛЕЗНАЯ НАГРУЗКА (после ffffffff-префикса) до 55 байт =
+         * 59 на проводе. Run 80 bug: паддинг считали С префиксом
+         * (итого 55 = payload 51) — на 4 байта короче фермы v13+.
          * Строка содержит "connect" -> движок идёт в connect-ветку
          * (+0x4c0=1, +0x8dc4="96\0\0"), доходит до LOADING->INGAME и шлёт
          * 'j' (join) — ферма это доказала живьём (run 68/72). */
@@ -6278,7 +6286,7 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
             out[n++] = 0;
         }
         out[n++] = '9'; out[n++] = '6'; out[n++] = 0;  /* "96\0" */
-        while (n < 55) out[n++] = 0;                   /* паддинг до 55 */
+        while (n < 59) out[n++] = 0;   /* payload до 55 (итого 59, байт-в-байт ферма) */
         break;
     }
     case 8: {                              /* 41e-g: N-агностик — хвост = (reserve)*9 NUL */
@@ -6380,11 +6388,20 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, addr, addrlen);
                 return (ssize_t)len;               /* движку обычный rc */
             }
-            if (g_clv2_enable && cls == C2B_CLQ_JOIN && g_clv2_phase == 3) {
-                /* фаза 4: движок прислал 'j' (JOIN, pending reserve set?) ->
-                 * третий ChallengeRequest; его reply подменяем на RESERVE-'A'
-                 * (fmt5-структура: строка "reserve") -> OnReserveAccepted с
-                 * pending-резервом должен выпустить reserve-confirm ('n'). */
+            if (g_clv2_enable && cls == C2B_CLQ_JOIN) {
+                /* 'j' в ЛЮБОЙ фазе — логируем (ключевое наблюдение: живой
+                 * fmt9-'A' должен сам вести движок в LOADING->INGAME и 'j'). */
+                C2B_LOGS("[c2b] CLV2 engine 'j' JOIN seen (phase=");
+                C2B_LOGN(g_clv2_phase);
+                C2B_LOGS(")\n");
+            }
+            if (g_clv2_enable && g_clv2_baits && cls == C2B_CLQ_JOIN &&
+                g_clv2_phase == 3) {
+                /* фаза 4 (C2B_CLV2_BAITS=1): движок прислал 'j' (JOIN,
+                 * pending reserve set?) -> третий ChallengeRequest; его reply
+                 * подменяем на RESERVE-'A' (fmt5-структура: строка "reserve")
+                 * -> OnReserveAccepted с pending-резервом должен выпустить
+                 * reserve-confirm ('n'). */
                 u8 out2[512];
                 g_clv2_phase = 4;
                 g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0002u) | 1u;
@@ -7224,9 +7241,10 @@ static void *c2b_poll_thread(void *arg)
         C2B_LOGS(" vt="); C2B_LOGN(g_vt_done);
         C2B_LOGS("\n");
     }
-    {   /* CLV2 фаза 2: ждём доставки 'A' (recvfrom-хук ставит phase=1),
-         * затем через 1.5с стреляем вторым ChallengeRequest — его reply
-         * подменяется на 'i'-промпт (bait для 'j' движка). */
+    if (g_clv2_baits) {
+    /* CLV2 фаза 2 (C2B_CLV2_BAITS=1): ждём доставки 'A' (recvfrom-хук ставит
+     * phase=1), затем через 1.5с стреляем вторым ChallengeRequest — его reply
+     * подменяется на 'i'-промпт (bait для 'j' движка). */
         int i;
         for (i = 0; i < 1200; i++) {              /* до 10 мин */
             if (g_clv2_phase == 1 && i >= 3) {
@@ -7249,9 +7267,10 @@ static void *c2b_poll_thread(void *arg)
             usleep(500000);
         }
     }
-    {   /* CLV2 фаза 6: после reserve-'A' (фаза 5) — четвёртый challenge,
-         * reply подменяем на 'B'+'.+8A (connection accept). Если движок
-         * примет — пошлёт 'k'-connect (капчур в sendto-хуке!). */
+    if (g_clv2_baits) {
+    /* CLV2 фаза 6 (C2B_CLV2_BAITS=1): после reserve-'A' (фаза 5) — четвёртый
+     * challenge, reply подменяем на 'B'+'.+8A (connection accept). Если движок
+     * примет — пошлёт 'k'-connect (капчур в sendto-хуке!). */
         int i;
         u8 got5 = 0;
         for (i = 0; i < 120; i++) {               /* до 60с */
@@ -7277,6 +7296,7 @@ static void *c2b_poll_thread(void *arg)
             C2B_LOGS("[c2b] CLV2 phase6: 4th ChallengeRequest (B-accept bait)\n");
         }
     }
+    /* конец гейта C2B_CLV2_BAITS (фазы 2/4/6) */
     /* t39-фикс: GC-опрос ТОЛЬКО после ARMED движка (ProcessMessages уже
      * идёт = SteamAPI_Init главного потока давно завершён). Прежде GC-цикл
      * мог дёрнуть accessor SteamAPI_ISteamGameCoordinator() ПОСРЕДИ
@@ -7423,6 +7443,13 @@ i32 c2b_main(void)
                 g_clv2_k = (u32)(e[0] - '0');
                 C2B_LOGS("[c2b] clv2 K="); C2B_LOGN(g_clv2_k);
                 C2B_LOGS("\n");
+            }
+            e = getenv("C2B_CLV2_BAITS");
+            if (e && e[0] == '1') {
+                g_clv2_baits = 1;
+                C2B_LOGS("[c2b] clv2 baits=1 (фазы 2/4/6: 'i'/reserve-'A'/'B')\n");
+            } else {
+                C2B_LOGS("[c2b] clv2 baits=0 (чистый fmt9-'A', без клоббера)\n");
             }
         }
     }
@@ -11416,6 +11443,37 @@ static void test_cl(void)
                         CHECK(ok, "clv2: fmt8 хвост = (reserve)*9");
                     }
                     CHECK(ar[78] == 0, "clv2: fmt8 NUL");
+                }
+                /* 41e-i: fmt9 — REAL-legacy 'A', 59 байт на проводе
+                 * (payload 55 после ffffffff-префикса; run 80: паддинг
+                 * считали с префиксом — 4 байта коротки) */
+                {
+                    u32 i9;
+                    al = c2b_clv2_build_chalreply(ar, (u32)sizeof(ar), 9,
+                                                  0x00000000u, 0x11223344u);
+                    CHECK(al == 59, "clv2: fmt9 = 59 байт (payload 55)");
+                    CHECK(ar[4]=='A' && ar[9]==3 && ar[13]==0 && ar[14]==0,
+                          "clv2: fmt9 заголовок (A, proto=3, ks=0)");
+                    CHECK(ar[15]==0x07 && ar[16]==0x0a && ar[17]==0xee &&
+                          ar[18]==0x00, "clv2: fmt9 value=steamid-low");
+                    CHECK(ar[19]==0 && ar[20]==0x00 && ar[21]==0x30 &&
+                          ar[22]==0x01 && ar[23]==0x01, "clv2: fmt9 flag+mystry4");
+                    {
+                        static const char p9[] = "connect0x00000000";
+                        u32 ok9 = 1;
+                        for (i9 = 0; i9 < 17; i9++)
+                            if (ar[24 + i9] != (u8)p9[i9]) ok9 = 0;
+                        CHECK(ok9, "clv2: fmt9 эхо connect0x%08X (qc=0)");
+                    }
+                    CHECK(ar[41]==0 && ar[42]=='9' && ar[43]=='6' && ar[44]==0,
+                          "clv2: fmt9 NUL строки + '96'");
+                    {
+                        u32 okp = 1;
+                        for (i9 = 45; i9 < 59; i9++) if (ar[i9] != 0) okp = 0;
+                        CHECK(okp, "clv2: fmt9 хвостовой паддинг NUL до 59");
+                    }
+                    CHECK(c2b_clv2_build_chalreply(ar, 32, 9, 0, 1) == 0,
+                          "clv2: fmt9 крошечный буфер -> 0");
                 }
             }
         }

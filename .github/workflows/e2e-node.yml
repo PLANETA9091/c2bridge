@@ -72,7 +72,8 @@ jobs:
           ls -la "$C2B_NODE_HOME/bridge/lib12/" || true
 
       - name: steam client session (burner account)
-        run: bash scripts/steam-login.sh || echo "WARNING: steam login failed — run will likely fail auth"
+        run: |
+          bash scripts/steam-login.sh || echo "WARNING: steam login failed — run will likely fail auth"
 
       - name: run full e2e
         run: |

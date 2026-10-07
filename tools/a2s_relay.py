@@ -138,6 +138,7 @@ def main():
     t_stat = time.time() + a.stats
 
     while True:
+      try:
         rl = [rx] + [c.sock for c in ups.values()]
         r, _, _ = select.select(rl, [], [], 5)
         now = time.time()
@@ -181,8 +182,13 @@ def main():
                 del ups[caddr]
         if now >= t_stat:
             log("stats: q=%(q)d r=%(r)d i_transformed=%(i)d bytes=%(bytes)d "
-                "clients=%d" % dict(stats, clients=len(ups)))
+                "clients=%(clients)d" % dict(stats, clients=len(ups)))
             t_stat = now + a.stats
+      except Exception as e:
+        # релей ОБЯЖЕН жить: DNAT уже направляет весь пользовательский
+        # UDP на него — смерть релея = чёрная дыра для цели
+        log("loop error (continuing): %r" % e)
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":

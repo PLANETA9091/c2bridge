@@ -6087,6 +6087,10 @@ static u32 g_clv2_baits;         /* C2B_CLV2_BAITS=1: фазы 2/4/6 ('i'/reserv
                                   * посланные через 1.5с после fmt9-'A', клоббят
                                   * развивающуюся реакцию движка (ферма между
                                   * пушами всегда держит consume_gap) */
+static char g_a2s_ver[24] = "1.38.0.4"; /* C2B_A2S_VERSION — версия бандла */
+static u8 g_a2s_peer[16];        /* sockaddr, куда движок послал A2S 'T' */
+static socklen_t g_a2s_peerlen;
+static u32 g_a2s_seen_t;         /* 'T' замечен — peer валиден */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
 static u32 c2b_clv2_rand32(void)
@@ -6318,6 +6322,55 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
 
 #define C2B_CL_RTLD_NEXT ((void *)-1L)
 
+/* ---------- 41e-j: трансформ A2S_INFO 'I'-ответа цели для движка ----------
+ * RUN 70/71 lessons фермы (fake_s1_server.py): продолжение connect-потока
+ * требует serverinfo БЕЗ EDF-хвоста, с appid u16=730 (appid владельца
+ * клиента) и версией БАНДЛА. Реальный CS2-сервер (run 83) шлёт EDF +
+ * версию 1.41.8.8 -> движок делает тихий abort на
+ * INGAME->MAINMENU без 'j'. Формат парсится как в ферме:
+ *   'I' prot(1) name\0 map\0 folder\0 game\0 appid(2) players max bots
+ *   type env vis vac [первая NUL-строка после vac = версия] [EDF — СРЕЗАЕМ]
+ * Возвращаем новую длину; 0 = отдать как есть. */
+static u32 c2b_a2s_transform_i(const u8 *in, u32 n, u8 *out, u32 cap)
+{
+    u32 i, j, apid, olen;
+    if (n < 40 || n > 1400 || cap < n + 32) return 0;
+    if (in[0] != 0xff || in[1] != 0xff || in[2] != 0xff || in[3] != 0xff)
+        return 0;
+    if (in[4] != 'I') return 0;
+    i = 6;                                       /* после ffff(4)+'I'(1)+prot(1) */
+    for (j = 0; j < 4; j++) {                    /* name, map, folder, game */
+        u32 sl = 0;
+        while (i < n && in[i] != 0) {
+            i++;
+            if (++sl > 256) return 0;            /* строка не кончается */
+        }
+        if (i >= n) return 0;
+        i++;                                     /* NUL */
+    }
+    if (i + 2 + 7 > n) return 0;
+    apid = i;                                    /* здесь appid u16 */
+    i += 2 + 7;                                  /* players/max/bots/type/env/vis/vac */
+    if (i >= n) return 0;
+    {
+        u32 vend = i;                            /* первая NUL-строка = версия */
+        while (vend < n && in[vend] != 0) {
+            vend++;
+            if (vend - i > 32) return 0;
+        }
+        if (vend >= n) return 0;
+    }
+    olen = 0;
+    out[olen++] = 0xff; out[olen++] = 0xff; out[olen++] = 0xff; out[olen++] = 0xff;
+    for (i = 4; i < apid; i++) out[olen++] = in[i];      /* 'I'+prot+4 строки */
+    out[olen++] = 0xda; out[olen++] = 0x02;              /* appid = 730 */
+    for (i = apid + 2; i < apid + 2 + 7; i++) out[olen++] = in[i]; /* 7 байт */
+    for (i = 0; g_a2s_ver[i] != 0; i++) out[olen++] = (u8)g_a2s_ver[i];
+    out[olen++] = 0;                                     /* версия\0, EDF нет */
+    return olen;
+}
+
+
 /* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
  * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
  * пишут одно и то же значение (x86: выровненный сторов атомарен). */
@@ -6350,6 +6403,25 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
         if (c2b_cl_is_connless(p, (u32)len)) {
             g_cl_s_cl++;
             i32 cls = c2b_cl_class_up(p, (u32)len);
+            /* 41e-j: A2S_INFO 'T'-запрос движка — запоминаем peer, чтобы
+             * трансформить 'I'-ответ с него (сам 'T' идёт на сервер без
+             * изменений: челлендж-танец движок отрабатывает с реальным
+             * сервером, меняем только финальный 'I'). */
+            if (g_clv2_enable && (u32)len > 6 && p[4] == 'T') {
+                if (addr && addrlen && addrlen <= 16) {
+                    u8 *d = (u8 *)&g_a2s_peer[0];
+                    u32 i2;
+                    const u8 *s2 = (const u8 *)addr;
+                    for (i2 = 0; i2 < (u32)addrlen; i2++) d[i2] = s2[i2];
+                    g_a2s_peerlen = addrlen;
+                    if (!g_a2s_seen_t) {
+                        g_a2s_seen_t = 1;
+                        C2B_LOGS("[c2b] A2S 'T' query seen -> will transform 'I' replies (ver=");
+                        C2B_LOGS(g_a2s_ver);
+                        C2B_LOGS(")\n");
+                    }
+                }
+            }
             if (g_clv2_enable && cls == C2B_CLQ_QCONNECT) {
                 /* CLV2 phase A: qconnect -> S2 ChallengeRequest (тот же fd:
                  * challenge привязан к источнику и живёт ~4s).
@@ -6533,6 +6605,26 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         }
         if (c2b_cl_is_connless(p, (u32)r)) {
             g_cl_r_cl++;
+            /* 41e-j: 'I'-ответ от A2S-peer (цели connect) — трансформ под
+             * бандл (no-EDF, appid=730, версия бандла), run 70/71 lessons */
+            if (g_clv2_enable && g_a2s_seen_t && addr && (u32)r > 10 &&
+                p[4] == 'I' && (u32)*addrlen == (u32)g_a2s_peerlen &&
+                memcmp(addr, g_a2s_peer, g_a2s_peerlen) == 0) {
+                u8 tmp[1200];
+                u32 nl = c2b_a2s_transform_i(p, (u32)r, tmp,
+                                             (u32)sizeof(tmp));
+                if (nl && (u32)len >= nl) {
+                    u32 ti;
+                    u8 *q = (u8 *)buf;
+                    for (ti = 0; ti < nl; ti++) q[ti] = tmp[ti];
+                    C2B_LOGS("[c2b] A2S 'I' transformed: no-EDF appid=730 ver=");
+                    C2B_LOGS(g_a2s_ver);
+                    C2B_LOGS(" ("); C2B_LOGN((u32)r); C2B_LOGS("->");
+                    C2B_LOGN(nl); C2B_LOGS("B)\n");
+                    r = (ssize_t)nl;
+                    p = (const u8 *)buf;
+                }
+            }
             i32 act = c2b_cl_filter_downlink(p, (u32)r);
             c2b_cl_trace(0, p, (u32)r, act);
             if (act == C2B_CL_DROP) return 0;   /* v2: движку нулевая датаграмма */
@@ -7450,6 +7542,13 @@ i32 c2b_main(void)
                 C2B_LOGS("[c2b] clv2 baits=1 (фазы 2/4/6: 'i'/reserve-'A'/'B')\n");
             } else {
                 C2B_LOGS("[c2b] clv2 baits=0 (чистый fmt9-'A', без клоббера)\n");
+            }
+            e = getenv("C2B_A2S_VERSION");
+            if (e && e[0]) {
+                u32 ai;
+                for (ai = 0; e[ai] && ai < sizeof(g_a2s_ver) - 1; ai++)
+                    g_a2s_ver[ai] = e[ai];
+                g_a2s_ver[ai] = 0;
             }
         }
     }
@@ -11474,6 +11573,51 @@ static void test_cl(void)
                     }
                     CHECK(c2b_clv2_build_chalreply(ar, 32, 9, 0, 1) == 0,
                           "clv2: fmt9 крошечный буфер -> 0");
+                }
+                /* 41e-j: A2S 'I' трансформ — реальные байты CYBERSHOKE
+                 * (run 83 барьер: EDF + версия 1.41.8.8 -> тихий abort) */
+                {
+                    static const char *RI_HEX =
+                        "ffffffff491143533220355835207c203576352023323837205b42525d20e28094204359"
+                        "42455253484f4b452e4e45540064655f6d6972616765006373676f00436f756e7465722d"
+                        "537472696b65203200da02004000646c0001312e34312e382e3800b1766d070aee000000"
+                        "3001656d7074792c3576352c357673352c3578352c62742c63796265722c6379626572"
+                        "73686f6b652c64655f6d69726167652c64726f702c6475656c2c656e2c6700da020000"
+                        "00000000";
+                    u8 rin[512], rout2[1200];
+                    u32 rn2 = 0, rq;
+                    for (rq = 0; RI_HEX[2 * rq] && RI_HEX[2 * rq + 1]; rq++) {
+                        char c1 = RI_HEX[2 * rq], c2c = RI_HEX[2 * rq + 1];
+                        u8 hi = (u8)((c1 > '9') ? (c1 | 32) - 'a' + 10 : c1 - '0');
+                        u8 lo = (u8)((c2c > '9') ? (c2c | 32) - 'a' + 10 : c2c - '0');
+                        rin[rq] = (u8)((hi << 4) | lo);
+                    }
+                    rn2 = rq;
+                    al = c2b_a2s_transform_i(rin, rn2, rout2,
+                                             (u32)sizeof(rout2));
+                    CHECK(al > 0, "a2s: CYBERSHOKE 'I' распарсен");
+                    CHECK(rout2[4] == 'I', "a2s: 'I' сохранён");
+                    {
+                        u32 q2 = 6, w2, vs2, ve2, okv = 1;
+                        static const char vexp[] = "1.38.0.4";
+                        for (w2 = 0; w2 < 4; w2++) {
+                            while (q2 < al && rout2[q2] != 0) q2++;
+                            q2++;
+                        }
+                        CHECK(q2 + 2 <= al && rout2[q2] == 0xda &&
+                              rout2[q2 + 1] == 0x02, "a2s: appid=730 на месте");
+                        vs2 = q2 + 2 + 7;
+                        for (ve2 = 0; ve2 < 8; ve2++)
+                            if (rout2[vs2 + ve2] != (u8)vexp[ve2]) okv = 0;
+                        CHECK(okv && rout2[vs2 + 8] == 0,
+                              "a2s: версия=1.38.0.4 (бандл)");
+                        CHECK(vs2 + 9 == al, "a2s: EDF срезан (конец после версии)");
+                    }
+                    CHECK(c2b_a2s_transform_i(rin, rn2, rout2, 16) == 0,
+                          "a2s: крошечный cap -> 0");
+                    CHECK(c2b_a2s_transform_i(rin, 30, rout2,
+                                              (u32)sizeof(rout2)) == 0,
+                          "a2s: слишком короткий -> 0");
                 }
             }
         }

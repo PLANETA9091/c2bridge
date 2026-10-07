@@ -488,7 +488,21 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 
   MODES=""
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9"
+  # 41e-j: версия бандла для трансформа A2S 'I' в мосту (run 70/71 lessons:
+  # движок требует no-EDF serverinfo с appid=730 и СВОЕЙ версией, иначе
+  # тихий abort на INGAME->MAINMENU — run 83)
+  A2S_VER="1.38.0.4"
+  STEAM_INF=$(find "$GAME_DIR" -name steam.inf 2>/dev/null | head -1)
+  if [[ -n "$STEAM_INF" ]]; then
+    VINF=$(grep -aoE '^Version=[0-9.]+' "$STEAM_INF" | head -1 | cut -d= -f2)
+    if [[ -n "$VINF" ]]; then
+      A2S_VER="$VINF"
+      log "bridge A2S transform: using bundle version $A2S_VER (from $STEAM_INF)"
+    fi
+  else
+    log "WARNING: no steam.inf under $GAME_DIR - A2S transform uses default $A2S_VER"
+  fi
+  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER"
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"

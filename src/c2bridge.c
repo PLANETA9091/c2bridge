@@ -7426,11 +7426,13 @@ static void *c2b_poll_thread(void *arg)
     }
     if (g_clv2_baits) {
     /* CLV2 фаза 2 (C2B_CLV2_BAITS=1): ждём доставки 'A' (recvfrom-хук ставит
-     * phase=1), затем через 1.5с стреляем вторым ChallengeRequest — его reply
+     * phase=1) + ТРИ раунда INFO-PUSH (41e-m: движок сначала потребляет info —
+     * ферма run 72: 'i'-промпт стрелял ПОСЛЕ info, и движок отвечал 'j'
+     * через 0.13с), затем стреляем вторым ChallengeRequest — его reply
      * подменяется на 'i'-промпт (bait для 'j' движка). */
         int i;
         for (i = 0; i < 1200; i++) {              /* до 10 мин */
-            if (g_clv2_phase == 1 && i >= 3) {
+            if (g_clv2_phase == 1 && i >= 3 && g_ipush_left <= 7) {
                 u8 out2[512];
                 g_clv2_conn_id = (g_clv2_conn_id ^ 0x5eed0001u) | 1u;
                 (void)c2b_clv2_build_chalreq(out2);

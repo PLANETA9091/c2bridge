@@ -356,7 +356,7 @@ fi
 # (IP_TRANSPARENT bind на TIP:TPORT — валидация источника проходит).
 # owner-match (! --uid-owner 0) исключает самого релея (root) из DNAT.
 A2S_DNAT_SET=""
-if [[ $TRANSLATE -eq 1 && -n "${TARGET:-}" && -x "$(dirname "$0")/tools/a2s_relay.py" ]]; then
+if [[ $TRANSLATE -eq 1 && -n "${TARGET:-}" && -f "$(dirname "$0")/tools/a2s_relay.py" ]]; then
   A2S_TIP="${TARGET%%:*}"; A2S_TPORT="${TARGET##*:}"
   A2S_LIP=$(hostname -I 2>/dev/null | awk '{print $1}')
   A2S_RPORT=29115

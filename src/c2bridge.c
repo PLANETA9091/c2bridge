@@ -6141,6 +6141,29 @@ static u32  g_ticket_ok;         /* с ненулевым handle */
 static u32  g_ticket_len;        /* длина последнего тикета */
 static u8   g_ticket_buf[2048];  /* последний тикет (полный, до 2048Б) */
 
+/* ---------- 41f-f: GNS-СПЬЮ через ISteamNetworkingUtils ----------
+ * Run 99 (6492195): тикет добыт (slot 13, 252Б, наш steamid внутри), GNS-серт
+ * есть, SDR OK — но движок по-прежнему аборитит GNS-хендшейк с целью между
+ * ChallengeReply(0x21) и ConnectRequest(0x22) (retry с новым connection_id,
+ * 0x22 НИКОГДА не летит). +sdr_spew_level 7 spew не дал (конвар не路由ит в
+ * condebug-консоль). Решение: капчурим ISteamNetworkingUtils в FUv и
+ * САМИ ставим debug-callback: SetDebugOutputFunction(5 = Verbose, our_cb)
+ * — vt[1] в ISteamNetworkingUtils003/004 (vt[0]=GetTimestamp безобиден).
+ * ГНС начнёт спьюить ВСЕ решения стейт-машины (в т.ч. причину аборта
+ * ChallengeReply->ConnectRequest) прямо в наш лог. */
+static void *g_steamnetutils_obj;   /* ISteamNetworkingUtils*, FUv */
+static u32  g_steamnetutils_seen;
+
+static void c2b_gns_spew(i32 lvl, const char *msg)
+{
+    u32 n = 0;
+    if (!msg) return;
+    while (msg[n] && n < 4096u) n++;
+    C2B_LOGS("[c2b] GNS["); C2B_LOGN((u32)lvl); C2B_LOGS("] ");
+    C2B_LOGS(msg);
+    if (n && msg[n - 1] != '\n') C2B_LOGS("\n");
+}
+
 static i32 c2b_ver_pfx(const char *ver, const char *pfx)
 {
     u32 i = 0;
@@ -7121,6 +7144,44 @@ void *SteamInternal_FindOrCreateUserInterface(int user, const char *ver)
         g_steamuser_obj = r;
         g_steamuser_seen = 1;
         C2B_LOGS("[c2b] AUTH: SteamUser captured\n");
+    }
+    /* 41f-f: капчур ISteamNetworkingUtils + спью-callback (vt[1],
+     * SEGV-защита как в 41f-c; vt[0] = GetTimestamp — безобиден).
+     * В selftest-сборке probe-глобалы не существуют — только капчур. */
+    if (r && !g_steamnetutils_seen && c2b_ver_pfx(ver, "SteamNetworkingUtils")) {
+        g_steamnetutils_obj = r;
+        g_steamnetutils_seen = 1;
+        C2B_LOGS("[c2b] GNS: NetworkingUtils captured\n");
+#ifndef C2B_SELFTEST
+        {
+            struct c2b_sigaction sa2, old2;
+            u32 k2;
+            for (k2 = 0; k2 < sizeof(sa2); k2++) ((u8 *)&sa2)[k2] = 0;
+            for (k2 = 0; k2 < sizeof(old2); k2++) ((u8 *)&old2)[k2] = 0;
+            sa2.handler = (uptr)c2b_probe_segv;
+            sa2.flags = 4;
+            sigemptyset(sa2.mask);
+            if (sigaction(11, &sa2, &old2) == 0) {
+                for (k2 = 0; k2 < 2; k2++) {
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        ((void (*)(void *, i32, void *))
+                            (*(void ***)g_steamnetutils_obj)[k2])(
+                            g_steamnetutils_obj, 5, (void *)c2b_gns_spew);
+                        g_probe_active = 0;
+                        C2B_LOGS("[c2b] GNS: vt["); C2B_LOGN(k2);
+                        C2B_LOGS("] called (spew cb installed if setter)\n");
+                    } else {
+                        g_probe_active = 0;
+                        C2B_LOGS("[c2b] GNS: vt["); C2B_LOGN(k2);
+                        C2B_LOGS("] segv\n");
+                        break;
+                    }
+                }
+                sigaction(11, &old2, (void *)0);
+            }
+        }
+#endif  /* C2B_SELFTEST */
     }
     if (ver && c2b_gc_is_gcver(ver)) {
         C2B_LOGS("[c2b] GC req FindOrCreateUser rv="); C2B_LOGH((u32)(uptr)r);

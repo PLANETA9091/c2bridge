@@ -6360,18 +6360,15 @@ static void *c2b_dlopen_loaded_steamclient(void)
     return dlopen(g5_nm, C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
 }
 
-/* 41f-g5: применить спью(6)+конфиг к ОДНОЙ копии GNS (SEGV-защищённо).
- * КОНФИГ: k_ESteamNetworkingConfig_IP_AllowWithoutAuth (ключ 29) = 1,
- * DataType Int32=1, скоупы 0 И 1 (нумерация Global между версиями SDK
- * отличалась — ставим оба, вызовы безобидны). ГИПОТЕЗА барьера: GNS-клиент
- * аборитит direct-IP коннект между ChallengeReply(0x21) и ConnectRequest
- * (0x22) с end-причиной "Require auth" — тикет в GNS-коннект не привязан
- * (движок сам отминтил h=1 единожды, ретраи не перевязывают). Разрешаем
- * коннект без auth: 0x22 должен ПОЛЕТЕТЬ, реакция сервера = прогресс. */
+/* 41f-g5: применить спью(6) к ОДНОЙ копии GNS (SEGV-защищённо).
+ * 41f-g6: запись SetConfigValue(29)=1 УДАЛЕНА: runtime-верификация run 105
+ * показала, что ключ 29 в этом билде = SDRClient_ForceRelayCluster (String!).
+ * Запись Int32 туда отравила SDR-клиент: "Network config has no POPs" во
+ * ВСЕХ попытках (SDR-конфиг застрял в Attempting) — регрессия run 105.
+ * Настоящие индексы даёт проба c2b_g5_probe_configs (0..200). */
 static void c2b_g5_apply(void *u, void *flat_spew, void *flat_cfg,
                          const char *tag, u8 verbose)
 {
-    volatile i32 one = 1;
     if (!u) return;
     if (flat_spew) {
         g_probe_active = 1;
@@ -6386,43 +6383,62 @@ static void c2b_g5_apply(void *u, void *flat_spew, void *flat_cfg,
                            C2B_LOGS(" segv\n"); }
         }
     }
-    if (flat_cfg) {
-        g_probe_active = 1;
-        if (__sigsetjmp(g_probe_jb, 1) == 0) {
-            ((void (*)(void *, i32, i32, uptr, i32, const void *))flat_cfg)(
-                u, 29, 0, (uptr)0, 1, (const void *)&one);
-            ((void (*)(void *, i32, i32, uptr, i32, const void *))flat_cfg)(
-                u, 29, 1, (uptr)0, 1, (const void *)&one);
-            g_probe_active = 0;
-            if (verbose) { C2B_LOGS("[c2b] GNS: cfg IP_AllowWithoutAuth=1 ");
-                           C2B_LOGS(tag); C2B_LOGS(" OK\n"); }
-        } else {
-            g_probe_active = 0;
-            if (verbose) { C2B_LOGS("[c2b] GNS: cfg "); C2B_LOGS(tag);
-                           C2B_LOGS(" segv\n"); }
-        }
-    }
 }
 
-/* 41f-g5: верификация ключа 29 по имени (GetConfigValueInfo, если экспорт
- * есть) — имя пишем в лог, сверяем с "IP_AllowWithoutAuth" по артефакту. */
-static void c2b_g5_verify_key29(void *u)
+/* 41f-g6: RUNTIME-ПРОБА таблицы конфигов 0..200 через GetConfigValueInfo
+ * (run 105: имя ключа 29 получили из рантайма — индексы билда отличаются от
+ * публичного SDK). Лог: name(type). Попутно КАЖДОМУ LogLevel_* ставим 6
+ * (Debug/Verbose) — спью run 105 показал только Warning'и, пер-топик уровни
+ * гейтят остальное; полный спью покажет end-причину аборта 0x21->0x22. */
+/* 41f-g6: локальный префикс-чек (c2b_sthas объявлен ниже по файлу) */
+static u8 c2b_g5_pfx(const char *s, const char *pfx)
+{
+    u32 i = 0;
+    if (!s) return 0;
+    while (pfx[i]) {
+        if (s[i] != pfx[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+static void c2b_g5_probe_configs(void *u, void *flat_cfg)
 {
     void *nfo = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_GetConfigValueInfo");
-    i32 dt = 0, sc = 0;
-    const char *nm;
+    i32 k;
     if (!nfo || !u) return;
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        nm = ((const char * (*)(void *, i32, void *, void *))nfo)(u, 29, &dt, &sc);
+    for (k = 0; k <= 200; k++) {
+        i32 dt = 0, sc = 0;
+        const char *nm;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) != 0) {
+            g_probe_active = 0;
+            continue;
+        }
+        nm = ((const char * (*)(void *, i32, void *, void *))nfo)(u, k, &dt, &sc);
         g_probe_active = 0;
-        C2B_LOGS("[c2b] GNS: cfgkey29 name=");
-        if (nm) { char nb[64]; u32 q = 0; while (nm[q] && q < 60) { nb[q] = nm[q]; q++; } nb[q] = 0; C2B_LOGS(nb); }
-        else C2B_LOGS("(null)");
+        if (!nm || !nm[0]) continue;
+        C2B_LOGS("[c2b] GNS cfg "); C2B_LOGN((u32)k); C2B_LOGS("= ");
+        {   char nb[64]; u32 q = 0;
+            while (nm[q] && q < 60) { nb[q] = nm[q]; q++; }
+            nb[q] = 0; C2B_LOGS(nb);
+        }
         C2B_LOGS(" dt="); C2B_LOGN((u32)dt); C2B_LOGS("\n");
-    } else {
-        g_probe_active = 0;
-        C2B_LOGS("[c2b] GNS: cfgkey29 name segv\n");
+        /* LogLevel_* -> уровень 6 глобально (полный спью стейт-машины) */
+        if (flat_cfg && dt == 1 && c2b_g5_pfx(nm, "LogLevel_")) {
+            i32 six = 6;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                ((void (*)(void *, i32, i32, uptr, i32, const void *))flat_cfg)(
+                    u, k, 1, (uptr)0, 1, (const void *)&six);
+                ((void (*)(void *, i32, i32, uptr, i32, const void *))flat_cfg)(
+                    u, k, 0, (uptr)0, 1, (const void *)&six);
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] GNS cfg LogLevel set 6 ok\n");
+            } else {
+                g_probe_active = 0;
+            }
+        }
     }
 }
 
@@ -6507,7 +6523,7 @@ static void c2b_gns_spew_install(void)
             if (flat || cfg) {
                 C2B_LOGS("[c2b] GNS: copy#1 apply flat="); C2B_LOGN(flat != 0);
                 C2B_LOGS("cfg="); C2B_LOGN(cfg != 0); C2B_LOGS("\n");
-                c2b_g5_verify_key29(u);
+                c2b_g5_probe_configs(u, cfg);
                 c2b_g5_apply(u, flat, cfg, "copy#1", 1);
                 c2b_g5_resolve_copy2();
                 if (g_gns_u[1])

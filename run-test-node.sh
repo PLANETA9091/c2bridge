@@ -88,6 +88,18 @@ finish() { # $1 exit code, $2 verdict
     log "A2S relay torn down (DNAT removed)"
   fi
   for f in "$NODE_HOME/tmp"/c2b-*.log; do [[ -f "$f" ]] && cp -f "$f" "$RUNDIR/"; done 2>/dev/null
+  # 41f: tcpdump teardown + summary (топ-разговоров по каждому pcap)
+  sudo -n pkill -f "tcpdump -i any" 2>/dev/null || true
+  for p in "$RUNDIR"/pcap.a*.pcap; do
+    [[ -f "$p" ]] || continue
+    sudo -n chmod 644 "$p" 2>/dev/null || true
+    if command -v tcpdump >/dev/null 2>&1; then
+      sudo -n tcpdump -nn -tttt -r "$p" 2>/dev/null \
+        | awk '{print $3, $4, $5}' | sort | uniq -c | sort -rn | head -30 \
+        > "${p%.pcap}.summary.txt" 2>/dev/null || true
+      log "pcap summary: ${p##*/} ($(wc -l < "${p%.pcap}.summary.txt" 2>/dev/null || echo 0) flows)"
+    fi
+  done
   save_conlog
   exit "$1"
 }
@@ -663,6 +675,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
     >"$OUT" 2>&1 &
   ENGINE_PID=$!
+  # 41f: GNS-видимость — Valve-код ходит мимо libc-хуков (runs 85/86), поэтому
+  # 'k'-connect / ConnectRequest невидимы в CL-трейсе. tcpdump отвечает на
+  # вопрос, уходит ли connect-трафик на провод ВООБЩЕ (цель / SDR-релеи /
+  # CM) во время попытки. pcap + summary (топ-разговоров) -> RUNDIR (артефакт).
+  TCPD_LOG="$RUNDIR/pcap.a${ATTEMPT}.pcap"
+  TCPD_PID=""
+  if command -v tcpdump >/dev/null 2>&1; then
+    sudo -n timeout $((DURATION + 60)) tcpdump -i any -U -s 128 \
+      -w "$TCPD_LOG" 'udp and not port 53' >/dev/null 2>&1 &
+    TCPD_PID=$!
+    log "attempt $ATTEMPT: tcpdump started (pid $TCPD_PID, cap $((DURATION+60))s)"
+  else
+    log "attempt $ATTEMPT: tcpdump NOT available (GNS wire visibility skipped)"
+  fi
   log "attempt $ATTEMPT: client launched (launch pid $ENGINE_PID), waiting up to ${DURATION}s for menu"
 
   # wait for the main menu (modals may cover it — steam://connect still works)

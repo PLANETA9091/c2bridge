@@ -6104,6 +6104,109 @@ static u8 g_a2s_peer[16];        /* sockaddr, куда движок послал
 static socklen_t g_a2s_peerlen;
 static u32 g_a2s_seen_t;         /* 'T' замечен — peer валиден */
 
+/* ---------- 41f-a: AUTH-TICKET CAPTURE (SteamUser022) ----------
+ * Run 62 lesson: 'k'-connect требует Steam auth session ticket. Run 93:
+ * движок потребляет 'A'/info/'i'/'j'/reserve/'B' но 'k' НЕ СТРОИТ и уходит
+ * в LanSearch; в libc-хуках тикет-путь не виден. Фаза B (б): капчурим
+ * ISteamUser* в FUv-интерцепторе (SteamUser022 заведомо проходит через
+ * SteamInternal_FindOrCreateUserInterface) и ВЫЗЫВАЕМ GetAuthSessionTicket
+ * сами — доказательство, что тикет-путь жив из процесса движка, плюс
+ * капчуренный тикет = ингредиент для S2 ConnectRequest (0x22).
+ * Модель vtable ISteamUser (v020-022): 0=GetHSteamUser 1=BLoggedOn
+ * 2=GetSteamID(u64 в RAX) ... 11=GetAuthSessionTicket(void*,int,u32*,
+ * const SteamNetworkingIdentity*). В x86-64 SysV лишний регистровый арг
+ * безвреден, поэтому 4-арг вызов безопасен и для 3-арг-имплантаций.
+ * SANITY перед тикетом: GetSteamID обязан вернуть 0x01100001xxxxxxxx
+ * (universe/public + account) — иначе индекс-модель неверна и тикет НЕ
+ * зовём (защита от вызова мусора). */
+static void *g_steamuser_obj;    /* ISteamUser*, капчурится в FUv */
+static u32  g_steamuser_seen;    /* капчур случился */
+static u32  g_ticket_calls;      /* вызовов GetAuthSessionTicket */
+static u32  g_ticket_ok;         /* с ненулевым handle */
+static u32  g_ticket_len;        /* длина последнего тикета */
+static u8   g_ticket_buf[2048];  /* последний тикет (полный, до 2048Б) */
+
+static i32 c2b_ver_pfx(const char *ver, const char *pfx)
+{
+    u32 i = 0;
+    if (!ver) return 0;
+    while (pfx[i]) {
+        if (ver[i] != pfx[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+static void *c2b_auth_thread(void *arg)
+{
+    u32 i, att;
+    (void)arg;
+    /* ждём капчур до 150с (движок грузит steam_api уже после меню-обвяза) */
+    for (i = 0; i < 150 && !g_steamuser_obj; i++) usleep(1000000);
+    if (!g_steamuser_obj) {
+        C2B_LOGS("[c2b] AUTH: SteamUser never appeared\n");
+        return 0;
+    }
+    void **vt = *(void ***)g_steamuser_obj;
+    u32 sane = 1;
+    for (i = 0; i < 13; i++)
+        if (!vt[i]) { sane = 0; break; }
+    C2B_LOGS("[c2b] AUTH: SteamUser ptr="); C2B_LOGH((u32)(uptr)g_steamuser_obj);
+    C2B_LOGS("vt sane="); C2B_LOGN(sane); C2B_LOGS("\n");
+    if (!sane) return 0;
+    {   /* BLoggedOn (vt[1]) */
+        i32 logged = ((i32 (*)(void *))vt[1])(g_steamuser_obj);
+        C2B_LOGS("[c2b] AUTH: BLoggedOn="); C2B_LOGN((u32)(logged != 0));
+        C2B_LOGS("\n");
+    }
+    {   /* GetSteamID (vt[2], u64 в RAX) — sanity модели vtable */
+        u64 sid = ((u64 (*)(void *))vt[2])(g_steamuser_obj);
+        C2B_LOGS("[c2b] AUTH: GetSteamID=0x"); C2B_LOGH((u32)(sid >> 32));
+        C2B_LOGH((u32)sid); C2B_LOGS("\n");
+        if ((sid >> 56) != 0x01) {
+            C2B_LOGS("[c2b] AUTH: steamid implausible — vtable model wrong, ticket skipped\n");
+            return 0;
+        }
+    }
+    /* GetAuthSessionTicket: до 6 попыток каждые 10с (тикеты можно запрашивать
+     * многократно; лимит движка ~200, мы в 2 порядках ниже). SteamNetworkingIdentity
+     * (v022, 4-арг): заполняем {type=3 (SteamID), steamid=self} — если импл
+     * разыменовывает identity БЕЗ NULL-чека, NULL уронил бы движок; заполненная
+     * 16Б-структура читается безопасно (type u32 @0 + u64 @8). Для 3-арг
+     * имплантаций 4-й арг игнорируется регистром SysV. */
+    {   u64 sid_self = ((u64 (*)(void *))vt[2])(g_steamuser_obj);
+        u8 ident[16];
+        u32 t4;
+        for (t4 = 0; t4 < 16; t4++) ident[t4] = 0;
+        ident[0] = 3;                                  /* k_ESteamNetworkingIdentityType_SteamID */
+        for (t4 = 0; t4 < 8; t4++) ident[8 + t4] = (u8)(sid_self >> (8 * t4));
+        for (att = 0; att < 6; att++) {
+            u32 tlen = 0, h;
+            if (att) usleep(10000000);
+            tlen = 0;
+            h = ((u32 (*)(void *, void *, i32, u32 *, void *))vt[11])(
+                g_steamuser_obj, g_ticket_buf, (i32)sizeof(g_ticket_buf), &tlen,
+                ident);
+            g_ticket_calls++;
+            C2B_LOGS("[c2b] AUTH: GetAuthSessionTicket h="); C2B_LOGN(h);
+            C2B_LOGS(" len="); C2B_LOGN(tlen);
+            if (h && tlen && tlen <= sizeof(g_ticket_buf)) {
+                char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
+                g_ticket_ok++;
+                g_ticket_len = tlen;
+                c2b_cl_hexline(g_ticket_buf, tlen, ln, (u32)sizeof(ln));
+                C2B_LOGS(" ticket "); C2B_LOGS(ln); C2B_LOGS("\n");
+            } else {
+                C2B_LOGS("\n");
+            }
+        }
+    }
+    C2B_LOGS("[c2b] AUTH: done calls="); C2B_LOGN(g_ticket_calls);
+    C2B_LOGS(" ok="); C2B_LOGN(g_ticket_ok);
+    C2B_LOGS("\n");
+    return 0;
+}
+
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
 static u32 c2b_clv2_rand32(void)
 {
@@ -6870,6 +6973,12 @@ void *SteamInternal_FindOrCreateUserInterface(int user, const char *ver)
         return 0;
     }
     void *r = ((void *(*)(int, const char *))g_clp_fouif)(user, ver);
+    /* 41f-a: капчур ISteamUser* (SteamUser0/22) для auth-воркера */
+    if (r && !g_steamuser_seen && c2b_ver_pfx(ver, "SteamUser0")) {
+        g_steamuser_obj = r;
+        g_steamuser_seen = 1;
+        C2B_LOGS("[c2b] AUTH: SteamUser captured\n");
+    }
     if (ver && c2b_gc_is_gcver(ver)) {
         C2B_LOGS("[c2b] GC req FindOrCreateUser rv="); C2B_LOGH((u32)(uptr)r);
         C2B_LOGS("\n");
@@ -7662,6 +7771,13 @@ i32 c2b_main(void)
                 g_a2s_ver[ai] = 0;
             }
         }
+    }
+    /* 41f-a: auth-воркер (ждёт FUv-капчур SteamUser022, зовёт GetAuthSessionTicket).
+     * Стартуем ДО try_install в обоих путях (ARMED и poll) — поток сам ждёт
+     * капчур до 150с и безопасен при его отсутствии. */
+    {
+        void *auth_tid = 0;
+        pthread_create(&auth_tid, 0, c2b_auth_thread, 0);
     }
     i32 r = c2b_try_install();
     if (r == 0) {
@@ -11587,6 +11703,12 @@ static void test_cl(void)
     /* 41e-c: CL v2 phase A — S2 GNS challenge-обмен (чистые функции, без сети) */
     {
         u8 req[512];
+        /* 41f-a: c2b_ver_pfx — префикс-чек версий интерфейсов (SteamUser022) */
+        CHECK(c2b_ver_pfx("SteamUser022", "SteamUser0") == 1, "auth: SteamUser022 матчит префикс");
+        CHECK(c2b_ver_pfx("SteamUser023", "SteamUser0") == 1, "auth: SteamUser023 матчит префикс");
+        CHECK(c2b_ver_pfx("SteamFriends017", "SteamUser0") == 0, "auth: SteamFriends не матчит");
+        CHECK(c2b_ver_pfx("SteamUser", "SteamUser0") == 0, "auth: короткая версия не матчит");
+        CHECK(c2b_ver_pfx(0, "SteamUser0") == 0, "auth: NULL версия безопасна");
         u32 rl = c2b_clv2_build_chalreq(req);
         CHECK(rl == 512, "clv2: ChallengeRequest = 512 байт (GNS min padded)");
         CHECK(req[0] == 0x20, "clv2: msgid 0x20");

@@ -6304,10 +6304,67 @@ static u32 g_auth_vtidx = 13;
 static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
 #endif  /* C2B_SELFTEST */
 
+#ifndef C2B_SELFTEST
+/* 41f-g: установка спью БЕЗ FUv — движок берёт NetworkingUtils через прямой
+ * C-экспорт (run 100: FUv не увидел НИ ОДНОГО запроса SteamNetworkingUtils*).
+ * Стоим сами: dlsym SteamAPI_SteamNetworkingUtils_v004/v003 или
+ * SteamNetworkingUtils_LibV4 (стендэлон-аксессор, вернёт синглтон), затем
+ * SEGV-защищённо vt[1] = SetDebugOutputFunction(5, cb). */
+static void c2b_gns_spew_install(void)
+{
+    static const char *syms[] = { "SteamAPI_SteamNetworkingUtils_v004",
+                                  "SteamAPI_SteamNetworkingUtils_v003",
+                                  "SteamAPI_SteamNetworkingUtils_v002",
+                                  "SteamNetworkingUtils_LibV4", 0 };
+    void *u = 0;
+    u32 k;
+    for (k = 0; syms[k] && !u; k++) {
+        void *fn = dlsym((void *)0, syms[k]);   /* RTLD_DEFAULT */
+        if (fn) u = ((void *(*)(void))fn)();
+        if (u) {
+            C2B_LOGS("[c2b] GNS: utils via "); C2B_LOGS(syms[k]);
+            C2B_LOGS(" ptr="); C2B_LOGH((u32)(uptr)u); C2B_LOGS("\n");
+        }
+    }
+    if (!u && g_steamnetutils_obj) u = g_steamnetutils_obj;   /* FUv-фоллбэк */
+    if (!u) {
+        C2B_LOGS("[c2b] GNS: utils iface not found — spew not installed\n");
+        return;
+    }
+    {
+        struct c2b_sigaction sa3, old3;
+        u32 k3;
+        for (k3 = 0; k3 < sizeof(sa3); k3++) ((u8 *)&sa3)[k3] = 0;
+        for (k3 = 0; k3 < sizeof(old3); k3++) ((u8 *)&old3)[k3] = 0;
+        sa3.handler = (uptr)c2b_probe_segv;
+        sa3.flags = 4;
+        sigemptyset(sa3.mask);
+        if (sigaction(11, &sa3, &old3) == 0) {
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                ((void (*)(void *, i32, void *))(*(void ***)u)[1])(u, 5,
+                                                    (void *)c2b_gns_spew);
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] GNS: SetDebugOutputFunction(5,cb) installed\n");
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] GNS: vt[1] segv — spew not installed\n");
+            }
+            sigaction(11, &old3, (void *)0);
+        }
+    }
+}
+#else
+static void c2b_gns_spew_install(void) { }   /* selftest: стаб */
+#endif  /* C2B_SELFTEST */
+
 static void *c2b_auth_thread(void *arg)
 {
     u32 i, att;
     (void)arg;
+#ifndef C2B_SELFTEST
+    c2b_gns_spew_install();       /* 41f-g: спью до всего остального */
+#endif
     /* ждём капчур до 150с (движок грузит steam_api уже после меню-обвяза) */
     for (i = 0; i < 150 && !g_steamuser_obj; i++) usleep(1000000);
     if (!g_steamuser_obj) {

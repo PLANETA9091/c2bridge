@@ -517,7 +517,7 @@ CONNECTED=0
 # GetVoiceOptimalSampleRate; 11 = DecompressVoice — тот самый memcpy-SEGV run 96)
 # GetAuthSessionTicket = 13. C2B_AUTH_VTIDX из env всё ещё перекрывает.
 AUTH_VTIDX="${C2B_AUTH_VTIDX:-13}"
-if [[ -z "$C2B_AUTH_VTIDX" ]] && command -v objdump >/dev/null 2>&1; then
+if [[ -z "${C2B_AUTH_VTIDX:-}" ]] && command -v objdump >/dev/null 2>&1; then
   API_SO=$(find "$GAME_DIR" /home/runner/.local/share/Steam -maxdepth 6 \
              -name 'libsteam_api.so' -o -maxdepth 6 -name 'steam_api.so' 2>/dev/null \
              | head -1)

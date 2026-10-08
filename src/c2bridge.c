@@ -6347,31 +6347,63 @@ static void c2b_gns_spew_install(void)
     /* 41f-g2: сперва C-ABI flat-экспорт (run 102: vt[1] segv — vtable билда
      * отличается от SDK-энумерации). Flat-функция не зависит от vtable:
      * SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction(u, level, fn). */
+    /* run 103: flat setter standalone-либы встал, но спью пуст — у GNS-билда
+     * движка может быть ВТОРАЯ (внутренняя) копия GNS в steamclient.so.
+     * Ставим спью (уровень 6=Debug, ловит всё) в КАЖДУЮ найденную копию. */
     {
-        void *flat = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
-        if (flat) {
-            struct c2b_sigaction saf, oldf;
-            u32 kf;
-            for (kf = 0; kf < sizeof(saf); kf++) ((u8 *)&saf)[kf] = 0;
-            for (kf = 0; kf < sizeof(oldf); kf++) ((u8 *)&oldf)[kf] = 0;
-            saf.handler = (uptr)c2b_probe_segv;
-            saf.flags = 4;
-            sigemptyset(saf.mask);
-            if (sigaction(11, &saf, &oldf) == 0) {
+        struct c2b_sigaction saf, oldf;
+        u32 kf;
+        for (kf = 0; kf < sizeof(saf); kf++) ((u8 *)&saf)[kf] = 0;
+        for (kf = 0; kf < sizeof(oldf); kf++) ((u8 *)&oldf)[kf] = 0;
+        saf.handler = (uptr)c2b_probe_segv;
+        saf.flags = 4;
+        sigemptyset(saf.mask);
+        if (sigaction(11, &saf, &oldf) == 0) {
+            /* копия 1: тот объект, что нашли (standalone или FUv) */
+            void *flat = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
+            if (flat) {
                 g_probe_active = 1;
                 if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                    ((void (*)(void *, i32, void *))flat)(u, 5, (void *)c2b_gns_spew);
+                    ((void (*)(void *, i32, void *))flat)(u, 6, (void *)c2b_gns_spew);
                     g_probe_active = 0;
-                    C2B_LOGS("[c2b] GNS: flat SetDebugOutputFunction(5,cb) OK\n");
+                    C2B_LOGS("[c2b] GNS: flat spew(6) copy#1 OK\n");
                 } else {
                     g_probe_active = 0;
-                    C2B_LOGS("[c2b] GNS: flat setter segv\n");
+                    C2B_LOGS("[c2b] GNS: flat copy#1 segv\n");
                 }
-                sigaction(11, &oldf, (void *)0);
             }
+            /* копия 2: внутренний GNS steamclient.so (если есть и это ДРУГОЙ
+             * экспорт — RTLD_DEFAULT уже отдал первый, берём по хэндлу) */
+            {
+                void *sch = dlopen("steamclient.so", C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+                if (sch) {
+                    void *flat2 = dlsym(sch, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
+                    void *acc2 = dlsym(sch, "SteamNetworkingUtils_LibV4");
+                    if (flat2 && acc2) {
+                        void *u2 = ((void *(*)(void))acc2)();
+                        if (u2 && u2 != u) {
+                            g_probe_active = 1;
+                            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                                ((void (*)(void *, i32, void *))flat2)(u2, 6, (void *)c2b_gns_spew);
+                                g_probe_active = 0;
+                                C2B_LOGS("[c2b] GNS: flat spew(6) copy#2 (steamclient) OK\n");
+                            } else {
+                                g_probe_active = 0;
+                                C2B_LOGS("[c2b] GNS: flat copy#2 segv\n");
+                            }
+                        } else {
+                            C2B_LOGS("[c2b] GNS: copy#2 same singleton or null\n");
+                        }
+                    } else {
+                        C2B_LOGS("[c2b] GNS: steamclient.so has no flat networking exports\n");
+                    }
+                } else {
+                    C2B_LOGS("[c2b] GNS: steamclient.so not dlopen-able\n");
+                }
+            }
+            sigaction(11, &oldf, (void *)0);
             return;
         }
-        C2B_LOGS("[c2b] GNS: no flat export — fallback to vtable\n");
     }
     {
         struct c2b_sigaction sa3, old3;

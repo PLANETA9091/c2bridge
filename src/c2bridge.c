@@ -6095,6 +6095,16 @@ static u32 g_clv2_baits;         /* C2B_CLV2_BAITS=1: фазы 2/4/6 ('i'/reserv
                                   * пушами всегда держит consume_gap) */
 static char g_a2s_ver[24] = "1.38.0.4"; /* C2B_A2S_VERSION — версия бандла */
 static u32 g_clv2_bhex;          /* C2B_CLV2_BHEX: хвост 'b' 0=AAAAAAAA 1=challenge 2=qc_val */
+/* 41f-d: длина ПОСЛЕДНЕГО 'A'-пейлоада, отданного движку через recvfrom-хук.
+ * RE 'B'-хендлера (0x25a8b0, engine 34a96ae): чеки B[0x1c]==snap[0x1c]∈{1..3},
+ * B[0x18]==0&&snap[0x18]==0, B.u64[0x0c]==snap.u64[0x0c], B.u32[0x14]==snap[0x14]
+ * — это ЗАГОЛОВОК netpacket (netadr from@0x00 + метаданные 0x0c..0x1f), который
+ * движок строит сам из реального recv. Единственное управляемое отличие между
+ * датаграммами 'A' и 'B' — РАЗМЕР (recvfrom return): 'A' шёл len=59/40, 'B'
+ * возвращался len=14 → u64@0x0c (скорее всего size) не сходился → молчаливый
+ * фейл. Фикс: паддить 'B' нулями до длины последнего 'A' (хвост битов парсер
+ * не читает). */
+static u32 g_clv2_last_A_len;
 /* 41e-m: INFO-PUSH — ферма пушит 'I'-блоб в сокеты движка UNSOLICITED и
  * движок ЕГО ПОТРЕБЛЯЕТ (run 72: CL dn #f4-8 «info» = ACK в консоли +
  * прогресс флоу). Движок сам A2S НЕ шлёт (ни в ферме, ни в мосту),
@@ -6813,6 +6823,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             *addrlen = g_clv2_dstlen;
             g_ipush_last_ms = now_ms;
             g_ipush_left--;
+            if (blob == g_ipush_abuf) g_clv2_last_A_len = blen; /* 41f-d */
             C2B_LOGS("[c2b] ");
             C2B_LOGS(blob == g_ipush_abuf ? "A pushed to engine (left=" :
                                             "INFO pushed to engine (left=");
@@ -6860,8 +6871,19 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                         }
                         C2B_LOGS("[c2b] CLV2 phase6: ChallengeReply -> 'B' accept hex=");
                         C2B_LOGN(hx);
-                        C2B_LOGS("\n");
-                        return 14;
+                        /* 41f-d: паддим 'B' нулями до длины последнего 'A',
+                         * чтобы метаданные размера в netpacket-заголовке
+                         * совпали со снапшотом (эхо-чеки u64@0x0c/u32@0x14). */
+                        {
+                            u32 pl = g_clv2_last_A_len;
+                            u32 i6;
+                            if (pl < 14) pl = 14;
+                            if (pl > (u32)len) pl = (u32)len;
+                            for (i6 = 14; i6 < pl; i6++) q[i6] = 0;
+                            C2B_LOGS(" pad="); C2B_LOGN(pl);
+                            C2B_LOGS(" lastA="); C2B_LOGN(g_clv2_last_A_len);
+                            return (ssize_t)pl;
+                        }
                     }
                     return r;
                 }
@@ -6886,6 +6908,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                         q[20] = 'r'; q[21] = 'e'; q[22] = 's'; q[23] = 'e';
                         q[24] = 'r'; q[25] = 'v'; q[26] = 'e'; q[27] = 0;
                         for (i3 = 28; i3 < 40; i3++) q[i3] = 0;
+                        g_clv2_last_A_len = 40;      /* 41f-d: 'B' паддим до этого */
                         g_clv2_phase = 5;
                         C2B_LOGS("[c2b] CLV2 phase4: ChallengeReply -> RESERVE-'A' (OnReserveAccepted bait)\n");
                         return 40;
@@ -6912,6 +6935,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 rl = c2b_clv2_build_chalreply(q, (u32)len, g_clv2_fmt,
                                               g_clv2_qc_val, g_clv2_ch32);
                 if (!rl) return r;                 /* не хватило буфера — отдаём как есть */
+                g_clv2_last_A_len = rl;            /* 41f-d: трек длины для 'B'-пада */
                 C2B_LOGS("[c2b] CLV2 S2 ChallengeReply #");
                 C2B_LOGN(g_clv2_got_ch);
                 C2B_LOGS(" ch64="); C2B_LOGH((u32)(ch >> 32)); C2B_LOGH((u32)ch);

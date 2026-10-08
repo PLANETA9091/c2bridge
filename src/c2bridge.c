@@ -6344,6 +6344,35 @@ static void c2b_gns_spew_install(void)
         C2B_LOGS("[c2b] GNS: utils iface not found after retries\n");
         return;
     }
+    /* 41f-g2: сперва C-ABI flat-экспорт (run 102: vt[1] segv — vtable билда
+     * отличается от SDK-энумерации). Flat-функция не зависит от vtable:
+     * SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction(u, level, fn). */
+    {
+        void *flat = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
+        if (flat) {
+            struct c2b_sigaction saf, oldf;
+            u32 kf;
+            for (kf = 0; kf < sizeof(saf); kf++) ((u8 *)&saf)[kf] = 0;
+            for (kf = 0; kf < sizeof(oldf); kf++) ((u8 *)&oldf)[kf] = 0;
+            saf.handler = (uptr)c2b_probe_segv;
+            saf.flags = 4;
+            sigemptyset(saf.mask);
+            if (sigaction(11, &saf, &oldf) == 0) {
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    ((void (*)(void *, i32, void *))flat)(u, 5, (void *)c2b_gns_spew);
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] GNS: flat SetDebugOutputFunction(5,cb) OK\n");
+                } else {
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] GNS: flat setter segv\n");
+                }
+                sigaction(11, &oldf, (void *)0);
+            }
+            return;
+        }
+        C2B_LOGS("[c2b] GNS: no flat export — fallback to vtable\n");
+    }
     {
         struct c2b_sigaction sa3, old3;
         u32 k3;

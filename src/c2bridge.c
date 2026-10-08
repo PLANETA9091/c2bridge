@@ -6310,6 +6310,152 @@ static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
  * Стоим сами: dlsym SteamAPI_SteamNetworkingUtils_v004/v003 или
  * SteamNetworkingUtils_LibV4 (стендэлон-аксессор, вернёт синглтон), затем
  * SEGV-защищённо vt[1] = SetDebugOutputFunction(5, cb). */
+/* 41f-g5: состояние найденных GNS-копий (инсталл + пере-арм) */
+static void *g_gns_u[2];        /* utils-объекты копий (0=standalone/FUv, 1=steamclient) */
+static void *g_gns_flat[2];     /* flat SetDebugOutputFunction на копию */
+static void *g_gns_cfg[2];      /* flat SetConfigValue на копию */
+static u8    g_gns_u2_done;     /* копия#2 разрешена (найдена или совпадает с #1) */
+
+/* 41f-g5: dl_iterate_phdr -> ТОЧНОЕ имя уже загруженного steamclient.so.
+ * Run 104: bare dlopen("steamclient.so") не взял — либа вне путей поиска.
+ * Имя из link_map (каким его загрузил steam_api — обычно полный путь)
+ * годится как ключ dlopen: загруженная копия НЕ перезагружается. */
+struct c2b_g5_phdr {
+    uptr        dlpi_addr;
+    const char *dlpi_name;
+    const void *dlpi_phdr;
+    u16         dlpi_phnum;
+};
+struct c2b_g5_ctx { char *out; u32 cap; u8 found; };
+
+static i32 c2b_g5_phdr_cb(void *info_v, void *size_v, void *data_v)
+{
+    struct c2b_g5_phdr *pi = (struct c2b_g5_phdr *)info_v;
+    struct c2b_g5_ctx *cx = (struct c2b_g5_ctx *)data_v;
+    const char *nm, *sfx = "steamclient.so";
+    u32 nl, sl = 0, j, q;
+    (void)size_v;
+    if (!pi || !pi->dlpi_name) return 0;
+    nm = pi->dlpi_name;
+    nl = 0; while (nm[nl]) nl++;
+    while (sfx[sl]) sl++;
+    if (nl < sl) return 0;
+    for (j = 0; j < sl && nm[nl - sl + j] == sfx[j]; j++) {}
+    if (j != sl) return 0;
+    for (q = 0; nm[q] && q < cx->cap - 1; q++) cx->out[q] = nm[q];
+    cx->out[q] = 0;
+    cx->found = 1;
+    return 1;
+}
+
+static void *c2b_dlopen_loaded_steamclient(void)
+{
+    static char g5_nm[512];
+    struct c2b_g5_ctx cx;
+    cx.out = g5_nm; cx.cap = (u32)sizeof(g5_nm); cx.found = 0;
+    g5_nm[0] = 0;
+    dl_iterate_phdr(c2b_g5_phdr_cb, &cx);
+    if (!cx.found) return (void *)0;
+    C2B_LOGS("[c2b] GNS: phdr steamclient path="); C2B_LOGS(g5_nm); C2B_LOGS("\n");
+    return dlopen(g5_nm, C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+}
+
+/* 41f-g5: применить спью(6)+конфиг к ОДНОЙ копии GNS (SEGV-защищённо).
+ * КОНФИГ: k_ESteamNetworkingConfig_IP_AllowWithoutAuth (ключ 29) = 1,
+ * DataType Int32=1, скоупы 0 И 1 (нумерация Global между версиями SDK
+ * отличалась — ставим оба, вызовы безобидны). ГИПОТЕЗА барьера: GNS-клиент
+ * аборитит direct-IP коннект между ChallengeReply(0x21) и ConnectRequest
+ * (0x22) с end-причиной "Require auth" — тикет в GNS-коннект не привязан
+ * (движок сам отминтил h=1 единожды, ретраи не перевязывают). Разрешаем
+ * коннект без auth: 0x22 должен ПОЛЕТЕТЬ, реакция сервера = прогресс. */
+static void c2b_g5_apply(void *u, void *flat_spew, void *flat_cfg,
+                         const char *tag, u8 verbose)
+{
+    volatile i32 one = 1;
+    if (!u) return;
+    if (flat_spew) {
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            ((void (*)(void *, i32, void *))flat_spew)(u, 6, (void *)c2b_gns_spew);
+            g_probe_active = 0;
+            if (verbose) { C2B_LOGS("[c2b] GNS: spew(6) "); C2B_LOGS(tag);
+                           C2B_LOGS(" OK\n"); }
+        } else {
+            g_probe_active = 0;
+            if (verbose) { C2B_LOGS("[c2b] GNS: spew "); C2B_LOGS(tag);
+                           C2B_LOGS(" segv\n"); }
+        }
+    }
+    if (flat_cfg) {
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            ((void (*)(void *, i32, i32, uptr, i32, const void *))flat_cfg)(
+                u, 29, 0, (uptr)0, 1, (const void *)&one);
+            ((void (*)(void *, i32, i32, uptr, i32, const void *))flat_cfg)(
+                u, 29, 1, (uptr)0, 1, (const void *)&one);
+            g_probe_active = 0;
+            if (verbose) { C2B_LOGS("[c2b] GNS: cfg IP_AllowWithoutAuth=1 ");
+                           C2B_LOGS(tag); C2B_LOGS(" OK\n"); }
+        } else {
+            g_probe_active = 0;
+            if (verbose) { C2B_LOGS("[c2b] GNS: cfg "); C2B_LOGS(tag);
+                           C2B_LOGS(" segv\n"); }
+        }
+    }
+}
+
+/* 41f-g5: верификация ключа 29 по имени (GetConfigValueInfo, если экспорт
+ * есть) — имя пишем в лог, сверяем с "IP_AllowWithoutAuth" по артефакту. */
+static void c2b_g5_verify_key29(void *u)
+{
+    void *nfo = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_GetConfigValueInfo");
+    i32 dt = 0, sc = 0;
+    const char *nm;
+    if (!nfo || !u) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        nm = ((const char * (*)(void *, i32, void *, void *))nfo)(u, 29, &dt, &sc);
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] GNS: cfgkey29 name=");
+        if (nm) { char nb[64]; u32 q = 0; while (nm[q] && q < 60) { nb[q] = nm[q]; q++; } nb[q] = 0; C2B_LOGS(nb); }
+        else C2B_LOGS("(null)");
+        C2B_LOGS(" dt="); C2B_LOGN((u32)dt); C2B_LOGS("\n");
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] GNS: cfgkey29 name segv\n");
+    }
+}
+
+/* 41f-g5: разрешение копии#2 (внутренний GNS steamclient.so) */
+static void c2b_g5_resolve_copy2(void)
+{
+    void *sch = dlopen("steamclient.so", C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+    void *acc2, *f2, *c2, *u2;
+    if (!sch) sch = c2b_dlopen_loaded_steamclient();
+    if (!sch) return;
+    f2 = dlsym(sch, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
+    c2 = dlsym(sch, "SteamAPI_ISteamNetworkingUtils_SetConfigValue");
+    acc2 = dlsym(sch, "SteamNetworkingUtils_LibV4");
+    if (!acc2) {
+        C2B_LOGS("[c2b] GNS: copy#2 no LibV4 accessor\n");
+        g_gns_u2_done = 1;
+        return;
+    }
+    u2 = ((void *(*)(void))acc2)();
+    if (!u2) { C2B_LOGS("[c2b] GNS: copy#2 acc2 null\n"); return; }
+    if (u2 == g_gns_u[0]) {
+        C2B_LOGS("[c2b] GNS: copy#2 same singleton as copy#1\n");
+        g_gns_u2_done = 1;
+        return;
+    }
+    g_gns_u[1] = u2; g_gns_flat[1] = f2; g_gns_cfg[1] = c2;
+    g_gns_u2_done = 1;
+    C2B_LOGS("[c2b] GNS: copy#2 resolved u2="); C2B_LOGH((u32)(uptr)u2);
+    C2B_LOGS("flat="); C2B_LOGN(f2 != 0);
+    C2B_LOGS("cfg="); C2B_LOGN(c2 != 0);
+    C2B_LOGS("\n");
+}
+
 static void c2b_gns_spew_install(void)
 {
     static const char *syms[] = { "SteamAPI_SteamNetworkingUtils_v004",
@@ -6344,12 +6490,8 @@ static void c2b_gns_spew_install(void)
         C2B_LOGS("[c2b] GNS: utils iface not found after retries\n");
         return;
     }
-    /* 41f-g2: сперва C-ABI flat-экспорт (run 102: vt[1] segv — vtable билда
-     * отличается от SDK-энумерации). Flat-функция не зависит от vtable:
-     * SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction(u, level, fn). */
-    /* run 103: flat setter standalone-либы встал, но спью пуст — у GNS-билда
-     * движка может быть ВТОРАЯ (внутренняя) копия GNS в steamclient.so.
-     * Ставим спью (уровень 6=Debug, ловит всё) в КАЖДУЮ найденную копию. */
+    /* 41f-g5: копия#1 — тот объект, что нашли (standalone или FUv) + копия#2
+     * через phdr-резолв; верифицируем ключ 29 по имени. */
     {
         struct c2b_sigaction saf, oldf;
         u32 kf;
@@ -6359,53 +6501,27 @@ static void c2b_gns_spew_install(void)
         saf.flags = 4;
         sigemptyset(saf.mask);
         if (sigaction(11, &saf, &oldf) == 0) {
-            /* копия 1: тот объект, что нашли (standalone или FUv) */
             void *flat = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
-            if (flat) {
-                g_probe_active = 1;
-                if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                    ((void (*)(void *, i32, void *))flat)(u, 6, (void *)c2b_gns_spew);
-                    g_probe_active = 0;
-                    C2B_LOGS("[c2b] GNS: flat spew(6) copy#1 OK\n");
-                } else {
-                    g_probe_active = 0;
-                    C2B_LOGS("[c2b] GNS: flat copy#1 segv\n");
-                }
-            }
-            /* копия 2: внутренний GNS steamclient.so (если есть и это ДРУГОЙ
-             * экспорт — RTLD_DEFAULT уже отдал первый, берём по хэндлу) */
-            {
-                void *sch = dlopen("steamclient.so", C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
-                if (sch) {
-                    void *flat2 = dlsym(sch, "SteamAPI_ISteamNetworkingUtils_SetDebugOutputFunction");
-                    void *acc2 = dlsym(sch, "SteamNetworkingUtils_LibV4");
-                    if (flat2 && acc2) {
-                        void *u2 = ((void *(*)(void))acc2)();
-                        if (u2 && u2 != u) {
-                            g_probe_active = 1;
-                            if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                                ((void (*)(void *, i32, void *))flat2)(u2, 6, (void *)c2b_gns_spew);
-                                g_probe_active = 0;
-                                C2B_LOGS("[c2b] GNS: flat spew(6) copy#2 (steamclient) OK\n");
-                            } else {
-                                g_probe_active = 0;
-                                C2B_LOGS("[c2b] GNS: flat copy#2 segv\n");
-                            }
-                        } else {
-                            C2B_LOGS("[c2b] GNS: copy#2 same singleton or null\n");
-                        }
-                    } else {
-                        C2B_LOGS("[c2b] GNS: steamclient.so has no flat networking exports\n");
-                    }
-                } else {
-                    C2B_LOGS("[c2b] GNS: steamclient.so not dlopen-able\n");
-                }
+            void *cfg  = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_SetConfigValue");
+            g_gns_u[0] = u; g_gns_flat[0] = flat; g_gns_cfg[0] = cfg;
+            if (flat || cfg) {
+                C2B_LOGS("[c2b] GNS: copy#1 apply flat="); C2B_LOGN(flat != 0);
+                C2B_LOGS("cfg="); C2B_LOGN(cfg != 0); C2B_LOGS("\n");
+                c2b_g5_verify_key29(u);
+                c2b_g5_apply(u, flat, cfg, "copy#1", 1);
+                c2b_g5_resolve_copy2();
+                if (g_gns_u[1])
+                    c2b_g5_apply(g_gns_u[1], g_gns_flat[1], g_gns_cfg[1],
+                                 "copy#2(steamclient)", 1);
+                sigaction(11, &oldf, (void *)0);
+                return;
             }
             sigaction(11, &oldf, (void *)0);
-            return;
         }
     }
     {
+        /* flat-экспортов нет вообще — старый vt[1] фоллбэк (run 102: segv,
+         * но других опций нет) */
         struct c2b_sigaction sa3, old3;
         u32 k3;
         for (k3 = 0; k3 < sizeof(sa3); k3++) ((u8 *)&sa3)[k3] = 0;
@@ -6428,8 +6544,33 @@ static void c2b_gns_spew_install(void)
         }
     }
 }
+
+/* 41f-g5: пере-арм-петля. Run 103/104: flat setter встал, строк НОЛЬ —
+ * гипотеза (а): движок/стартап ставит СВОЙ callback ПОСЛЕ нашего инсталла,
+ * наш затирается. Решение: каждые 5с в течение 5 минут пере-устанавливаем
+ * callback и конфиг (последним остаёмся МЫ) + доз-resолв копии#2 (steamclient
+ * мог загрузиться позже). Повторная установка того же значения безобидна. */
+static void c2b_gns_spew_rearm(void)
+{
+    u32 it, c, applied = 0;
+    if (!g_gns_u[0]) return;
+    for (it = 0; it < 60; it++) {
+        if (!g_gns_u2_done) c2b_g5_resolve_copy2();
+        for (c = 0; c < 2; c++) {
+            if (g_gns_u[c]) {
+                c2b_g5_apply(g_gns_u[c], g_gns_flat[c], g_gns_cfg[c],
+                             c ? "copy#2" : "copy#1", 0);
+                applied++;
+            }
+        }
+        usleep(5000000);
+    }
+    C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);
+    C2B_LOGS("u2done="); C2B_LOGN(g_gns_u2_done); C2B_LOGS("\n");
+}
 #else
 static void c2b_gns_spew_install(void) { }   /* selftest: стаб */
+static void c2b_gns_spew_rearm(void) { }     /* selftest: стаб */
 #endif  /* C2B_SELFTEST */
 
 static void *c2b_auth_thread(void *arg)
@@ -6470,6 +6611,7 @@ static void *c2b_auth_thread(void *arg)
     C2B_LOGS("[c2b] AUTH: done calls="); C2B_LOGN(g_ticket_calls);
     C2B_LOGS(" ok="); C2B_LOGN(g_ticket_ok);
     C2B_LOGS("\n");
+    c2b_gns_spew_rearm();   /* 41f-g5: пин спью+конфига в окне коннектов движка */
     return 0;
 }
 

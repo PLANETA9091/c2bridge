@@ -339,6 +339,25 @@ jobs:
           if command -v import >/dev/null 2>&1 && pgrep -f 'Xvfb :99' >/dev/null 2>&1; then
             DISPLAY=:99 import -window root e2e-out/xvfb-state.png 2>/dev/null || true
           fi
+          # 41f-g5 heist: GNS binaries for OFFLINE RE of the 0x21->0x22 abort.
+          # steamclient.so (internal GNS copy) + libsteamnetworkingsockets.so
+          # (standalone). find -L: ~/.steam/steam is a symlink. Also dump the
+          # config name table (verify IP_AllowWithoutAuth = enum 29).
+          mkdir -p e2e-out/bins
+          for name in steamclient.so libsteamnetworkingsockets.so; do
+            find -L ~/.steam ~/.local/share/Steam ~/csgo-lite /tmp -maxdepth 8 \
+              -type f -name "$name" 2>/dev/null | head -4 | while IFS= read -r f; do
+              tgt="e2e-out/bins/${name}__$(echo "$f" | md5sum | cut -c1-6).so"
+              cp -f "$f" "$tgt" 2>/dev/null || true
+              echo "$f -> $tgt" >> e2e-out/bins/heist-map.txt
+            done
+          done
+          for f in e2e-out/bins/*.so; do
+            [ -f "$f" ] || continue
+            nm -D --defined-only "$f" 2>/dev/null | gzip -1 > "$f.exports.gz" || true
+            { strings -a "$f" 2>/dev/null | grep -E 'IP_AllowWithoutAuth|LogLevel_|AllowWithoutAuth' | head -40; } > "$f.cfgnames.txt" || true
+          done
+          du -sh e2e-out/bins 2>/dev/null || true
           echo "=== verdict ==="; cat e2e-out/verdict.txt 2>/dev/null || true
           echo "=== harness tail ==="; tail -30 e2e-out/harness.log 2>/dev/null || true
           echo "=== login session ==="; grep -ao '"mostrecent"\s*"1"' e2e-out/loginusers.vdf 2>/dev/null || echo "NO LOGIN SESSION"

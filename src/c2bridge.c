@@ -72,6 +72,10 @@ extern i32   pthread_create(void *t, const void *a, void *(*fn)(void *), void *a
 extern char *getenv(const char *name);
 extern i32   strcmp(const char *a, const char *b);   /* t39: GC policy lookup */
 extern i32   clock_gettime(i32 clk, void *ts);   /* 41e-m: monotonic ms для темпа INFO-PUSH */
+extern i32   __sigsetjmp(void *buf, i32 savemask);   /* 41f-c: SEGV-защита probe */
+extern void  siglongjmp(void *buf, i32 val);
+extern i32   sigaction(i32 sig, const void *act, void *oldact);
+extern i32   sigemptyset(void *set);   /* маска sa_mask */
 
 static int g_logfd = 2;
 
@@ -6138,6 +6142,124 @@ static i32 c2b_ver_pfx(const char *ver, const char *pfx)
     return 1;
 }
 
+/* ---------- 41f-c: SEGV-защита probe-вызовов vtable ----------
+ * Run 96 (60807ef): vt[11] НЕ GetAuthSessionTicket в ISteamUser022 бандла —
+ * gdb: c2b_auth_thread -> steamclient.so x3 -> __memcpy_avx SEGV (импл
+ * интерпретировал аргументы иначе и писал в мусорный указатель; модель
+ * верна до индекса 2 — BLoggedOn/GetSteamID вернули sane значения, значит
+ * между GetSteamID и voice-блоком вставлены методы). Фикс: probe
+ * последовательности индексов под временной SIGSEGV-ловушкой
+ * (__sigsetjmp/siglongjmp): крашнутый вызов не роняет процесс, логируем
+ * индекс и переходим к следующему. Стартовый индекс = C2B_AUTH_VTIDX
+ * (харнесс декодирует точный слот из wrapper'а SteamAPI_ISteamUser_*
+ * libsteam_api.so, если найдёт её на раннере; дефолт 11).
+ * В selftest-сборке (настоящие libc-хедеры) блок стабится. */
+#ifndef C2B_SELFTEST
+struct c2b_sigaction {          /* glibc x86-64 layout */
+    uptr handler;               /* sa_handler / sa_sigaction (union @0) */
+    u8   mask[128];             /* sa_mask (sigset_t) */
+    u32  flags;                 /* sa_flags; SA_SIGINFO = 4 */
+    uptr restorer;              /* sa_restorer */
+};
+static u8  g_probe_jb[512] __attribute__((aligned(16)));
+static u8  g_probe_active;
+
+static void c2b_probe_segv(i32 sig, void *si, void *uc)
+{
+    (void)sig; (void)si; (void)uc;
+    if (g_probe_active) {
+        g_probe_active = 0;
+        siglongjmp(g_probe_jb, 1);
+    }
+    /* не наш контекст — крайний случай, окно probe микросекундное;
+     * игнорируем: движок жив */
+}
+
+static u32 g_auth_vtidx = 11;    /* C2B_AUTH_VTIDX: стартовый слот probe */
+
+static void c2b_auth_ticket_probe(void)
+{
+    u64 sid_self = ((u64 (*)(void *))(*(void ***)g_steamuser_obj)[2])(g_steamuser_obj);
+    u8 ident[16];
+    u32 t4, att;
+    struct c2b_sigaction sa, oldsa;
+    u8 have_old;
+    for (t4 = 0; t4 < sizeof(ident); t4++) ident[t4] = 0;
+    ident[0] = 3;                                  /* k_ESteamNetworkingIdentityType_SteamID */
+    for (t4 = 0; t4 < 8; t4++) ident[8 + t4] = (u8)(sid_self >> (8 * t4));
+    for (t4 = 0; t4 < sizeof(sa); t4++) ((u8 *)&sa)[t4] = 0;
+    for (t4 = 0; t4 < sizeof(oldsa); t4++) ((u8 *)&oldsa)[t4] = 0;
+    sa.handler = (uptr)c2b_probe_segv;
+    sa.flags = 4;                                  /* SA_SIGINFO */
+    sigemptyset(sa.mask);
+    have_old = (sigaction(11, &sa, &oldsa) == 0);  /* SIGSEGV = 11 */
+    for (att = 0; att < 4 && g_ticket_ok == 0; att++) {
+        u32 idx = g_auth_vtidx + att;
+        u32 tlen = 0, h;
+        if (att) usleep(5000000);
+        tlen = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            h = ((u32 (*)(void *, void *, i32, u32 *, void *))(*(void ***)g_steamuser_obj)[idx])(
+                g_steamuser_obj, g_ticket_buf, (i32)sizeof(g_ticket_buf),
+                &tlen, ident);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] AUTH: slot "); C2B_LOGN(idx);
+            C2B_LOGS(" segv — not GetAuthSessionTicket\n");
+            usleep(5000000);                       /* дать имплу отпустить локи */
+            continue;
+        }
+        g_ticket_calls++;
+        C2B_LOGS("[c2b] AUTH: slot "); C2B_LOGN(idx);
+        C2B_LOGS("GetAuthSessionTicket h="); C2B_LOGN(h);
+        C2B_LOGS(" len="); C2B_LOGN(tlen);
+        if (h && tlen && tlen <= sizeof(g_ticket_buf)) {
+            char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
+            u32 rep;
+            g_ticket_ok++;
+            g_ticket_len = tlen;
+            c2b_cl_hexline(g_ticket_buf, tlen, ln, (u32)sizeof(ln));
+            C2B_LOGS(" ticket "); C2B_LOGS(ln); C2B_LOGS("\n");
+            for (rep = 0; rep < 2 && g_ticket_ok < 3; rep++) {
+                usleep(10000000);
+                tlen = 0;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    h = ((u32 (*)(void *, void *, i32, u32 *, void *))(*(void ***)g_steamuser_obj)[idx])(
+                        g_steamuser_obj, g_ticket_buf,
+                        (i32)sizeof(g_ticket_buf), &tlen, ident);
+                    g_probe_active = 0;
+                } else {
+                    g_probe_active = 0;
+                    break;
+                }
+                g_ticket_calls++;
+                C2B_LOGS("[c2b] AUTH: slot "); C2B_LOGN(idx);
+                C2B_LOGS("repeat h="); C2B_LOGN(h);
+                C2B_LOGS(" len="); C2B_LOGN(tlen);
+                if (h && tlen && tlen <= sizeof(g_ticket_buf)) {
+                    g_ticket_ok++;
+                    g_ticket_len = tlen;
+                    c2b_cl_hexline(g_ticket_buf, tlen, ln, (u32)sizeof(ln));
+                    C2B_LOGS(" ticket "); C2B_LOGS(ln); C2B_LOGS("\n");
+                } else {
+                    C2B_LOGS("\n");
+                }
+            }
+        } else {
+            C2B_LOGS("\n");
+            usleep(5000000);
+        }
+    }
+    if (have_old) sigaction(11, &oldsa, (void *)0);
+}
+#else
+static u32 g_auth_vtidx = 11;
+static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
+#endif  /* C2B_SELFTEST */
+
 static void *c2b_auth_thread(void *arg)
 {
     u32 i, att;
@@ -6150,7 +6272,7 @@ static void *c2b_auth_thread(void *arg)
     }
     void **vt = *(void ***)g_steamuser_obj;
     u32 sane = 1;
-    for (i = 0; i < 13; i++)
+    for (i = 0; i < 16; i++)
         if (!vt[i]) { sane = 0; break; }
     C2B_LOGS("[c2b] AUTH: SteamUser ptr="); C2B_LOGH((u32)(uptr)g_steamuser_obj);
     C2B_LOGS("vt sane="); C2B_LOGN(sane); C2B_LOGS("\n");
@@ -6169,39 +6291,7 @@ static void *c2b_auth_thread(void *arg)
             return 0;
         }
     }
-    /* GetAuthSessionTicket: до 6 попыток каждые 10с (тикеты можно запрашивать
-     * многократно; лимит движка ~200, мы в 2 порядках ниже). SteamNetworkingIdentity
-     * (v022, 4-арг): заполняем {type=3 (SteamID), steamid=self} — если импл
-     * разыменовывает identity БЕЗ NULL-чека, NULL уронил бы движок; заполненная
-     * 16Б-структура читается безопасно (type u32 @0 + u64 @8). Для 3-арг
-     * имплантаций 4-й арг игнорируется регистром SysV. */
-    {   u64 sid_self = ((u64 (*)(void *))vt[2])(g_steamuser_obj);
-        u8 ident[16];
-        u32 t4;
-        for (t4 = 0; t4 < 16; t4++) ident[t4] = 0;
-        ident[0] = 3;                                  /* k_ESteamNetworkingIdentityType_SteamID */
-        for (t4 = 0; t4 < 8; t4++) ident[8 + t4] = (u8)(sid_self >> (8 * t4));
-        for (att = 0; att < 6; att++) {
-            u32 tlen = 0, h;
-            if (att) usleep(10000000);
-            tlen = 0;
-            h = ((u32 (*)(void *, void *, i32, u32 *, void *))vt[11])(
-                g_steamuser_obj, g_ticket_buf, (i32)sizeof(g_ticket_buf), &tlen,
-                ident);
-            g_ticket_calls++;
-            C2B_LOGS("[c2b] AUTH: GetAuthSessionTicket h="); C2B_LOGN(h);
-            C2B_LOGS(" len="); C2B_LOGN(tlen);
-            if (h && tlen && tlen <= sizeof(g_ticket_buf)) {
-                char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
-                g_ticket_ok++;
-                g_ticket_len = tlen;
-                c2b_cl_hexline(g_ticket_buf, tlen, ln, (u32)sizeof(ln));
-                C2B_LOGS(" ticket "); C2B_LOGS(ln); C2B_LOGS("\n");
-            } else {
-                C2B_LOGS("\n");
-            }
-        }
-    }
+    c2b_auth_ticket_probe();
     C2B_LOGS("[c2b] AUTH: done calls="); C2B_LOGN(g_ticket_calls);
     C2B_LOGS(" ok="); C2B_LOGN(g_ticket_ok);
     C2B_LOGS("\n");
@@ -7801,6 +7891,14 @@ i32 c2b_main(void)
      * капчур до 150с и безопасен при его отсутствии. */
     {
         void *auth_tid = 0;
+        const char *e = getenv("C2B_AUTH_VTIDX");
+        if (e && e[0] >= '0' && e[0] <= '9') {
+            u32 v = 0;
+            while (*e >= '0' && *e <= '9') { v = v * 10 + (u32)(*e - '0'); e++; }
+            if (v > 0 && v < 64) g_auth_vtidx = v;
+        }
+        C2B_LOGS("[c2b] AUTH: vtidx probe start="); C2B_LOGN(g_auth_vtidx);
+        C2B_LOGS("\n");
         pthread_create(&auth_tid, 0, c2b_auth_thread, 0);
     }
     i32 r = c2b_try_install();

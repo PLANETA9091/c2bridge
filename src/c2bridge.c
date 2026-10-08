@@ -6090,6 +6090,7 @@ static u32 g_clv2_baits;         /* C2B_CLV2_BAITS=1: фазы 2/4/6 ('i'/reserv
                                   * развивающуюся реакцию движка (ферма между
                                   * пушами всегда держит consume_gap) */
 static char g_a2s_ver[24] = "1.38.0.4"; /* C2B_A2S_VERSION — версия бандла */
+static u32 g_clv2_bhex;          /* C2B_CLV2_BHEX: хвост 'b' 0=AAAAAAAA 1=challenge 2=qc_val */
 /* 41e-m: INFO-PUSH — ферма пушит 'I'-блоб в сокеты движка UNSOLICITED и
  * движок ЕГО ПОТРЕБЛЯЕТ (run 72: CL dn #f4-8 «info» = ACK в консоли +
  * прогресс флоу). Движок сам A2S НЕ шлёт (ни в ферме, ни в мосту),
@@ -6746,13 +6747,30 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 g_clv2_ch32 = (u32)ch;
                 g_clv2_got_ch++;
                 if (g_clv2_phase == 6) {
-                    /* фаза 6: четвёртый ChallengeReply -> 'B'+'.+8A (accept) */
+                    /* фаза 6: четвёртый ChallengeReply -> 'B'+'.+8hex (accept).
+                     * RE 'b'-хендлера (0x25a8b0, engine_client 34a96ae): после
+                     * header-проверок движок bit-читает байт — обязан быть '.'
+                     * (0x2e) — затем 8 байт, парсит sscanf("%08X") и требует
+                     * НЕНУЛЕВОЙ результат, при успехе зовёт vtable+0x170(this,
+                     * packet). Варианты хвоста (C2B_CLV2_BHEX): 0="AAAAAAAA"
+                     * (ран 80-93), 1=hex challenge из 'A', 2=hex qc_val
+                     * (эхо qconnect0x). Дифференцирует реакцию движка. */
                     if ((u32)len >= 14) {
+                        u32 hx;
                         q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
                         q[4] = 'B'; q[5] = '.';
-                        q[6] = 'A'; q[7] = 'A'; q[8] = 'A'; q[9] = 'A';
-                        q[10] = 'A'; q[11] = 'A'; q[12] = 'A'; q[13] = 'A';
-                        C2B_LOGS("[c2b] CLV2 phase6: ChallengeReply -> 'B' accept\n");
+                        hx = (g_clv2_bhex == 1) ? g_clv2_ch32 :
+                                             ((g_clv2_bhex == 2) ? g_clv2_qc_val : 0xAAAAAAAAu);
+                        if (!hx) hx = 0xAAAAAAAAu;      /* sscanf требует nonzero */
+                        {
+                            static const char hxk[] = "0123456789ABCDEF";
+                            u32 sh;
+                            for (sh = 0; sh < 8; sh++)
+                                q[6 + sh] = (u8)hxk[(hx >> (28 - sh * 4)) & 0xF];
+                        }
+                        C2B_LOGS("[c2b] CLV2 phase6: ChallengeReply -> 'B' accept hex=");
+                        C2B_LOGN(hx);
+                        C2B_LOGS("\n");
                         return 14;
                     }
                     return r;
@@ -7762,6 +7780,12 @@ i32 c2b_main(void)
                 C2B_LOGS("[c2b] clv2 baits=1 (фазы 2/4/6: 'i'/reserve-'A'/'B')\n");
             } else {
                 C2B_LOGS("[c2b] clv2 baits=0 (чистый fmt9-'A', без клоббера)\n");
+            }
+            e = getenv("C2B_CLV2_BHEX");
+            if (e && e[0] >= '0' && e[0] <= '2') {
+                g_clv2_bhex = (u32)(e[0] - '0');
+                C2B_LOGS("[c2b] clv2 bhex="); C2B_LOGN(g_clv2_bhex);
+                C2B_LOGS(" (0=AAAAAAAA 1=challenge 2=qc_val)\n");
             }
             e = getenv("C2B_A2S_VERSION");
             if (e && e[0]) {

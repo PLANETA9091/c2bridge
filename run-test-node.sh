@@ -574,8 +574,9 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     VARIANT="farm-passive"
   else
     case $ATTEMPT in
-      1) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello" ;;
-      2) EXTRA_ENV="C2B_HELLO=1"; VARIANT="client-up-bridge-hello-gdb" ;;
+      1) EXTRA_ENV="C2B_HELLO=1 C2B_CLV2_BHEX=0"; VARIANT="client-up-bridge-hello" ;;
+      2) EXTRA_ENV="C2B_HELLO=1 C2B_CLV2_BHEX=1"; VARIANT="client-up-bridge-hello-gdb" ;;
+      3) EXTRA_ENV="C2B_CLV2_BHEX=2"; VARIANT="client-up-bridge-bhex-qc" ;;
       4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
       5) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
     esac

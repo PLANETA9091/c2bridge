@@ -6316,19 +6316,32 @@ static void c2b_gns_spew_install(void)
                                   "SteamAPI_SteamNetworkingUtils_v003",
                                   "SteamAPI_SteamNetworkingUtils_v002",
                                   "SteamNetworkingUtils_LibV4", 0 };
+    static const char *libs[] = { "libsteamnetworkingsockets.so",
+                                  "steamclient.so", 0 };
     void *u = 0;
-    u32 k;
-    for (k = 0; syms[k] && !u; k++) {
-        void *fn = dlsym((void *)0, syms[k]);   /* RTLD_DEFAULT */
-        if (fn) u = ((void *(*)(void))fn)();
-        if (u) {
-            C2B_LOGS("[c2b] GNS: utils via "); C2B_LOGS(syms[k]);
-            C2B_LOGS(" ptr="); C2B_LOGH((u32)(uptr)u); C2B_LOGS("\n");
+    u32 k, try;
+    /* run 101: на старте auth-потока steamclient/GNS ещё НЕ загружены ->
+     * dlsym(RTLD_DEFAULT) пуст. Ретраим до ~120с, попутно dlopen-им
+     * кандидатов (steamclient уже загружен движком -> просто refcount). */
+    for (try = 0; try < 60 && !u; try++) {
+        for (k = 0; syms[k] && !u; k++) {
+            void *fn = dlsym((void *)0, syms[k]);   /* RTLD_DEFAULT */
+            if (fn) u = ((void *(*)(void))fn)();
+            if (u) {
+                C2B_LOGS("[c2b] GNS: utils via "); C2B_LOGS(syms[k]);
+                C2B_LOGS(" ptr="); C2B_LOGH((u32)(uptr)u); C2B_LOGS("\n");
+            }
         }
+        if (!u && (try == 0 || try == 10)) {
+            u32 l;
+            for (l = 0; libs[l]; l++)
+                dlopen(libs[l], C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+        }
+        if (!u) usleep(2000000);
     }
     if (!u && g_steamnetutils_obj) u = g_steamnetutils_obj;   /* FUv-фоллбэк */
     if (!u) {
-        C2B_LOGS("[c2b] GNS: utils iface not found — spew not installed\n");
+        C2B_LOGS("[c2b] GNS: utils iface not found after retries\n");
         return;
     }
     {
@@ -6362,15 +6375,15 @@ static void *c2b_auth_thread(void *arg)
 {
     u32 i, att;
     (void)arg;
-#ifndef C2B_SELFTEST
-    c2b_gns_spew_install();       /* 41f-g: спью до всего остального */
-#endif
     /* ждём капчур до 150с (движок грузит steam_api уже после меню-обвяза) */
     for (i = 0; i < 150 && !g_steamuser_obj; i++) usleep(1000000);
     if (!g_steamuser_obj) {
         C2B_LOGS("[c2b] AUTH: SteamUser never appeared\n");
         return 0;
     }
+#ifndef C2B_SELFTEST
+    c2b_gns_spew_install();  /* 41f-g: ПОСЛЕ капчура — steamclient уже загружен */
+#endif
     void **vt = *(void ***)g_steamuser_obj;
     u32 sane = 1;
     for (i = 0; i < 16; i++)

@@ -6185,7 +6185,10 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
      * игнорируем: движок жив */
 }
 
-static u32 g_auth_vtidx = 11;    /* C2B_AUTH_VTIDX: стартовый слот probe */
+static u32 g_auth_vtidx = 13;    /* C2B_AUTH_VTIDX: стартовый слот probe.
+ * 41f-e: run 97 эмпирика — 14=BeginAuthSession(h=1 InvalidTicket), 15/16=void
+ * (stale rax), 17=UserHasLicenseForApp(h=2); 11=DecompressVoice (memcpy-SEGV
+ * run 96). SDK-нумерация ISteamUser: 13 = GetAuthSessionTicket. */
 
 static void c2b_auth_ticket_probe(void)
 {
@@ -6260,13 +6263,21 @@ static void c2b_auth_ticket_probe(void)
             }
         } else {
             C2B_LOGS("\n");
+            /* 41f-e: len=0 — дампим первые 16 Б буфера: вдруг импл тикет
+             * записал, а pcbTicket не тронул (модель вызова угадана не до
+             * конца) — hex покажет запись без счётчика. */
+            {
+                char ln16[64];
+                c2b_cl_hexline(g_ticket_buf, 16, ln16, (u32)sizeof(ln16));
+                C2B_LOGS(" buf16 "); C2B_LOGS(ln16); C2B_LOGS("\n");
+            }
             usleep(5000000);
         }
     }
     if (have_old) sigaction(11, &oldsa, (void *)0);
 }
 #else
-static u32 g_auth_vtidx = 11;
+static u32 g_auth_vtidx = 13;
 static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
 #endif  /* C2B_SELFTEST */
 

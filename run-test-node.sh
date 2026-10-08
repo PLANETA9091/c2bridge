@@ -509,12 +509,15 @@ VERDICT_CODE=1; VERDICT_TEXT="FAIL: no verdict"
 PASSED_LIST=""   # C2B_RUN_ALL: номера попыток, прошедших smoke-check
 CONNECTED=0
 
-# 41f-c: точный vtable-слот GetAuthSessionTicket декодируем из wrapper'а
-# libsteam_api.so (SteamAPI_ISteamUser_GetAuthSessionTicket -> call *0xNN(%rax))
-# — run 96 доказал, что слепой vt[11] = memcpy-SEGV внутри steamclient.so
-# (модель v022 сдвинута после индекса 2). Найденный слот -> C2B_AUTH_VTIDX.
-AUTH_VTIDX="${C2B_AUTH_VTIDX:-}"
-if [[ -z "$AUTH_VTIDX" ]] && command -v objdump >/dev/null 2>&1; then
+# 41f-e: стартовый слот probe = 13. Эмпирика run 97 (c76c312): wrapper-decode дал
+# 14, но реальные вызовы показали: slot 14 = BeginAuthSession (h=1 = InvalidTicket,
+# SysV-аргументы совпали), 15/16 = void/bool-методы (stale rax = heap-птр), 17 =
+# UserHasLicenseForApp (h=2). По SDK-нумерации ISteamUser (0=GetHSteamUser,
+# 1=BLoggedOn, 2=GetSteamID — подтверждено эмпирикой; 3-12 = InitiateGame...
+# GetVoiceOptimalSampleRate; 11 = DecompressVoice — тот самый memcpy-SEGV run 96)
+# GetAuthSessionTicket = 13. C2B_AUTH_VTIDX из env всё ещё перекрывает.
+AUTH_VTIDX="${C2B_AUTH_VTIDX:-13}"
+if [[ -z "$C2B_AUTH_VTIDX" ]] && command -v objdump >/dev/null 2>&1; then
   API_SO=$(find "$GAME_DIR" /home/runner/.local/share/Steam -maxdepth 6 \
              -name 'libsteam_api.so' -o -maxdepth 6 -name 'steam_api.so' 2>/dev/null \
              | head -1)
@@ -524,13 +527,12 @@ if [[ -z "$AUTH_VTIDX" ]] && command -v objdump >/dev/null 2>&1; then
       | grep -oE 'call\s+\*0x[0-9a-f]+\(%rax\)' | head -1)
     if [[ -n "$WRAP" ]]; then
       OFF16=$(echo "$WRAP" | sed -n 's/.*\*0x\([0-9a-f]*\)(%rax).*/\1/p')
-      AUTH_VTIDX=$(( 16#$OFF16 / 8 ))
-      log "auth vtidx decoded from $API_SO: call $WRAP -> slot $AUTH_VTIDX"
+      log "auth vtidx wrapper decode (INFO only, NOT overriding 41f-e default): $API_SO: $WRAP -> slot $(( 16#$OFF16 / 8 ))"
     else
-      log "auth vtidx: wrapper call pattern not found in $API_SO (probe fallback)"
+      log "auth vtidx: wrapper call pattern not found in $API_SO (default 13)"
     fi
   else
-    log "auth vtidx: no libsteam_api.so found (probe fallback)"
+    log "auth vtidx: no libsteam_api.so found (default 13)"
   fi
 fi
 AUTH_VTIDX_ENV=""
@@ -701,7 +703,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     SDL_AUDIODRIVER=dummy \
     LD_PRELOAD="$LDPRELOAD" \
     $MODES $EXTRA_ENV $AUTH_VTIDX_ENV \
-    sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug" \
+    sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug +sdr_spew_level 7" \
     >"$OUT" 2>&1 &
   ENGINE_PID=$!
   # 41f: GNS-видимость — Valve-код ходит мимо libc-хуков (runs 85/86), поэтому

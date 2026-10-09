@@ -19,6 +19,14 @@ name: e2e-cloud
 #     loopback: which wire response makes the legacy engine SEND its connect
 #     packet (the CL v2 phase-B capture prize). Bridge passive, engine vanilla.
 
+# runs 118-121 lesson: parallel e2e runs share ONE burner Steam account and
+# fight over the steam-node-v4 cache. Second login KICKS the first session
+# (BLoggedOn=0 -> GNS dead -> no evidence), cache saves race ("Unable to
+# reserve cache"). Serialize all e2e-cloud runs.
+concurrency:
+  group: e2e-cloud
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:

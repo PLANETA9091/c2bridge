@@ -6745,9 +6745,72 @@ static void c2b_g7_client_utils(void)
  * наш затирается. Решение: каждые 5с в течение 5 минут пере-устанавливаем
  * callback и конфиг (последним остаёмся МЫ) + доз-resолв копии#2 (steamclient
  * мог загрузиться позже). Повторная установка того же значения безобидна. */
+/* 41f-g8: ХИРУРГИЧЕСКИЙ пач внутреннего GNS steamclient.so.
+ * run 111: vtable-скан IClient опасен (кандидат vt[1] на чужом интерфейсе
+ * роняет процесс). Вместо вызовов — ПРЯМАЯ ЗАПИСЬ указателя callback'а.
+ * RE steamclient.so (run105/bins/steamclient.so__d975c5.so, диз /tmp/sc.asm):
+ * spew-ядро 0x26fc0b0 (chain: 0x26fcb60 -> 0x26fca50 -> 0x26fc0b0) читает
+ * глобал 0x2d1e1b0 и зовёт call *%rax при ненулевом; аргументы на вызове =
+ * (level i32, msg ptr) — сигнатура совпадает с c2b_gns_spew(lvl, msg).
+ * RVA 0x2d1e1b0 валиден для билда linux64 d975c5 (ровно тот, что грузит
+ * движок — phdr run 105: /home/runner/.local/share/Steam/linux64/steamclient.so).
+ * Слот в .data — обычная запись; перед записью логируем старое значение
+ * (0 = колбэк нет). */
+static volatile void **g_g8_slot;
+static u8 g_g8_armed;
+
+static void c2b_g8_phdr_cb(void *info_v, void *size_v, void *data_v)
+{
+    struct c2b_g5_phdr *pi = (struct c2b_g5_phdr *)info_v;
+    uptr *out = (uptr *)data_v;
+    const char *nm, *sfx = "steamclient.so";
+    u32 nl, sl = 0, j;
+    (void)size_v;
+    if (!pi || !pi->dlpi_name) return;
+    nm = pi->dlpi_name;
+    nl = 0; while (nm[nl]) nl++;
+    while (sfx[sl]) sl++;
+    if (nl < sl) return;
+    for (j = 0; j < sl && nm[nl - sl + j] == sfx[j]; j++) {}
+    if (j != sl) return;
+    *out = pi->dlpi_addr;   /* load bias найденной копии */
+}
+
+static void c2b_g8_patch_apply(void)
+{
+    uptr base = 0;
+    volatile void **slot;
+    uptr old;
+    dl_iterate_phdr(c2b_g8_phdr_cb, &base);
+    if (!base) {
+        C2B_LOGS("[c2b] GNS g8: steamclient.so not mapped\n");
+        return;
+    }
+    slot = (volatile void **)(base + 0x2d1e1b0);
+    old = (uptr)(*slot);
+    if (old == (uptr)c2b_gns_spew) { g_g8_armed = 1; return; }
+    *slot = (const volatile void *)c2b_gns_spew;
+    g_g8_slot = slot;
+    g_g8_armed = 1;
+    C2B_LOGS("[c2b] GNS g8: slot patched base+0x2d1e1b0 old=");
+    C2B_LOGH((u32)old); C2B_LOGS("\n");
+}
+
+static void c2b_g8_patch_verify(void)
+{
+    /* через 6с проверяем живость: внутренний GNS пингует POPs постоянно */
+    u32 before = g_gns_spew_n;
+    usleep(6000000);
+    C2B_LOGS("[c2b] GNS g8: spew lines in 6s after patch = ");
+    C2B_LOGN(g_gns_spew_n - before);
+    C2B_LOGS("\n");
+}
+
 static void c2b_gns_spew_rearm(void)
 {
     u32 it, c, applied = 0;
+    c2b_g8_patch_apply();   /* 41f-g8: пач слота независимо от copy#1 */
+    c2b_g8_patch_verify();
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
         if (!g_gns_u2_done) c2b_g5_resolve_copy2();
@@ -6758,6 +6821,7 @@ static void c2b_gns_spew_rearm(void)
                 applied++;
             }
         }
+        if (g_g8_slot) *g_g8_slot = (const volatile void *)c2b_gns_spew;
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

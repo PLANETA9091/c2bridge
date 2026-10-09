@@ -6611,32 +6611,57 @@ static void c2b_g7_client_utils(void)
         return;
     }
     C2B_LOGS("[c2b] GNS g7: pipe="); C2B_LOGN((u32)pipe); C2B_LOGS("\n");
-    /* ConnectToGlobalUser = vt[4] */
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        user = ((uptr (*)(void *, uptr))vt[4])(cl, pipe);
-        g_probe_active = 0;
-    } else g_probe_active = 0;
-    if (!user || user > 0x100000) {
-        C2B_LOGS("[c2b] GNS g7: ConnectToGlobalUser bad\n");
-        sigaction(11, &oldsa, (void *)0);
-        return;
-    }
-    C2B_LOGS("[c2b] GNS g7: user="); C2B_LOGN((u32)user); C2B_LOGS("\n");
-    /* GetISteamUser = vt[7] — верификация хэндлов по SteamID */
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        void *uobj = ((void *(*)(void *, uptr, uptr, const char *))vt[7])(
-            cl, user, pipe, "SteamUser022");
-        if (uobj) sid = ((u64 (*)(void *))(*(void ***)uobj)[2])(uobj);
-        g_probe_active = 0;
-    } else g_probe_active = 0;
-    C2B_LOGS("[c2b] GNS g7: user obj sid=0x"); C2B_LOGH((u32)(sid >> 32));
-    C2B_LOGH((u32)sid); C2B_LOGS("\n");
-    if ((sid >> 56) != 0x01) {
-        C2B_LOGS("[c2b] GNS g7: steamid implausible — handles wrong\n");
-        sigaction(11, &oldsa, (void *)0);
-        return;
+    /* Кандидаты user: vt[3] GetHSteamUserCurrent (движковый, без аргументов),
+     * vt[4] ConnectToGlobalUser(pipe), vt[5] CreateLocalUser(&pipe2, 1).
+     * Верификация каждого — через GetISteamUser(vt[7]) -> GetSteamID. */
+    {
+        uptr cand[4];
+        u32 nc = 0, ci;
+        uptr cur = 0, guser = 0, luser = 0, pipe2 = pipe;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            cur = ((uptr (*)(void *))vt[3])(cl);
+            g_probe_active = 0;
+        } else g_probe_active = 0;
+        C2B_LOGS("[c2b] GNS g7: cur user="); C2B_LOGN((u32)cur); C2B_LOGS("\n");
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            guser = ((uptr (*)(void *, uptr))vt[4])(cl, pipe);
+            g_probe_active = 0;
+        } else g_probe_active = 0;
+        C2B_LOGS("[c2b] GNS g7: global user="); C2B_LOGN((u32)guser);
+        C2B_LOGS("\n");
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            luser = ((uptr (*)(void *, uptr *, uptr))vt[5])(cl, &pipe2, 1);
+            g_probe_active = 0;
+        } else g_probe_active = 0;
+        C2B_LOGS("[c2b] GNS g7: local user="); C2B_LOGN((u32)luser);
+        C2B_LOGS(" pipe2="); C2B_LOGN((u32)pipe2); C2B_LOGS("\n");
+        if (guser && guser <= 0x100000) cand[nc++] = guser;
+        if (cur && cur <= 0x100000) cand[nc++] = cur;
+        if (luser && luser <= 0x100000) cand[nc++] = luser;
+        /* верификация: user+pipe -> ISteamUser -> GetSteamID */
+        for (ci = 0; ci < nc && !user; ci++) {
+            void *uobj = 0;
+            u64 s2 = 0;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                uobj = ((void *(*)(void *, uptr, uptr, const char *))vt[7])(
+                    cl, cand[ci], pipe, "SteamUser022");
+                if (uobj) s2 = ((u64 (*)(void *))(*(void ***)uobj)[2])(uobj);
+                g_probe_active = 0;
+            } else g_probe_active = 0;
+            C2B_LOGS("[c2b] GNS g7: user cand "); C2B_LOGN((u32)cand[ci]);
+            C2B_LOGS(" sid=0x"); C2B_LOGH((u32)(s2 >> 32));
+            C2B_LOGH((u32)s2); C2B_LOGS("\n");
+            if ((s2 >> 56) == 0x01) user = cand[ci];
+        }
+        if (!user) {
+            C2B_LOGS("[c2b] GNS g7: no verified user\n");
+            sigaction(11, &oldsa, (void *)0);
+            return;
+        }
     }
     /* GetISteamNetworkingUtils: перебор индексов. Форма A: (pipe, ver);
      * верификация объекта = vt[0] возвращает микросекунды (~1.7e15). */

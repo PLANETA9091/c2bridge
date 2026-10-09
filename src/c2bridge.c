@@ -6561,6 +6561,136 @@ static void c2b_gns_spew_install(void)
     }
 }
 
+/* 41f-g7: доходим до steamclient-внутреннего GNS (копия#2) через ISteamClient.
+ * run 105/106 факты: спью copy#1 (LibV4-синглтон) показывает ТОЛЬКО пинги
+ * (LogLevel=6 включён — вывода по коннектам НЕТ), а 0x20/0x21 к цели в pcap
+ * идут -> коннекты делает ДРУГОЙ GNS: steamclient-внутренний (строки GNS есть
+ * в steamclient.so, из экспортов только CreateInterface; libsteamnetworkingsockets
+ * в бандле MISSING — движок берёт сокеты через ISteamClient). Путь:
+ * g_iclient_obj (SteamClient020, захвачен в хуке) -> CreateSteamPipe ->
+ * ConnectToGlobalUser -> GetISteamUser (верификация по GetSteamID) ->
+ * GetISteamNetworkingUtils(pipe, ver) -> vt[0]=GetTimestamp-чек ->
+ * SetDebugOutputFunction(vt[1], 6, cb). Пробы ТОЛЬКО с НАШИМИ pipe/user:
+ * разрушительные индексы портят наши хэндлы, не движковые. */
+static void *g_iclient_obj;   /* fwd — реальное определение в хуке ниже */
+
+static void c2b_g7_vt_spew(void *uo, i32 lvl, void *fn)
+{
+    ((void (**)(void *, i32, void *))(*(void ***)uo))[1](uo, lvl, fn);
+}
+
+static void c2b_g7_client_utils(void)
+{
+    void *cl = g_iclient_obj;
+    void **vt;
+    uptr pipe = 0, user = 0;
+    u64 sid = 0;
+    u32 k;
+    struct c2b_sigaction sa, oldsa;
+    u32 kf;
+    if (!cl) {
+        C2B_LOGS("[c2b] GNS g7: no IClient obj\n");
+        return;
+    }
+    for (kf = 0; kf < sizeof(sa); kf++) ((u8 *)&sa)[kf] = 0;
+    for (kf = 0; kf < sizeof(oldsa); kf++) ((u8 *)&oldsa)[kf] = 0;
+    sa.handler = (uptr)c2b_probe_segv;
+    sa.flags = 4;
+    sigemptyset(sa.mask);
+    if (sigaction(11, &sa, &oldsa) != 0) return;
+    vt = *(void ***)cl;
+    /* CreateSteamPipe = vt[0] */
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        pipe = ((uptr (*)(void *))vt[0])(cl);
+        g_probe_active = 0;
+    } else g_probe_active = 0;
+    if (!pipe || pipe > 0x100000) {
+        C2B_LOGS("[c2b] GNS g7: CreateSteamPipe bad\n");
+        sigaction(11, &oldsa, (void *)0);
+        return;
+    }
+    C2B_LOGS("[c2b] GNS g7: pipe="); C2B_LOGN((u32)pipe); C2B_LOGS("\n");
+    /* ConnectToGlobalUser = vt[4] */
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        user = ((uptr (*)(void *, uptr))vt[4])(cl, pipe);
+        g_probe_active = 0;
+    } else g_probe_active = 0;
+    if (!user || user > 0x100000) {
+        C2B_LOGS("[c2b] GNS g7: ConnectToGlobalUser bad\n");
+        sigaction(11, &oldsa, (void *)0);
+        return;
+    }
+    C2B_LOGS("[c2b] GNS g7: user="); C2B_LOGN((u32)user); C2B_LOGS("\n");
+    /* GetISteamUser = vt[7] — верификация хэндлов по SteamID */
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        void *uobj = ((void *(*)(void *, uptr, uptr, const char *))vt[7])(
+            cl, user, pipe, "SteamUser022");
+        if (uobj) sid = ((u64 (*)(void *))(*(void ***)uobj)[2])(uobj);
+        g_probe_active = 0;
+    } else g_probe_active = 0;
+    C2B_LOGS("[c2b] GNS g7: user obj sid=0x"); C2B_LOGH((u32)(sid >> 32));
+    C2B_LOGH((u32)sid); C2B_LOGS("\n");
+    if ((sid >> 56) != 0x01) {
+        C2B_LOGS("[c2b] GNS g7: steamid implausible — handles wrong\n");
+        sigaction(11, &oldsa, (void *)0);
+        return;
+    }
+    /* GetISteamNetworkingUtils: перебор индексов. Форма A: (pipe, ver);
+     * верификация объекта = vt[0] возвращает микросекунды (~1.7e15). */
+    {
+        static const char *vers[] = { "SteamNetworkingUtils004",
+                                      "SteamNetworkingUtils003", 0 };
+        u32 v;
+        for (v = 0; vers[v]; v++) {
+            for (k = 5; k <= 24; k++) {
+                void *uo = 0;
+                u64 ts = 0;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    uo = ((void *(*)(void *, uptr, const char *))vt[k])(
+                        cl, pipe, vers[v]);
+                    g_probe_active = 0;
+                } else { g_probe_active = 0; continue; }
+                if (!uo) continue;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    ts = ((u64 (*)(void *))(*(void ***)uo)[0])(uo);
+                    g_probe_active = 0;
+                } else { g_probe_active = 0; continue; }
+                if (ts < 1000000000000000ull || ts > 20000000000000000ull)
+                    continue;
+                C2B_LOGS("[c2b] GNS g7: utils via vt["); C2B_LOGN(k);
+                C2B_LOGS("] "); C2B_LOGS(vers[v]);
+                C2B_LOGS(" obj="); C2B_LOGH((u32)(uptr)uo);
+                C2B_LOGS(" ts ok\n");
+                /* SetDebugOutputFunction = vt[1] (SDK-порядок 004) */
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    c2b_g7_vt_spew(uo, 6, (void *)c2b_gns_spew);
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] GNS g7: spew(6) copy#2(client) OK\n");
+                } else {
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] GNS g7: vt[1] spew segv\n");
+                    continue;
+                }
+                /* в rearm: копия#2 = клиентский utils, callable = vtable-санк */
+                g_gns_u[1] = uo;
+                g_gns_flat[1] = (void *)c2b_g7_vt_spew;
+                g_gns_cfg[1] = 0;
+                g_gns_u2_done = 1;
+                sigaction(11, &oldsa, (void *)0);
+                return;
+            }
+        }
+    }
+    C2B_LOGS("[c2b] GNS g7: utils not found via IClient vtable scan\n");
+    sigaction(11, &oldsa, (void *)0);
+}
+
 /* 41f-g5: пере-арм-петля. Run 103/104: flat setter встал, строк НОЛЬ —
  * гипотеза (а): движок/стартап ставит СВОЙ callback ПОСЛЕ нашего инсталла,
  * наш затирается. Решение: каждые 5с в течение 5 минут пере-устанавливаем
@@ -6587,6 +6717,7 @@ static void c2b_gns_spew_rearm(void)
 #else
 static void c2b_gns_spew_install(void) { }   /* selftest: стаб */
 static void c2b_gns_spew_rearm(void) { }     /* selftest: стаб */
+static void c2b_g7_client_utils(void) { }    /* selftest: стаб */
 #endif  /* C2B_SELFTEST */
 
 static void *c2b_auth_thread(void *arg)
@@ -6627,6 +6758,7 @@ static void *c2b_auth_thread(void *arg)
     C2B_LOGS("[c2b] AUTH: done calls="); C2B_LOGN(g_ticket_calls);
     C2B_LOGS(" ok="); C2B_LOGN(g_ticket_ok);
     C2B_LOGS("\n");
+    c2b_g7_client_utils();   /* 41f-g7: спью в steamclient-внутренний GNS */
     c2b_gns_spew_rearm();   /* 41f-g5: пин спью+конфига в окне коннектов движка */
     return 0;
 }

@@ -7048,7 +7048,7 @@ static void *volatile c2b_g11_gather_cont = 0;
 static void *volatile c2b_g11_lag_cont = 0;
 static u8 *g_g11_udp_tramp_mem;
 
-static void c2b_g11_xport_log(uptr wrap)
+void c2b_g11_xport_log(uptr wrap)
 {
     uptr xport, inner, vt0, conn;
     u32 n;
@@ -7083,7 +7083,7 @@ static void c2b_g11_xport_log(uptr wrap)
     g_probe_active = 0;
 }
 
-static void c2b_g11_udp_log(uptr obj, uptr nseg, uptr segs, uptr dest)
+void c2b_g11_udp_log(uptr obj, uptr nseg, uptr segs, uptr dest)
 {
     i32 fd;
     u32 n;
@@ -7118,7 +7118,7 @@ static void c2b_g11_udp_log(uptr obj, uptr nseg, uptr segs, uptr dest)
     g_probe_active = 0;
 }
 
-static void c2b_g11_gather_log(uptr self, uptr nseg, uptr segs, uptr adr, uptr efd)
+void c2b_g11_gather_log(uptr self, uptr nseg, uptr segs, uptr adr, uptr efd)
 {
     u32 n, sockcnt, ratelim, loss, lag, reorder;
     u32 total = 0, k;
@@ -7158,7 +7158,7 @@ static void c2b_g11_gather_log(uptr self, uptr nseg, uptr segs, uptr adr, uptr e
     g_probe_active = 0;
 }
 
-static void c2b_g11_gate_log(uptr conn, uptr msg)
+void c2b_g11_gate_log(uptr conn, uptr msg)
 {
     u32 n, k;
     if (!g_g11_base) return;
@@ -7186,7 +7186,7 @@ static void c2b_g11_gate_log(uptr conn, uptr msg)
     g_probe_active = 0;
 }
 
-static void c2b_g11_lag_log(uptr self, uptr pkt)
+void c2b_g11_lag_log(uptr self, uptr pkt)
 {
     u32 n, k;
     if (!g_g11_base) return;
@@ -7534,7 +7534,7 @@ static void *volatile c2b_g12s_tramp = 0;
 static void *volatile c2b_g12i_tramp = 0;
 static u8 *g_g12s_tramp_mem, *g_g12i_tramp_mem;
 
-static void c2b_g12s_log(uptr conn, uptr newstate, uptr usec)
+void c2b_g12s_log(uptr conn, uptr newstate, uptr usec)
 {
     u32 n;
     if (!g_g11_base || !conn) return;
@@ -7555,7 +7555,7 @@ static void c2b_g12s_log(uptr conn, uptr newstate, uptr usec)
     g_probe_active = 0;
 }
 
-static void c2b_g12i_log(uptr conn, uptr a1, uptr a2)
+void c2b_g12i_log(uptr conn, uptr a1, uptr a2)
 {
     u32 n;
     (void)a2;
@@ -7708,7 +7708,7 @@ static i32 c2b_g13_exec_phdr_cb(void *info_v, void *size_v, void *data_v)
     return 0;
 }
 
-static void c2b_g13_log(uptr state, uptr pkt)
+void c2b_g13_log(uptr state, uptr pkt)
 {
     u32 n, i;
     uptr data;

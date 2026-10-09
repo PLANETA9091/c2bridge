@@ -7897,8 +7897,8 @@ static const u8 c2b_g16b_sig[15] = {
     0x0F, 0x8E, 0xA0, 0x06, 0x00, 0x00 };
 static u8 *g_g16a_tramp_mem;
 static u8 *g_g16b_tramp_mem;
-static void *volatile c2b_g16a_tramp;
-static void *volatile c2b_g16b_tramp;
+__attribute__((used)) static void *volatile c2b_g16a_tramp;
+__attribute__((used)) static void *volatile c2b_g16b_tramp;
 
 /* уникальные ret0-сайты (стиль g15): LanSearch-спам не вытеснит редкие
  * 'j'-реакции из лога — логируем КАЖДЫЙ новый сайт, hot-метки 100/10000 */
@@ -8146,8 +8146,8 @@ static const u8 c2b_g17b_sig[14] = {
     0xE9, 0x68, 0xF7, 0xFF, 0xFF };
 static u8 *g_g17a_tramp_mem;
 static u8 *g_g17b_tramp_mem;
-static void *volatile c2b_g17a_tramp;
-static void *volatile c2b_g17b_tramp;
+__attribute__((used)) static void *volatile c2b_g17a_tramp;
+__attribute__((used)) static void *volatile c2b_g17b_tramp;
 
 void c2b_g17a_log(uptr obj)
 {
@@ -8327,8 +8327,8 @@ static const u8 c2b_g18a_sig[17] = {
     0x48, 0x85, 0xC0, 0x0F, 0x84, 0x61, 0x08, 0x00, 0x00,
     0x4C, 0x8D, 0x68, 0x17, 0x49, 0x83, 0xE5, 0xF0 };
 static u8 *g_g18a_tramp_mem;
-static void *volatile c2b_g18a_tramp;
-static uptr volatile c2b_g18_orig_free;
+__attribute__((used)) static void *volatile c2b_g18a_tramp;
+__attribute__((used)) static uptr volatile c2b_g18_orig_free;
 #define C2B_G18_RING 64   /* 8 было мало: LanSearch-эхо вытесняло bait-ноду до free */
 static uptr volatile g_g18_nodes[C2B_G18_RING];
 static u32 volatile g_g18_node_idx;
@@ -8517,7 +8517,7 @@ static const u8 c2b_g19a_sig[14] = {
     0x48, 0x8B, 0x38, 0x48, 0x8B, 0x07, 0xFF, 0x50,
     0x10, 0xE9, 0x58, 0xFE, 0xFF, 0xFF };
 static u8 *g_g19a_tramp_mem;
-static void *volatile c2b_g19a_tramp;
+__attribute__((used)) static void *volatile c2b_g19a_tramp;
 
 void c2b_g19a_log(uptr node)
 {
@@ -10534,12 +10534,11 @@ i32 c2b_main(void)
         C2B_LOGS("\n");
         pthread_create(&auth_tid, 0, c2b_auth_thread, 0);
     }
-    /* 41f-g20: ранний арм движковых зондов — НЕ ждём steamuser/auth:
-     * bait-цепочка CLV2 стартует раньше auth-флоу (run134 урок) */
-    {
-        void *early_tid = 0;
-        pthread_create(&early_tid, 0, c2b_early_arm_thread, 0);
-    }
+    /* 41f-g20 BISECT run138: early-arm DISABLED - run135/136/137 showed early
+     * arming kills the connect flow regardless of the probe subset (run137:
+     * g19a off, allocs returned, chain still dead). run132's mid-flow arming
+     * (rearm loop) is the proven config. Re-introduce early arms one probe at
+     * a time in later rounds. */
     i32 r = c2b_try_install();
     if (r == 0) {
         C2B_LOGS("[c2b] ARMED: detours in place\n");

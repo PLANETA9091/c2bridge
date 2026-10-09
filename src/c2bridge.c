@@ -9049,7 +9049,7 @@ static u32 g_g24_nstate;
  * chal!=0, vptr-в-движок). Диапазоны: RW engine_client.so + АНОНИМНЫЕ RW
  * (куча!) + [h[heap]; каждый <=256МБ, суммарно <=768МБ. */
 struct c2b_g24_range { uptr lo, hi; };
-struct c2b_g24_rset { struct c2b_g24_range r[96]; u32 n; u64 total; };
+struct c2b_g24_rset { struct c2b_g24_range r[512]; u32 n; u32 p0, p1; u64 total; };
 static u32 c2b_g24_hex32(const char *p, uptr *out)
 {
     uptr v = 0;
@@ -9076,12 +9076,13 @@ static void c2b_g24_add_range(struct c2b_g24_rset *rs, uptr lo, uptr hi)
     if (rs->total + sz > ((uptr)6144 << 20)) return;
     for (i = 0; i < rs->n; i++)
         if (rs->r[i].lo == lo) { dup = 1; break; }
-    if (dup || rs->n >= 96) return;
+    if (dup || rs->n >= 512) return;
     rs->r[rs->n].lo = lo;
     rs->r[rs->n].hi = hi;
     rs->n++;
     rs->total += sz;
 }
+static u32 c2b_g24_add_range_t(struct c2b_g24_rset *rs, uptr lo, uptr hi, u32 pass);
 static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
 {
     static const char *p24 = "/proc/self/maps";
@@ -9115,7 +9116,7 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
     for (pass = 0; pass < 2; pass++) {
       want_eng = (pass == 0);
       p = mb;
-      while (p < end && rs->n < 96) {   /* v3.6.1: while-cap тоже был 64! */
+      while (p < end && rs->n < 512) {  /* v3.8: 96 опять съелось мелкими; 512x16Б=8КБ */
         /* format: lo-hi perms offset dev inode [path]\n */
         uptr lo = 0, hi = 0;
         u32 k;
@@ -9180,9 +9181,16 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
                 C2B_LOGS("\n");
             }
         }
-        c2b_g24_add_range(rs, lo, hi);
+        c2b_g24_add_range_t(rs, lo, hi, pass);
       }
     }
+}
+static u32 c2b_g24_add_range_t(struct c2b_g24_rset *rs, uptr lo, uptr hi, u32 pass)
+{
+    u32 before = rs->n;
+    c2b_g24_add_range(rs, lo, hi);
+    if (rs->n > before) { if (pass == 0) rs->p0++; else rs->p1++; }
+    return rs->n > before;
 }
 static u32 c2b_g24_add_state(uptr p)
 {
@@ -9246,6 +9254,11 @@ static void c2b_g24_find_state(void)
     C2B_LOGS("[c2b] g24: state scan ranges=");
     C2B_LOGN(rs.n);
     C2B_LOGS("tot=");
+    C2B_LOGH((u32)(rs.total >> 32)); C2B_LOGH((u32)rs.total);
+    C2B_LOGS("p0=");
+    C2B_LOGN(rs.p0);
+    C2B_LOGS("p1=");
+    C2B_LOGN(rs.p1);
     C2B_LOGH((u32)(rs.total >> 32)); C2B_LOGH((u32)rs.total);
     C2B_LOGS("n=");
     C2B_LOGN(g_g24_nstate);

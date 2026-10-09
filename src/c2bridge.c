@@ -7464,6 +7464,217 @@ static void c2b_g11_apply(void)
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 
+/* ---------- 41f-g12: state-machine probes (observer) ----------
+ * RE round 1437 (sc.asm d975c5):
+ *  - conn+0x1b40 = ESteamNetworkingConnectionState (m_eConnState),
+ *    +0x1b44 = m_eConnStateOld, +0x1b48 = m_usecWhenEnteredConnState.
+ *    Доказательство: единственная статическая запись b40/b48 — SetState
+ *    @0x1f76390 (this=rdi, esi=eNewState, rdx=usecNow): mov %ebx,0x1b40
+ *    @0x1f763dd, mov %r13,0x1b48 @0x1f763e3; спец-ветки -1/-2/-3 и запись
+ *    old-state @0x1f764bd/0x1f76414 = семантика ESteamNetworkingConnectionState
+ *    (0 None, 1 Connecting, 2 FindingRoute, 3 Connected, 4 ClosedByPeer,
+ *    5 ProblemDetectedLocally, -1 Linger, -2 FinWait, -3 Dead).
+ *  - Гейт ChallengeReply @0x1fd5f68 требует state==1 (Connecting).
+ *  - InitiateConnection @0x1f799c0 (rdi=this, rsi=usecNow, rdx=errMsg):
+ *    state!=0 -> assert-spew через 26fcb60 (line 0xcca, строка @d6c790);
+ *    виртуальный vtable+0x58 (слот 11) обязан вернуть true;
+ *    conn+0x34==0 -> snprintf(d45390) + spew (line 0xcd9) + ВЫХОД БЕЗ
+ *    SetState(1) (0x1f79b08 -> ret 0) — НЕВИДИМЫЙ отказ в Connecting;
+ *    успех: SetState(1) @0x1f79a72 (второй сайт esi=1: 0x1f82f5c Think-retry).
+ *  - ConnectTo @0x1fd14xx: holder{vt 2bd3b08, disp 0x1fd65e0} -> create
+ *    (1fcb2f0) -> BInitConnect 0x1f83240 (rdi=conn, rsi=usecNow, edx=int,
+ *    rcx=ptr, r8=errMsg; фейлы: state!=0, +0x30!=0, identity-несовпадение,
+ *    GetIdentity vslot21) -> если true -> InitiateConnection @0x1fd16e9.
+ * Зонды (детур входа; трамплин = сырая копия пролога + jmp cont):
+ *  g12s: SetState 0x1f76390; пролог 16Б (байты 9-11 wildcard: objdump
+ *        показывает 'push %rbp' на 3Б-спэне 0x1f76399..0x1f7639b; rip-rel
+ *        в 16Б нет), cont 0x1f763a0. Лог: conn-rva, old, new(esi), usec,
+ *        g30, g34, f158. Ловит КАЖДЫЙ переход состояния ЛЮБОГО коннекта.
+ *  g12i: InitiateConnection 0x1f799c0; пролог 20Б точный, cont 0x1f799d4.
+ *        Лог: conn-rva, state, g30, g34, f158, a1(usec).
+ * Матрица решения (вместе с g11f run122):
+ *  g12i есть + g12s new=1 тот же conn -> стейт-машина ОК, барьер дальше
+ *  g12i есть, g12s(1) НЕТ -> блокировка внутри (vslot11 / +0x34==0 / assert)
+ *  g12i НЕТ -> ConnectTo не вызывался вообще (верхний слой) */
+#define C2B_G12_STATE_RVA  0x1f76390ull
+#define C2B_G12_STATE_CONT 0x1f763a0ull
+#define C2B_G12_INIT_RVA   0x1f799c0ull
+#define C2B_G12_INIT_CONT  0x1f799d4ull
+
+static const u8 c2b_g12_sig_init[20] = {
+    0x41, 0x56,                   /* push %r14 */
+    0x41, 0x55,                   /* push %r13 */
+    0x49, 0x89, 0xD5,             /* mov %rdx,%r13 */
+    0x41, 0x54,                   /* push %r12 */
+    0x55,                         /* push %rbp */
+    0x48, 0x89, 0xFD,             /* mov %rdi,%rbp */
+    0x53,                         /* push %rbx */
+    0x8B, 0x97, 0x40, 0x1B, 0x00, 0x00  /* mov 0x1b40(%rdi),%edx */
+};
+/* g12s: маска 1 = wildcard (байты 9-11 неясного содержания) */
+static const u8 c2b_g12_pat_state[16] = {
+    0x41, 0x56, 0x41, 0x55, 0x49, 0x89, 0xD5, 0x41, 0x54,
+    0, 0, 0,
+    0x48, 0x89, 0xFD, 0x53
+};
+static const u8 c2b_g12_msk_state[16] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0,
+    1, 1, 1, 1
+};
+
+static volatile u32 g_g11_ns;   /* анти-спам state-логгера */
+static volatile u32 g_g11_ni;   /* анти-спам init-логгера */
+static void *volatile c2b_g12s_tramp = 0;
+static void *volatile c2b_g12i_tramp = 0;
+static u8 *g_g12s_tramp_mem, *g_g12i_tramp_mem;
+
+static void c2b_g12s_log(uptr conn, uptr newstate, uptr usec)
+{
+    u32 n;
+    if (!g_g11_base || !conn) return;
+    n = ++g_g11_ns;
+    if (n > 32 && (n & 0x0F) != 1) return;   /* первые 32, далее 1/16 */
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g12s state: conn=");
+    C2B_LOGH((u32)(conn > g_g11_base ? conn - g_g11_base : 0));
+    C2B_LOGS(" old="); C2B_LOGN(*(volatile u32 *)(conn + 0x1b40));
+    C2B_LOGS(" new="); C2B_LOGN((u32)newstate);
+    C2B_LOGS(" usec="); C2B_LOGH((u32)(usec >> 32)); C2B_LOGH((u32)usec);
+    C2B_LOGS(" g30="); C2B_LOGN(*(volatile u32 *)(conn + 0x30));
+    C2B_LOGS(" g34="); C2B_LOGN(*(volatile u32 *)(conn + 0x34));
+    C2B_LOGS(" f158="); C2B_LOGN((u32)*(volatile u8 *)(conn + 0x158));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+static void c2b_g12i_log(uptr conn, uptr a1, uptr a2)
+{
+    u32 n;
+    (void)a2;
+    if (!g_g11_base || !conn) return;
+    n = ++g_g11_ni;
+    if (n > 32 && (n & 0x0F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g12i init: conn=");
+    C2B_LOGH((u32)(conn > g_g11_base ? conn - g_g11_base : 0));
+    C2B_LOGS(" st="); C2B_LOGN(*(volatile u32 *)(conn + 0x1b40));
+    C2B_LOGS(" g30="); C2B_LOGN(*(volatile u32 *)(conn + 0x30));
+    C2B_LOGS(" g34="); C2B_LOGN(*(volatile u32 *)(conn + 0x34));
+    C2B_LOGS(" f158="); C2B_LOGN((u32)*(volatile u8 *)(conn + 0x158));
+    C2B_LOGS(" a1="); C2B_LOGH((u32)(a1 >> 32)); C2B_LOGH((u32)a1);
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g12s_thunk\n"
+".type  c2b_g12s_thunk,@function\n"
+"c2b_g12s_thunk:\n"   /* вход: rsp%16==8; rdi=this esi=new rdx=usec */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g12s_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g12s_tramp(%rip)\n"
+".size c2b_g12s_thunk, .-c2b_g12s_thunk\n"
+".globl c2b_g12i_thunk\n"
+".type  c2b_g12i_thunk,@function\n"
+"c2b_g12i_thunk:\n"   /* вход: rsp%16==8; rdi=this rsi=usec rdx=errMsg */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g12i_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g12i_tramp(%rip)\n"
+".size c2b_g12i_thunk, .-c2b_g12i_thunk\n"
+".previous\n"
+);
+extern void c2b_g12s_thunk(void);
+extern void c2b_g12i_thunk(void);
+
+static void c2b_g12_apply(void)
+{
+    static u8 done;
+    uptr base, st, in, tr;
+    if (done) return;
+    base = g_g11_base;
+    if (!base) return;
+    st = base + C2B_G12_STATE_RVA;
+    in = base + C2B_G12_INIT_RVA;
+    {   const u8 *p = (const u8 *)st;
+        u32 i;
+        for (i = 0; i < 16; i++)
+            if (c2b_g12_msk_state[i] && p[i] != c2b_g12_pat_state[i]) {
+                C2B_LOGS("[c2b] g12: state sig mismatch\n"); done = 1; return;
+            }
+    }
+    if (memcmp((const void *)in, c2b_g12_sig_init, sizeof c2b_g12_sig_init) != 0) {
+        C2B_LOGS("[c2b] g12: init sig mismatch\n"); done = 1; return;
+    }
+    /* g12i: трамплин 20Б + jmp 0x1f799d4 */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g12i_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)in, sizeof c2b_g12_sig_init);
+    c2b_write_jmp((void *)(tr + sizeof c2b_g12_sig_init),
+                  (const void *)(in + sizeof c2b_g12_sig_init));
+    c2b_g12i_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(in, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)in, (const void *)&c2b_g12i_thunk);
+    /* g12s: трамплин 16Б + jmp 0x1f763a0 */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g12s_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)st, 16);
+    c2b_write_jmp((void *)(tr + 16), (const void *)(st + 16));
+    c2b_g12s_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(st, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)st, (const void *)&c2b_g12s_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g12: armed state+init base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
 static void c2b_gns_spew_rearm(void)
 {
     u32 it, c, applied = 0;
@@ -7471,6 +7682,7 @@ static void c2b_gns_spew_rearm(void)
     c2b_g9_patch_apply();   /* 41f-g9: IP_AllowWithoutAuth=1 во все копии */
     c2b_g9_flat_set();      /* 41f-g9: flat set через copy#1 */
     c2b_g11_apply();        /* 41f-g11: транспортная выводка ConnectRequest */
+    c2b_g12_apply();        /* 41f-g12: зонды стейт-машины (SetState/InitConn) */
     c2b_g8_patch_verify();
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
@@ -7486,6 +7698,7 @@ static void c2b_gns_spew_rearm(void)
         c2b_g9_patch_apply();   /* 41f-g9: re-assert (поздние копии/гонки) */
         c2b_g9_flat_set();      /* 41f-g9: copy#1 мог появиться позже */
         c2b_g11_apply();        /* 41f-g11: одноразово (done-флаг внутри) */
+        c2b_g12_apply();        /* 41f-g12: одноразово (done-флаг внутри) */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

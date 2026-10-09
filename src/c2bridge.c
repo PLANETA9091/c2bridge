@@ -7675,17 +7675,36 @@ static const u8 c2b_g13_pat_clp[26] = {
 static void *volatile c2b_g13_tramp = 0;
 static u8 *g_g13_tramp_mem;
 static volatile u32 g_g13_n;
-static uptr g_g13_base;           /* база модуля, в котором армился */
+static uptr g_g13_base;           /* (резерв) */
 
-/* минимальная копия dl_phdr_info (glibc ABI стабилен: addr@0, name@8) —
- * полный struct объявлен ниже по файлу, а g13-код выше него */
-struct c2b_g13_phdr_min { uptr addr; const char *name; };
-static i32 c2b_g13_main_phdr_cb(void *info_v, void *size_v, void *data_v)
+/* минимальная копия dl_phdr_info (glibc ABI стабилен: addr@0, name@8,
+ * phdr@16, phnum@24) — полный struct объявлен ниже по файлу */
+struct c2b_g13_phdr_min { uptr addr; const char *name; const void *phdr; u16 phnum; };
+struct c2b_g13_phdr64 {          /* Elf64_Phdr (только нужное) */
+    u32 type; u32 flags;
+    u64 off, vaddr, paddr, filesz, memsz, align;
+};
+struct c2b_g13_ranges { uptr lo[16], hi[16]; u32 n; };
+static i32 c2b_g13_exec_phdr_cb(void *info_v, void *size_v, void *data_v)
 {
     struct c2b_g13_phdr_min *info = (struct c2b_g13_phdr_min *)info_v;
+    struct c2b_g13_ranges *r = (struct c2b_g13_ranges *)data_v;
     (void)size_v;
-    if (!info->name) return 0;
-    if (!info->name[0]) { *(uptr *)data_v = info->addr; return 1; }
+    if (!info->phdr || !info->phnum) return 0;
+    {
+        u16 i;
+        for (i = 0; i < info->phnum && r->n < 16; i++) {
+            const struct c2b_g13_phdr64 *ph =
+                (const struct c2b_g13_phdr64 *)((const u8 *)info->phdr +
+                                                (uptr)i * sizeof(*ph));
+            if (ph->type == 1 && (ph->flags & 1) && ph->filesz > 0x1000 &&
+                ph->filesz < ((uptr)1 << 28)) {
+                r->lo[r->n] = info->addr + (uptr)ph->vaddr;
+                r->hi[r->n] = r->lo[r->n] + (uptr)ph->filesz;
+                r->n++;
+            }
+        }
+    }
     return 0;
 }
 
@@ -7709,7 +7728,7 @@ static void c2b_g13_log(uptr state, uptr pkt)
         C2B_LOGS("-");
     }
     C2B_LOGS(" st=");
-    C2B_LOGH((u32)(state > g_g13_base ? state - g_g13_base : 0));
+    C2B_LOGH((u32)(state >> 32)); C2B_LOGH((u32)state);
     C2B_LOGS(" hdr=");
     for (i = 0; i < 32; i++)
         C2B_LOGH(*(volatile const u8 *)(pkt + i));
@@ -7755,104 +7774,68 @@ __asm__(
 );
 extern void c2b_g13_thunk(void);
 
-/* скан r-x диапазонов csgo_linux64 из /proc/self/maps -> g13-паттерн.
- * Возврат: 0=нашли ровно 1 (tgt), 1=0 или >1 (диагностика в логе). */
-static i32 c2b_sthas(const char *h, const char *nd);   /* fwd (реализация ниже) */
+/* Самолокализация диспатчера (26B паттерн) по ВСЕМ модулям процесса:
+ * dl_iterate_phdr -> PT_LOAD+PF_X сегменты каждого модуля (безопасные
+ * границы) -> скан. Арм ТОЛЬКО при ровно одном совпадении на процесс.
+ * Возврат: 0 = нашли ровно 1 (*tgt), 1 = 0 или >1 (диагностика в логе). */
 static i32 c2b_g13_selfscan(uptr *tgt)
 {
-    extern i32  open(const char *, i32, ...);
-    extern i64  read(i32, void *, u64);
-    extern i32  close(i32);
-    static char mb[65536];
-    uptr lo[8], hi[8];
-    u32 nr = 0, hits = 0, i;
-    i32 fd = open("/proc/self/maps", 0);
-    if (fd < 0) { C2B_LOGS("[c2b] g13: no maps\n"); return 1; }
-    {
-        i64 n = read(fd, mb, sizeof(mb) - 1);
-        close(fd);
-        if (n <= 0) { C2B_LOGS("[c2b] g13: maps empty\n"); return 1; }
-        mb[n] = 0;
-        {
-            char *p = mb;
-            while (p < mb + n && nr < 8) {
-                char *e = p;
-                char sav;
-                while (e < mb + n && *e != '\n') e++;
-                sav = *e; *e = 0;
-                if (c2b_sthas(p, "csgo_linux64")) {
-                        /* формат: start-end perms ... путь; perms[1]=='x' */
-                        uptr a = 0, b = 0;
-                        u32 k = 0;
-                        while (p[k] && p[k] != '-') {
-                            char c = p[k];
-                            a = a * 16 + (u32)(c <= '9' ? c - '0' : (c | 32) - 'a' + 10);
-                            k++;
-                        }
-                        k++;  /* '-' */
-                        while (p[k] && p[k] != ' ') {
-                            char c = p[k];
-                            b = b * 16 + (u32)(c <= '9' ? c - '0' : (c | 32) - 'a' + 10);
-                            k++;
-                        }
-                        /* perms: "r-xp" -> p[q]=='r', p[q+2]=='x' */
-                        if (a && b > a) {
-                            u32 q = k + 1;          /* perms starts */
-                            if (q + 3 < (u32)n && p[q] == 'r' && p[q + 2] == 'x') {
-                                lo[nr] = a; hi[nr] = b; nr++;
-                            }
-                        }
-                    }
-                    *e = sav;
-                p = (sav == '\n') ? e + 1 : e;
-            }
-        }
-    }
-    if (!nr) { C2B_LOGS("[c2b] g13: no csgo_linux64 x-range\n"); return 1; }
-    for (i = 0; i < nr; i++) {
-        const u8 *p = (const u8 *)lo[i], *end = (const u8 *)hi[i] - C2B_G13_SIG_N;
-        if (hi[i] - lo[i] > (uptr)1 << 28) continue;  /* >256MB: защита от мусора */
+    struct c2b_g13_ranges rg;
+    u32 hits = 0, i;
+    rg.n = 0;
+    dl_iterate_phdr(c2b_g13_exec_phdr_cb, &rg);
+    if (!rg.n) { C2B_LOGS("[c2b] g13: no exec ranges\n"); return 1; }
+    for (i = 0; i < rg.n; i++) {
+        const u8 *p = (const u8 *)rg.lo[i];
+        const u8 *end = (const u8 *)rg.hi[i] - C2B_G13_SIG_N;
         for (; p <= end; p++) {
             if (p[0] == 0x55 && p[1] == 0x48 && p[2] == 0x89 && p[3] == 0xE5 &&
                 p[4] == 0x41 && p[6] == 0x49 &&
                 memcmp(p, c2b_g13_pat_clp, C2B_G13_SIG_N) == 0) {
                 if (hits < 4) {
-                    C2B_LOGS("[c2b] g13: hit off=");
-                    C2B_LOGH((u32)((uptr)p - g_g13_base));
+                    C2B_LOGS("[c2b] g13: hit @");
+                    C2B_LOGH((u32)((uptr)p >> 32));
+                    C2B_LOGH((u32)(uptr)p);
                     C2B_LOGS("\n");
                 }
+                if (hits == 0) *tgt = (uptr)p;
                 hits++;
-                if (hits == 1) *tgt = (uptr)p;
-                if (hits >= 2) return 1;   /* неуникален — не армим вслепую */
+                if (hits >= 2) return 1;   /* неуникален — вслепую не армим */
             }
         }
     }
-    if (!hits) C2B_LOGS("[c2b] g13: pattern not found in monolith\n");
+    if (!hits) C2B_LOGS("[c2b] g13: pattern not found in any module\n");
     return hits != 1;
 }
 
 static void c2b_g13_apply(void)
 {
     static u8 done;
-    uptr base, tgt, tr;
+    uptr base, tgt = 0, tr;
     if (done) return;
+    /* 1) быстрый путь: известная база движка + RVA (uplink sig уже доказал
+     *    совпадение рантайм-движка с 34a96ae) */
     base = g_engine_base;
-    if (!base) {
-        uptr mb = 0;
-        dl_iterate_phdr(c2b_g13_main_phdr_cb, &mb);   /* main exe (имя пустое) */
-        base = mb;
+    if (base) {
+        tgt = base + C2B_G13_CLP_RVA;
+        if (memcmp((const void *)tgt, c2b_g13_pat_clp, C2B_G13_SIG_N) == 0)
+            goto arm;
+        C2B_LOGS("[c2b] g13: rva mismatch -> selfscan\n");
     }
-    if (!base) return;                     /* база ещё не готова — ретрай */
-    g_g13_base = base;
-    tgt = base + C2B_G13_CLP_RVA;
-    if (memcmp((const void *)tgt, c2b_g13_pat_clp, C2B_G13_SIG_N) != 0) {
-        /* run124: рантайм = монолит csgo_linux64 (engine_client.so из бандла —
-         * легаси-остаток, RVA не совпадает) -> само-скан r-x диапазона */
-        C2B_LOGS("[c2b] g13: rva mismatch (base=");
-        C2B_LOGH((u32)(base >> 32)); C2B_LOGH((u32)base);
-        C2B_LOGS(") -> selfscan\n");
-        if (c2b_g13_selfscan(&tgt) != 0) { done = 1; return; }
+    /* 2) общий путь: скан всех модулей (run124: в ряде попыток движок
+     *    вообще не резолвится legacy-сканом; модуль может грузиться поздно).
+     *    «Не найдено» — НЕ терминально: ретрай до ~40 итераций rearm-цикла
+     *    (~3.5 мин), потом сдаться с диагностикой. */
+    if (c2b_g13_selfscan(&tgt) != 0) {
+        static u32 tries;
+        u32 miss = 0;
+        if (++tries <= 40) return;         /* ретрай в следующей итерации */
+        miss = 1;
+        (void)miss;
+        done = 1;
+        return;
     }
+arm:
     tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
     if (tr == (uptr)-1) { done = 1; return; }
     g_g13_tramp_mem = (u8 *)tr;
@@ -7864,9 +7847,7 @@ static void c2b_g13_apply(void)
     c2b_write_jmp((void *)tgt, (const void *)&c2b_g13_thunk);
     done = 1;
     C2B_LOGS("[c2b] g13: armed clp @");
-    C2B_LOGH((u32)((tgt - base) >> 32)); C2B_LOGH((u32)(tgt - base));
-    C2B_LOGS(" base=");
-    C2B_LOGH((u32)(base >> 32)); C2B_LOGH((u32)base);
+    C2B_LOGH((u32)(tgt >> 32)); C2B_LOGH((u32)tgt);
     C2B_LOGS("\n");
 }
 

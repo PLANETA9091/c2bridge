@@ -6657,11 +6657,8 @@ static void c2b_g7_client_utils(void)
             C2B_LOGH((u32)s2); C2B_LOGS("\n");
             if ((s2 >> 56) == 0x01) user = cand[ci];
         }
-        if (!user) {
-            C2B_LOGS("[c2b] GNS g7: no verified user\n");
-            sigaction(11, &oldsa, (void *)0);
-            return;
-        }
+        if (!user)
+            C2B_LOGS("[c2b] GNS g7: no verified user (продолжаем — utils не нужен user)\n");
     }
     /* GetISteamNetworkingUtils: перебор индексов. Форма A: (pipe, ver);
      * верификация объекта = vt[0] возвращает микросекунды (~1.7e15). */

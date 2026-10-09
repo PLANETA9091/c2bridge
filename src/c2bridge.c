@@ -6981,6 +6981,24 @@ static void c2b_g9_flat_set(void)
  * cont = 0x1fcd4f8. */
 #define C2B_G11_LAG_RVA     0x1fcd4e0ull
 #define C2B_G11_LAG_CONT    0x1fcd4f8ull
+/* g11f (раунд 1407): ТИХИЙ ГЕЙТ обработчика ChallengeReply @0x1fd5f68:
+ * cmpl $0x1,0x1b40(%rbp); jne 0x1fd5f3c (эпилог, БЕЗ warning) — если
+ * conn+0x1b40 != 1, обработка 0x21 и отправка 0x22 молча пропускаются.
+ * Ран118: сервер ОТВЕЧАЕТ 0x21 (a1:7, a3:4, a4:2), спью чист, g11x молчит
+ * => единственный невидимый выход = этот гейт (или функ не вызывается).
+ * conn+0x1b40: пишется ТОЛЬКО нулём в конторе (15d0083 movups), статических
+ * записей 1/3 НЕ найдено — семантика неизвестна (вопрос к логу). Пролог 14Б:
+ * cmpl(7) + jne(2) + первые 5Б mov 0x180(%rbp),%eax (шестой байт — сирота).
+ * Репликация: cmpl, jne->0x1fd5f3c, mov; cont = 0x1fd5f77 (mov %rsi,%r15). */
+#define C2B_G11_GATE_RVA    0x1fd5f68ull
+#define C2B_G11_GATE_CONT   0x1fd5f77ull
+#define C2B_G11_GATE_BAIL   0x1fd5f3cull
+
+static const u8 c2b_g11_sig_gate[14] = {
+    0x83, 0xBB, 0x40, 0x1B, 0x00, 0x00, 0x01,  /* cmpl $0x1,0x1b40(%rbp) */
+    0x75, 0xCB,                                 /* jne 0x1fd5f3c */
+    0x8B, 0x85, 0x80, 0x01, 0x00                /* mov 0x180(%rbp),%eax (5/6) */
+};
 
 static const u8 c2b_g11_sig_lag[24] = {
     0x48, 0x8D, 0x4E, 0x28,          /* lea 0x28(%rsi),%rcx */
@@ -7019,6 +7037,9 @@ static volatile u32 g_g11_nx;           /* анти-спам xport-логгер�
 static volatile u32 g_g11_nu;           /* анти-спам udp-логгера */
 static volatile u32 g_g11_ng;           /* анти-спам gather-логгера */
 static volatile u32 g_g11_nl;           /* анти-спам lagger-drain-логгера */
+static volatile u32 g_g11_nf;           /* анти-спам gate-логгера */
+static void *volatile c2b_g11_gate_cont = 0;
+static void *volatile c2b_g11_gate_bail = 0;
 static volatile u64 c2b_g11_cont_addr, c2b_g11_null_addr;
 /* void *volatile (НЕ volatile void*): gcc удаляет unused static без
  * volatile-объекта, а тюнк ссылается на символ из asm (урок сборки g11) */
@@ -7132,6 +7153,34 @@ static void c2b_g11_gather_log(uptr self, uptr nseg, uptr segs, uptr adr, uptr e
             C2B_LOGH(*(volatile u32 *)(adr + k));
     } else {
         C2B_LOGH(0);
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+static void c2b_g11_gate_log(uptr conn, uptr msg)
+{
+    u32 n, k;
+    if (!g_g11_base) return;
+    n = ++g_g11_nf;
+    if (n > 24 && (n & 0x3F) != 1) return;   /* первые 24, далее 1/64 */
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g11f gate: conn=");
+    C2B_LOGH((u32)(conn > g_g11_base ? conn - g_g11_base : 0));
+    if (conn) {
+        C2B_LOGS(" b40="); C2B_LOGN(*(volatile u32 *)(conn + 0x1b40));
+        C2B_LOGS(" b44="); C2B_LOGN(*(volatile u32 *)(conn + 0x1b44));
+        C2B_LOGS(" id180="); C2B_LOGN(*(volatile u32 *)(conn + 0x180));
+        C2B_LOGS(" f158="); C2B_LOGN((u32)*(volatile u8 *)(conn + 0x158));
+        C2B_LOGS(" cr1848="); C2B_LOGN((u32)*(volatile u8 *)(conn + 0x1848));
+        C2B_LOGS(" cr1870="); C2B_LOGN((u32)*(volatile u8 *)(conn + 0x1870));
+    }
+    if (msg) {
+        C2B_LOGS(" msg[8B]=");
+        for (k = 0x20; k < 0x28; k += 4)
+            C2B_LOGH(*(volatile u32 *)(msg + k));
     }
     C2B_LOGS("\n");
     g_probe_active = 0;
@@ -7304,17 +7353,57 @@ __asm__(
 "  mov  c2b_g11_lag_cont(%rip),%r11\n"
 "  jmp  *%r11\n"
 ".size c2b_g11_lag_thunk, .-c2b_g11_lag_thunk\n"
+".globl c2b_g11_gate_thunk\n"
+".type  c2b_g11_gate_thunk,@function\n"
+"c2b_g11_gate_thunk:\n" /* вход: rsp%16==8 (call в функ); rbp=conn rsi=msg; rdx/rbx живы */
+"  endbr64\n"
+"  sub  $0x68,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %rbp,0x48(%rsp)\n"
+"  mov  %rbp,%rdi\n"          /* arg1=conn */
+"  mov  0x18(%rsp),%rsi\n"    /* arg2=msg */
+"  call c2b_g11_gate_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  mov  0x48(%rsp),%rbp\n"
+"  add  $0x68,%rsp\n"
+/* реплика 14Б: cmpl $1,0x1b40(%rbp); jne bail; mov 0x180(%rbp),%eax */
+"  cmpl $0x1,0x1b40(%rbp)\n"
+"  jne  12f\n"
+"  mov  0x180(%rbp),%eax\n"
+"  mov  c2b_g11_gate_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+"12:\n"
+"  mov  c2b_g11_gate_bail(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g11_gate_thunk, .-c2b_g11_gate_thunk\n"
 ".previous\n"
 );
 extern void c2b_g11_xport_thunk(void);
 extern void c2b_g11_udp_thunk(void);
 extern void c2b_g11_gather_thunk(void);
 extern void c2b_g11_lag_thunk(void);
+extern void c2b_g11_gate_thunk(void);
 
 static void c2b_g11_apply(void)
 {
     static u8 done;
-    uptr base = 0, site, udp, tr, gather, lag;
+    uptr base = 0, site, udp, tr, gather, lag, gate;
     if (done) return;
     dl_iterate_phdr(c2b_g8_phdr_cb, &base);   /* тот же фильтр steamclient.so */
     if (!base) return;
@@ -7361,8 +7450,17 @@ static void c2b_g11_apply(void)
     c2b_g11_lag_cont = (const volatile void *)(base + C2B_G11_LAG_CONT);
     if (c2b_page_protect(lag, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
     c2b_write_jmp((void *)lag, (const void *)&c2b_g11_lag_thunk);
+    /* g11f: тихий гейт обработчика ChallengeReply */
+    gate = base + C2B_G11_GATE_RVA;
+    if (memcmp((const void *)gate, c2b_g11_sig_gate, sizeof c2b_g11_sig_gate) != 0) {
+        C2B_LOGS("[c2b] g11: gate sig mismatch\n"); done = 1; return;
+    }
+    c2b_g11_gate_cont = (const volatile void *)(base + C2B_G11_GATE_CONT);
+    c2b_g11_gate_bail = (const volatile void *)(base + C2B_G11_GATE_BAIL);
+    if (c2b_page_protect(gate, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)gate, (const void *)&c2b_g11_gate_thunk);
     done = 1;
-    C2B_LOGS("[c2b] g11: armed site+udp+gather+lag base=");
+    C2B_LOGS("[c2b] g11: armed site+udp+gather+lag+gate base=");
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 

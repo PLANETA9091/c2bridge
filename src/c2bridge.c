@@ -9033,6 +9033,34 @@ static void c2b_g22_apply(void)
 #define C2B_G24_VPTR2 0xd78de8ull
 static uptr g_g24_state[4];
 static u32 g_g24_nstate;
+/* ---------- g26/g28: 'k'-build unlock (RE run161 engine_client.so) --------
+ * ОФЛАЙН-RE bins run161 (engine_client.so__2cd041, НЕ strip, RVA = живым:
+ * gate-сиг 48 83 bf 30 04 00 00 00 @0x2491f0 совпал байт-в-байт):
+ *  SendConnectPacket = vt+0x198 -> 0x24aa20 (первая строка:
+ *  COM_TimestampedLog("SendConnectPacket")). Пишет BF: 'k', auth-proto
+ *  (state+0x8dc4), proto, chal, name, pwd, потом тикет-зону (0x478 blob,
+ *  0x510/0x514/0x520/0x530) и шлёт (0x248010). САМ движок строит 'k'.
+ *  ТРИ внутри-функции чека рубят его ДО первого байта:
+ *   (a) @0x24aa76: snap[0x1c] (state+0x50c) == 0 -> je 0x24b071 fail;
+ *   (b) @0x24aa96: netadr cmp state+0x148 vs snap (0x248330) -> je 0x24b2c7;
+ *   (c) @0x24aae3: state->0x8dc4 (auth-proto) == 0 -> je 0x24b065 fail.
+ *  ПОСТАВЩИК флагов (0x4c0 connect-in-progress + 0x8dc4) — ветка
+ *  "connect"-КОМАНДЫ диспетчера (@0x25cf38: cmpl $1,0x1a0 -> cstate==1 ->
+ *  movb $1,0x4c0 @0x25cf46; mov %r14d,0x8dc4 @0x25cf99) — но диспетчер
+ *  0x259df0 в живом пути НЕ зовётся (g13-детур молчит), а 'A'-парс чалль
+ *  ПИШЕТ (run157/162 эмпирика) — т.е. живой консьюмер обрабатывает 'A'
+ *  своей копией, не доходя до ветки флагов. Pump 0x24b520 (vt+0x198 зовёт
+ *  при 0x4c0!=0) тоже мёртв для живого пути (зовут только dispatch-ер и
+ *  pwd-handler). ИТОГ: все недостающие флаги — В ПАМЯТИ СТЕЙТА, которой
+ *  g24 владеет. g26: пишем snap[0x1c]=1, 0x8dc4=3 (если 0) -> чеки (a)/(c)
+ *  проходя. g28: СОВЕРШАЕМ вызов vt+0x198 сами (сигнатура из pump-а
+ *  @0x24b56b: rdi=state, rsi=&snap(0x4f0), edx=chal, ecx=proto, r8=val
+ *  u64, r9d=u8@0x4c1): тикет-путь исполняет сам движок. Рефрактерность
+ *  2с, кап 10, C2B_G28=0 выкл. (b) не трогаем: na-зона логируется в
+ *  dumpone, адрес сравнения — решающие данные следующего ранa. */
+static u32 g_g28_sends;
+static u32 g_g28_last_it;
+static u32 g_g28_en = 1;
 /* v3 (run144/145 post-mortem: g24 v1/v2 = dl_iterate_phdr КАЖДЫЕ 5с по 2мин +
  * rescan каждые 64с -> КОНКУРЕНЦИЯ за loader-lock с auth-тредом, чей rearm
  * (g8/g9/g13/modmap) ТОЖЕ зовёт dl_iterate_phdr: run144 a2 backtrace = auth
@@ -9296,6 +9324,31 @@ static void c2b_g24_dumpone(u32 i, u32 cs)
     C2B_LOGS("snap=");
     for (k = 0; k < 32; k++)
         C2B_LOGH(*(volatile const u8 *)(st + 0x4f0 + k));
+    /* g27 diag: флаги/поля 'k'-пути (RE run161): s1c=snap[0x1c] (чек (a)),
+     * c0/c1/c5=0x4c0/0x4c1/0x4c5 (connect-in-progress, арг, флаги),
+     * e8=0x4e8 (pump-гейт), ap=0x8dc4 (auth-proto, чек (c)), tkt=0x478
+     * (тикет-блоб ptr), na=0x148 16Б (netadr для cmp (b) со snap) */
+    C2B_LOGS("s1c=");
+    C2B_LOGH(*(volatile const u32 *)(st + 0x50c));
+    C2B_LOGS("c0=");
+    C2B_LOGH(*(volatile const u8 *)(st + 0x4c0));
+    C2B_LOGS("c1=");
+    C2B_LOGH(*(volatile const u8 *)(st + 0x4c1));
+    C2B_LOGS("c5=");
+    C2B_LOGH(*(volatile const u8 *)(st + 0x4c5));
+    {   u64 e8 = *(volatile const u64 *)(st + 0x4e8);
+        u64 tk = *(volatile const u64 *)(st + 0x478);
+        u32 kk;
+        C2B_LOGS("e8=");
+        C2B_LOGH((u32)(e8 >> 32)); C2B_LOGH((u32)e8);
+        C2B_LOGS("ap=");
+        C2B_LOGH(*(volatile const u32 *)(st + 0x8dc4));
+        C2B_LOGS("tkt=");
+        C2B_LOGH((u32)(tk >> 32)); C2B_LOGH((u32)tk);
+        C2B_LOGS("na=");
+        for (kk = 0; kk < 16; kk++)
+            C2B_LOGH(*(volatile const u8 *)(st + 0x148 + kk));
+    }
     C2B_LOGS("\n");
 }
 static void *c2b_g24_thread(void *arg)
@@ -9304,6 +9357,10 @@ static void *c2b_g24_thread(void *arg)
     u32 last_c[4];
     u64 last_h[4];
     (void)arg;
+    {   const char *e = getenv("C2B_G28");
+        if (e && e[0] == '0') { g_g28_en = 0;
+            C2B_LOGS("[c2b] g28: disabled by env\n"); }
+    }
     for (it = 0; it < 600 && !g_engine_base; it++) usleep(1000000);
     for (i = 0; i < 4; i++) { last_c[i] = 0xffffffffu; last_h[i] = 0; }
     /* v3.9.1: скан #1 через 45с после базы (движок встал, стейт создан,
@@ -9329,15 +9386,70 @@ static void *c2b_g24_thread(void *arg)
         for (i = 0; i < g_g24_nstate; i++) {
             uptr st = g_g24_state[i];
             u32 cs = *(volatile const u32 *)(st + 0x1a0);
+            u32 chal = *(volatile const u32 *)(st + 0x4d8);
+            u32 proto = *(volatile const u32 *)(st + 0x4dc);
             u64 h;
             u32 k;
             h = (u64)cs * 1000003u;
             h ^= *(volatile const u64 *)(st + 0x128);
-            h = h * 1000003u + *(volatile const u32 *)(st + 0x4d8);
-            h = h * 1000003u + *(volatile const u32 *)(st + 0x4dc);
+            h = h * 1000003u + chal;
+            h = h * 1000003u + proto;
             h = h * 1000003u + *(volatile const u32 *)(st + 0x4e0);
             for (k = 0; k < 4; k++)
                 h = h * 1000003u + *(volatile const u64 *)(st + 0x4f0 + k * 8);
+            h = h * 1000003u + *(volatile const u32 *)(st + 0x50c);
+            h = h * 1000003u + *(volatile const u32 *)(st + 0x8dc4);
+            /* g26: пред-чеки SendConnectPacket — snap[0x1c] и auth-proto
+             * в норме ставит мёртвая для живого пути ветка "connect"-
+             * команды диспетчера; чиним в памяти (чек (b) netadr-cmp не
+             * трогаем — na-зона видна в dumpone) */
+            if (chal != 0 && proto == 3) {
+                u32 s1c = *(volatile u32 *)(st + 0x50c);
+                u32 ap = *(volatile u32 *)(st + 0x8dc4);
+                if (s1c == 0) {
+                    *(volatile u32 *)(st + 0x50c) = 1;
+                    C2B_LOGS("[c2b] g26: snap[0x1c] 0->1 st=");
+                    C2B_LOGH((u32)st); C2B_LOGS("\n");
+                }
+                if (ap == 0) {
+                    *(volatile u32 *)(st + 0x8dc4) = 3;
+                    C2B_LOGS("[c2b] g26: auth-proto 0->3 st=");
+                    C2B_LOGH((u32)st); C2B_LOGS("\n");
+                }
+                /* g28: прямой вызов vt+0x198 SendConnectPacket(state,&snap,
+                 * chal,proto,val,u8@0x4c1) — рефрактерность 2с (8 итераций),
+                 * кап 10; тикет-зону исполняет сам движок */
+                if (g_g28_en && g_g28_sends < 10 &&
+                    (u32)(it - g_g28_last_it) >= 8) {
+                    uptr vt = *(volatile const uptr *)st;
+                    uptr fn = vt ? *(volatile const uptr *)(vt + 0x198) : 0;
+                    g_g28_last_it = it;
+                    if (fn && g_engine_base &&
+                        fn - g_engine_base < 0x4000000ull) {
+                        C2B_LOGS("[c2b] g28: scp call #");
+                        C2B_LOGN(g_g28_sends + 1);
+                        C2B_LOGS("fn=");
+                        C2B_LOGH((u32)(fn >> 32)); C2B_LOGH((u32)fn);
+                        C2B_LOGS("chal=");
+                        C2B_LOGH(chal);
+                        C2B_LOGS("proto=");
+                        C2B_LOGH(proto);
+                        C2B_LOGS("\n");
+                        ((void (*)(uptr, const void *, u32, u32, u64, u32))fn)(
+                            st, (const void *)(st + 0x4f0), chal, proto,
+                            *(volatile const u64 *)(st + 0x4e0),
+                            *(volatile const u8 *)(st + 0x4c1));
+                        g_g28_sends++;
+                        C2B_LOGS("[c2b] g28: scp returned\n");
+                    } else {
+                        C2B_LOGS("[c2b] g28: fn rejected vt=");
+                        C2B_LOGH((u32)(vt >> 32)); C2B_LOGH((u32)vt);
+                        C2B_LOGS("fn=");
+                        C2B_LOGH((u32)(fn >> 32)); C2B_LOGH((u32)fn);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
             /* v3.9: cstate!=0 = подключающееся окно (может быть короче 250мс
              * опроса) — логируем КАЖДУЮ итерацию пока подключается: траектория
              * cstate + snap В МОМЕНТ 'A' — решающие данные */

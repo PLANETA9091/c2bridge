@@ -8368,13 +8368,22 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
     if (cnt > 8 && (cnt & 0x1F) != 1) return;
     /* БЕЗ sigsetjmp-гарда: гарды живут только пока стоит хендлер auth-пробой,
      * а слот Free патчится с РАННЕГО арма — фолт тут = мгновенная смерть.
-     * Здесь только чтение кольца и лог — фолт невозможен. */
+     * Здесь только чтение кольца и лог — фолт невозможен.
+     * 41f-g19-перенос: раз г19-сайт (0x2e1ad5) ЛЕТАЛЕН (run133: краш сразу
+     * после первого исполнения; run132 без него — чисто), дамп ноды делаем
+     * ЗДЕСЬ: ptr в кольце = нода насоса (Fork1 0x47=71Б), читаем 32Б полей
+     * (+0=sockobj, +8=payload ptr, +0x10=len, +0x18/+0x1c=netadr) — риск
+     * page-end только для 0x27-канальных нод, и то 9Б в тот же heap-чанк. */
     C2B_LOGS("[c2b] g18 free-node: ra=");
     C2B_LOGH((u32)(ret0 >> 32)); C2B_LOGH((u32)ret0);
     if (g_engine_base && ret0 > g_engine_base &&
         ret0 - g_engine_base < 0x8000000ull) {
         C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - g_engine_base));
     }
+    C2B_LOGS(" node=");
+    C2B_LOGH((u32)(ptr >> 32)); C2B_LOGH((u32)ptr);
+    for (i = 0; i < 8; i++)                        /* 32Б полей ноды */
+        C2B_LOGH(((const volatile u32 *)ptr)[i]);
     C2B_LOGS("\n");
 }
 

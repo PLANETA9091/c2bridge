@@ -6759,21 +6759,22 @@ static void c2b_g7_client_utils(void)
 static volatile void **g_g8_slot;
 static u8 g_g8_armed;
 
-static void c2b_g8_phdr_cb(void *info_v, void *size_v, void *data_v)
+static i32 c2b_g8_phdr_cb(void *info_v, void *size_v, void *data_v)
 {
     struct c2b_g5_phdr *pi = (struct c2b_g5_phdr *)info_v;
     uptr *out = (uptr *)data_v;
     const char *nm, *sfx = "steamclient.so";
     u32 nl, sl = 0, j;
     (void)size_v;
-    if (!pi || !pi->dlpi_name) return;
+    if (!pi || !pi->dlpi_name) return 0;
     nm = pi->dlpi_name;
     nl = 0; while (nm[nl]) nl++;
     while (sfx[sl]) sl++;
-    if (nl < sl) return;
+    if (nl < sl) return 0;
     for (j = 0; j < sl && nm[nl - sl + j] == sfx[j]; j++) {}
-    if (j != sl) return;
+    if (j != sl) return 0;
     *out = pi->dlpi_addr;   /* load bias найденной копии */
+    return 0;               /* продолжаем — берём последнюю замапленную */
 }
 
 static void c2b_g8_patch_apply(void)

@@ -6918,12 +6918,251 @@ static void c2b_g9_flat_set(void)
     C2B_LOGS("[c2b] GNS g9: flat set cfg23 IP_AllowWithoutAuth=1 ok\n");
 }
 
+/* ---------- 41f-g11: транспортная выводка ConnectRequest (observer) ----------
+ * RE run116 (диз sc.asm, билд d975c5) + pcap a3/a4:
+ *  - 0x22 строится (крипто-гейты пройдены, "crypt not ready" НЕТ), но до
+ *    UDP-сокета НЕ доходит: в pcap 0x20->0x21 идут, 0x22 — нет, при этом
+ *    POP-пинги уходят сотнями пакетов (sendto-путь жив).
+ *  - сайт отправки 0x1fd622a: call *(%rax), где rcx=*(wrap+0x10) (транспорт),
+ *    rdi=*(xport+0x20) (внутр. объект), rsi=1, rdx=&{buf,len} (16Б сегмент),
+ *    r8d=-1. ГЕЙТ перед ним: 0x1fd61f0 je 0x1fd651e — при NULL-транспорте
+ *    печатается warning "Attemt to send packet, but socket has been closed!"
+ *    (@0xcc1ae8, id 0x545) через СПЬЮ-канал — в спью run116 ОТСУТСТВУЕТ =>
+ *    транспорт НЕ NULL, пакет уходит ВНУТРЬ транспортного объекта.
+ *  - CConnectionTransportIPV4 в билде НЕ существует (только SDR/P2P) =>
+ *    транспорт скорее всего SDR-очередь (роут к POP не установлен).
+ *  - нижний уровень: UDP-обёртка 0x1fcd110 (fd@obj+0x1c==-1 -> abort;
+ *    sendmsg 0x1fcd1ee / sendto 0x1fcd3f4; сегменты 16Б).
+ * Инструментация (строго observer, логика не меняется):
+ *  g11a: пач 0x1fd61f0 (14Б = je 6Б + mov 5Б + lea[0..2]) -> c2b_g11_xport_
+ *        thunk: лог (xport, inner, vtable[0] RVA, conn-счётчики 0x9e8/0xa00),
+ *        затем реплика cmpq/je/mov/lea -> jmp 0x1fd6200 (не-NULL) либо
+ *        0x1fd651e (NULL).
+ *  g11b: детур входа 0x1fcd110 (29Б пролога) -> c2b_g11_udp_thunk: лог
+ *        (fd, nseg, дамп сегментов, дамп dest-объекта), затем jmp трамплин
+ *        (копия 29Б + jmp 0x1fcd12d).
+ * Ожидаемый сигнал: g11a даст RVA vtable[0] (константа — сравним с
+ * 0x1fcd110-регионом в анализе), g11b — вызывается ли UDP-слой вообще. */
+
+#define C2B_G11_UDP_RVA   0x1fcd110ull
+#define C2B_G11_UDP_CONT  0x1fcd12dull   /* после 29Б пролога */
+#define C2B_G11_SITE_RVA  0x1fd61f0ull
+#define C2B_G11_CONT_RVA  0x1fd6200ull   /* mov $-1,%r8d */
+#define C2B_G11_NULL_RVA  0x1fd651eull   /* warning "Attemt to send..." */
+
+static const u8 c2b_g11_sig_site[14] = {
+    0x0F, 0x84, 0x28, 0x03, 0x00, 0x00,   /* je 1fd651e */
+    0x49, 0x8B, 0x44, 0x24, 0x08,         /* mov 0x8(%r12),%rax */
+    0x48, 0x8D, 0x54                      /* lea 0x10(%rsp),%rdx (3/5) */
+};
+static const u8 c2b_g11_sig_udp[29] = {
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x55,   /* push r15/r14/r13 */
+    0x49, 0x89, 0xCD,                     /* mov %rcx,%r13 */
+    0x41, 0x54, 0x49, 0x89, 0xFC,         /* push r12; mov %rdi,%r12 */
+    0x55, 0x48, 0x89, 0xD5,               /* push rbp; mov %rdx,%rbp */
+    0x53, 0x48, 0x63, 0xDE,               /* push rbx; movslq %esi,%ebx */
+    0x48, 0x81, 0xEC, 0x38, 0x02, 0x00, 0x00  /* sub $0x238,%rsp */
+};
+
+static uptr g_g11_base;                 /* load bias steamclient.so */
+static volatile u32 g_g11_nx;           /* анти-спам xport-логгера */
+static volatile u32 g_g11_nu;           /* анти-спам udp-логгера */
+static volatile u64 c2b_g11_cont_addr, c2b_g11_null_addr;
+/* void *volatile (НЕ volatile void*): gcc удаляет unused static без
+ * volatile-объекта, а тюнк ссылается на символ из asm (урок сборки g11) */
+static void *volatile c2b_g11_udp_tramp = 0;
+static u8 *g_g11_udp_tramp_mem;
+
+static void c2b_g11_xport_log(uptr wrap)
+{
+    uptr xport, inner, vt0, conn;
+    u32 n;
+    if (!g_g11_base) return;
+    n = ++g_g11_nx;
+    if (n > 24 && (n & 0x3F) != 1) return;   /* первые 24, далее 1/64 */
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    xport = *(volatile uptr *)(wrap + 0x10);
+    C2B_LOGS("[c2b] g11x try: xport=");
+    if (!xport) {
+        C2B_LOGS("0 (NULL -> 'Attemt to send' path)\n");
+        g_probe_active = 0;
+        return;
+    }
+    C2B_LOGH((u32)(xport - g_g11_base));
+    inner = *(volatile uptr *)(xport + 0x20);
+    C2B_LOGS(" inner=");
+    C2B_LOGH((u32)(inner > g_g11_base ? inner - g_g11_base : 0));
+    vt0 = inner ? *(volatile uptr *)inner : 0;
+    C2B_LOGS(" vt0_rva=");
+    C2B_LOGH((u32)(vt0 > g_g11_base ? vt0 - g_g11_base : 0));
+    conn = *(volatile uptr *)(wrap + 8);
+    if (conn) {
+        C2B_LOGS(" conn msgs=");
+        C2B_LOGN(*(volatile u32 *)(conn + 0x9e8));
+        C2B_LOGS(" bytes=");
+        C2B_LOGN(*(volatile u32 *)(conn + 0xa00));
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+static void c2b_g11_udp_log(uptr obj, uptr nseg, uptr segs, uptr dest)
+{
+    i32 fd;
+    u32 n;
+    if (!g_g11_base) return;
+    n = ++g_g11_nu;
+    if (n > 40 && (n & 0x3F) != 1) return;   /* первые 40, далее 1/64 */
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    fd = obj ? *(volatile i32 *)(obj + 0x1c) : -2;
+    C2B_LOGS("[c2b] g11u: fd=");
+    C2B_LOGN((u32)fd);
+    C2B_LOGS(" nseg=");
+    C2B_LOGN((u32)nseg);
+    C2B_LOGS(" dest[20B]=");
+    if (dest) {
+        u32 i;
+        for (i = 0; i < 20; i += 4)
+            C2B_LOGH(*(volatile u32 *)(dest + i));
+    } else {
+        C2B_LOGH(0);
+    }
+    C2B_LOGS(" segs[16B]=");
+    if (segs) {
+        u32 i;
+        for (i = 0; i < 16; i += 4)
+            C2B_LOGH(*(volatile u32 *)(segs + i));
+    } else {
+        C2B_LOGH(0);
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g11_xport_thunk\n"
+".type  c2b_g11_xport_thunk,@function\n"
+"c2b_g11_xport_thunk:\n"    /* вход: rsp=rsp@0x1fd61f0 (jmp-пач); r12 жив */
+"  endbr64\n"
+"  push %rax\n"
+"  push %rcx\n"
+"  push %rdx\n"
+"  push %rsi\n"
+"  push %rdi\n"
+"  push %r8\n"
+"  push %r9\n"
+"  push %r10\n"
+"  push %r11\n"
+"  push %rbx\n"             /* 10 push = 80Б */
+"  mov  %rsp,%r10\n"
+"  sub  $0x8,%rsp\n"
+"  and  $0xfffffffffffffff0,%rsp\n"
+"  mov  %r10,0x00(%rsp)\n"  /* якорь rsp в памяти (call его не тронет) */
+"  mov  %r12,%rdi\n"
+"  call c2b_g11_xport_log\n"
+"  mov  0x00(%rsp),%r10\n"
+"  mov  %r10,%rsp\n"
+"  pop  %rbx\n"
+"  pop  %r11\n"
+"  pop  %r10\n"
+"  pop  %r9\n"
+"  pop  %r8\n"
+"  pop  %rdi\n"
+"  pop  %rsi\n"
+"  pop  %rdx\n"
+"  pop  %rcx\n"
+"  pop  %rax\n"
+/* реплика затёртого (je зависел от cmpq @0x1fd61e0 — cmpq повторяем) */
+"  cmpq $0x0,0x10(%r12)\n"
+"  jne  11f\n"
+"  mov  c2b_g11_null_addr(%rip),%r11\n"
+"  jmp  *%r11\n"
+"11:\n"
+"  mov  0x8(%r12),%rax\n"
+"  lea  0x10(%rsp),%rdx\n"
+"  mov  c2b_g11_cont_addr(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g11_xport_thunk, .-c2b_g11_xport_thunk\n"
+".globl c2b_g11_udp_thunk\n"
+".type  c2b_g11_udp_thunk,@function\n"
+"c2b_g11_udp_thunk:\n"      /* вход: rsp%16==8, rdi=obj rsi=nseg rdx=segs rcx=dest */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"       /* 88; rsp%16==0 */
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %r8, 0x08(%rsp)\n"
+"  mov  %r9, 0x10(%rsp)\n"
+"  mov  %r10,0x18(%rsp)\n"
+"  mov  %r11,0x20(%rsp)\n"
+"  mov  %rcx,0x28(%rsp)\n"
+"  mov  %rdx,0x30(%rsp)\n"
+"  mov  %rsi,0x38(%rsp)\n"
+"  mov  %rdi,0x40(%rsp)\n"
+"  mov  0x40(%rsp),%rdi\n"
+"  mov  0x38(%rsp),%rsi\n"
+"  mov  0x30(%rsp),%rdx\n"
+"  mov  0x28(%rsp),%rcx\n"
+"  call c2b_g11_udp_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%r8\n"
+"  mov  0x10(%rsp),%r9\n"
+"  mov  0x18(%rsp),%r10\n"
+"  mov  0x20(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g11_udp_tramp(%rip)\n"
+".size c2b_g11_udp_thunk, .-c2b_g11_udp_thunk\n"
+".previous\n"
+);
+extern void c2b_g11_xport_thunk(void);
+extern void c2b_g11_udp_thunk(void);
+
+static void c2b_g11_apply(void)
+{
+    static u8 done;
+    uptr base = 0, site, udp, tr;
+    if (done) return;
+    dl_iterate_phdr(c2b_g8_phdr_cb, &base);   /* тот же фильтр steamclient.so */
+    if (!base) return;
+    site = base + C2B_G11_SITE_RVA;
+    udp  = base + C2B_G11_UDP_RVA;
+    if (memcmp((const void *)site, c2b_g11_sig_site, sizeof c2b_g11_sig_site) != 0) {
+        C2B_LOGS("[c2b] g11: site sig mismatch\n"); done = 1; return;
+    }
+    if (memcmp((const void *)udp, c2b_g11_sig_udp, sizeof c2b_g11_sig_udp) != 0) {
+        C2B_LOGS("[c2b] g11: udp sig mismatch\n"); done = 1; return;
+    }
+    /* g11a: сайт транспорта */
+    if (c2b_page_protect(site, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_g11_cont_addr = base + C2B_G11_CONT_RVA;   /* ДО пача сайта */
+    c2b_g11_null_addr = base + C2B_G11_NULL_RVA;
+    g_g11_base = base;                              /* ДО пача сайта */
+    c2b_write_jmp((void *)site, (const void *)&c2b_g11_xport_thunk);
+    /* g11b: udp-обёртка (трамплин = копия пролога + jmp-хвост) */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22 /*PRIVATE|ANON*/, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g11_udp_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)udp, sizeof c2b_g11_sig_udp);
+    c2b_write_jmp((void *)(tr + sizeof c2b_g11_sig_udp),
+                  (const void *)(udp + sizeof c2b_g11_sig_udp));
+    c2b_g11_udp_tramp = (const volatile void *)tr;  /* ДО пача udp */
+    if (c2b_page_protect(udp, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)udp, (const void *)&c2b_g11_udp_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g11: armed site+udp base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
 static void c2b_gns_spew_rearm(void)
 {
     u32 it, c, applied = 0;
     c2b_g8_patch_apply();   /* 41f-g8: пач слота независимо от copy#1 */
     c2b_g9_patch_apply();   /* 41f-g9: IP_AllowWithoutAuth=1 во все копии */
     c2b_g9_flat_set();      /* 41f-g9: flat set через copy#1 */
+    c2b_g11_apply();        /* 41f-g11: транспортная выводка ConnectRequest */
     c2b_g8_patch_verify();
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
@@ -6938,6 +7177,7 @@ static void c2b_gns_spew_rearm(void)
         if (g_g8_slot) *g_g8_slot = (const volatile void *)c2b_gns_spew;
         c2b_g9_patch_apply();   /* 41f-g9: re-assert (поздние копии/гонки) */
         c2b_g9_flat_set();      /* 41f-g9: copy#1 мог появиться позже */
+        c2b_g11_apply();        /* 41f-g11: одноразово (done-флаг внутри) */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

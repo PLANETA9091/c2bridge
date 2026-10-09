@@ -9012,6 +9012,154 @@ static void c2b_g22_apply(void)
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 
+/* ---------- 41f-g24: СНАП-ВОТЧЕР стейта (zero-detour evidence) ------------
+ * run143 (87a9448): g21 gate+path ARMены ДО цепочки (a2/a3 healthy: 12
+ * реальных 'A' type=0x41, 23-25 verdict=1, phase6 x2, 'B'-бейты на wire)
+ * и НЕ СРАБОТАЛИ (0 acc) — entry-детур ловит ЛЮБОГО зовущего (vtable ИЛИ
+ * прямой call), значит 0x2491f0 не вызывает НИКТО. Гипотезы: (A) очередь
+ * connectionless вообще не выгребается; (B) консьюмер выгребает и
+ * обрабатывает 'A' СВОЕЙ инлайн-копией хендлера (снапшот в state+0x4f0
+ * пишется, но вирт. зова accept нет). РАЗЛИЧАЕМ ПАССИВНО: state
+ * CClientState — глобал движка; инстанс опознаётся парой vptr (primary
+ * 0xd78bb8 @+0, вторичный 0xd78de8 @+8 — xref ctor 0x256890). Сканируем
+ * RW-сегменты ДВИГАТЕЛЯ на пару -> адрес(а) стейта -> поллинг 250мс:
+ * cstate=u32@0x1a0 ('A'-чек 1: должен быть 1 — если !=1, ГЛАВНЫЙ барьер
+ * НАЙДЕН: чек 1 рубит пакет до снапшота), gate=u64@0x430,
+ * netchan=u64@0x128 (FullConnect пишет !=0 = 'B'-успех независимо от
+ * g22!), chal/proto/val @0x4d8/0x4dc/0x4e0, snap 32Б @0x4f0..0x50f.
+ * Лог на каждое изменение (cap 64, дальше 1/64). Snap-change при
+ * cstate==1 = инлайн-хендлер жив -> те же 'B'-формулы, что у g21. */
+#define C2B_G24_VPTR1 0xd78bb8ull
+#define C2B_G24_VPTR2 0xd78de8ull
+struct c2b_g24_wseg { uptr lo[8], hi[8]; u32 n; };
+static i32 c2b_g24_wseg_cb(void *info_v, void *size_v, void *data_v)
+{
+    struct c2b_g13_phdr_min *info = (struct c2b_g13_phdr_min *)info_v;
+    struct c2b_g24_wseg *r = (struct c2b_g24_wseg *)data_v;
+    u16 i;
+    (void)size_v;
+    if ((uptr)info->addr != g_engine_base || !info->phdr || !info->phnum)
+        return 0;                                /* не движок — дальше */
+    for (i = 0; i < info->phnum && r->n < 8; i++) {
+        const struct c2b_g13_phdr64 *ph =
+            (const struct c2b_g13_phdr64 *)((const u8 *)info->phdr +
+                                            (uptr)i * sizeof(*ph));
+        if (ph->type == 1 && (ph->flags & 2)) {  /* PT_LOAD + W (data/bss) */
+            r->lo[r->n] = info->addr + ph->vaddr;
+            r->hi[r->n] = r->lo[r->n] + ph->memsz;
+            r->n++;
+        }
+    }
+    return 1;                                    /* движок найден — хватит */
+}
+static uptr g_g24_state[4];
+static u32 g_g24_nstate;
+static void c2b_g24_find_state(void)
+{
+    struct c2b_g24_wseg ws;
+    u32 i;
+    uptr p;
+    if (g_g24_nstate || !g_engine_base) return;
+    ws.n = 0;
+    dl_iterate_phdr(c2b_g24_wseg_cb, &ws);
+    if (!ws.n) return;
+    for (i = 0; i < ws.n && g_g24_nstate < 4; i++) {
+        for (p = ws.lo[i]; p + 16 <= ws.hi[i] && g_g24_nstate < 4; p += 8) {
+            u32 j, dup = 0;
+            if (*(volatile uptr *)p != g_engine_base + C2B_G24_VPTR1) continue;
+            if (*(volatile uptr *)(p + 8) != g_engine_base + C2B_G24_VPTR2) continue;
+            for (j = 0; j < g_g24_nstate; j++)
+                if (g_g24_state[j] == p) { dup = 1; break; }
+            if (!dup) g_g24_state[g_g24_nstate++] = p;
+        }
+    }
+    C2B_LOGS("[c2b] g24: state scan n=");
+    C2B_LOGN(g_g24_nstate);
+    for (i = 0; i < g_g24_nstate; i++) {
+        C2B_LOGS(" @");
+        C2B_LOGH((u32)(g_g24_state[i] >> 32)); C2B_LOGH((u32)g_g24_state[i]);
+    }
+    C2B_LOGS("\n");
+}
+static void c2b_g24_dumpone(u32 i, u32 cs)
+{
+    uptr st = g_g24_state[i];
+    u32 k;
+    u64 nc, g;
+    C2B_LOGS("[c2b] g24 i=");
+    C2B_LOGN(i);
+    C2B_LOGS("st=");
+    C2B_LOGH((u32)(st >> 32)); C2B_LOGH((u32)st);
+    C2B_LOGS("cstate=");
+    C2B_LOGH(cs);
+    nc = *(volatile const u64 *)(st + 0x128);
+    C2B_LOGS("netchan=");
+    C2B_LOGH((u32)nc); C2B_LOGH((u32)(nc >> 32));
+    g = *(volatile const u64 *)(st + 0x430);
+    C2B_LOGS("gate=");
+    C2B_LOGH((u32)g); C2B_LOGH((u32)(g >> 32));
+    C2B_LOGS("chal=");
+    C2B_LOGH(*(volatile const u32 *)(st + 0x4d8));
+    C2B_LOGS("proto=");
+    C2B_LOGH(*(volatile const u32 *)(st + 0x4dc));
+    C2B_LOGS("val=");
+    C2B_LOGH(*(volatile const u32 *)(st + 0x4e0));
+    C2B_LOGS("snap=");
+    for (k = 0; k < 32; k++)
+        C2B_LOGH(*(volatile const u8 *)(st + 0x4f0 + k));
+    C2B_LOGS("\n");
+}
+static void *c2b_g24_thread(void *arg)
+{
+    u32 it, i, logged = 0;
+    u32 last_c[4];
+    u64 last_h[4];
+    (void)arg;
+    for (it = 0; it < 600 && !g_engine_base; it++) usleep(1000000);
+    for (i = 0; i < 4; i++) { last_c[i] = 0xffffffffu; last_h[i] = 0; }
+    for (it = 0; it < 24 && !g_g24_nstate; it++) {   /* стейт строится при ините */
+        c2b_g24_find_state();
+        if (g_g24_nstate) break;
+        usleep(5000000);
+    }
+    if (!g_g24_nstate) {
+        C2B_LOGS("[c2b] g24: no state instance found (vptr scan empty)\n");
+        return 0;
+    }
+    for (i = 0; i < g_g24_nstate; i++) {             /* базовая линия */
+        u32 cs = *(volatile const u32 *)(g_g24_state[i] + 0x1a0);
+        last_c[i] = cs;
+        last_h[i] = 0;                               /* форс первого chg-лога */
+        c2b_g24_dumpone(i, cs);
+    }
+    for (it = 0; it < 4800; it++) {                  /* 20 мин по 250мс */
+        for (i = 0; i < g_g24_nstate; i++) {
+            uptr st = g_g24_state[i];
+            u32 cs = *(volatile const u32 *)(st + 0x1a0);
+            u64 h;
+            u32 k;
+            h = (u64)cs * 1000003u;
+            h ^= *(volatile const u64 *)(st + 0x128);
+            h = h * 1000003u + *(volatile const u32 *)(st + 0x4d8);
+            h = h * 1000003u + *(volatile const u32 *)(st + 0x4dc);
+            h = h * 1000003u + *(volatile const u32 *)(st + 0x4e0);
+            for (k = 0; k < 4; k++)
+                h = h * 1000003u + *(volatile const u64 *)(st + 0x4f0 + k * 8);
+            if (cs != last_c[i] || h != last_h[i]) {
+                last_c[i] = cs;
+                last_h[i] = h;
+                logged++;
+                if (logged <= 64 || (logged & 0x3F) == 1) c2b_g24_dumpone(i, cs);
+            }
+        }
+        usleep(250000);
+    }
+    C2B_LOGS("[c2b] g24: watch done changes=");
+    C2B_LOGN(logged);
+    C2B_LOGS("\n");
+    return 0;
+}
+
 static void c2b_g12_apply(void)
 {
     static u8 done;
@@ -10950,7 +11098,14 @@ i32 c2b_main(void)
      * g19a off, allocs returned, chain still dead). run132's mid-flow arming
      * (rearm loop) is the proven config. Re-introduce early arms one probe at
      * a time in later rounds. */
-    i32 r = c2b_try_install();
+    i32 r;
+#ifndef C2B_SELFTEST
+    {   /* 41f-g24: снап-вотчер стейта — пассивные чтения, свой тред */
+        void *t24 = 0;
+        pthread_create(&t24, 0, c2b_g24_thread, 0);
+    }
+#endif
+    r = c2b_try_install();
     if (r == 0) {
         C2B_LOGS("[c2b] ARMED: detours in place\n");
         return 0;

@@ -8309,12 +8309,118 @@ typedef ssize_t (*c2b_sendto_fn)(int, const void *, size_t, int,
 typedef ssize_t (*c2b_recvfrom_fn)(int, void *, size_t, int,
                                    struct sockaddr *, socklen_t *);
 
+/* 41f-g15: LIVE recv-loop consumer finder. Run126: g13 доказал, что
+ * диспетчер 0x259df0 (engine 34a96ae) НЕ участвует в живом пути потребления
+ * 'A'/'B' (армился в активной фазе — ноль срабатываний), а pcap показал,
+ * что весь UDP-поток движок<->цель медиится shim'ом (в wire НОЛЬ пакетов от
+ * движка напрямую). Значит живой потребитель connectionless-пакетов —
+ * ДРУГАЯ функция (возможно в другом модуле lite-бандла). Вместо слепого RE:
+ * shim-хук recvfrom/sendto видит ТОЧНЫЙ call-site живого потребителя —
+ * __builtin_return_address(0) вызывающего. Логируем новые уникальные адреса
+ * с атрибуцией модуль/RVA (dl_iterate_phdr, PT_LOAD containment), частотные
+ * hot-метки (100/10000) показывают, какой из сайтов — net-цикл. Дизасм
+ * вокруг RVA -> где type-switch 'A'/'B' -> g16 дамп уже на живом потребителе.
+ * Гонки таблицы между потоками безвредны (стиль g_clp_* кэшей).
+ * Собственные минимальные копии dl_phdr_info/Elf64_Phdr (glibc ABI стабилен:
+ * addr@0, name@8, phdr@16, phnum@24; Phdr: type@0,flags@4,vaddr@0x10,
+ * memsz@0x28) — g13-структуры живут внутри #ifndef C2B_SELFTEST. */
+struct c2b_g15_phdr_min { uptr addr; const char *name; const void *phdr; u16 phnum; };
+struct c2b_g15_phdr64 { u32 type; u32 flags; u64 off, vaddr, paddr, filesz, memsz, align; };
+/* extern-декларация в selftest-ветке отсутствует (строка ~69 вне её) —
+ * повторяем идентичную (легальна в C) */
+extern i32 dl_iterate_phdr(i32 (*cb)(void *info, void *size, void *data), void *data);
+struct c2b_g15_site { uptr ra; u32 hits; };
+static struct c2b_g15_site g_g15_tab[16];
+static u32 g_g15_n;
+static u32 g_g15_other;
+
+struct c2b_g15_find { uptr a; const char *nm; uptr base; u8 found; };
+
+static i32 c2b_g15_mod_cb(void *info_v, void *size_v, void *data_v)
+{
+    struct c2b_g15_phdr_min *info = (struct c2b_g15_phdr_min *)info_v;
+    struct c2b_g15_find *f = (struct c2b_g15_find *)data_v;
+    u16 i;
+    (void)size_v;
+    if (!info->phdr || !info->phnum) return 0;
+    for (i = 0; i < info->phnum; i++) {
+        const struct c2b_g15_phdr64 *ph = (const struct c2b_g15_phdr64 *)
+            ((const u8 *)info->phdr + (uptr)i * sizeof(*ph));
+        if (ph->type != 1) continue;
+        if (f->a >= info->addr + (uptr)ph->vaddr &&
+            f->a < info->addr + (uptr)ph->vaddr + (uptr)ph->memsz) {
+            f->nm = info->name;
+            f->base = info->addr;
+            f->found = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void c2b_g15_note(uptr ra, const char *tag)
+{
+    u32 i;
+    for (i = 0; i < g_g15_n && i < 16; i++) {
+        if (g_g15_tab[i].ra == ra) {
+            u32 h = ++g_g15_tab[i].hits;
+            if (h == 100 || h == 10000) {
+                C2B_LOGS("[c2b] g15 "); C2B_LOGS(tag);
+                C2B_LOGS("hot ra="); C2B_LOGH((u32)(ra >> 32));
+                C2B_LOGH((u32)ra);
+                C2B_LOGS("h="); C2B_LOGN(h); C2B_LOGS("\n");
+            }
+            return;
+        }
+    }
+    if (g_g15_n < 16) {
+        struct c2b_g15_find f;
+        const char *nm;
+        g_g15_tab[g_g15_n].ra = ra;
+        g_g15_tab[g_g15_n].hits = 1;
+        g_g15_n++;
+        f.a = ra; f.nm = 0; f.base = 0; f.found = 0;
+        dl_iterate_phdr(c2b_g15_mod_cb, &f);
+        C2B_LOGS("[c2b] g15 "); C2B_LOGS(tag);
+        C2B_LOGS("new ra="); C2B_LOGH((u32)(ra >> 32)); C2B_LOGH((u32)ra);
+        C2B_LOGS("mod=");
+        if (f.found) {
+            nm = f.nm;
+            if (!nm || !nm[0]) nm = "[main]";
+            C2B_LOGS(nm);
+            C2B_LOGS(" rva="); C2B_LOGH((u32)(ra - f.base));
+        } else {
+            C2B_LOGS("? ");
+        }
+        C2B_LOGS("\n");
+        return;
+    }
+    /* таблица полна: вытесняем слот с минимумом hits (init-сайты уходят,
+     * hot net-loop остаётся); после 24 вытеснений — только счётчик,
+     * чтобы неловой зоопарк одноразовых сайтов не спамил лог */
+    if (g_g15_other < 24) {
+        u32 mi = 0;
+        for (i = 1; i < 16; i++)
+            if (g_g15_tab[i].hits < g_g15_tab[mi].hits) mi = i;
+        C2B_LOGS("[c2b] g15 "); C2B_LOGS(tag);
+        C2B_LOGS("evict ra="); C2B_LOGH((u32)(g_g15_tab[mi].ra >> 32));
+        C2B_LOGH((u32)g_g15_tab[mi].ra);
+        C2B_LOGS("h="); C2B_LOGN(g_g15_tab[mi].hits);
+        C2B_LOGS("-> new ra="); C2B_LOGH((u32)(ra >> 32)); C2B_LOGH((u32)ra);
+        C2B_LOGS("\n");
+        g_g15_tab[mi].ra = ra;
+        g_g15_tab[mi].hits = 1;
+    }
+    g_g15_other++;
+}
+
 /* libc-совместимые сигнатуры; visibility default обязателен: файл собирается
  * с -fvisibility=hidden, а перехват работает только с глобальным символом. */
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
+    c2b_g15_note((uptr)__builtin_return_address(0), "s");
     if (!g_clp_sendto) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "sendto");
         if (!f) f = (void *)1;
@@ -8443,6 +8549,7 @@ __attribute__((visibility("default")))
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
 {
+    c2b_g15_note((uptr)__builtin_return_address(0), "r");
     if (!g_clp_recvfrom) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "recvfrom");
         if (!f) f = (void *)1;

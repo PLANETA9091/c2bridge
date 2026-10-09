@@ -6660,52 +6660,73 @@ static void c2b_g7_client_utils(void)
         if (!user)
             C2B_LOGS("[c2b] GNS g7: no verified user (продолжаем — utils не нужен user)\n");
     }
-    /* GetISteamNetworkingUtils: перебор индексов. Форма A: (pipe, ver);
-     * верификация объекта = vt[0] возвращает микросекунды (~1.7e15). */
+    /* GetISteamNetworkingUtils: перебор индексов и форм вызова.
+     * Форма A: (pipe, ver) — run 109: не нашла (геттер, видимо, 3-арговый).
+     * Форма B: (user, pipe, ver) c user из {1,2,0} — SDK-порядок старших
+     * версий ISteamClient. Верификация объекта = vt[0] микросекунды
+     * (~1.77e15). Все не-null возвраты логируем (видно почти-попадания). */
     {
         static const char *vers[] = { "SteamNetworkingUtils004",
                                       "SteamNetworkingUtils003", 0 };
-        u32 v;
+        static const uptr ucand[3] = { 1, 2, 0 };
+        u32 v, uci;
         for (v = 0; vers[v]; v++) {
-            for (k = 5; k <= 24; k++) {
-                void *uo = 0;
-                u64 ts = 0;
-                g_probe_active = 1;
-                if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                    uo = ((void *(*)(void *, uptr, const char *))vt[k])(
-                        cl, pipe, vers[v]);
-                    g_probe_active = 0;
-                } else { g_probe_active = 0; continue; }
-                if (!uo) continue;
-                g_probe_active = 1;
-                if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                    ts = ((u64 (*)(void *))(*(void ***)uo)[0])(uo);
-                    g_probe_active = 0;
-                } else { g_probe_active = 0; continue; }
-                if (ts < 1000000000000000ull || ts > 20000000000000000ull)
-                    continue;
-                C2B_LOGS("[c2b] GNS g7: utils via vt["); C2B_LOGN(k);
-                C2B_LOGS("] "); C2B_LOGS(vers[v]);
-                C2B_LOGS(" obj="); C2B_LOGH((u32)(uptr)uo);
-                C2B_LOGS(" ts ok\n");
-                /* SetDebugOutputFunction = vt[1] (SDK-порядок 004) */
-                g_probe_active = 1;
-                if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                    c2b_g7_vt_spew(uo, 6, (void *)c2b_gns_spew);
-                    g_probe_active = 0;
-                    C2B_LOGS("[c2b] GNS g7: spew(6) copy#2(client) OK\n");
-                } else {
-                    g_probe_active = 0;
-                    C2B_LOGS("[c2b] GNS g7: vt[1] spew segv\n");
-                    continue;
+            for (k = 4; k <= 30; k++) {
+                u32 try3;
+                for (try3 = 0; try3 < 2; try3++) {
+                    u32 nu = try3 ? 3 : 1;
+                    for (uci = 0; uci < nu; uci++) {
+                        void *uo = 0;
+                        u64 ts = 0;
+                        g_probe_active = 1;
+                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                            if (try3)
+                                uo = ((void *(*)(void *, uptr, uptr,
+                                     const char *))vt[k])(cl, ucand[uci],
+                                     pipe, vers[v]);
+                            else
+                                uo = ((void *(*)(void *, uptr,
+                                     const char *))vt[k])(cl, pipe, vers[v]);
+                            g_probe_active = 0;
+                        } else { g_probe_active = 0; continue; }
+                        if (!uo) continue;
+                        g_probe_active = 1;
+                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                            ts = ((u64 (*)(void *))(*(void ***)uo)[0])(uo);
+                            g_probe_active = 0;
+                        } else { g_probe_active = 0; continue; }
+                        C2B_LOGS("[c2b] GNS g7: vt["); C2B_LOGN(k);
+                        C2B_LOGS(try3 ? "] 3arg u=" : "] 2arg u=");
+                        C2B_LOGN(try3 ? (u32)ucand[uci] : 0);
+                        C2B_LOGS("obj="); C2B_LOGH((u32)(uptr)uo);
+                        C2B_LOGS("ts_hi="); C2B_LOGN((u32)(ts >> 32));
+                        C2B_LOGS("\n");
+                        if (ts < 1000000000000000ull ||
+                            ts > 20000000000000000ull)
+                            continue;
+                        C2B_LOGS("[c2b] GNS g7: UTILS FOUND vt[");
+                        C2B_LOGN(k); C2B_LOGS("] "); C2B_LOGS(vers[v]);
+                        C2B_LOGS("\n");
+                        /* SetDebugOutputFunction = vt[1] (SDK-порядок 004) */
+                        g_probe_active = 1;
+                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                            c2b_g7_vt_spew(uo, 6, (void *)c2b_gns_spew);
+                            g_probe_active = 0;
+                            C2B_LOGS("[c2b] GNS g7: spew(6) copy#2(client) OK\n");
+                        } else {
+                            g_probe_active = 0;
+                            C2B_LOGS("[c2b] GNS g7: vt[1] spew segv\n");
+                            continue;
+                        }
+                        /* в rearm: копия#2 = клиентский utils, callable = vtable-санк */
+                        g_gns_u[1] = uo;
+                        g_gns_flat[1] = (void *)c2b_g7_vt_spew;
+                        g_gns_cfg[1] = 0;
+                        g_gns_u2_done = 1;
+                        sigaction(11, &oldsa, (void *)0);
+                        return;
+                    }
                 }
-                /* в rearm: копия#2 = клиентский utils, callable = vtable-санк */
-                g_gns_u[1] = uo;
-                g_gns_flat[1] = (void *)c2b_g7_vt_spew;
-                g_gns_cfg[1] = 0;
-                g_gns_u2_done = 1;
-                sigaction(11, &oldsa, (void *)0);
-                return;
             }
         }
     }

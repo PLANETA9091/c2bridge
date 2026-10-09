@@ -357,9 +357,11 @@ jobs:
           # 2307: + matchmaking_client.so — g18-атрибуция указала на него как
           # на второй сайт освобождения нод (0x2a029); нужен бинарник для
           # офлайн RE консьюмера/парсера ('B'-чеки).
+          # run141: bundle lives in the WORKSPACE (/home/runner/work/.../csgo-lite),
+          # NOT ~; modmap confirmed /home/runner/work/c2bridge/c2bridge/csgo-lite.
           mkdir -p e2e-out/bins
           for name in steamclient.so libsteamnetworkingsockets.so matchmaking_client.so; do
-            find -L ~/.steam ~/.local/share/Steam ~/csgo-lite /tmp -maxdepth 8 \
+            find -L ~/.steam ~/.local/share/Steam "$GITHUB_WORKSPACE" /tmp -maxdepth 8 \
               -type f -name "$name" 2>/dev/null | head -4 | while IFS= read -r f; do
               tgt="e2e-out/bins/${name}__$(echo "$f" | md5sum | cut -c1-6).so"
               cp -f "$f" "$tgt" 2>/dev/null || true

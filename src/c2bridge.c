@@ -8515,7 +8515,8 @@ static i32 c2b_g18_modmap_cb(void *info_v, void *size_v, void *data_v)
     if (!pi || !pi->dlpi_name) return 0;
     nm = pi->dlpi_name;
     if (!nm[0]) return 0;                        /* главный exe — пропустить */
-    if (++(*cnt) > 48) return 1;                 /* ограничить лог */
+    if (++(*cnt) > 128) return 1;                /* run141: 48 ОБРЕЗАЛО карту до X11/GL —
+                                                    engine/matchmaking грузятся ПОЗЖЕ; 128 */
     C2B_LOGS("[c2b] g18 modmap: ");
     C2B_LOGH((u32)(pi->dlpi_addr >> 32)); C2B_LOGH((u32)pi->dlpi_addr);
     C2B_LOGS(" ");

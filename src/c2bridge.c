@@ -6807,10 +6807,116 @@ static void c2b_g8_patch_verify(void)
     C2B_LOGS("\n");
 }
 
+/* 41f-g9: IP_AllowWithoutAuth (enum 0x17=23, dt Int32) — вероятный gate аборта
+ * 0x21->0x22: у клиентского GNS нет серта (identity), соединение абортирует
+ * ConnectRequest, пока флаг 0. Run 106 runtime-проба: "cfg 0x17 =
+ * IP_AllowWithoutAuth dt=1" (совпадает с публичным SDK 23). RE offline
+ * (run105/bins): таблица конфигов = linked list, register fn (d975c5:0x1ef3a70)
+ * пишет entry{+0x00 enum, +0x08 name, +0x10 scope, +0x14 dt, +0x18 cfg_off,
+ * +0x20 next}, значение INLINE в entry+0x30 (ctor: movq $0x0); walker
+ * (d975c5:0x1ef3af0, fallback=NULL) строит global-структуру как
+ * cfg_global[entry->off] = &entry+0x30 => запись 1 в entry+0x30 пробрасывается
+ * во ВСЕ конфиг-структуры без явных оверрайдов (connection -> socket ->
+ * global цепочка указателей).
+ * Entry RVA на билд (ctor lea/mov-паттерн + mov $0x17,%esi верифицирован):
+ *   d975c5 (64Б): entry 0x2cb8060, name 0xd1e1b7, cfg_off 0x108 (r9d)
+ *   5b08b7 (64Б): entry 0x32113e0, name 0xe0b6da, cfg_off 0xb0
+ * (6820f9/8629c2 = 32Б копии, наш процесс 64Б — не матчатся сиг-чеком.)
+ * Сиг-чек перед записью: enum==0x17 && name==base+name_rva && off==cfg_off &&
+ * val==0. Выровненная 4-байтная запись — атомарна на x86; .data страница RW. */
+struct c2b_g9_build {
+    const char *tag;
+    uptr entry_rva;
+    uptr name_rva;
+    i32  cfg_off;
+};
+static const struct c2b_g9_build c2b_g9_builds[2] = {
+    { "d975c5", 0x2cb8060ull, 0xd1e1b7ull, 0x108 },
+    { "5b08b7", 0x32113e0ull, 0xe0b6daull, 0xb0  },
+};
+struct c2b_g9_ctx { uptr base[8]; u32 n; };
+
+static i32 c2b_g9_phdr_cb(void *info_v, void *size_v, void *data_v)
+{
+    struct c2b_g5_phdr *pi = (struct c2b_g5_phdr *)info_v;
+    struct c2b_g9_ctx *cx = (struct c2b_g9_ctx *)data_v;
+    const char *nm, *sfx = "steamclient.so";
+    u32 nl, sl = 0, j;
+    (void)size_v;
+    if (!pi || !pi->dlpi_name) return 0;
+    nm = pi->dlpi_name;
+    nl = 0; while (nm[nl]) nl++;
+    while (sfx[sl]) sl++;
+    if (nl < sl) return 0;
+    for (j = 0; j < sl && nm[nl - sl + j] == sfx[j]; j++) {}
+    if (j != sl) return 0;
+    if (cx->n < 8) cx->base[cx->n++] = pi->dlpi_addr;
+    return 0;
+}
+
+static void c2b_g9_patch_one(uptr base, const struct c2b_g9_build *b)
+{
+    uptr entry = base + b->entry_rva;
+    volatile u32 *val;
+    if (*(volatile u32 *)entry != 0x17) return;                    /* enum  */
+    if (*(volatile uptr *)(entry + 8) != base + b->name_rva) return; /* name */
+    if (*(volatile i32 *)(entry + 0x18) != b->cfg_off) return;     /* off   */
+    val = (volatile u32 *)(entry + 0x30);
+    if (*val != 0) return;        /* 1 = уже наш; прочее = чужой оверрайд */
+    *val = 1;
+    C2B_LOGS("[c2b] GNS g9: IP_AllowWithoutAuth 0->1 build "); C2B_LOGS(b->tag);
+    C2B_LOGS("entry="); C2B_LOGH((u32)b->entry_rva); C2B_LOGS("\n");
+}
+
+static void c2b_g9_patch_apply(void)
+{
+    struct c2b_g9_ctx cx;
+    u32 i, b;
+    static u8 said_no;
+    cx.n = 0;
+    dl_iterate_phdr(c2b_g9_phdr_cb, &cx);
+    if (!cx.n) {
+        if (!said_no) { C2B_LOGS("[c2b] GNS g9: no steamclient.so mapped\n"); said_no = 1; }
+        return;
+    }
+    for (i = 0; i < cx.n; i++)
+        for (b = 0; b < 2; b++)
+            c2b_g9_patch_one(cx.base[i], &c2b_g9_builds[b]);
+}
+
+/* 41f-g9: плоский set cfg23=1 через copy#1 — ТОЛЬКО после рантайм-верификации
+ * имени ключа (урок run 105: enum 29 оказался строкой SDRClient_ForceRelay-
+ * Cluster). Scope Global=0, как у LogLevel из g6. Идемпотентно. */
+static void c2b_g9_flat_set(void)
+{
+    void *nfo = dlsym((void *)0, "SteamAPI_ISteamNetworkingUtils_GetConfigValueInfo");
+    static u8 done;
+    i32 dt = 0, sc = 0;
+    const char *nm;
+    if (done || !g_gns_u[0] || !g_gns_cfg[0] || !nfo) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    nm = ((const char * (*)(void *, i32, void *, void *))nfo)(g_gns_u[0], 23, &dt, &sc);
+    g_probe_active = 0;
+    if (!nm || !c2b_g5_pfx(nm, "IP_AllowWithoutAuth") || dt != 1) {
+        C2B_LOGS("[c2b] GNS g9: cfg23 mismatch dt="); C2B_LOGN((u32)dt); C2B_LOGS("\n");
+        done = 1;   /* не ретраим: имя не то — таблица не та, чинить нечем */
+        return;
+    }
+    {   i32 one = 1;
+        ((void (*)(void *, i32, i32, uptr, i32, const void *))g_gns_cfg[0])(
+            g_gns_u[0], 23, 1, (uptr)0, 1, (const void *)&one);
+    }
+    done = 1;
+    C2B_LOGS("[c2b] GNS g9: flat set cfg23 IP_AllowWithoutAuth=1 ok\n");
+}
+
 static void c2b_gns_spew_rearm(void)
 {
     u32 it, c, applied = 0;
     c2b_g8_patch_apply();   /* 41f-g8: пач слота независимо от copy#1 */
+    c2b_g9_patch_apply();   /* 41f-g9: IP_AllowWithoutAuth=1 во все копии */
+    c2b_g9_flat_set();      /* 41f-g9: flat set через copy#1 */
     c2b_g8_patch_verify();
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
@@ -6823,6 +6929,8 @@ static void c2b_gns_spew_rearm(void)
             }
         }
         if (g_g8_slot) *g_g8_slot = (const volatile void *)c2b_gns_spew;
+        c2b_g9_patch_apply();   /* 41f-g9: re-assert (поздние копии/гонки) */
+        c2b_g9_flat_set();      /* 41f-g9: copy#1 мог появиться позже */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

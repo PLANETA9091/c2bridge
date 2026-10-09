@@ -6949,6 +6949,35 @@ static void c2b_g9_flat_set(void)
 #define C2B_G11_SITE_RVA  0x1fd61f0ull
 #define C2B_G11_CONT_RVA  0x1fd6200ull   /* mov $-1,%r8d */
 #define C2B_G11_NULL_RVA  0x1fd651eull   /* warning "Attemt to send..." */
+/* g11d (раунд 1337): BSendPacketGather = vtable[0] внутреннего сокета
+ * (CRawUDPSocketImpl, RE vtable 0x2bd38c8/[0]=0x1fc7c80). Сигнатура совпадает
+ * с call-site 0x1fd622a: (self, nChunks, pChunks, adr, efDontRoute).
+ * Точки ТИХОГО ДРОПА до sendto (все молча возвращают успех):
+ *  1) *(u32*)0x2cbb900 = счётчик открытых raw-UDP-сокетов; <=0 -> fake-success
+ *     ret 1 (0x1fc7d1d) — ЛУЧШИЙ кандидат на барьер (0x22 исчезает бесследно);
+ *  2) FakeRateLimit_Send_Rate (int, entry 0x2cb8ae0+0x40) > 0 -> лимит-ветка;
+ *  3) FakePacketLoss_Send (float, 0x2cb8f00+0x40) 0<f<1e9 -> ролл лосса;
+ *  4) FakePacketLag_Send (0x2cb8e40+0x40) / FakePacketReorder_Send
+ *     (0x2cb8d80+0x40) — отложенная постановка в lagger (0x1fc7f40 -> 0x1fcd530
+ *     очередь) вместо прямой отправки.
+ * cfg-имена верифицированы по RTTI-регистрации (esi=2..6, 0x29..0x2c @0x1efceea):
+ * enum 2=FakePacketLoss_Send 3=FakePacketLoss_Recv 4=FakePacketLag_Send
+ * 5=FakePacketLag_Recv 6=FakePacketReorder_Send 0x2a=FakeRateLimit_Send_Rate.
+ * Детур входа 0x1fc7c80 (14Б до rip-relative lea @0x1fc7c8e): реплика 6 инснов
+ * в тунке, jmp на 0x1fc7c8e — lea остаётся валидной (оригинальный rip).
+ * Транзитные вызовы: g11u (0x1fcd110) покрыт отдельно — пара g11d-есть/
+ * g11u-нет = дроп внутри gather; g11d/g11u оба есть = пакет ушёл в sendto. */
+#define C2B_G11_GATHER_RVA  0x1fc7c80ull
+#define C2B_G11_GATHER_CONT 0x1fc7c8eull   /* lea rip-rel спью-имени */
+
+static const u8 c2b_g11_sig_gather[14] = {
+    0x41, 0x57,             /* push %r15 */
+    0x41, 0x56,             /* push %r14 */
+    0x49, 0x89, 0xCE,       /* mov %rcx,%r14 */
+    0x41, 0x55,             /* push %r13 */
+    0x49, 0x89, 0xFD,       /* mov %rdi,%r13 */
+    0x41, 0x54              /* push %r12 (байты 12-13; инсн обрывается джампом) */
+};
 
 static const u8 c2b_g11_sig_site[14] = {
     0x0F, 0x84, 0x28, 0x03, 0x00, 0x00,   /* je 1fd651e */
@@ -6967,10 +6996,12 @@ static const u8 c2b_g11_sig_udp[29] = {
 static uptr g_g11_base;                 /* load bias steamclient.so */
 static volatile u32 g_g11_nx;           /* анти-спам xport-логгера */
 static volatile u32 g_g11_nu;           /* анти-спам udp-логгера */
+static volatile u32 g_g11_ng;           /* анти-спам gather-логгера */
 static volatile u64 c2b_g11_cont_addr, c2b_g11_null_addr;
 /* void *volatile (НЕ volatile void*): gcc удаляет unused static без
  * volatile-объекта, а тюнк ссылается на символ из asm (урок сборки g11) */
 static void *volatile c2b_g11_udp_tramp = 0;
+static void *volatile c2b_g11_gather_cont = 0;
 static u8 *g_g11_udp_tramp_mem;
 
 static void c2b_g11_xport_log(uptr wrap)
@@ -7036,6 +7067,46 @@ static void c2b_g11_udp_log(uptr obj, uptr nseg, uptr segs, uptr dest)
         u32 i;
         for (i = 0; i < 16; i += 4)
             C2B_LOGH(*(volatile u32 *)(segs + i));
+    } else {
+        C2B_LOGH(0);
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+static void c2b_g11_gather_log(uptr self, uptr nseg, uptr segs, uptr adr, uptr efd)
+{
+    u32 n, sockcnt, ratelim, loss, lag, reorder;
+    u32 total = 0, k;
+    if (!g_g11_base) return;
+    n = ++g_g11_ng;
+    if (n > 24 && (n & 0x3F) != 1) return;   /* первые 24, далее 1/64 */
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    sockcnt = *(volatile u32 *)(g_g11_base + 0x2cbb900);
+    ratelim = *(volatile u32 *)(g_g11_base + 0x2cb8ae0 + 0x40);
+    loss    = *(volatile u32 *)(g_g11_base + 0x2cb8f00 + 0x40);
+    lag     = *(volatile u32 *)(g_g11_base + 0x2cb8e40 + 0x40);
+    reorder = *(volatile u32 *)(g_g11_base + 0x2cb8d80 + 0x40);
+    C2B_LOGS("[c2b] g11d gather: self=");
+    C2B_LOGH((u32)(self > g_g11_base ? self - g_g11_base : 0));
+    C2B_LOGS(" nseg="); C2B_LOGN((u32)nseg);
+    C2B_LOGS(" efd="); C2B_LOGN((u32)(i32)efd);
+    C2B_LOGS(" sockcnt="); C2B_LOGN(sockcnt);
+    C2B_LOGS(" ratelimit="); C2B_LOGN(ratelim);
+    C2B_LOGS(" loss="); C2B_LOGH(loss);
+    C2B_LOGS(" lag="); C2B_LOGN(lag);
+    C2B_LOGS(" reorder="); C2B_LOGH(reorder);
+    if (segs && nseg && nseg < 64) {
+        for (k = 0; k < nseg; k++)
+            total += *(volatile u32 *)(segs + 16 * k);
+        C2B_LOGS(" total="); C2B_LOGN(total);
+    }
+    C2B_LOGS(" adr[16B]=");
+    if (adr) {
+        for (k = 0; k < 16; k += 4)
+            C2B_LOGH(*(volatile u32 *)(adr + k));
     } else {
         C2B_LOGH(0);
     }
@@ -7115,15 +7186,51 @@ __asm__(
 "  add  $0x58,%rsp\n"
 "  jmp  *c2b_g11_udp_tramp(%rip)\n"
 ".size c2b_g11_udp_thunk, .-c2b_g11_udp_thunk\n"
+".globl c2b_g11_gather_thunk\n"
+".type  c2b_g11_gather_thunk,@function\n"
+"c2b_g11_gather_thunk:\n" /* вход: rsp%16==8; args: rdi=self rsi=nseg rdx=segs rcx=adr r8d=efd */
+"  endbr64\n"
+"  sub  $0x68,%rsp\n"      /* 104; rsp%16==0 */
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g11_gather_log\n" /* args уже в регах */
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x68,%rsp\n"
+/* реплика 14Б пролога (0x1fc7c80..0x1fc7c8d), затем jmp на lea */
+"  push %r15\n"
+"  push %r14\n"
+"  mov  %rcx,%r14\n"
+"  push %r13\n"
+"  mov  %rdi,%r13\n"
+"  push %r12\n"
+"  mov  c2b_g11_gather_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g11_gather_thunk, .-c2b_g11_gather_thunk\n"
 ".previous\n"
 );
 extern void c2b_g11_xport_thunk(void);
 extern void c2b_g11_udp_thunk(void);
+extern void c2b_g11_gather_thunk(void);
 
 static void c2b_g11_apply(void)
 {
     static u8 done;
-    uptr base = 0, site, udp, tr;
+    uptr base = 0, site, udp, tr, gather;
     if (done) return;
     dl_iterate_phdr(c2b_g8_phdr_cb, &base);   /* тот же фильтр steamclient.so */
     if (!base) return;
@@ -7134,6 +7241,12 @@ static void c2b_g11_apply(void)
     }
     if (memcmp((const void *)udp, c2b_g11_sig_udp, sizeof c2b_g11_sig_udp) != 0) {
         C2B_LOGS("[c2b] g11: udp sig mismatch\n"); done = 1; return;
+    }
+    /* g11d: BSendPacketGather (сиг-чек до установки g_g11_base — не критично,
+     * но логгер требует base, ставим заранее вместе с cont) */
+    gather = base + C2B_G11_GATHER_RVA;
+    if (memcmp((const void *)gather, c2b_g11_sig_gather, sizeof c2b_g11_sig_gather) != 0) {
+        C2B_LOGS("[c2b] g11: gather sig mismatch\n"); done = 1; return;
     }
     /* g11a: сайт транспорта */
     if (c2b_page_protect(site, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
@@ -7151,8 +7264,13 @@ static void c2b_g11_apply(void)
     c2b_g11_udp_tramp = (const volatile void *)tr;  /* ДО пача udp */
     if (c2b_page_protect(udp, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
     c2b_write_jmp((void *)udp, (const void *)&c2b_g11_udp_thunk);
+    /* g11d: вход BSendPacketGather — чистая asm-репликация пролога в тунке,
+     * cont = 0x1fc7c8e (lea rip-rel валидна в оригинальном положении) */
+    c2b_g11_gather_cont = (const volatile void *)(base + C2B_G11_GATHER_CONT);
+    if (c2b_page_protect(gather, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)gather, (const void *)&c2b_g11_gather_thunk);
     done = 1;
-    C2B_LOGS("[c2b] g11: armed site+udp base=");
+    C2B_LOGS("[c2b] g11: armed site+udp+gather base=");
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 

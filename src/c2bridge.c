@@ -9049,7 +9049,7 @@ static u32 g_g24_nstate;
  * chal!=0, vptr-в-движок). Диапазоны: RW engine_client.so + АНОНИМНЫЕ RW
  * (куча!) + [h[heap]; каждый <=256МБ, суммарно <=768МБ. */
 struct c2b_g24_range { uptr lo, hi; };
-struct c2b_g24_rset { struct c2b_g24_range r[48]; u32 n; u64 total; };
+struct c2b_g24_rset { struct c2b_g24_range r[64]; u32 n; u64 total; };
 static u32 c2b_g24_hex32(const char *p, uptr *out)
 {
     uptr v = 0;
@@ -9074,7 +9074,7 @@ static void c2b_g24_add_range(struct c2b_g24_rset *rs, uptr lo, uptr hi)
     if (rs->total + sz > ((uptr)2048 << 20)) return;
     for (i = 0; i < rs->n; i++)
         if (rs->r[i].lo == lo) { dup = 1; break; }
-    if (dup || rs->n >= 48) return;
+    if (dup || rs->n >= 64) return;
     rs->r[rs->n].lo = lo;
     rs->r[rs->n].hi = hi;
     rs->n++;
@@ -9106,7 +9106,14 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
     mb[n] = 0;
     p = mb;
     end = mb + n;
-    while (p < end && rs->n < 48) {
+    /* v3.4: ДВЕ ПРОХОДКИ — диапазоны движка собираются ПЕРВЫМИ (кап 48
+     * однажды уже съели анонимные низкие регионы ДО движка — точь-в-точь
+     * баг g13-selfscan-cap 16); вторая проходка — анонимные/[heap]. */
+    u32 pass, want_eng;
+    for (pass = 0; pass < 2; pass++) {
+      want_eng = (pass == 0);
+      p = mb;
+      while (p < end && rs->n < 64) {
         /* format: lo-hi perms offset dev inode [path]\n */
         uptr lo = 0, hi = 0;
         u32 k;
@@ -9158,8 +9165,10 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
                 C2B_LOGS("\n");
             }
             if (!eng && !anon) continue;
+            if (eng != want_eng) continue;      /* проходка 0: движок, 1: anon */
         }
         c2b_g24_add_range(rs, lo, hi);
+      }
     }
 }
 static u32 c2b_g24_add_state(uptr p)

@@ -9031,50 +9031,103 @@ static void c2b_g22_apply(void)
  * cstate==1 = инлайн-хендлер жив -> те же 'B'-формулы, что у g21. */
 #define C2B_G24_VPTR1 0xd78bb8ull
 #define C2B_G24_VPTR2 0xd78de8ull
-struct c2b_g24_wseg { uptr lo[8], hi[8]; u32 n; };
+static uptr g_g24_state[4];
+static u32 g_g24_nstate;
+/* v2 (run144 dead-run diagnostic: engine-only vptr-pair scan = 0 при
+ * вооружённых g13/g21 => инстанс НЕ в RW-сегментах движка): три канала —
+ * (B) vptr-пара по ВСЕМ модулям (стейт может быть глобалом launcher!),
+ * (A) discovery слотов accept: qword == base+0x2491f0 в W-памяти = живые
+ *     vtable-слоты (если стейт — ПОТОК, его vptr перезаписан производным
+ *     классом! Пары 0xd78bb8 он не имеет) -> кандидат vtbase = V-0x200,
+ *     инстансы = qword == vtbase; (C) контент-скан: u32@X+0x1a0==1 &&
+ *     u32@X+0x4dc==3 && u32@X+0x4d8!=0 (chesтный след 'A'-парса) с
+ *     верификацией vptr-в-движок. Все каналы -> общий пул кандидатов. */
+struct c2b_g24_wseg { uptr lo[64], hi[64]; u32 n; };
 static i32 c2b_g24_wseg_cb(void *info_v, void *size_v, void *data_v)
 {
     struct c2b_g13_phdr_min *info = (struct c2b_g13_phdr_min *)info_v;
     struct c2b_g24_wseg *r = (struct c2b_g24_wseg *)data_v;
     u16 i;
     (void)size_v;
-    if ((uptr)info->addr != g_engine_base || !info->phdr || !info->phnum)
-        return 0;                                /* не движок — дальше */
-    for (i = 0; i < info->phnum && r->n < 8; i++) {
+    if (!info->addr || !info->phdr || !info->phnum) return 0;
+    for (i = 0; i < info->phnum && r->n < 64; i++) {
         const struct c2b_g13_phdr64 *ph =
             (const struct c2b_g13_phdr64 *)((const u8 *)info->phdr +
                                             (uptr)i * sizeof(*ph));
-        if (ph->type == 1 && (ph->flags & 2)) {  /* PT_LOAD + W (data/bss) */
+        if (ph->type == 1 && (ph->flags & 2) && ph->memsz > 0x1000) {
             r->lo[r->n] = info->addr + ph->vaddr;
             r->hi[r->n] = r->lo[r->n] + ph->memsz;
             r->n++;
         }
     }
-    return 1;                                    /* движок найден — хватит */
+    return 0;
 }
-static uptr g_g24_state[4];
-static u32 g_g24_nstate;
+static u32 c2b_g24_add_state(uptr p)
+{
+    u32 j;
+    if (g_g24_nstate >= 4) return 0;
+    for (j = 0; j < g_g24_nstate; j++)
+        if (g_g24_state[j] == p) return 0;
+    g_g24_state[g_g24_nstate++] = p;
+    return 1;
+}
 static void c2b_g24_find_state(void)
 {
     struct c2b_g24_wseg ws;
-    u32 i;
+    u32 i, found = 0;
     uptr p;
-    if (g_g24_nstate || !g_engine_base) return;
+    if (g_g24_nstate >= 4 || !g_engine_base) return;
     ws.n = 0;
     dl_iterate_phdr(c2b_g24_wseg_cb, &ws);
     if (!ws.n) return;
+    /* канал B: vptr-пара (0xd78bb8@0 + 0xd78de8@8) по всем W-сегментам */
     for (i = 0; i < ws.n && g_g24_nstate < 4; i++) {
         for (p = ws.lo[i]; p + 16 <= ws.hi[i] && g_g24_nstate < 4; p += 8) {
-            u32 j, dup = 0;
-            if (*(volatile uptr *)p != g_engine_base + C2B_G24_VPTR1) continue;
-            if (*(volatile uptr *)(p + 8) != g_engine_base + C2B_G24_VPTR2) continue;
-            for (j = 0; j < g_g24_nstate; j++)
-                if (g_g24_state[j] == p) { dup = 1; break; }
-            if (!dup) g_g24_state[g_g24_nstate++] = p;
+            if (*(volatile uptr *)p == g_engine_base + C2B_G24_VPTR1 &&
+                *(volatile uptr *)(p + 8) == g_engine_base + C2B_G24_VPTR2) {
+                if (c2b_g24_add_state(p)) found++;
+            }
+        }
+    }
+    /* канал A: живые слоты accept (qword == base+0x2491f0) -> vtbase=V-0x200
+     * -> инстансы с vptr == vtbase. Отловит производные классы с ПЕРЕЗАПИСАННЫМ
+     * vptr, у которых accept унаследован на idx 64. */
+    for (i = 0; i < ws.n && g_g24_nstate < 4; i++) {
+        for (p = ws.lo[i]; p + 8 <= ws.hi[i] && g_g24_nstate < 4; p += 8) {
+            uptr v = *(volatile uptr *)p;
+            if (v == g_engine_base + C2B_G21_GATE_RVA) {
+                uptr vtbase = p - 0x200;      /* слот ПОД ПАРУ строк в логе */
+                u32 k;
+                C2B_LOGS("[c2b] g24: accept-slot @");
+                C2B_LOGH((u32)(p >> 32)); C2B_LOGH((u32)p);
+                C2B_LOGS("vtbase=");
+                C2B_LOGH((u32)(vtbase >> 32)); C2B_LOGH((u32)vtbase);
+                C2B_LOGS("\n");
+                for (k = 0; k < ws.n && g_g24_nstate < 4; k++) {
+                    uptr q;
+                    for (q = ws.lo[k]; q + 8 <= ws.hi[k] && g_g24_nstate < 4; q += 8)
+                        if (*(volatile uptr *)q == vtbase && c2b_g24_add_state(q))
+                            found++;
+                }
+            }
+        }
+    }
+    /* канал C: контент-скан (cstate==1, proto==3, chal!=0) + vptr в движке */
+    for (i = 0; i < ws.n && g_g24_nstate < 4; i++) {
+        for (p = ws.lo[i]; p + 0x520 <= ws.hi[i] && g_g24_nstate < 4; p += 8) {
+            uptr vp;
+            if (*(volatile const u32 *)(p + 0x1a0) != 1) continue;
+            if (*(volatile const u32 *)(p + 0x4dc) != 3) continue;
+            if (*(volatile const u32 *)(p + 0x4d8) == 0) continue;
+            vp = *(volatile uptr *)p;
+            if (vp < g_engine_base || vp >= g_engine_base + 0x4000000) continue;
+            if (c2b_g24_add_state(p)) found++;
         }
     }
     C2B_LOGS("[c2b] g24: state scan n=");
     C2B_LOGN(g_g24_nstate);
+    C2B_LOGS("new=");
+    C2B_LOGN(found);
     for (i = 0; i < g_g24_nstate; i++) {
         C2B_LOGS(" @");
         C2B_LOGH((u32)(g_g24_state[i] >> 32)); C2B_LOGH((u32)g_g24_state[i]);
@@ -9133,6 +9186,8 @@ static void *c2b_g24_thread(void *arg)
         c2b_g24_dumpone(i, cs);
     }
     for (it = 0; it < 4800; it++) {                  /* 20 мин по 250мс */
+        if ((it & 0xFF) == 0xFF && g_g24_nstate < 4)
+            c2b_g24_find_state();                    /* поздний construction/rescan */
         for (i = 0; i < g_g24_nstate; i++) {
             uptr st = g_g24_state[i];
             u32 cs = *(volatile const u32 *)(st + 0x1a0);

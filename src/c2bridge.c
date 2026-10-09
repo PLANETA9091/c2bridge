@@ -9149,23 +9149,19 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
         }
         if (perms[0] != 'r' || perms[1] != 'w') continue;   /* RW only */
         {
-            u32 eng = 0, anon = 0, j;
-            for (j = 0; j + 14 <= pathlen; j++)
-                if (path[j] == 'e' && path[j+1] == 'n' && path[j+2] == 'g' &&
-                    path[j+3] == 'i' && path[j+4] == 'n' && path[j+5] == 'e' &&
-                    path[j+6] == '_') { eng = 1; break; }
+            /* v3.5: pass 0 = ВСЁ, что пересекает окно [base, base+1GB):
+             * file-backed RW движка + anon-продолжения bss + арены с
+             * рантайм-копиями vtable (+223MB) — путь не важен; прошлый
+             * фильтр по пути ловил 18 мелких фрагментов и ТЕРЯЛ главный
+             * регион (224МБ). pass 1 = анонимные/[heap] (куча). */
+            u32 anon = 0, inwin;
+            inwin = (lo < g_engine_base + 0x40000000ull) &&
+                    (hi > g_engine_base);
             if (pathlen == 0) anon = 1;                     /* anon RW = heap */
             else if (pathlen >= 6 && path[0] == '[' &&
                      path[1] == 'h' && path[2] == 'e') anon = 1;
-            if (eng) {          /* diag: the engine RW range was collected? */
-                C2B_LOGS("[c2b] g24: eng RW ");
-                C2B_LOGH((u32)(lo >> 32)); C2B_LOGH((u32)lo);
-                C2B_LOGS("-");
-                C2B_LOGH((u32)(hi >> 32)); C2B_LOGH((u32)hi);
-                C2B_LOGS("\n");
-            }
-            if (!eng && !anon) continue;
-            if (eng != want_eng) continue;      /* проходка 0: движок, 1: anon */
+            if (want_eng) { if (!inwin) continue; }
+            else        { if (!anon) continue; }
         }
         c2b_g24_add_range(rs, lo, hi);
       }

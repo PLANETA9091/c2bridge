@@ -9337,7 +9337,15 @@ static void *c2b_g24_thread(void *arg)
             h = h * 1000003u + *(volatile const u32 *)(st + 0x4e0);
             for (k = 0; k < 4; k++)
                 h = h * 1000003u + *(volatile const u64 *)(st + 0x4f0 + k * 8);
-            if (cs != last_c[i] || h != last_h[i]) {
+            /* v3.9: cstate!=0 = подключающееся окно (может быть короче 250мс
+             * опроса) — логируем КАЖДУЮ итерацию пока подключается: траектория
+             * cstate + snap В МОМЕНТ 'A' — решающие данные */
+            if (cs != 0 && logged < 512) {
+                last_c[i] = cs;
+                last_h[i] = h;
+                logged++;
+                c2b_g24_dumpone(i, cs);
+            } else if (cs != last_c[i] || h != last_h[i]) {
                 last_c[i] = cs;
                 last_h[i] = h;
                 logged++;

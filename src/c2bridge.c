@@ -9149,7 +9149,14 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
             }
             if (p < end) p++;
         }
-        if (perms[0] != 'r' || perms[1] != 'w') continue;   /* RW only */
+        /* v3.7: pass 0 (окно движка) теперь принимает ЛЮБОЙ читаемый регион:
+         * VTABLES живут в .data.rel.ro, который после релокаций RELRO
+         * переводится в r--p — RW-only фильтр исключал ровно те страницы,
+         * где лежат статик-primary vtable и слоты accept! run145 видел их
+         * phdr-сканом (флаг W у PT_LOAD не отражает runtime-RELRO).
+         * pass 1 (куча) остаётся rw-only. */
+        if (want_eng) { if (perms[0] != 'r') continue; }
+        else { if (perms[0] != 'r' || perms[1] != 'w') continue; }
         {
             /* v3.5: pass 0 = ВСЁ, что пересекает окно [base, base+1GB):
              * file-backed RW движка + anon-продолжения bss + арены с

@@ -7851,6 +7851,212 @@ arm:
     C2B_LOGS("\n");
 }
 
+/* ---------- 41f-g16: ЖИВОЙ путь датаграмм движка (evidence run 127 / g15) ----
+ * g15 (run127): живой recvfrom-сайт = engine_client.so+0x4d63a1 (HOT h=100),
+ * send-сайт = +0x4d0934. Статика (34a96ae, engine.asm):
+ *  - 0x4d63a1 = точка сразу ПОСЛЕ call recvfrom@plt (0x4d639c) в насосе
+ *    0x4d61d0: recv-ТРЕД (обёртка-тело 0x4d70b0 -> CreateSimpleThread @0x4d0f3a,
+ *    init с socketpair), буфер = sockobj+4 (sockobj{u32 len; u8 buf[0x100010]}),
+ *    from = rbp-0x70. После приёма датаграмма копируется в аккумулятор и
+ *    ПУШИТСЯ в lock-free очередь (node 0x2a3, Alloc @0x4d661d) — консьюмер
+ *    на другом треде, его парсер пока неизвестен.
+ *  - 0x4d08c0 = send-обёртка (rdi=sock, esi=fd, rdx=data, ecx=len, r9=netadr;
+ *    NetAdrToSockaddr @0x65ec40 -> sendto@plt @0x4d092f). ЕЮ движок шлёт ВСЁ
+ *    исходящее UDP: 'j' после 'A', LanSearch, getchallenge.
+ *  - Семейство 0x259df0 (g13) извне входит ТОЛЬКО через entry (2 vtable-wrappers,
+ *    0x25de04/0x2c9545) — и после арма НЕ ОГОРАЕТ при живых bait'ах (run126),
+ *    т.е. живой парсер connectionless — ДРУГОЙ код. g16 даёт его адреса:
+ *   a) g16a = entry-детур send-обёртки 0x4d08c0: рет0 вызывающего = САЙТ
+ *      РЕАКЦИИ ('j'-отправитель = 'A'-парсер; LanSearch-эмиттер отдельно).
+ *   b) g16b = пост-recvfrom детур 0x4d63a1: дамп КАЖДОЙ входящей датаграммы
+ *      (len, from, data[0..11]) — что реально доезжает до насоса.
+ * Патч 14Б (jmp [rip+0]); крадём до границы инструкций: g16a 16Б (0x4d08c0..cf,
+ * все позиционно-независимые), cont 0x4d08d0; g16b 15Б (0x4d63a1..af, ВКЛЮЧАЯ
+ * jle rel32 — в трамплине rel32 ПЕРЕСЧИТЫВАЕТСЯ на 0x4d6a50!), cont 0x4d63b0.
+ * Сигнатуры сверены оффлайн с 34a96ae (BuildID e9f63d98). */
+#define C2B_G16_SEND_RVA  0x4d08c0ull
+#define C2B_G16_SEND_CONT 0x4d08d0ull
+#define C2B_G16_RECV_RVA  0x4d63a1ull
+#define C2B_G16_RECV_CONT 0x4d63b0ull
+#define C2B_G16_JLE_TGT   0x4d6a50ull
+static const u8 c2b_g16a_sig[16] = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x49, 0x89, 0xD7,
+    0x41, 0x56, 0x41, 0x55, 0x41, 0x89, 0xCD };
+static const u8 c2b_g16b_sig[15] = {
+    0x85, 0xC0, 0x48, 0x89, 0x85, 0x98, 0xFE, 0xFF, 0xFF,
+    0x0F, 0x8E, 0xA0, 0x06, 0x00, 0x00 };
+static u8 *g_g16a_tramp_mem;
+static u8 *g_g16b_tramp_mem;
+static void *volatile c2b_g16a_tramp;
+static void *volatile c2b_g16b_tramp;
+
+void c2b_g16a_log(uptr ret0, uptr dataptr, u32 len)
+{
+    static volatile u32 n;
+    u32 i, cnt = ++n;
+    if (cnt > 8 && (cnt & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g16 send: ra=");
+    C2B_LOGH((u32)(ret0 >> 32)); C2B_LOGH((u32)ret0);
+    if (g_engine_base && ret0 > g_engine_base &&
+        ret0 - g_engine_base < 0x8000000ull) {
+        C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - g_engine_base));
+    }
+    if (dataptr && len) {
+        C2B_LOGS("d=");
+        for (i = 0; i < 8 && i < len; i++)
+            C2B_LOGH(*(volatile const u8 *)(dataptr + i));
+    }
+    C2B_LOGS("len="); C2B_LOGN(len); C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+void c2b_g16b_log(uptr rlen, uptr frame)
+{
+    static volatile u32 n;
+    u32 i, cnt;
+    uptr sp;
+    const u8 *data, *from;
+    if (!frame) return;
+    cnt = ++n;
+    if (cnt > 24 && (cnt & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g16 recv: len=");
+    C2B_LOGN((u32)(i32)rlen);
+    from = (const u8 *)(frame - 0x70);      /* sockaddr_in: fam2 port2 ip4 */
+    C2B_LOGS("from=");
+    for (i = 0; i < 8; i++) C2B_LOGH(from[i]);
+    sp = *(volatile uptr *)(frame - 0x140);  /* sockobj */
+    data = sp ? (const u8 *)(sp + 4) : (const u8 *)0;
+    if (data && (i32)rlen > 0) {
+        C2B_LOGS("d=");
+        for (i = 0; i < 12 && (u32)i < (u32)rlen; i++)
+            C2B_LOGH(data[i]);
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g16a_thunk\n"
+".type  c2b_g16a_thunk,@function\n"
+"c2b_g16a_thunk:\n"   /* вход: rsp%16==8; r10/r11/rax мертвы до записи */
+"  endbr64\n"
+"  mov  (%rsp),%r10\n"          /* ret0 = вызывающий обёртки */
+"  sub  $0x58,%rsp\n"
+"  mov  %r10,0x00(%rsp)\n"
+"  mov  %rdi,0x08(%rsp)\n"
+"  mov  %rsi,0x10(%rsp)\n"
+"  mov  %rdx,0x18(%rsp)\n"
+"  mov  %rcx,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %rax,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r10,%rdi\n"            /* arg1 = ret0 */
+"  mov  %rdx,%rsi\n"            /* arg2 = data ptr */
+"  mov  %rcx,%rdx\n"            /* arg3 = len (ecx) */
+"  call c2b_g16a_log\n"
+"  mov  0x00(%rsp),%r10\n"
+"  mov  0x08(%rsp),%rdi\n"
+"  mov  0x10(%rsp),%rsi\n"
+"  mov  0x18(%rsp),%rdx\n"
+"  mov  0x20(%rsp),%rcx\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%rax\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g16a_tramp(%rip)\n"
+".size c2b_g16a_thunk, .-c2b_g16a_thunk\n"
+".globl c2b_g16b_thunk\n"
+".type  c2b_g16b_thunk,@function\n"
+"c2b_g16b_thunk:\n"   /* вход сразу после recvfrom: rax=len, rbp=кадр насоса */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rbp,0x08(%rsp)\n"
+"  mov  %rdi,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdx,0x20(%rsp)\n"
+"  mov  %rcx,0x28(%rsp)\n"
+"  mov  %r8, 0x30(%rsp)\n"
+"  mov  %r9, 0x38(%rsp)\n"
+"  mov  %r10,0x40(%rsp)\n"
+"  mov  %r11,0x48(%rsp)\n"
+"  mov  %rax,%rdi\n"            /* arg1 = recvfrom rc */
+"  mov  %rbp,%rsi\n"            /* arg2 = кадр насоса */
+"  call c2b_g16b_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rbp\n"
+"  mov  0x10(%rsp),%rdi\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdx\n"
+"  mov  0x28(%rsp),%rcx\n"
+"  mov  0x30(%rsp),%r8\n"
+"  mov  0x38(%rsp),%r9\n"
+"  mov  0x40(%rsp),%r10\n"
+"  mov  0x48(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g16b_tramp(%rip)\n" /* tramp: test+mov+jle(фикс rel32) -> cont */
+".size c2b_g16b_thunk, .-c2b_g16b_thunk\n"
+".previous\n"
+);
+extern void c2b_g16a_thunk(void);
+extern void c2b_g16b_thunk(void);
+
+static void c2b_g16_apply(void)
+{
+    static u8 done;
+    uptr base, sa, ra, tr;
+    if (done) return;
+    base = g_engine_base;
+    if (!base) return;               /* движок ещё не_resolved — ретрай */
+    sa = base + C2B_G16_SEND_RVA;
+    if (memcmp((const void *)sa, c2b_g16a_sig, sizeof c2b_g16a_sig) != 0) {
+        C2B_LOGS("[c2b] g16: send sig mismatch\n"); done = 1; return;
+    }
+    ra = base + C2B_G16_RECV_RVA;
+    if (memcmp((const void *)ra, c2b_g16b_sig, sizeof c2b_g16b_sig) != 0) {
+        C2B_LOGS("[c2b] g16: recv sig mismatch\n"); done = 1; return;
+    }
+    /* g16a tramp: 16Б украденных + jmp cont */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g16a_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)sa, sizeof c2b_g16a_sig);
+    c2b_write_jmp((void *)(tr + sizeof c2b_g16a_sig),
+                  (const void *)(base + C2B_G16_SEND_CONT));
+    c2b_g16a_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(sa, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)sa, (const void *)&c2b_g16a_thunk);
+    /* g16b tramp: 9Б (test+mov) + jle С ПЕРЕСЧИТОМ rel32 -> jmp cont */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g16b_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)ra, 9);
+    {
+        u8 jl[6];
+        i32 rel = (i32)(C2B_G16_JLE_TGT - (tr + 9 + 6));
+        jl[0] = 0x0F; jl[1] = 0x8E;
+        jl[2] = (u8)(u32)rel;         jl[3] = (u8)((u32)rel >> 8);
+        jl[4] = (u8)((u32)rel >> 16); jl[5] = (u8)((u32)rel >> 24);
+        memcpy((void *)(tr + 9), jl, 6);
+    }
+    c2b_write_jmp((void *)(tr + 15), (const void *)(base + C2B_G16_RECV_CONT));
+    c2b_g16b_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(ra, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)ra, (const void *)&c2b_g16b_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g16: armed send+recv base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
 static void c2b_g12_apply(void)
 {
     static u8 done;
@@ -7903,7 +8109,7 @@ static void c2b_gns_spew_rearm(void)
     c2b_g11_apply();        /* 41f-g11: транспортная выводка ConnectRequest */
     c2b_g12_apply();        /* 41f-g12: зонды стейт-машины (SetState/InitConn) */
     c2b_g13_apply();        /* 41f-g13: диспетчер connectionless движка (слепая зона hdr) */
-    c2b_g8_patch_verify();
+    c2b_g16_apply();        /* 41f-g16: живой путь датаграмм (send-обёртка + пост-recvfrom) */
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
         if (!g_gns_u2_done) c2b_g5_resolve_copy2();
@@ -7920,6 +8126,7 @@ static void c2b_gns_spew_rearm(void)
         c2b_g11_apply();        /* 41f-g11: одноразово (done-флаг внутри) */
         c2b_g12_apply();        /* 41f-g12: одноразово (done-флаг внутри) */
         c2b_g13_apply();        /* 41f-g13: одноразово (done-флаг внутри) */
+        c2b_g16_apply();        /* 41f-g16: одноразово (done-флаг внутри) */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

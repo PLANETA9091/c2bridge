@@ -8105,6 +8105,191 @@ static void c2b_g16_apply(void)
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 
+/* ---------- 41f-g17: вердикт connectionless-фильтра (evidence run129) -------
+ * Run129: 'A'-bait (ff ff ff ff 'A' ch32, from 152.233.19.133:28022) И 'I'-info
+ * ДОХОДЯТ до pump-recvfrom (g16b), но движок НЕ реагирует (нет 'j', фазы не
+ * идут, getchallenge НЕ повторяется). Статика: connectionless-ветка насоса
+ * 0x4d6b80 строит объект {netadr@0, field8@8, ...} и зовёт ФИЛЬТР 0x390d80;
+ * его вердикт (al): TRUE -> test/jne 0x4d64fb = ENQUEUE в очередь (консьюмер
+ * на гл. треде = живой парсер), FALSE -> jmp 0x4d6360 = СИЛЫЙ ДРОП (обратно в
+ * recv). Фильтр: obj+0x1c!=0 -> сразу 1; иначе мьютекс + матчер 0x38e830
+ * (Plat_FloatTime + проход списка зарегистрированных соединений, typeinfo
+ * 0x224f30) — ПРЕЙМ-ПОДОЗРЕВАЕМЫЙ БАРЬЕР: baits могут дропаться из-за
+ * "нет активного соединения с адресом" -> объясняет нули g13 (семейство
+ * 0x259df0 зовётся консьюмером очереди, куда baits не доходят) и молчание.
+ * g17a = entry-детур фильтра 0x390d80 (крадём 20Б до 0x390d94, все
+ * позиционно-независимые): дамп obj[0..31] (netadr+поля) на входе.
+ * g17b = патч точки вердикта 0x4d6bea (ровно 14Б: test %r13b + jne + jmp,
+ * ОБА rel32 в трамплине пересчитаны: jne->0x4d64fb, jmp->0x4d6360): лог
+ * вердикта r13b + obj. Сигнатуры сверены оффлайн с 34a96ae. */
+#define C2B_G17_FILT_RVA  0x390d80ull
+#define C2B_G17_FILT_CONT 0x390d94ull
+#define C2B_G17_VERD_RVA  0x4d6beaull
+#define C2B_G17_VERD_CONT 0x4d6bf8ull
+#define C2B_G17_JNE_TGT   0x4d64fbull
+#define C2B_G17_JMP_TGT   0x4d6360ull
+static const u8 c2b_g17a_sig[20] = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+    0x41, 0x54, 0x53, 0x48, 0x83, 0xEC, 0x58, 0x8B, 0x4F, 0x1C };
+static const u8 c2b_g17b_sig[14] = {
+    0x45, 0x84, 0xED, 0x0F, 0x85, 0x08, 0xF9, 0xFF, 0xFF,
+    0xE9, 0x68, 0xF7, 0xFF, 0xFF };
+static u8 *g_g17a_tramp_mem;
+static u8 *g_g17b_tramp_mem;
+static void *volatile c2b_g17a_tramp;
+static void *volatile c2b_g17b_tramp;
+
+void c2b_g17a_log(uptr obj)
+{
+    static volatile u32 n;
+    u32 i, cnt;
+    if (!obj) return;
+    cnt = ++n;
+    if (cnt > 24 && (cnt & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g17 filt-in: ");
+    for (i = 0; i < 32; i++)
+        C2B_LOGH(*(volatile const u8 *)(obj + i));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+void c2b_g17b_log(uptr verdict, uptr obj)
+{
+    static volatile u32 n;
+    u32 i, cnt;
+    if (!obj) return;
+    cnt = ++n;
+    if (cnt > 24 && (cnt & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g17 verdict: ");
+    C2B_LOGN((u32)(verdict & 0xff));
+    C2B_LOGS("obj=");
+    for (i = 0; i < 32; i++)
+        C2B_LOGH(*(volatile const u8 *)(obj + i));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g17a_thunk\n"
+".type  c2b_g17a_thunk,@function\n"
+"c2b_g17a_thunk:\n"   /* вход: rdi=obj; rdi протаскиваем в логгер как есть */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %r8, 0x20(%rsp)\n"
+"  mov  %r9, 0x28(%rsp)\n"
+"  mov  %r10,0x30(%rsp)\n"
+"  mov  %r11,0x38(%rsp)\n"
+"  call c2b_g17a_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%r8\n"
+"  mov  0x28(%rsp),%r9\n"
+"  mov  0x30(%rsp),%r10\n"
+"  mov  0x38(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g17a_tramp(%rip)\n"
+".size c2b_g17a_thunk, .-c2b_g17a_thunk\n"
+".globl c2b_g17b_thunk\n"
+".type  c2b_g17b_thunk,@function\n"
+"c2b_g17b_thunk:\n"   /* вход: r13b=вердикт, rbx=obj; callee-saved не трогаем */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rdi,0x18(%rsp)\n"
+"  mov  %rsi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r13d,%edi\n"
+"  mov  %rbx,%rsi\n"
+"  call c2b_g17b_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rdi\n"
+"  mov  0x20(%rsp),%rsi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g17b_tramp(%rip)\n"
+".size c2b_g17b_thunk, .-c2b_g17b_thunk\n"
+".previous\n"
+);
+extern void c2b_g17a_thunk(void);
+extern void c2b_g17b_thunk(void);
+
+static void c2b_g17_apply(void)
+{
+    static u8 done;
+    uptr base, fa, va, tr;
+    if (done) return;
+    base = g_engine_base;
+    if (!base) return;
+    fa = base + C2B_G17_FILT_RVA;
+    if (memcmp((const void *)fa, c2b_g17a_sig, sizeof c2b_g17a_sig) != 0) {
+        C2B_LOGS("[c2b] g17: filt sig mismatch\n"); done = 1; return;
+    }
+    va = base + C2B_G17_VERD_RVA;
+    if (memcmp((const void *)va, c2b_g17b_sig, sizeof c2b_g17b_sig) != 0) {
+        C2B_LOGS("[c2b] g17: verdict sig mismatch\n"); done = 1; return;
+    }
+    /* g17a tramp: 20Б украденных + jmp cont */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g17a_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)fa, sizeof c2b_g17a_sig);
+    c2b_write_jmp((void *)(tr + sizeof c2b_g17a_sig),
+                  (const void *)(base + C2B_G17_FILT_CONT));
+    c2b_g17a_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(fa, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)fa, (const void *)&c2b_g17a_thunk);
+    /* g17b tramp: test(3Б) + jne(6Б, rel32->0x4d64fb) + jmp(5Б, rel32->0x4d6360)
+     * + write_jmp cont */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g17b_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)va, 3);
+    {
+        u8 br[6];
+        i32 rel;
+        rel = (i32)(C2B_G17_JNE_TGT - (tr + 3 + 6));
+        br[0] = 0x0F; br[1] = 0x85;
+        br[2] = (u8)(u32)rel;         br[3] = (u8)((u32)rel >> 8);
+        br[4] = (u8)((u32)rel >> 16); br[5] = (u8)((u32)rel >> 24);
+        memcpy((void *)(tr + 3), br, 6);
+        rel = (i32)(C2B_G17_JMP_TGT - (tr + 9 + 5));
+        br[0] = 0xE9;
+        br[1] = (u8)(u32)rel;         br[2] = (u8)((u32)rel >> 8);
+        br[3] = (u8)((u32)rel >> 16); br[4] = (u8)((u32)rel >> 24);
+        memcpy((void *)(tr + 9), br, 5);
+    }
+    c2b_write_jmp((void *)(tr + 14), (const void *)(base + C2B_G17_VERD_CONT));
+    c2b_g17b_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(va, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)va, (const void *)&c2b_g17b_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g17: armed filt+verdict base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
 static void c2b_g12_apply(void)
 {
     static u8 done;
@@ -8158,6 +8343,7 @@ static void c2b_gns_spew_rearm(void)
     c2b_g12_apply();        /* 41f-g12: зонды стейт-машины (SetState/InitConn) */
     c2b_g13_apply();        /* 41f-g13: диспетчер connectionless движка (слепая зона hdr) */
     c2b_g16_apply();        /* 41f-g16: живой путь датаграмм (send-обёртка + пост-recvfrom) */
+    c2b_g17_apply();        /* 41f-g17: вердикт connectionless-фильтра (enqueue vs drop) */
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
         if (!g_gns_u2_done) c2b_g5_resolve_copy2();
@@ -8175,6 +8361,7 @@ static void c2b_gns_spew_rearm(void)
         c2b_g12_apply();        /* 41f-g12: одноразово (done-флаг внутри) */
         c2b_g13_apply();        /* 41f-g13: одноразово (done-флаг внутри) */
         c2b_g16_apply();        /* 41f-g16: одноразово (done-флаг внутри) */
+        c2b_g17_apply();        /* 41f-g17: одноразово (done-флаг внутри) */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

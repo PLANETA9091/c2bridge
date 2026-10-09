@@ -47,16 +47,33 @@ jobs:
             fi
           done
           if [ -z "$E" ]; then
-            echo "::error::no engine binary with challenge string found"
-            grep -rl 'Invalid challenge packet' "$C2B_GAME_DIR" 2>/dev/null | head
-            exit 1
+            echo "::warning::no .so with challenge string; monolith fallback"
           fi
           echo "engine=$E" >> "$GITHUB_OUTPUT"
-          strings -t x "$E" | grep -aiE 'qconnect|Invalid challenge|getchallenge|Connecting to public' \
-            | head -40 > re-out/strings.txt
-          cat re-out/strings.txt
+          # run124 lesson: runtime client = monolithic csgo_linux64 (phdr shows
+          # NO engine_client.so module; bundle's .so's are legacy leftovers).
+          # Always ship the monolith + map of which binaries carry the connless
+          # strings, so offline RE targets the ACTUAL runtime code.
+          M="$C2B_GAME_DIR/csgo_linux64"
+          if [ -x "$M" ]; then
+            echo "monolith=$M ($(du -h "$M" | cut -f1))"
+            grep -aq 'Invalid challenge packet' "$M" \
+              && echo "monolith HAS challenge strings" || echo "monolith lacks challenge strings"
+            grep -aq 'ProcessConnectionlessPacket' "$M" \
+              && echo "monolith HAS ProcessConnectionlessPacket" || true
+          else
+            echo "::warning::no csgo_linux64 at $M"
+          fi
+          for f in "$C2B_GAME_DIR"/csgo_linux64 "$C2B_GAME_DIR"/bin/linux64/*.so; do
+            [ -f "$f" ] || continue
+            grep -aq 'LanSearch' "$f" 2>/dev/null && echo "LanSearch-IN: $f"
+          done | head -10 > re-out/monolith-scan.txt
+          cat re-out/monolith-scan.txt
+          strings -t x "$E" 2>/dev/null | grep -aiE 'qconnect|Invalid challenge|getchallenge|Connecting to public' \
+            | head -40 > re-out/strings.txt || true
 
       - name: xref disassembly
+        if: steps.find.outputs.engine != ''
         run: |
           set -u
           export ENGINE="${{ steps.find.outputs.engine }}"
@@ -69,8 +86,17 @@ jobs:
         run: |
           set -u
           E="${{ steps.find.outputs.engine }}"
-          cp -f "$E" re-out/engine_client.so
-          sha256sum re-out/engine_client.so > re-out/engine.sha256
+          if [ -n "$E" ] && [ -f "$E" ]; then
+            cp -f "$E" re-out/engine_client.so
+            sha256sum re-out/engine_client.so > re-out/engine.sha256
+          fi
+          # monolith: the REAL runtime binary (csgo_linux64) — needed to derive
+          # g13 RVAs for the engine connless dispatcher in the live process
+          M="$C2B_GAME_DIR/csgo_linux64"
+          if [ -f "$M" ]; then
+            cp -f "$M" re-out/csgo_linux64
+            sha256sum re-out/csgo_linux64 > re-out/csgo_linux64.sha256
+          fi
 
       - name: upload RE artifact
         if: always()

@@ -9125,9 +9125,11 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
                 p++;
             }
             if (path) {
-                const char *q = p;
-                while (q > path && q[-1] != ' ') q--;
-                pathlen = (u32)(q - path);
+                /* pathlen = от начала пути до '\n' (q-прогон возвращал 0
+                 * ВСЕГДА: он останавливается на пробеле ПЕРЕД путём ->
+                 * pathlen==0 -> eng-фильтр никогда не матчил -> v3/v3.1
+                 * сканировали ТОЛЬКО анонимные диапазоны!) */
+                pathlen = (u32)(p - path);
             }
             if (p < end) p++;
         }

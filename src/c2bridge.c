@@ -8331,6 +8331,7 @@ __attribute__((used)) static void *volatile c2b_g18a_tramp;
 __attribute__((used)) static uptr volatile c2b_g18_orig_free;
 #define C2B_G18_RING 64   /* 8 было мало: LanSearch-эхо вытесняло bait-ноду до free */
 static uptr volatile g_g18_nodes[C2B_G18_RING];
+static uptr volatile g_g18_raw[C2B_G18_RING];   /* 2307: и СЫРЫЕ указатели Alloc */
 static u32 volatile g_g18_node_idx;
 /* 2307: таблица уникальных САЙТОВ свободных вызовов (не попавших в кольцо).
  * Тайна runs 138/139: 1-4 allocs в кольце, консьюмер жив ('A'->'j'), но 0
@@ -8342,7 +8343,18 @@ static u32 volatile g_g18_node_idx;
 #define C2B_G18_SITES 32
 static uptr volatile g_g18_sites[C2B_G18_SITES];
 static u32 volatile g_g18_site_cnt;   /* 1/64 семпл при полной таблице */
-static u32 volatile g_g18_site_logs;  /* шапка семплов: не более 32 строк */
+static u32 volatile g_g18_site_logs;  /* шапка семплов: не более 64 строк */
+/* run140 УРОК: 65 строк free-site УШЛИ в интервал 417-487 (между патчем
+ * слота и первым bait) — бюджет таблицы/семплов выгорел ДО окна наживки.
+ * ФИКС: реарм канала сайтов при КАЖДОМ node-alloc (насос выделил ноду =
+ * bait-поток активен): таблица чистится, счётчики в 0. Гонки бенигны. */
+static void c2b_g18_site_rearm(void)
+{
+    u32 i;
+    for (i = 0; i < C2B_G18_SITES; i++) g_g18_sites[i] = 0;
+    g_g18_site_cnt = 0;
+    g_g18_site_logs = 0;
+}
 /* run133 УРОК: атрибуция через dl_iterate_phdr ВНУТРИ Free (слот патчится на
  * ВСЁ-ПРОЦЕССНЫЙ аллокатор!) совпала с нулевыми Alloc и SIGSEGV консьюмера —
  * атрибуция УБРАНА из hot-пути (ответ уже получен: matchmaking_client.so
@@ -8355,7 +8367,9 @@ void c2b_g18a_log(uptr raw_node)
     if (!raw_node) return;
     /* насос выравнивает: (rax+0x17) & ~0xF — свободят именно выровненный */
     g_g18_nodes[g_g18_node_idx % C2B_G18_RING] = (raw_node + 0x17) & ~(uptr)0xF;
+    g_g18_raw[g_g18_node_idx % C2B_G18_RING] = raw_node;   /* 2307: и сырый */
     g_g18_node_idx++;
+    c2b_g18_site_rearm();   /* окно сайтов переоткрывается после каждой ноды */
     cnt = ++n;
     if (cnt > 4) return;
     if (g_probe_active) return;
@@ -8374,6 +8388,9 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
     if (!ptr) return;                          /* Free(NULL): кольцо нулевое -> false match (run133) */
     for (i = 0; i < C2B_G18_RING; i++)
         if (g_g18_nodes[i] == ptr) break;
+    if (i >= C2B_G18_RING)
+        for (i = 0; i < C2B_G18_RING; i++)     /* 2307: и сырое значение Alloc */
+            if (g_g18_raw[i] == ptr) break;
     if (i >= C2B_G18_RING) {
         /* 2307: не наша нода — сайт свободного вызова. Первый sighting
          * логируем, повторные молчат; полная таблица -> 1/64 семпл. */
@@ -8383,7 +8400,7 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
             if (g_g18_sites[j] == 0) { g_g18_sites[j] = ret0; break; }
         if (j >= C2B_G18_SITES) {
             cnt = ++g_g18_site_cnt;
-            if ((cnt & 0x3F) != 1 || g_g18_site_logs > 32) return;
+            if ((cnt & 0x3F) != 1 || g_g18_site_logs > 64) return;
             g_g18_site_logs++;
         }
         C2B_LOGS("[c2b] g18 free-site: ra=");
@@ -8484,6 +8501,42 @@ __asm__(
 extern void c2b_g18a_thunk(void);
 extern void c2b_g18b_thunk(void);
 
+/* 2307: РАЗОВАЯ карта модулей в момент арма (КОНТЕКСТ ИНИЦИАЛИЗАЦИИ потока
+ * rearm — НЕ hot-путь Free; урок run133 не нарушен). Цель: узнать on-disk
+ * путь matchmaking_client.so (второй сайт освобождения нод, +0x2a029) для
+ * heist-фикса — run140: find по ~steaam/~local/Steam/~/csgo-lite /tmp его
+ * НЕ НАШЁЛ (heist-map только steamclient-копии). */
+static i32 c2b_g18_modmap_cb(void *info_v, void *size_v, void *data_v)
+{
+    struct c2b_g5_phdr *pi = (struct c2b_g5_phdr *)info_v;
+    u32 *cnt = (u32 *)data_v;
+    const char *nm;
+    (void)size_v;
+    if (!pi || !pi->dlpi_name) return 0;
+    nm = pi->dlpi_name;
+    if (!nm[0]) return 0;                        /* главный exe — пропустить */
+    if (++(*cnt) > 48) return 1;                 /* ограничить лог */
+    C2B_LOGS("[c2b] g18 modmap: ");
+    C2B_LOGH((u32)(pi->dlpi_addr >> 32)); C2B_LOGH((u32)pi->dlpi_addr);
+    C2B_LOGS(" ");
+    {
+        u32 nl = 0;
+        while (nm[nl] && nl < 128) nl++;         /* до 128 символов пути */
+        c2b_out(nm, nl);
+    }
+    C2B_LOGS("\n");
+    return 0;
+}
+
+static void c2b_g18_modmap_dump(void)
+{
+    static u32 modmap_cnt;
+    modmap_cnt = 0;
+    C2B_LOGS("[c2b] g18 modmap begin\n");
+    dl_iterate_phdr(c2b_g18_modmap_cb, &modmap_cnt);
+    C2B_LOGS("[c2b] g18 modmap end\n");
+}
+
 static void c2b_g18_apply(void)
 {
     static u8 done_a, done_b;
@@ -8532,6 +8585,7 @@ static void c2b_g18_apply(void)
         C2B_LOGH((u32)obj); C2B_LOGS(" vt=");
         C2B_LOGH((u32)vt); C2B_LOGS(" orig=");
         C2B_LOGH((u32)c2b_g18_orig_free); C2B_LOGS("\n");
+        c2b_g18_modmap_dump();   /* разово, контекст арма — путь matchmaking_client.so */
     }
 }
 

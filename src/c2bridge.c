@@ -8322,35 +8322,10 @@ static uptr volatile c2b_g18_orig_free;
 #define C2B_G18_RING 64   /* 8 было мало: LanSearch-эхо вытесняло bait-ноду до free */
 static uptr volatile g_g18_nodes[C2B_G18_RING];
 static u32 volatile g_g18_node_idx;
-
-/* атрибуция модуля для ret0 ВНЕ engine (run132: второй сайт ra=0x9322a029
- * в чужом модуле — какой именно, узнаём тут). Своя мини-копия dl_phdr_info/
- * Elf64_Phdr (glibc ABI стабилен): g15-структуры объявлены ниже по файлу,
- * вне selftest-гарда — отсюда не видны. */
-struct c2b_g18b_phdr_min { uptr addr; const char *name; const void *phdr; u16 phnum; };
-struct c2b_g18b_phdr64 { u32 type; u32 flags; u64 off, vaddr, paddr, filesz, memsz, align; };
-struct c2b_g18b_find { uptr a; const char *nm; uptr base; u8 found; };
-static i32 c2b_g18b_mod_cb(void *info_v, void *size_v, void *data_v)
-{
-    struct c2b_g18b_phdr_min *info = (struct c2b_g18b_phdr_min *)info_v;
-    struct c2b_g18b_find *f = (struct c2b_g18b_find *)data_v;
-    u16 i;
-    (void)size_v;
-    if (!info->phdr || !info->phnum) return 0;
-    for (i = 0; i < info->phnum; i++) {
-        const struct c2b_g18b_phdr64 *ph = (const struct c2b_g18b_phdr64 *)
-            ((const u8 *)info->phdr + (uptr)i * sizeof(*ph));
-        if (ph->type != 1) continue;
-        if (f->a >= info->addr + (uptr)ph->vaddr &&
-            f->a < info->addr + (uptr)ph->vaddr + (uptr)ph->memsz) {
-            f->nm = info->name;
-            f->base = info->addr;
-            f->found = 1;
-            return 1;
-        }
-    }
-    return 0;
-}
+/* run133 УРОК: атрибуция через dl_iterate_phdr ВНУТРИ Free (слот патчится на
+ * ВСЁ-ПРОЦЕССНЫЙ аллокатор!) совпала с нулевыми Alloc и SIGSEGV консьюмера —
+ * атрибуция УБРАНА из hot-пути (ответ уже получен: matchmaking_client.so
+ * +0x2a029). Слот Free = самыи горячии путь в процессе — только кольцо и лог. */
 
 void c2b_g18a_log(uptr raw_node)
 {
@@ -8375,6 +8350,7 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
 {
     static volatile u32 n;
     u32 i, cnt;
+    if (!ptr) return;                          /* Free(NULL): кольцо нулевое -> false match (run133) */
     for (i = 0; i < C2B_G18_RING; i++)
         if (g_g18_nodes[i] == ptr) break;
     if (i >= C2B_G18_RING) return;             /* чужая память — молча */
@@ -8388,20 +8364,6 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
     if (g_engine_base && ret0 > g_engine_base &&
         ret0 - g_engine_base < 0x8000000ull) {
         C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - g_engine_base));
-    } else if (ret0 > 0x10000) {
-        /* чужой модуль (run132: 0x9322a029) — атрибуция через phdr */
-        struct c2b_g18b_find f;
-        const char *nm;
-        f.a = ret0; f.nm = 0; f.base = 0; f.found = 0;
-        dl_iterate_phdr(c2b_g18b_mod_cb, &f);
-        if (f.found) {
-            nm = f.nm;
-            if (!nm || !nm[0]) nm = "[main]";
-            C2B_LOGS("mod="); C2B_LOGS(nm);
-            C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - f.base));
-        } else {
-            C2B_LOGS("mod=?");
-        }
     }
     C2B_LOGS("\n");
     g_probe_active = 0;
@@ -8411,9 +8373,9 @@ __asm__(
 ".text\n"
 ".globl c2b_g18a_thunk\n"
 ".type  c2b_g18a_thunk,@function\n"
-"c2b_g18a_thunk:\n"   /* вход: rax = сырая нода от Alloc */
+"c2b_g18a_thunk:\n"   /* вход: rax = сырая нода от Alloc; ВХОД mid-function rsp%16==0 */
 "  endbr64\n"
-"  sub  $0x58,%rsp\n"
+"  sub  $0x60,%rsp\n"   /* 0x60%16==0: logger entry rsp%16==8 (ABI); 0x58 давал 0 = UB/movaps */
 "  mov  %rax,0x00(%rsp)\n"
 "  mov  %rcx,0x08(%rsp)\n"
 "  mov  %rdx,0x10(%rsp)\n"
@@ -8434,7 +8396,7 @@ __asm__(
 "  mov  0x30(%rsp),%r9\n"
 "  mov  0x38(%rsp),%r10\n"
 "  mov  0x40(%rsp),%r11\n"
-"  add  $0x58,%rsp\n"
+"  add  $0x60,%rsp\n"
 "  jmp  *c2b_g18a_tramp(%rip)\n"
 ".size c2b_g18a_thunk, .-c2b_g18a_thunk\n"
 ".globl c2b_g18b_thunk\n"
@@ -8553,11 +8515,17 @@ void c2b_g19a_log(uptr node)
     static volatile u32 n;
     u32 i, cnt;
     u32 ring = 0;
+    u32 spin;
     if (!node) return;
     for (i = 0; i < C2B_G18_RING; i++)
         if (g_g18_nodes[i] == node) { ring = 1; break; }
     cnt = ++n;
     if (cnt > 12 && (cnt & 0x07) != 1) return;
+    /* run133: g16b/g17 (насос) могут держать g_probe_active в момент free у
+     * консьюмера (другой тред) — дамп bait-ноды терялся. Крутимся до ~10мкс:
+     * rare-событие дороже короткой задержки; не освободилось — пропускаем. */
+    for (spin = 0; g_probe_active && spin < 64; spin++)
+        __builtin_ia32_pause();
     if (g_probe_active) return;
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
@@ -8582,9 +8550,9 @@ __asm__(
 ".text\n"
 ".globl c2b_g19a_thunk\n"
 ".type  c2b_g19a_thunk,@function\n"
-"c2b_g19a_thunk:\n"   /* вход: rsi=нода, rax=g_pMemAlloc**; не трогаем callee-saved */
+"c2b_g19a_thunk:\n"   /* вход: rsi=нода, rax=g_pMemAlloc**; mid-function rsp%16==0 */
 "  endbr64\n"
-"  sub  $0x58,%rsp\n"
+"  sub  $0x60,%rsp\n"   /* 0x60: logger entry rsp%16==8 (ABI); 0x58 давал misalign */
 "  mov  %rax,0x00(%rsp)\n"
 "  mov  %rcx,0x08(%rsp)\n"
 "  mov  %rdx,0x10(%rsp)\n"
@@ -8605,7 +8573,7 @@ __asm__(
 "  mov  0x30(%rsp),%r9\n"
 "  mov  0x38(%rsp),%r10\n"
 "  mov  0x40(%rsp),%r11\n"
-"  add  $0x58,%rsp\n"
+"  add  $0x60,%rsp\n"
 "  jmp  *c2b_g19a_tramp(%rip)\n"
 ".size c2b_g19a_thunk, .-c2b_g19a_thunk\n"
 ".previous\n"

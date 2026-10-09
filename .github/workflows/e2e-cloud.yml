@@ -354,8 +354,11 @@ jobs:
           # steamclient.so (internal GNS copy) + libsteamnetworkingsockets.so
           # (standalone). find -L: ~/.steam/steam is a symlink. Also dump the
           # config name table (verify IP_AllowWithoutAuth = enum 29).
+          # 2307: + matchmaking_client.so — g18-атрибуция указала на него как
+          # на второй сайт освобождения нод (0x2a029); нужен бинарник для
+          # офлайн RE консьюмера/парсера ('B'-чеки).
           mkdir -p e2e-out/bins
-          for name in steamclient.so libsteamnetworkingsockets.so; do
+          for name in steamclient.so libsteamnetworkingsockets.so matchmaking_client.so; do
             find -L ~/.steam ~/.local/share/Steam ~/csgo-lite /tmp -maxdepth 8 \
               -type f -name "$name" 2>/dev/null | head -4 | while IFS= read -r f; do
               tgt="e2e-out/bins/${name}__$(echo "$f" | md5sum | cut -c1-6).so"

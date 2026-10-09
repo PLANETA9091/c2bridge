@@ -8332,6 +8332,17 @@ __attribute__((used)) static uptr volatile c2b_g18_orig_free;
 #define C2B_G18_RING 64   /* 8 было мало: LanSearch-эхо вытесняло bait-ноду до free */
 static uptr volatile g_g18_nodes[C2B_G18_RING];
 static u32 volatile g_g18_node_idx;
+/* 2307: таблица уникальных САЙТОВ свободных вызовов (не попавших в кольцо).
+ * Тайна runs 138/139: 1-4 allocs в кольце, консьюмер жив ('A'->'j'), но 0
+ * ring-matched frees. Кто вообще зовёт Free через патченный слот? Таблица
+ * отвечает: каждый новый ret0 логируется ОДИН раз; при полной таблице —
+ * 1/64 семплирование (канал открытия новых сайтов). ЖЁСТКИЕ ОГРАНИЧЕНИЯ
+ * (урок run133): БЕЗ deref ptr, БЕЗ loader-вызовов, БЕЗ блокировок —
+ * только волатильные статики; гонки бенигны (дубль строки допустим). */
+#define C2B_G18_SITES 32
+static uptr volatile g_g18_sites[C2B_G18_SITES];
+static u32 volatile g_g18_site_cnt;   /* 1/64 семпл при полной таблице */
+static u32 volatile g_g18_site_logs;  /* шапка семплов: не более 32 строк */
 /* run133 УРОК: атрибуция через dl_iterate_phdr ВНУТРИ Free (слот патчится на
  * ВСЁ-ПРОЦЕССНЫЙ аллокатор!) совпала с нулевыми Alloc и SIGSEGV консьюмера —
  * атрибуция УБРАНА из hot-пути (ответ уже получен: matchmaking_client.so
@@ -8359,11 +8370,33 @@ void c2b_g18a_log(uptr raw_node)
 void c2b_g18b_log(uptr ret0, uptr ptr)
 {
     static volatile u32 n;
-    u32 i, cnt;
+    u32 i, j, cnt;
     if (!ptr) return;                          /* Free(NULL): кольцо нулевое -> false match (run133) */
     for (i = 0; i < C2B_G18_RING; i++)
         if (g_g18_nodes[i] == ptr) break;
-    if (i >= C2B_G18_RING) return;             /* чужая память — молча */
+    if (i >= C2B_G18_RING) {
+        /* 2307: не наша нода — сайт свободного вызова. Первый sighting
+         * логируем, повторные молчат; полная таблица -> 1/64 семпл. */
+        for (j = 0; j < C2B_G18_SITES; j++)
+            if (g_g18_sites[j] == ret0) return;
+        for (j = 0; j < C2B_G18_SITES; j++)
+            if (g_g18_sites[j] == 0) { g_g18_sites[j] = ret0; break; }
+        if (j >= C2B_G18_SITES) {
+            cnt = ++g_g18_site_cnt;
+            if ((cnt & 0x3F) != 1 || g_g18_site_logs > 32) return;
+            g_g18_site_logs++;
+        }
+        C2B_LOGS("[c2b] g18 free-site: ra=");
+        C2B_LOGH((u32)(ret0 >> 32)); C2B_LOGH((u32)ret0);
+        if (g_engine_base && ret0 > g_engine_base &&
+            ret0 - g_engine_base < 0x8000000ull) {
+            C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - g_engine_base));
+        }
+        C2B_LOGS(" ptr=");
+        C2B_LOGH((u32)(ptr >> 32)); C2B_LOGH((u32)ptr);
+        C2B_LOGS("\n");
+        return;
+    }
     cnt = ++n;
     if (cnt > 8 && (cnt & 0x1F) != 1) return;
     /* БЕЗ sigsetjmp-гарда: гарды живут только пока стоит хендлер auth-пробой,

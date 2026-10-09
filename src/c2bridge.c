@@ -7890,11 +7890,45 @@ static u8 *g_g16b_tramp_mem;
 static void *volatile c2b_g16a_tramp;
 static void *volatile c2b_g16b_tramp;
 
+/* уникальные ret0-сайты (стиль g15): LanSearch-спам не вытеснит редкие
+ * 'j'-реакции из лога — логируем КАЖДЫЙ новый сайт, hot-метки 100/10000 */
+struct c2b_g16_site { uptr ra; u32 hits; };
+static struct c2b_g16_site g_g16a_tab[8];
+static u32 g_g16a_n;
+static u32 g_g16a_ev;
+
 void c2b_g16a_log(uptr ret0, uptr dataptr, u32 len)
 {
-    static volatile u32 n;
-    u32 i, cnt = ++n;
-    if (cnt > 8 && (cnt & 0x3F) != 1) return;
+    u32 i, h = 1;
+    for (i = 0; i < g_g16a_n && i < 8; i++) {
+        if (g_g16a_tab[i].ra == ret0) {
+            h = ++g_g16a_tab[i].hits;
+            if (h != 100 && h != 10000) return;
+            if (g_probe_active) return;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+            C2B_LOGS("[c2b] g16 send hot ra=");
+            C2B_LOGH((u32)(ret0 >> 32)); C2B_LOGH((u32)ret0);
+            C2B_LOGS("h="); C2B_LOGN(h); C2B_LOGS("\n");
+            g_probe_active = 0;
+            return;
+        }
+    }
+    if (g_g16a_n < 8) {
+        g_g16a_tab[g_g16a_n].ra = ret0;
+        g_g16a_tab[g_g16a_n].hits = 1;
+        g_g16a_n++;
+    } else if (g_g16a_ev < 24) {
+        /* вытеснение минимального (init-сайты уходят, hot остаётся) */
+        u32 mi = 0;
+        for (i = 1; i < 8; i++)
+            if (g_g16a_tab[i].hits < g_g16a_tab[mi].hits) mi = i;
+        g_g16a_ev++;
+        g_g16a_tab[mi].ra = ret0;
+        g_g16a_tab[mi].hits = 1;
+    } else {
+        return;   /* зоопарк одноразовых — молча */
+    }
     if (g_probe_active) return;
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
@@ -7916,12 +7950,26 @@ void c2b_g16a_log(uptr ret0, uptr dataptr, u32 len)
 void c2b_g16b_log(uptr rlen, uptr frame)
 {
     static volatile u32 n;
+    static volatile u32 cl;   /* connectionless-помеченные */
     u32 i, cnt;
     uptr sp;
     const u8 *data, *from;
     if (!frame) return;
     cnt = ++n;
-    if (cnt > 24 && (cnt & 0x3F) != 1) return;
+    /* первые 24 — всё подряд (калибровка шума); дальше ТОЛЬКО
+     * connectionless-помеченные (ffffffff + печатный тип) — редкие 'A'/'B'
+     * bait'ы не теряются в broadcast-шуме */
+    if (cnt > 24) {
+        sp = *(volatile uptr *)(frame - 0x140);
+        data = sp ? (const u8 *)(sp + 4) : (const u8 *)0;
+        if (!data || (i32)rlen < 5) return;
+        if (*(volatile const u32 *)data != 0xffffffffu) return;
+        {
+            u8 t = *(volatile const u8 *)(data + 4);
+            if (t < 0x21 || t > 0x7e) return;
+        }
+        if (++cl > 40 && (cl & 0x0F) != 1) return;
+    }
     if (g_probe_active) return;
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }

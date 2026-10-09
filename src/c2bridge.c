@@ -6969,6 +6969,27 @@ static void c2b_g9_flat_set(void)
  * g11u-нет = дроп внутри gather; g11d/g11u оба есть = пакет ушёл в sendto. */
 #define C2B_G11_GATHER_RVA  0x1fc7c80ull
 #define C2B_G11_GATHER_CONT 0x1fc7c8eull   /* lea rip-rel спью-имени */
+/* g11e: CPacketLaggerSend::vtable[5] = 0x1fcd4e0 — «отправить лагированный
+ * пакет сейчас» (вызывается из дрена очереди lagger'а). RE 1337: ВСЕ пакеты
+ * через BSendPacketGather ставятся в очередь CPacketLagger::LagPacket
+ * (0x1fcd530: fd==-1/obj+0x28==0 -> warning 0x2f2 "Tried to lag a packet on a
+ * socket that has already been closed..."; MTU 0x514), реальный sendto — из
+ * дрена: vtable[5] -> 0x1fcd110. Если очередь НЕ дренируется — пакеты висят
+ * вечно (кандидат на барьер 0x22). Цепь сигналов: g11d (enqueue) -> g11e
+ * (drain per-packet) -> g11u (socket write). g11d есть + g11e НЕТ = lagger
+ * не дренируется -> g12: форс-дрен/байпас. Пролог 24Б без rip-relative,
+ * cont = 0x1fcd4f8. */
+#define C2B_G11_LAG_RVA     0x1fcd4e0ull
+#define C2B_G11_LAG_CONT    0x1fcd4f8ull
+
+static const u8 c2b_g11_sig_lag[24] = {
+    0x48, 0x8D, 0x4E, 0x28,          /* lea 0x28(%rsi),%rcx */
+    0x48, 0x83, 0xEC, 0x18,          /* sub $0x18,%rsp */
+    0x48, 0x63, 0x46, 0x18,          /* movslq 0x18(%rsi),%rax */
+    0x44, 0x0F, 0xB6, 0x46, 0x41,    /* movzbl 0x41(%rsi),%r8d */
+    0x48, 0x89, 0xE2,                /* mov %rsp,%rdx */
+    0x48, 0x8B, 0x7E, 0x48           /* mov 0x48(%rsi),%rdi */
+};
 
 static const u8 c2b_g11_sig_gather[14] = {
     0x41, 0x57,             /* push %r15 */
@@ -6997,11 +7018,13 @@ static uptr g_g11_base;                 /* load bias steamclient.so */
 static volatile u32 g_g11_nx;           /* анти-спам xport-логгера */
 static volatile u32 g_g11_nu;           /* анти-спам udp-логгера */
 static volatile u32 g_g11_ng;           /* анти-спам gather-логгера */
+static volatile u32 g_g11_nl;           /* анти-спам lagger-drain-логгера */
 static volatile u64 c2b_g11_cont_addr, c2b_g11_null_addr;
 /* void *volatile (НЕ volatile void*): gcc удаляет unused static без
  * volatile-объекта, а тюнк ссылается на символ из asm (урок сборки g11) */
 static void *volatile c2b_g11_udp_tramp = 0;
 static void *volatile c2b_g11_gather_cont = 0;
+static void *volatile c2b_g11_lag_cont = 0;
 static u8 *g_g11_udp_tramp_mem;
 
 static void c2b_g11_xport_log(uptr wrap)
@@ -7114,6 +7137,31 @@ static void c2b_g11_gather_log(uptr self, uptr nseg, uptr segs, uptr adr, uptr e
     g_probe_active = 0;
 }
 
+static void c2b_g11_lag_log(uptr self, uptr pkt)
+{
+    u32 n, k;
+    if (!g_g11_base) return;
+    n = ++g_g11_nl;
+    if (n > 24 && (n & 0x3F) != 1) return;   /* первые 24, далее 1/64 */
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g11e lagdrain: self=");
+    C2B_LOGH((u32)(self > g_g11_base ? self - g_g11_base : 0));
+    if (pkt) {
+        C2B_LOGS(" len="); C2B_LOGN(*(volatile u32 *)(pkt + 0x18));
+        C2B_LOGS(" tos="); C2B_LOGN((u32)*(volatile u8 *)(pkt + 0x41));
+        C2B_LOGS(" sock=");
+        C2B_LOGH((u32)(*(volatile uptr *)(pkt + 0x48) > g_g11_base
+                          ? *(volatile uptr *)(pkt + 0x48) - g_g11_base : 0));
+        C2B_LOGS(" dest[16B]=");
+        for (k = 0; k < 16; k += 4)
+            C2B_LOGH(*(volatile u32 *)(pkt + 0x28 + k));
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
 __asm__(
 ".text\n"
 ".globl c2b_g11_xport_thunk\n"
@@ -7221,16 +7269,52 @@ __asm__(
 "  mov  c2b_g11_gather_cont(%rip),%r11\n"
 "  jmp  *%r11\n"
 ".size c2b_g11_gather_thunk, .-c2b_g11_gather_thunk\n"
+".globl c2b_g11_lag_thunk\n"
+".type  c2b_g11_lag_thunk,@function\n"
+"c2b_g11_lag_thunk:\n" /* вход: rsp%16==8; rdi=self rsi=pkt */
+"  endbr64\n"
+"  sub  $0x68,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g11_lag_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x68,%rsp\n"
+/* реплика 24Б пролога 0x1fcd4e0 */
+"  lea  0x28(%rsi),%rcx\n"
+"  sub  $0x18,%rsp\n"
+"  movslq 0x18(%rsi),%rax\n"
+"  movzbl 0x41(%rsi),%r8d\n"
+"  mov  %rsp,%rdx\n"
+"  mov  0x48(%rsi),%rdi\n"
+"  mov  c2b_g11_lag_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g11_lag_thunk, .-c2b_g11_lag_thunk\n"
 ".previous\n"
 );
 extern void c2b_g11_xport_thunk(void);
 extern void c2b_g11_udp_thunk(void);
 extern void c2b_g11_gather_thunk(void);
+extern void c2b_g11_lag_thunk(void);
 
 static void c2b_g11_apply(void)
 {
     static u8 done;
-    uptr base = 0, site, udp, tr, gather;
+    uptr base = 0, site, udp, tr, gather, lag;
     if (done) return;
     dl_iterate_phdr(c2b_g8_phdr_cb, &base);   /* тот же фильтр steamclient.so */
     if (!base) return;
@@ -7269,8 +7353,16 @@ static void c2b_g11_apply(void)
     c2b_g11_gather_cont = (const volatile void *)(base + C2B_G11_GATHER_CONT);
     if (c2b_page_protect(gather, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
     c2b_write_jmp((void *)gather, (const void *)&c2b_g11_gather_thunk);
+    /* g11e: дрен lagger'а (per-packet send) */
+    lag = base + C2B_G11_LAG_RVA;
+    if (memcmp((const void *)lag, c2b_g11_sig_lag, sizeof c2b_g11_sig_lag) != 0) {
+        C2B_LOGS("[c2b] g11: lag sig mismatch\n"); done = 1; return;
+    }
+    c2b_g11_lag_cont = (const volatile void *)(base + C2B_G11_LAG_CONT);
+    if (c2b_page_protect(lag, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)lag, (const void *)&c2b_g11_lag_thunk);
     done = 1;
-    C2B_LOGS("[c2b] g11: armed site+udp+gather base=");
+    C2B_LOGS("[c2b] g11: armed site+udp+gather+lag base=");
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 

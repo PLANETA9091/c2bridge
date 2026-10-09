@@ -35,8 +35,13 @@ fi
 
 if [[ -n "${MEGA_USER:-}" && -n "${MEGA_PASS:-}" ]]; then
   MEGA_DIR="${MEGA_DIR:-csgo}"   # user's MEGA folder created 20261003
-  rclone config create c2bmega mega \
-    user "$MEGA_USER" pass "$(rclone obscure "$MEGA_PASS")" >/dev/null
+  # run 117: `rclone config create ... pass "$(rclone obscure ...)"` broke when
+  # the obscured string starts with '-' ("unknown shorthand flag: '7' in -7Fz...").
+  # Env-based remote config (same pattern as the MEGA_URL branch below) bypasses
+  # CLI flag parsing entirely - values can never be mistaken for flags.
+  export RCLONE_CONFIG_C2BMEGA_TYPE=mega
+  export RCLONE_CONFIG_C2BMEGA_USER="$MEGA_USER"
+  export RCLONE_CONFIG_C2BMEGA_PASS="$(rclone obscure "$MEGA_PASS")"
   REMOTE="c2bmega:$MEGA_DIR"
 elif [[ -n "${MEGA_URL:-}" ]]; then
   # run 69: the connection-string form ":mega,link=URL:" breaks when the

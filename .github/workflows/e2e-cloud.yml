@@ -70,7 +70,10 @@ jobs:
         id: cache-bundle
         uses: actions/cache/restore@v4
         with:
-          path: ~/csgo-lite
+          # run 117: was ~/csgo-lite but fetch-bundle.sh unpacks into
+          # $C2B_GAME_DIR = ${{ github.workspace }}/csgo-lite - cache was
+          # saved from an EMPTY dir and every run re-fetched 2 GiB from MEGA.
+          path: ${{ github.workspace }}/csgo-lite
           key: csgo-lite-v1
       - name: restore steam client cache (runtime + sentry = silent logins)
         id: cache-steam
@@ -375,7 +378,8 @@ jobs:
         if: always() && steps.cache-bundle.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ~/csgo-lite
+          # same path as restore (see run 117 note above)
+          path: ${{ github.workspace }}/csgo-lite
           key: csgo-lite-v1
       - name: ensure cache dirs exist
         if: always()

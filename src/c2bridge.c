@@ -7694,7 +7694,8 @@ struct c2b_g13_phdr64 {          /* Elf64_Phdr (только нужное) */
     u32 type; u32 flags;
     u64 off, vaddr, paddr, filesz, memsz, align;
 };
-struct c2b_g13_ranges { uptr lo[16], hi[16]; u32 n; };
+struct c2b_g13_ranges { uptr lo[128], hi[128]; u32 n; };  /* run142: 128+ модулей,
+    cap 16 ЗАПОЛНЯЛСЯ ДО engine (загрузка #7-8) -> "pattern not found" в 141/142 */
 static i32 c2b_g13_exec_phdr_cb(void *info_v, void *size_v, void *data_v)
 {
     struct c2b_g13_phdr_min *info = (struct c2b_g13_phdr_min *)info_v;
@@ -7703,7 +7704,7 @@ static i32 c2b_g13_exec_phdr_cb(void *info_v, void *size_v, void *data_v)
     if (!info->phdr || !info->phnum) return 0;
     {
         u16 i;
-        for (i = 0; i < info->phnum && r->n < 16; i++) {
+        for (i = 0; i < info->phnum && r->n < 128; i++) {
             const struct c2b_g13_phdr64 *ph =
                 (const struct c2b_g13_phdr64 *)((const u8 *)info->phdr +
                                                 (uptr)i * sizeof(*ph));
@@ -8515,8 +8516,8 @@ static i32 c2b_g18_modmap_cb(void *info_v, void *size_v, void *data_v)
     if (!pi || !pi->dlpi_name) return 0;
     nm = pi->dlpi_name;
     if (!nm[0]) return 0;                        /* главный exe — пропустить */
-    if (++(*cnt) > 128) return 1;                /* run141: 48 ОБРЕЗАЛО карту до X11/GL —
-                                                    engine/matchmaking грузятся ПОЗЖЕ; 128 */
+    if (++(*cnt) > 192) return 1;                /* run141: 48 ОБРЕЗАЛО до X11/GL; 128: matchmaking
+                                                    ВСЁ ЕЩЁ за cap (грузится после panorama) -> 192 */
     C2B_LOGS("[c2b] g18 modmap: ");
     C2B_LOGH((u32)(pi->dlpi_addr >> 32)); C2B_LOGH((u32)pi->dlpi_addr);
     C2B_LOGS(" ");
@@ -8702,6 +8703,315 @@ static void c2b_g19_apply(void)
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 
+/* ---------- 41f-g21: ЭМПИРИЧЕСКИЙ ВАЛИДАТОР 'A'-accept (проба vt+0x200) ---
+ * ФАКТ runs 138-142: g13 (0x259df0) armится, но НЕ ФУРЫЧИТ (0 строк "g13
+ * clp") при живых g16/g17/g18 — живой консьюмер НЕ зовёт диспатчер
+ * 0x259df0 (инлайнен в консьюмере или в другом модуле). НО vt+0x200
+ * (0x2491f0, 'A'-accept продолжение) и vt+0x170 (0x24a760, FullConnect)
+ * — ВИРТУАЛЬНЫЕ вызовы через vtable стейта: инлайнинг диспатчера их не
+ * убивает (девиртуализация требует ДОКАЗАТЬ конкретный тип; xref прямо
+ * видел call *0x200(%rax) из 'A'-хендлера).
+ * g21a: 0x2491f0 gate = cmpq $0,0x430(%rdi); push rbp; mov %rsp,%rbp;
+ *       je ret-путь (pop rbp; ret @0x249208); fall-through: pop rbp; jmp
+ *       0x2490f0. Stolen 12Б БЕЗ ветвлений; патч 14Б накрывает je на
+ *       сайте (je достижим ТОЛЬКО с 0x2491fc — внутрь никто не jmp-ит).
+ *       Трамплин ВОССТАНАВЛИВАЕТ управление: je rel32 -> локальный
+ *       retpath (pop rbp; ret — возврат исходному зовущему), fall-
+ *       through: pop rbp; АБСОЛЮТНЫЙ jmp -> 0x2490f0 ЭТОГО ЖЕ модуля
+ *       (= site-0x100, позиционная связь, rel32-дальность не нужна).
+ * g21b: 0x2490f0 полный путь — 19Б PIC-пролога (push rbp; mov $-1,%ecx;
+ *       mov $0x2d8,%edx; mov %rsp,%rbp; push %r13; mov %esi,%r13d), на
+ *       случай прямого зова полного пути мимо gate. Трамплин = stolen +
+ *       abs-jmp cont.
+ * ЛОГ (решает слепую зону hdr): cstate=u32@0x1a0, gate=u64@0x430,
+ * chal=u32@0x4d8, proto=u32@0x4dc, val=u32@0x4e0, snap=32Б @0x4f0..0x50f
+ * — СНЕПШОТ 'A'-hdr, с которым сверяются чеки 'B' 2-5 (xref). Эмпирика
+ * скажет: netadr@0x00+нули (чеки 2/3 НЕВОЗМОЖНЫ через wire -> нужен
+ * другой ход) vs распарсенные поля (chal@0x18, proto@0x1c -> считаем
+ * точные байты 'B'-бейта).
+ * g22: FullConnect 0x24a760 (vt+0x170) — детектор 'B'-успеха: лог
+ * cstate + pkthdr 32Б + data-птр. До слома барьера ожидаем 0 событий.
+ * Арм: sig-verify на g_engine_base+RVA (копия g16/g17/g18 — ОНА живая,
+ * их строки фурычат); при мисматче hexdump 16Б фактических байт ОДИН
+ * РАЗ + ретрай до 40 итераций (диагноз дрейфа бандла, mystery g13
+ * run141/142). Мисматч НЕ ретраится вечно: rearm-цикл сам конечен. */
+#define C2B_G21_GATE_RVA 0x2491f0ull
+#define C2B_G21_PATH_RVA 0x2490f0ull
+#define C2B_G22_FC_RVA   0x24a760ull
+static const u8 c2b_g21a_sig[12] = {
+    0x48, 0x83, 0xBF, 0x30, 0x04, 0x00, 0x00, 0x00,   /* cmpq $0,0x430(%rdi) */
+    0x55, 0x48, 0x89, 0xE5 };                          /* push rbp; mov rsp,rbp */
+static const u8 c2b_g21b_sig[19] = {
+    0x55, 0xB9, 0xFF, 0xFF, 0xFF, 0xFF, 0xBA, 0xD8, 0x02, 0x00, 0x00,
+    0x48, 0x89, 0xE5, 0x41, 0x55, 0x41, 0x89, 0xF5 };
+static const u8 c2b_g22_sig[21] = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+    0x49, 0x89, 0xFC, 0x53, 0x48, 0x89, 0xF3, 0x48, 0x83, 0xEC, 0x60 };
+static u8 *g_g21a_tramp_mem, *g_g21b_tramp_mem, *g_g22_tramp_mem;
+__attribute__((used)) static void *volatile c2b_g21a_tramp;
+__attribute__((used)) static void *volatile c2b_g21b_tramp;
+__attribute__((used)) static void *volatile c2b_g22_tramp;
+
+void c2b_g21_log(uptr state, uptr tag)
+{
+    static volatile u32 n;
+    u32 i, cnt;
+    u64 g;
+    if (!state) return;
+    cnt = ++n;
+    if (cnt > 24 && (cnt & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g21 acc t=");
+    C2B_LOGN((u32)tag);
+    C2B_LOGS("st=");
+    C2B_LOGH((u32)(state >> 32)); C2B_LOGH((u32)state);
+    C2B_LOGS("cstate=");
+    C2B_LOGH(*(volatile const u32 *)(state + 0x1a0));
+    g = *(volatile const u64 *)(state + 0x430);
+    C2B_LOGS("gate=");
+    C2B_LOGH((u32)g); C2B_LOGH((u32)(g >> 32));
+    C2B_LOGS("chal=");
+    C2B_LOGH(*(volatile const u32 *)(state + 0x4d8));
+    C2B_LOGS("proto=");
+    C2B_LOGH(*(volatile const u32 *)(state + 0x4dc));
+    C2B_LOGS("val=");
+    C2B_LOGH(*(volatile const u32 *)(state + 0x4e0));
+    C2B_LOGS("snap=");
+    for (i = 0; i < 32; i++)
+        C2B_LOGH(*(volatile const u8 *)(state + 0x4f0 + i));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+void c2b_g22_log(uptr state, uptr pkt)
+{
+    static volatile u32 n;
+    u32 i, cnt;
+    uptr data;
+    if (!state) return;
+    cnt = ++n;
+    if (cnt > 24 && (cnt & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g22 fc st=");
+    C2B_LOGH((u32)(state >> 32)); C2B_LOGH((u32)state);
+    C2B_LOGS("cstate=");
+    C2B_LOGH(*(volatile const u32 *)(state + 0x1a0));
+    C2B_LOGS("pkthdr=");
+    if (pkt) {
+        for (i = 0; i < 32; i++)
+            C2B_LOGH(*(volatile const u8 *)(pkt + i));
+        data = *(volatile uptr *)(pkt + 0x38);
+        C2B_LOGS("d0=");
+        if (data) {
+            for (i = 0; i < 8; i++)
+                C2B_LOGH(*(volatile const u8 *)(data + i));
+        } else {
+            C2B_LOGS("-");
+        }
+    } else {
+        C2B_LOGS("-");
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g21a_thunk\n"
+".type  c2b_g21a_thunk,@function\n"
+"c2b_g21a_thunk:\n"   /* вход: rsp%16==8; rdi=state; тег 1 (gate) */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  $1,%esi\n"
+"  call c2b_g21_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g21a_tramp(%rip)\n"
+".size c2b_g21a_thunk, .-c2b_g21a_thunk\n"
+".globl c2b_g21b_thunk\n"
+".type  c2b_g21b_thunk,@function\n"
+"c2b_g21b_thunk:\n"   /* вход: rsp%16==8; rdi=state; тег 2 (полный путь) */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  $2,%esi\n"
+"  call c2b_g21_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g21b_tramp(%rip)\n"
+".size c2b_g21b_thunk, .-c2b_g21b_thunk\n"
+".globl c2b_g22_thunk\n"
+".type  c2b_g22_thunk,@function\n"
+"c2b_g22_thunk:\n"   /* вход: rsp%16==8; rdi=state rsi=pkt — протаскиваем */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g22_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g22_tramp(%rip)\n"
+".size c2b_g22_thunk, .-c2b_g22_thunk\n"
+".previous\n"
+);
+extern void c2b_g21a_thunk(void);
+extern void c2b_g21b_thunk(void);
+extern void c2b_g22_thunk(void);
+
+static void c2b_g21_apply(void)
+{
+    static u8 done, dump_shown;
+    static u32 tries;
+    uptr base, ga, tr;
+    if (done) return;
+    base = g_engine_base;
+    if (!base) return;                       /* движок ещё не резолвнут — ретрай */
+    ga = base + C2B_G21_GATE_RVA;
+    if (memcmp((const void *)ga, c2b_g21a_sig, sizeof c2b_g21a_sig) != 0) {
+        if (!dump_shown) {                   /* ОДИН раз: дрейф бандла/базы в лоб */
+            u32 i;
+            dump_shown = 1;
+            C2B_LOGS("[c2b] g21: gate sig mismatch @base+rva 0x2491f0, bytes:");
+            for (i = 0; i < 16; i++)
+                C2B_LOGH(*(volatile const u8 *)(ga + i));
+            C2B_LOGS("\n");
+        }
+        if (++tries >= 40) { C2B_LOGS("[c2b] g21: gate sig gone, giving up\n"); done = 1; }
+        return;
+    }
+    /* gate-трамплин: 12Б stolen + je rel32 -> retpath + pop rbp + abs-jmp
+     * -> 0x2490f0 этого модуля (site-0x100) + retpath (pop rbp; ret) */
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g21a_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)ga, sizeof c2b_g21a_sig);
+    {
+        u8 br[6];
+        i32 rel;
+        rel = (i32)(33 - 18);                /* retpath_off - (12+6) = 15 */
+        br[0] = 0x0F; br[1] = 0x84;
+        br[2] = (u8)(u32)rel;         br[3] = (u8)((u32)rel >> 8);
+        br[4] = (u8)((u32)rel >> 16); br[5] = (u8)((u32)rel >> 24);
+        memcpy((void *)(tr + 12), br, 6);
+    }
+    *(volatile u8 *)(tr + 18) = 0x5D;        /* fall-through: pop %rbp */
+    c2b_write_jmp((void *)(tr + 19), (const void *)(ga - 0x100));
+    *(volatile u8 *)(tr + 33) = 0x5D;        /* retpath: pop %rbp */
+    *(volatile u8 *)(tr + 34) = 0xC3;        /* ret -> исходному зовущему */
+    c2b_g21a_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(ga, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)ga, (const void *)&c2b_g21a_thunk);
+    /* полный путь 0x2490f0: stolen 19Б + abs-jmp cont (мисматч НЕ фатален —
+     * гейт главный) */
+    {
+        uptr pa = base + C2B_G21_PATH_RVA;
+        if (memcmp((const void *)pa, c2b_g21b_sig, sizeof c2b_g21b_sig) == 0) {
+            tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+            if (tr != (uptr)-1) {
+                g_g21b_tramp_mem = (u8 *)tr;
+                memcpy((void *)tr, (const void *)pa, sizeof c2b_g21b_sig);
+                c2b_write_jmp((void *)(tr + sizeof c2b_g21b_sig),
+                              (const void *)(pa + sizeof c2b_g21b_sig));
+                c2b_g21b_tramp = (const volatile void *)tr;
+                if (c2b_page_protect(pa, C2B_PATCH_LEN, 0x07) == 0)
+                    c2b_write_jmp((void *)pa, (const void *)&c2b_g21b_thunk);
+            }
+        } else {
+            C2B_LOGS("[c2b] g21: path sig mismatch (non-fatal)\n");
+        }
+    }
+    done = 1;
+    C2B_LOGS("[c2b] g21: armed gate+path base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
+static void c2b_g22_apply(void)
+{
+    static u8 done, dump_shown;
+    static u32 tries;
+    uptr base, fa, tr;
+    if (done) return;
+    base = g_engine_base;
+    if (!base) return;
+    fa = base + C2B_G22_FC_RVA;
+    if (memcmp((const void *)fa, c2b_g22_sig, sizeof c2b_g22_sig) != 0) {
+        if (!dump_shown) {
+            u32 i;
+            dump_shown = 1;
+            C2B_LOGS("[c2b] g22: fc sig mismatch @base+rva 0x24a760, bytes:");
+            for (i = 0; i < 16; i++)
+                C2B_LOGH(*(volatile const u8 *)(fa + i));
+            C2B_LOGS("\n");
+        }
+        if (++tries >= 40) { C2B_LOGS("[c2b] g22: fc sig gone, giving up\n"); done = 1; }
+        return;
+    }
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g22_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)fa, sizeof c2b_g22_sig);
+    c2b_write_jmp((void *)(tr + sizeof c2b_g22_sig),
+                  (const void *)(fa + sizeof c2b_g22_sig));
+    c2b_g22_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(fa, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)fa, (const void *)&c2b_g22_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g22: armed fullconnect base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
 static void c2b_g12_apply(void)
 {
     static u8 done;
@@ -8757,6 +9067,8 @@ static void c2b_gns_spew_rearm(void)
     c2b_g16_apply();        /* 41f-g16: живой путь датаграмм (send-обёртка + пост-recvfrom) */
     c2b_g17_apply();        /* 41f-g17: вердикт connectionless-фильтра (enqueue vs drop) */
     c2b_g18_apply();        /* 41f-g18: поиск консьюмера (кольцо нод + слот Free) */
+    c2b_g21_apply();        /* 41f-g21: 'A'-accept валидатор (gate+path, vt+0x200) */
+    c2b_g22_apply();        /* 41f-g22: FullConnect детектор (vt+0x170, 'B'-успех) */
     /* c2b_g19_apply();  41f-g19 BISECT run137: disabled - run135/136 connect-flow death suspect (0x2e1ad5 in the connect path) */
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
@@ -8777,6 +9089,8 @@ static void c2b_gns_spew_rearm(void)
         c2b_g16_apply();        /* 41f-g16: одноразово (done-флаг внутри) */
         c2b_g17_apply();        /* 41f-g17: одноразово (done-флаг внутри) */
         c2b_g18_apply();        /* 41f-g18: одноразово (done-флаги внутри) */
+        c2b_g21_apply();        /* 41f-g21: одноразово (done-флаги внутри) */
+        c2b_g22_apply();        /* 41f-g22: одноразово (done-флаги внутри) */
         /* c2b_g19_apply();  41f-g19 BISECT run137: disabled */
         usleep(5000000);
     }

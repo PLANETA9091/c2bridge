@@ -8692,10 +8692,35 @@ static void c2b_gns_spew_rearm(void)
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);
     C2B_LOGS("u2done="); C2B_LOGN(g_gns_u2_done); C2B_LOGS("\n");
 }
+
+/* 41f-g20: РАННИЙ арм движковых зондов. Run134 урок: bait-цепочка CLV2
+ * уходит ЦЕЛИКОМ до арма (auth-тред ждёт steamuser до 150с, а baits идут
+ * сразу; в a2 g18/g19 armed на строке 830 ПОСЛЕ phase6 на 810 — дампы
+ * 'A'/'B' потеряны). Отдельный тред: как только g_engine_base известен
+ * (legacy-скан, очень рано), гоняем g13/g16/g17/g18/g19 каждую секунду до
+ * 4 мин. Арм ДО начала bait-цепочки = дампы гарантированы. Применения
+ * идемпотентны (done-флаги), гонка с rearm-тредом benign (те же байты). */
+static void *c2b_early_arm_thread(void *arg)
+{
+    u32 it;
+    (void)arg;
+    C2B_LOGS("[c2b] EARLY: engine-probe arm thread start\n");
+    for (it = 0; it < 240; it++) {
+        c2b_g13_apply();
+        c2b_g16_apply();
+        c2b_g17_apply();
+        c2b_g18_apply();
+        c2b_g19_apply();
+        usleep(1000000);
+    }
+    C2B_LOGS("[c2b] EARLY: arm loop exit\n");
+    return 0;
+}
 #else
 static void c2b_gns_spew_install(void) { }   /* selftest: стаб */
 static void c2b_gns_spew_rearm(void) { }     /* selftest: стаб */
 static void c2b_g7_client_utils(void) { }    /* selftest: стаб */
+static void *c2b_early_arm_thread(void *arg) { (void)arg; return 0; }  /* стаб */
 #endif  /* C2B_SELFTEST */
 
 static void *c2b_auth_thread(void *arg)
@@ -10502,6 +10527,12 @@ i32 c2b_main(void)
         C2B_LOGS("[c2b] AUTH: vtidx probe start="); C2B_LOGN(g_auth_vtidx);
         C2B_LOGS("\n");
         pthread_create(&auth_tid, 0, c2b_auth_thread, 0);
+    }
+    /* 41f-g20: ранний арм движковых зондов — НЕ ждём steamuser/auth:
+     * bait-цепочка CLV2 стартует раньше auth-флоу (run134 урок) */
+    {
+        void *early_tid = 0;
+        pthread_create(&early_tid, 0, c2b_early_arm_thread, 0);
     }
     i32 r = c2b_try_install();
     if (r == 0) {

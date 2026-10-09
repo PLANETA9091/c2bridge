@@ -6590,6 +6590,13 @@ static void c2b_g7_client_utils(void)
     u32 k;
     struct c2b_sigaction sa, oldsa;
     u32 kf;
+    /* 41f-g10: СКАН ОПАСЕН — детерминированно убивает процесс (run 111, 114:
+     * vt[1] на кандидате u=2 = не-SEGV краш/minidump, guard не спас; в run 114
+     * погибли ВСЕ попытки на одном месте, g8-патч ни разу не применился).
+     * Цели скана (спью+конфиг внутреннего GNS) перекрыты хирургией: g8 (слот
+     * debug-callback base+0x2d1e1b0) и g9 (IP_AllowWithoutAuth entry+0x30).
+     * Тело сохранено для архивных целей — не вызывать без острой нужды. */
+    return;
     if (!cl) {
         C2B_LOGS("[c2b] GNS g7: no IClient obj\n");
         return;
@@ -6980,8 +6987,8 @@ static void *c2b_auth_thread(void *arg)
     C2B_LOGS("[c2b] AUTH: done calls="); C2B_LOGN(g_ticket_calls);
     C2B_LOGS(" ok="); C2B_LOGN(g_ticket_ok);
     C2B_LOGS("\n");
-    c2b_g7_client_utils();   /* 41f-g7: спью в steamclient-внутренний GNS */
-    c2b_gns_spew_rearm();   /* 41f-g5: пин спью+конфига в окне коннектов движка */
+    c2b_gns_spew_rearm();   /* 41f-g5/g8/g9: пин спью+конфига (ПЕРВЫМ — патчи) */
+    c2b_g7_client_utils();   /* 41f-g10: ЗАГЛУШЕН (убивал процесс до rearm) */
     return 0;
 }
 

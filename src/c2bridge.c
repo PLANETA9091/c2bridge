@@ -6995,7 +6995,7 @@ static void c2b_g9_flat_set(void)
 #define C2B_G11_GATE_BAIL   0x1fd5f3cull
 
 static const u8 c2b_g11_sig_gate[14] = {
-    0x83, 0xBB, 0x40, 0x1B, 0x00, 0x00, 0x01,  /* cmpl $0x1,0x1b40(%rbp) */
+    0x83, 0xBD, 0x40, 0x1B, 0x00, 0x00, 0x01,  /* cmpl $0x1,0x1b40(%rbp) — БЫЛО 0xBB (%rbx): опечатка раунда 1407, вскрыта в run122 (bins/steamclient.so__d975c5.so) */
     0x75, 0xCB,                                 /* jne 0x1fd5f3c */
     0x8B, 0x85, 0x80, 0x01, 0x00                /* mov 0x180(%rbp),%eax (5/6) */
 };
@@ -7486,10 +7486,10 @@ static void c2b_g11_apply(void)
  *    rcx=ptr, r8=errMsg; фейлы: state!=0, +0x30!=0, identity-несовпадение,
  *    GetIdentity vslot21) -> если true -> InitiateConnection @0x1fd16e9.
  * Зонды (детур входа; трамплин = сырая копия пролога + jmp cont):
- *  g12s: SetState 0x1f76390; пролог 16Б (байты 9-11 wildcard: objdump
- *        показывает 'push %rbp' на 3Б-спэне 0x1f76399..0x1f7639b; rip-rel
- *        в 16Б нет), cont 0x1f763a0. Лог: conn-rva, old, new(esi), usec,
- *        g30, g34, f158. Ловит КАЖДЫЙ переход состояния ЛЮБОГО коннекта.
+ *  g12s: SetState 0x1f76390; пролог 16Б ТОЧНЫЙ (байты сверены с бинарем
+ *        из run122: 4156 4155 4989d5 31d2 4154 55 4889fd 53; в sc.asm
+ *        xor %edx,%edx @0x1f76397 был неверно прочитан как push %r12),
+ *        cont 0x1f763a0. Лог: conn-rva, old, new(esi), usec, g30, g34, f158. Ловит КАЖДЫЙ переход состояния ЛЮБОГО коннекта.
  *  g12i: InitiateConnection 0x1f799c0; пролог 20Б точный, cont 0x1f799d4.
  *        Лог: conn-rva, state, g30, g34, f158, a1(usec).
  * Матрица решения (вместе с g11f run122):
@@ -7511,16 +7511,21 @@ static const u8 c2b_g12_sig_init[20] = {
     0x53,                         /* push %rbx */
     0x8B, 0x97, 0x40, 0x1B, 0x00, 0x00  /* mov 0x1b40(%rdi),%edx */
 };
-/* g12s: маска 1 = wildcard (байты 9-11 неясного содержания) */
+/* g12s: ТОЧНЫЙ пролог (сырье сверено с bins/steamclient.so__d975c5.so
+ * из артефакта run122: @0x1f76397 = 31 D2 (xor %edx,%edx) — в sc.asm я
+ * прочёл это как push %r12; маска wildcard больше не нужна) */
 static const u8 c2b_g12_pat_state[16] = {
-    0x41, 0x56, 0x41, 0x55, 0x49, 0x89, 0xD5, 0x41, 0x54,
-    0, 0, 0,
-    0x48, 0x89, 0xFD, 0x53
+    0x41, 0x56,                   /* push %r14 */
+    0x41, 0x55,                   /* push %r13 */
+    0x49, 0x89, 0xD5,             /* mov %rdx,%r13 */
+    0x31, 0xD2,                   /* xor %edx,%edx */
+    0x41, 0x54,                   /* push %r12 */
+    0x55,                         /* push %rbp */
+    0x48, 0x89, 0xFD,             /* mov %rdi,%rbp */
+    0x53                          /* push %rbx */
 };
 static const u8 c2b_g12_msk_state[16] = {
-    1, 1, 1, 1, 1, 1, 1, 1, 1,
-    0, 0, 0,
-    1, 1, 1, 1
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
 };
 
 static volatile u32 g_g11_ns;   /* анти-спам state-логгера */

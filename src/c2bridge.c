@@ -8290,6 +8290,195 @@ static void c2b_g17_apply(void)
     C2B_LOGH((u32)base); C2B_LOGS("\n");
 }
 
+/* ---------- 41f-g18: поиск консьюмера через захват освободителя нод --------
+ * Run130: 'A'-bait verdict=1 -> ENQUEUED, но консьюмер не зовёт 0x259df0 и
+ * движок молчит. Статический поиск консьюмера провалился: TSQueue —
+ * header-only шаблон, pop-код инлайнится ПОМОДУЛЬНО (0x4d49c0 зовут только
+ * shutdown-пути насоса 0x4d6a7b/0x4d6fee) — консьюмер может жить в другом
+ * модуле бандла со своей инлайн-копией. РЕШАЮЩАЯ РАНТАЙМ-ПРОБА: поймать,
+ * КТО освобождает датаграммные ноды.
+ * g18a: пост-Alloc детур в насосе 0x4d6620 (rax = сырая нода от IMemAlloc
+ * Alloc; крадём 17Б: test/je[rel32 ФИКС -> 0x4d6e8a]/lea 0x17(%rax),%r13/
+ * and ~0xF,%r13, cont 0x4d6631) — в кольцо (8 слотов) пишется ВЫРОВНЕННЫЙ
+ * указатель ноды (rax+0x17)&~0xF — именно его потом освобождают.
+ * g18b: патч слота Free в vtable аллокатора: obj = *(*(base+0xdf6e50))
+ * (g_pMemAlloc = GOT-слот на IMemAlloc**, два разыменования — насос
+ * 0x4d7013/создание 0x4d0e2d); vt = *obj; слот vt+0x10 = Free (насос зовёт
+ * с rdi=this, rsi=ptr). Слoт ХРАНИТ УКАЗАТЕЛЬ НА ФУНКЦИЮ — трaмплин не
+ * нужен: пишем туда адрес g18b-thunk, thunk логирует ret0 (только если rsi
+ * совпал с кольцом нод) и хвостовым jmp зовёт сохранённый оригинал.
+ * ret0 при освобождении НАШЕЙ ноды = адрес ВНУТРИ КОНСЬЮМЕРА. */
+#define C2B_G18_NODEALLOC_RVA  0x4d6620ull
+#define C2B_G18_NODEALLOC_CONT 0x4d6631ull
+#define C2B_G18_JE_TGT         0x4d6e8aull
+#define C2B_G18_GPTR_RVA       0xdf6e50ull   /* g_pMemAlloc (IMemAlloc**) */
+#define C2B_G18_FREE_SLOT      0x10ull
+static const u8 c2b_g18a_sig[17] = {
+    0x48, 0x85, 0xC0, 0x0F, 0x84, 0x61, 0x08, 0x00, 0x00,
+    0x4C, 0x8D, 0x68, 0x17, 0x49, 0x83, 0xE5, 0xF0 };
+static u8 *g_g18a_tramp_mem;
+static void *volatile c2b_g18a_tramp;
+static uptr volatile c2b_g18_orig_free;
+#define C2B_G18_RING 8
+static uptr volatile g_g18_nodes[C2B_G18_RING];
+static u32 volatile g_g18_node_idx;
+
+void c2b_g18a_log(uptr raw_node)
+{
+    static volatile u32 n;
+    u32 cnt;
+    if (!raw_node) return;
+    /* насос выравнивает: (rax+0x17) & ~0xF — свободят именно выровненный */
+    g_g18_nodes[g_g18_node_idx % C2B_G18_RING] = (raw_node + 0x17) & ~(uptr)0xF;
+    g_g18_node_idx++;
+    cnt = ++n;
+    if (cnt > 4) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g18 node-alloc: ");
+    C2B_LOGH((u32)(raw_node >> 32)); C2B_LOGH((u32)raw_node);
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+void c2b_g18b_log(uptr ret0, uptr ptr)
+{
+    static volatile u32 n;
+    u32 i, cnt;
+    for (i = 0; i < C2B_G18_RING; i++)
+        if (g_g18_nodes[i] == ptr) break;
+    if (i >= C2B_G18_RING) return;             /* чужая память — молча */
+    cnt = ++n;
+    if (cnt > 8 && (cnt & 0x1F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g18 free-node: ra=");
+    C2B_LOGH((u32)(ret0 >> 32)); C2B_LOGH((u32)ret0);
+    if (g_engine_base && ret0 > g_engine_base &&
+        ret0 - g_engine_base < 0x8000000ull) {
+        C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - g_engine_base));
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g18a_thunk\n"
+".type  c2b_g18a_thunk,@function\n"
+"c2b_g18a_thunk:\n"   /* вход: rax = сырая нода от Alloc */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %rax,%rdi\n"
+"  call c2b_g18a_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g18a_tramp(%rip)\n"
+".size c2b_g18a_thunk, .-c2b_g18a_thunk\n"
+".globl c2b_g18b_thunk\n"
+".type  c2b_g18b_thunk,@function\n"
+"c2b_g18b_thunk:\n"   /* вход: rdi=this(аллокатор), rsi=освобождаемый ptr */
+"  endbr64\n"
+"  mov  (%rsp),%r10\n"          /* ret0 = вызывающий Free */
+"  sub  $0x58,%rsp\n"
+"  mov  %r10,0x00(%rsp)\n"
+"  mov  %rdi,0x08(%rsp)\n"
+"  mov  %rsi,0x10(%rsp)\n"
+"  mov  %rdx,0x18(%rsp)\n"
+"  mov  %rcx,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %rax,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r10,%rdi\n"            /* arg1 = ret0 */
+"  call c2b_g18b_log\n"         /* arg2 = rsi (ptr) уже на месте */
+"  mov  0x00(%rsp),%r10\n"
+"  mov  0x08(%rsp),%rdi\n"
+"  mov  0x10(%rsp),%rsi\n"
+"  mov  0x18(%rsp),%rdx\n"
+"  mov  0x20(%rsp),%rcx\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%rax\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g18_orig_free(%rip)\n"  /* хвостовой вызов оригинального Free */
+".size c2b_g18b_thunk, .-c2b_g18b_thunk\n"
+".previous\n"
+);
+extern void c2b_g18a_thunk(void);
+extern void c2b_g18b_thunk(void);
+
+static void c2b_g18_apply(void)
+{
+    static u8 done_a, done_b;
+    uptr base, na, tr, pp, obj, vt, slot;
+    if (done_a && done_b) return;
+    base = g_engine_base;
+    if (!base) return;
+    if (!done_a) {
+        na = base + C2B_G18_NODEALLOC_RVA;
+        if (memcmp((const void *)na, c2b_g18a_sig, sizeof c2b_g18a_sig) != 0) {
+            C2B_LOGS("[c2b] g18: nodealloc sig mismatch\n"); done_a = 1; return;
+        }
+        tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+        if (tr == (uptr)-1) { done_a = 1; return; }
+        g_g18a_tramp_mem = (u8 *)tr;
+        memcpy((void *)tr, (const void *)na, 3);          /* test %rax,%rax */
+        {
+            u8 br[6];
+            i32 rel = (i32)(C2B_G18_JE_TGT - (tr + 3 + 6));
+            br[0] = 0x0F; br[1] = 0x84;
+            br[2] = (u8)(u32)rel;         br[3] = (u8)((u32)rel >> 8);
+            br[4] = (u8)((u32)rel >> 16); br[5] = (u8)((u32)rel >> 24);
+            memcpy((void *)(tr + 3), br, 6);              /* je ФИКС */
+        }
+        memcpy((void *)(tr + 9), (const void *)(na + 9), 8); /* lea+and */
+        c2b_write_jmp((void *)(tr + 17),
+                      (const void *)(base + C2B_G18_NODEALLOC_CONT));
+        c2b_g18a_tramp = (const volatile void *)tr;
+        if (c2b_page_protect(na, C2B_PATCH_LEN, 0x07) != 0) { done_a = 1; return; }
+        c2b_write_jmp((void *)na, (const void *)&c2b_g18a_thunk);
+        done_a = 1;
+        C2B_LOGS("[c2b] g18: nodealloc armed\n");
+    }
+    if (!done_b) {
+        pp = *(volatile uptr *)(base + C2B_G18_GPTR_RVA);
+        obj = pp ? *(volatile uptr *)pp : 0;
+        vt  = obj ? *(volatile uptr *)obj : 0;
+        if (!pp || !obj || !vt) return;               /* аллокатор ещё не готов — ретрай */
+        slot = vt + C2B_G18_FREE_SLOT;
+        c2b_g18_orig_free = *(volatile uptr *)slot;
+        if (!c2b_g18_orig_free) { C2B_LOGS("[c2b] g18: free slot 0\n"); done_b = 1; return; }
+        if (c2b_page_protect(slot, 8, 0x07) != 0) { done_b = 1; return; }
+        *(volatile uptr *)slot = (uptr)&c2b_g18b_thunk;
+        done_b = 1;
+        C2B_LOGS("[c2b] g18: free slot patched obj=");
+        C2B_LOGH((u32)obj); C2B_LOGS(" vt=");
+        C2B_LOGH((u32)vt); C2B_LOGS(" orig=");
+        C2B_LOGH((u32)c2b_g18_orig_free); C2B_LOGS("\n");
+    }
+}
+
 static void c2b_g12_apply(void)
 {
     static u8 done;
@@ -8344,6 +8533,7 @@ static void c2b_gns_spew_rearm(void)
     c2b_g13_apply();        /* 41f-g13: диспетчер connectionless движка (слепая зона hdr) */
     c2b_g16_apply();        /* 41f-g16: живой путь датаграмм (send-обёртка + пост-recvfrom) */
     c2b_g17_apply();        /* 41f-g17: вердикт connectionless-фильтра (enqueue vs drop) */
+    c2b_g18_apply();        /* 41f-g18: поиск консьюмера (кольцо нод + слот Free) */
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
         if (!g_gns_u2_done) c2b_g5_resolve_copy2();
@@ -8362,6 +8552,7 @@ static void c2b_gns_spew_rearm(void)
         c2b_g13_apply();        /* 41f-g13: одноразово (done-флаг внутри) */
         c2b_g16_apply();        /* 41f-g16: одноразово (done-флаг внутри) */
         c2b_g17_apply();        /* 41f-g17: одноразово (done-флаг внутри) */
+        c2b_g18_apply();        /* 41f-g18: одноразово (done-флаги внутри) */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

@@ -7637,6 +7637,135 @@ __asm__(
 extern void c2b_g12s_thunk(void);
 extern void c2b_g12i_thunk(void);
 
+/* ---------- 41f-g13: диспетчер connectionless-пакетов ДВИЖКА (engine_client.so)
+ *
+ * ProcessConnectionlessPacket 0x259df0 (CClientState primary vt+0x68, base
+ * 0xd78bb8; xref-clientstate.md): вход this=rdi (state), packet=rsi.
+ * Пролог 19Б ТОЧНЫЙ (55 4889e5 4157 4989ff 4156 4155 4154 53 4889f3 — сверено
+ * objdump с /tmp/engine-re/engine_client.so 34a96ae BuildID e9f63d98;
+ * все инструкции позиционно-независимые), cont 0x259e03.
+ * Лог: type-байт (bitbuf data@pkt+0x38, bitpos@pkt+0x50), hdr[0x00..0x1f]
+ * (32Б — СНЕПОК-ФОРМАТ 'B'-чеков), data[0..7], state-rva.
+ * ЦЕЛЬ: слепая зона xref-clientstate.md — что recv-путь кладёт в hdr для 'A'
+ * и 'B' (чеки B: hdr[0x1c]==snap[0x50c]∈1..3, hdr[0x18]==-snap[0x508] (оба!=0),
+ * u64@0x0c==snap, u32@0x14==snap) + доходит ли 'B' до диспатчера вообще.
+ * Матрица решения:
+ *  'A' и 'B' есть -> сравнить B.hdr c A.hdr локально -> точный фейл-чек
+ *  'A' есть, 'B' НЕТ -> 'B' не доходит (recv-фильтр/порт/сокет/порядок фаз)
+ *  ничего НЕТ -> диспатчер не тот / state[0x1a0] фильтр раньше (vt не тот)   */
+#define C2B_G13_CLP_RVA  0x259df0ull
+#define C2B_G13_CLP_CONT 0x259e03ull
+
+static const u8 c2b_g13_pat_clp[19] = {
+    0x55,                         /* push %rbp */
+    0x48, 0x89, 0xE5,             /* mov %rsp,%rbp */
+    0x41, 0x57,                   /* push %r15 */
+    0x49, 0x89, 0xFF,             /* mov %rdi,%r15 */
+    0x41, 0x56,                   /* push %r14 */
+    0x41, 0x55,                   /* push %r13 */
+    0x41, 0x54,                   /* push %r12 */
+    0x53,                         /* push %rbx */
+    0x48, 0x89, 0xF3              /* mov %rsi,%rbx */
+};
+static void *volatile c2b_g13_tramp = 0;
+static u8 *g_g13_tramp_mem;
+static volatile u32 g_g13_n;
+
+static void c2b_g13_log(uptr state, uptr pkt)
+{
+    u32 n, i;
+    uptr data;
+    if (!pkt || !g_engine_base) return;
+    n = ++g_g13_n;
+    if (n > 24 && (n & 0x3F) != 1) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g13 clp: t=");
+    data = *(volatile uptr *)(pkt + 0x38);
+    if (data) {
+        u32 bp = *(volatile u32 *)(pkt + 0x50);
+        C2B_LOGH(*(volatile const u8 *)(data + (bp >> 3)));
+        C2B_LOGS(" bp="); C2B_LOGN(bp);
+    } else {
+        C2B_LOGS("-");
+    }
+    C2B_LOGS(" st=");
+    C2B_LOGH((u32)(state > g_engine_base ? state - g_engine_base : 0));
+    C2B_LOGS(" hdr=");
+    for (i = 0; i < 32; i++)
+        C2B_LOGH(*(volatile const u8 *)(pkt + i));
+    if (data) {
+        C2B_LOGS(" d0=");
+        for (i = 0; i < 8; i++)
+            C2B_LOGH(*(volatile const u8 *)(data + i));
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g13_thunk\n"
+".type  c2b_g13_thunk,@function\n"
+"c2b_g13_thunk:\n"   /* вход: rsp%16==8; rdi=state rsi=pkt */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g13_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g13_tramp(%rip)\n"
+".size c2b_g13_thunk, .-c2b_g13_thunk\n"
+".previous\n"
+);
+extern void c2b_g13_thunk(void);
+
+static void c2b_g13_apply(void)
+{
+    static u8 done;
+    uptr base, tgt, tr;
+    if (done) return;
+    base = g_engine_base;
+    if (!base) return;
+    tgt = base + C2B_G13_CLP_RVA;
+    {   const u8 *p = (const u8 *)tgt;
+        u32 i;
+        for (i = 0; i < sizeof c2b_g13_pat_clp; i++)
+            if (p[i] != c2b_g13_pat_clp[i]) {
+                C2B_LOGS("[c2b] g13: clp sig mismatch\n"); done = 1; return;
+            }
+    }
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g13_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)tgt, sizeof c2b_g13_pat_clp);
+    c2b_write_jmp((void *)(tr + sizeof c2b_g13_pat_clp),
+                  (const void *)(tgt + sizeof c2b_g13_pat_clp));
+    c2b_g13_tramp = (const volatile void *)tr;
+    if (c2b_page_protect(tgt, C2B_PATCH_LEN, 0x07) != 0) { done = 1; return; }
+    c2b_write_jmp((void *)tgt, (const void *)&c2b_g13_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g13: armed clp base=");
+    C2B_LOGH((u32)base); C2B_LOGS("\n");
+}
+
 static void c2b_g12_apply(void)
 {
     static u8 done;
@@ -7688,6 +7817,7 @@ static void c2b_gns_spew_rearm(void)
     c2b_g9_flat_set();      /* 41f-g9: flat set через copy#1 */
     c2b_g11_apply();        /* 41f-g11: транспортная выводка ConnectRequest */
     c2b_g12_apply();        /* 41f-g12: зонды стейт-машины (SetState/InitConn) */
+    c2b_g13_apply();        /* 41f-g13: диспетчер connectionless движка (слепая зона hdr) */
     c2b_g8_patch_verify();
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
@@ -7704,6 +7834,7 @@ static void c2b_gns_spew_rearm(void)
         c2b_g9_flat_set();      /* 41f-g9: copy#1 мог появиться позже */
         c2b_g11_apply();        /* 41f-g11: одноразово (done-флаг внутри) */
         c2b_g12_apply();        /* 41f-g12: одноразово (done-флаг внутри) */
+        c2b_g13_apply();        /* 41f-g13: одноразово (done-флаг внутри) */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);

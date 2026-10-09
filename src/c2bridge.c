@@ -9047,7 +9047,7 @@ static u32 g_g24_nstate;
  * run145 нашёл 3: статик primary + ДВЕ рантайм-копии — живой стейт на КУЧЕ,
  * vptr на копию!), (C) контент-след 'A'-парса (cstate==1 && proto==3 &&
  * chal!=0, vptr-в-движок). Диапазоны: RW engine_client.so + АНОНИМНЫЕ RW
- * (куча!) + [heap]; каждый <=256МБ, суммарно <=768МБ. */
+ * (куча!) + [h[heap]; каждый <=256МБ, суммарно <=768МБ. */
 struct c2b_g24_range { uptr lo, hi; };
 struct c2b_g24_rset { struct c2b_g24_range r[48]; u32 n; u64 total; };
 static u32 c2b_g24_hex32(const char *p, uptr *out)
@@ -9070,8 +9070,8 @@ static void c2b_g24_add_range(struct c2b_g24_rset *rs, uptr lo, uptr hi)
 {
     u32 i, dup = 0;
     u64 sz = hi - lo;
-    if (sz < 0x1000 || sz > ((uptr)256 << 20)) return;
-    if (rs->total + sz > ((uptr)768 << 20)) return;
+    if (sz < 0x1000 || sz > ((uptr)1024 << 20)) return;
+    if (rs->total + sz > ((uptr)2048 << 20)) return;
     for (i = 0; i < rs->n; i++)
         if (rs->r[i].lo == lo) { dup = 1; break; }
     if (dup || rs->n >= 48) return;
@@ -9100,7 +9100,7 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
     p = mb;
     end = mb + n;
     while (p < end && rs->n < 48) {
-        /* формат: lo-hi perms offset dev inode [path]\n */
+        /* format: lo-hi perms offset dev inode [path]\n */
         uptr lo = 0, hi = 0;
         u32 k;
         char perms[8];
@@ -9113,7 +9113,6 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
         if (k == 0) break;
         p += k;
         if (p >= end) break;
-        /* perms: до первого пробела */
         {
             u32 j = 0;
             while (p < end && *p == ' ') p++;
@@ -9130,18 +9129,25 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
                 while (q > path && q[-1] != ' ') q--;
                 pathlen = (u32)(q - path);
             }
-            if (p < end) p++;                       /* \n */
+            if (p < end) p++;
         }
-        if (perms[0] != 'r' || perms[1] != 'w') continue;   /* только RW */
+        if (perms[0] != 'r' || perms[1] != 'w') continue;   /* RW only */
         {
             u32 eng = 0, anon = 0, j;
             for (j = 0; j + 14 <= pathlen; j++)
                 if (path[j] == 'e' && path[j+1] == 'n' && path[j+2] == 'g' &&
                     path[j+3] == 'i' && path[j+4] == 'n' && path[j+5] == 'e' &&
                     path[j+6] == '_') { eng = 1; break; }
-            if (pathlen == 0) anon = 1;             /* анонимная RW = куча */
+            if (pathlen == 0) anon = 1;                     /* anon RW = heap */
             else if (pathlen >= 6 && path[0] == '[' &&
-                     path[1] == 'h' && path[2] == 'e') anon = 1;  /* [heap] */
+                     path[1] == 'h' && path[2] == 'e') anon = 1;
+            if (eng) {          /* diag: the engine RW range was collected? */
+                C2B_LOGS("[c2b] g24: eng RW ");
+                C2B_LOGH((u32)(lo >> 32)); C2B_LOGH((u32)lo);
+                C2B_LOGS("-");
+                C2B_LOGH((u32)(hi >> 32)); C2B_LOGH((u32)hi);
+                C2B_LOGS("\n");
+            }
             if (!eng && !anon) continue;
         }
         c2b_g24_add_range(rs, lo, hi);
@@ -9254,18 +9260,25 @@ static void *c2b_g24_thread(void *arg)
     (void)arg;
     for (it = 0; it < 600 && !g_engine_base; it++) usleep(1000000);
     for (i = 0; i < 4; i++) { last_c[i] = 0xffffffffu; last_h[i] = 0; }
-    /* v3: скан #1 через ~3 мин после базы (движок успевает bootsrap + 'A'ы) */
-    for (it = 0; it < 180; it++) usleep(1000000);
+    /* v3.1: скан t+2мин и t+4мин, дальше каждые 45с если nstate==0 (кап 8):
+     * attempt живёт ~5-6мин — расписание t+10мин никогда не успевало;
+     * сканы теперь БЕЗОПАСНЫ на любой частоте (ноль блокировок) */
+    for (it = 0; it < 120; it++) usleep(1000000);
     c2b_g24_find_state();
+    for (it = 0; it < 120 && !g_g24_nstate; it++) usleep(1000000);
+    if (!g_g24_nstate) c2b_g24_find_state();
     for (i = 0; i < g_g24_nstate; i++) {             /* базовая линия */
         u32 cs = *(volatile const u32 *)(g_g24_state[i] + 0x1a0);
         last_c[i] = cs;
         last_h[i] = 0;                               /* форс первого chg-лога */
         c2b_g24_dumpone(i, cs);
     }
-    for (it = 0; it < 4800; it++) {                  /* 20 мин по 250мс */
-        if (it == 1680 && g_g24_nstate < 4)
-            c2b_g24_find_state();                    /* скан #2 (~t+10мин) */
+    {   u32 scans = 2;
+        for (it = 0; it < 4800; it++) {              /* 20 мин по 250мс */
+            if (g_g24_nstate < 4 && scans < 10 && (it & 0xB7) == 0xB7) {
+                c2b_g24_find_state();                /* ~каждые 45с пока 0 */
+                scans++;
+            }
         for (i = 0; i < g_g24_nstate; i++) {
             uptr st = g_g24_state[i];
             u32 cs = *(volatile const u32 *)(st + 0x1a0);
@@ -9286,6 +9299,7 @@ static void *c2b_g24_thread(void *arg)
             }
         }
         usleep(250000);
+        }
     }
     C2B_LOGS("[c2b] g24: watch done changes=");
     C2B_LOGN(logged);

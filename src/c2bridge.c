@@ -8090,7 +8090,7 @@ static void c2b_g16_apply(void)
     memcpy((void *)tr, (const void *)ra, 9);
     {
         u8 jl[6];
-        i32 rel = (i32)(C2B_G16_JLE_TGT - (tr + 9 + 6));
+        i32 rel = (i32)((base + C2B_G16_JLE_TGT) - (tr + 9 + 6));
         jl[0] = 0x0F; jl[1] = 0x8E;
         jl[2] = (u8)(u32)rel;         jl[3] = (u8)((u32)rel >> 8);
         jl[4] = (u8)((u32)rel >> 16); jl[5] = (u8)((u32)rel >> 24);
@@ -8270,12 +8270,12 @@ static void c2b_g17_apply(void)
     {
         u8 br[6];
         i32 rel;
-        rel = (i32)(C2B_G17_JNE_TGT - (tr + 3 + 6));
+        rel = (i32)((base + C2B_G17_JNE_TGT) - (tr + 3 + 6));
         br[0] = 0x0F; br[1] = 0x85;
         br[2] = (u8)(u32)rel;         br[3] = (u8)((u32)rel >> 8);
         br[4] = (u8)((u32)rel >> 16); br[5] = (u8)((u32)rel >> 24);
         memcpy((void *)(tr + 3), br, 6);
-        rel = (i32)(C2B_G17_JMP_TGT - (tr + 9 + 5));
+        rel = (i32)((base + C2B_G17_JMP_TGT) - (tr + 9 + 5));
         br[0] = 0xE9;
         br[1] = (u8)(u32)rel;         br[2] = (u8)((u32)rel >> 8);
         br[3] = (u8)((u32)rel >> 16); br[4] = (u8)((u32)rel >> 24);
@@ -8446,7 +8446,7 @@ static void c2b_g18_apply(void)
         memcpy((void *)tr, (const void *)na, 3);          /* test %rax,%rax */
         {
             u8 br[6];
-            i32 rel = (i32)(C2B_G18_JE_TGT - (tr + 3 + 6));
+            i32 rel = (i32)((base + C2B_G18_JE_TGT) - (tr + 3 + 6));
             br[0] = 0x0F; br[1] = 0x84;
             br[2] = (u8)(u32)rel;         br[3] = (u8)((u32)rel >> 8);
             br[4] = (u8)((u32)rel >> 16); br[5] = (u8)((u32)rel >> 24);

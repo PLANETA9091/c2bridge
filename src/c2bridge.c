@@ -9086,14 +9086,21 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
     extern i32 open(const char *, i32, ...);
     extern i64 read(i32, void *, u64);
     extern i32 close(i32);
-    static char mb[262144];
+    static char mb[2 * 1024 * 1024];    /* v3.3: 256KB ОБРЕЗАЛ maps ПО АДРЕСУ:
+     * файл отсортирован по адресу, движок живёт на ВЫСОКИХ адресах
+     * (0x7fxx-xxxx-xxxx) и попадал ЗА срез -> engRW=0/слоты=0. Читаем до EOF. */
     i32 fd = open(p24, 0);
-    i64 n;
+    i64 n = 0;
     char *p, *end;
     rs->n = 0;
     rs->total = 0;
     if (fd < 0) return;
-    n = read(fd, mb, (u64)(sizeof(mb) - 1));
+    for (;;) {
+        i64 r = read(fd, mb + n, (i64)sizeof(mb) - 1 - n);
+        if (r <= 0) break;
+        n += r;
+        if (n >= (i64)sizeof(mb) - 1) break;
+    }
     close(fd);
     if (n <= 0) return;
     mb[n] = 0;

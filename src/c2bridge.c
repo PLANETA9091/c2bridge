@@ -9115,7 +9115,7 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
     for (pass = 0; pass < 2; pass++) {
       want_eng = (pass == 0);
       p = mb;
-      while (p < end && rs->n < 64) {
+      while (p < end && rs->n < 96) {   /* v3.6.1: while-cap тоже был 64! */
         /* format: lo-hi perms offset dev inode [path]\n */
         uptr lo = 0, hi = 0;
         u32 k;
@@ -9238,6 +9238,8 @@ static void c2b_g24_find_state(void)
     }
     C2B_LOGS("[c2b] g24: state scan ranges=");
     C2B_LOGN(rs.n);
+    C2B_LOGS("tot=");
+    C2B_LOGH((u32)(rs.total >> 32)); C2B_LOGH((u32)rs.total);
     C2B_LOGS("n=");
     C2B_LOGN(g_g24_nstate);
     C2B_LOGS("new=");

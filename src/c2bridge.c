@@ -9049,7 +9049,7 @@ static u32 g_g24_nstate;
  * chal!=0, vptr-в-движок). Диапазоны: RW engine_client.so + АНОНИМНЫЕ RW
  * (куча!) + [h[heap]; каждый <=256МБ, суммарно <=768МБ. */
 struct c2b_g24_range { uptr lo, hi; };
-struct c2b_g24_rset { struct c2b_g24_range r[64]; u32 n; u64 total; };
+struct c2b_g24_rset { struct c2b_g24_range r[96]; u32 n; u64 total; };
 static u32 c2b_g24_hex32(const char *p, uptr *out)
 {
     uptr v = 0;
@@ -9070,11 +9070,13 @@ static void c2b_g24_add_range(struct c2b_g24_rset *rs, uptr lo, uptr hi)
 {
     u32 i, dup = 0;
     u64 sz = hi - lo;
-    if (sz < 0x1000 || sz > ((uptr)1024 << 20)) return;
-    if (rs->total + sz > ((uptr)2048 << 20)) return;
+    if (sz < 0x1000 || sz > ((uptr)4096 << 20)) return;  /* v3.6: 1GB cap
+        SKIPPAL главный arena движка (>1GB зарезерв) — run145 видел его
+        phdr-сканом без капа; скан 4ГБ ~2-4с, 2 скана/попытка — ок */
+    if (rs->total + sz > ((uptr)6144 << 20)) return;
     for (i = 0; i < rs->n; i++)
         if (rs->r[i].lo == lo) { dup = 1; break; }
-    if (dup || rs->n >= 64) return;
+    if (dup || rs->n >= 96) return;
     rs->r[rs->n].lo = lo;
     rs->r[rs->n].hi = hi;
     rs->n++;
@@ -9162,6 +9164,14 @@ static void c2b_g24_collect_ranges(struct c2b_g24_rset *rs)
                      path[1] == 'h' && path[2] == 'e') anon = 1;
             if (want_eng) { if (!inwin) continue; }
             else        { if (!anon) continue; }
+        }
+        if ((hi - lo) > ((uptr)4096 << 20)) {          /* v3.6 diag */
+            static u32 nbig;
+            if (nbig++ < 8) {
+                C2B_LOGS("[c2b] g24: huge skip sz=");
+                C2B_LOGH((u32)((hi - lo) >> 32)); C2B_LOGH((u32)(hi - lo));
+                C2B_LOGS("\n");
+            }
         }
         c2b_g24_add_range(rs, lo, hi);
       }

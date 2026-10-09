@@ -6206,8 +6206,18 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
         g_probe_active = 0;
         siglongjmp(g_probe_jb, 1);
     }
-    /* не наш контекст — крайний случай, окно probe микросекундное;
-     * игнорируем: движок жив */
+    /* не наш контекст: возврат = refault-спин (run134/135 SIGKILL-клон).
+     * Восстанавливаем SIG_DFL и возвращаемся — повторныи фолт убьёт процесс
+     * ШТАТНО (core/dmesg), с честным ip==fault. */
+    {
+        struct c2b_sigaction dfl;
+        u32 t;
+        for (t = 0; t < sizeof(dfl); t++) ((u8 *)&dfl)[t] = 0;
+        dfl.handler = 0;                       /* SIG_DFL */
+        dfl.flags = 0;
+        sigemptyset(dfl.mask);
+        sigaction(11, &dfl, (void *)0);
+    }
 }
 
 static u32 g_auth_vtidx = 13;    /* C2B_AUTH_VTIDX: стартовый слот probe.
@@ -8356,9 +8366,9 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
     if (i >= C2B_G18_RING) return;             /* чужая память — молча */
     cnt = ++n;
     if (cnt > 8 && (cnt & 0x1F) != 1) return;
-    if (g_probe_active) return;
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    /* БЕЗ sigsetjmp-гарда: гарды живут только пока стоит хендлер auth-пробой,
+     * а слот Free патчится с РАННЕГО арма — фолт тут = мгновенная смерть.
+     * Здесь только чтение кольца и лог — фолт невозможен. */
     C2B_LOGS("[c2b] g18 free-node: ra=");
     C2B_LOGH((u32)(ret0 >> 32)); C2B_LOGH((u32)ret0);
     if (g_engine_base && ret0 > g_engine_base &&
@@ -8366,7 +8376,6 @@ void c2b_g18b_log(uptr ret0, uptr ptr)
         C2B_LOGS("rva="); C2B_LOGH((u32)(ret0 - g_engine_base));
     }
     C2B_LOGS("\n");
-    g_probe_active = 0;
 }
 
 __asm__(
@@ -8515,35 +8524,20 @@ void c2b_g19a_log(uptr node)
     static volatile u32 n;
     u32 i, cnt;
     u32 ring = 0;
-    u32 spin;
     if (!node) return;
     for (i = 0; i < C2B_G18_RING; i++)
         if (g_g18_nodes[i] == node) { ring = 1; break; }
     cnt = ++n;
     if (cnt > 12 && (cnt & 0x07) != 1) return;
-    /* run133: g16b/g17 (насос) могут держать g_probe_active в момент free у
-     * консьюмера (другой тред) — дамп bait-ноды терялся. Крутимся до ~10мкс:
-     * rare-событие дороже короткой задержки; не освободилось — пропускаем. */
-    for (spin = 0; g_probe_active && spin < 64; spin++)
-        __builtin_ia32_pause();
-    if (g_probe_active) return;
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    /* БЕЗ sigsetjmp-гарда и БЕЗ разыменования *(node+8): гарды мертвы вне
+     * auth-окна (ранний арм), unsafe-дереф = смерть консьюмера. 64Б ноды
+     * достаточно: там ptr/len/netadr — корреляция с g16b-дампами по len. */
     C2B_LOGS("[c2b] g19 free-dump: node=");
     C2B_LOGH((u32)(node >> 32)); C2B_LOGH((u32)node);
     C2B_LOGS("ring="); C2B_LOGN(ring);
     for (i = 0; i < 16; i++)                     /* 64Б ноды */
         C2B_LOGH(((const volatile u32 *)node)[i]);
-    {   uptr op = *(volatile uptr *)(node + 8);  /* кандидат-obj */
-        if (op > 0x10000 && (op & 0x7) == 0) {
-            C2B_LOGS("\n[c2b] g19 obj: ");
-            C2B_LOGH((u32)(op >> 32)); C2B_LOGH((u32)op);
-            for (i = 0; i < 8; i++)              /* 32Б obj */
-                C2B_LOGH(((const volatile u32 *)op)[i]);
-        }
-    }
     C2B_LOGS("\n");
-    g_probe_active = 0;
 }
 
 __asm__(
@@ -8704,6 +8698,18 @@ static void *c2b_early_arm_thread(void *arg)
 {
     u32 it;
     (void)arg;
+    /* Хендлер ставим ПЕРМАНЕНТНО ДО первого арма: гарды логгеров мертвы вне
+     * auth-окна (ранний арм g20), а чужие фолты c2b_probe_segv теперь честно
+     * убивает (SIG_DFL-чейн) — refault-спин/SIGKILL-клон невозможен. */
+    {
+        struct c2b_sigaction sa;
+        u32 t;
+        for (t = 0; t < sizeof(sa); t++) ((u8 *)&sa)[t] = 0;
+        sa.handler = (uptr)c2b_probe_segv;
+        sa.flags = 4;                          /* SA_SIGINFO */
+        sigemptyset(sa.mask);
+        sigaction(11, &sa, (void *)0);
+    }
     C2B_LOGS("[c2b] EARLY: engine-probe arm thread start\n");
     for (it = 0; it < 240; it++) {
         c2b_g13_apply();

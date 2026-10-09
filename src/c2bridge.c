@@ -8660,7 +8660,7 @@ static void c2b_gns_spew_rearm(void)
     c2b_g16_apply();        /* 41f-g16: живой путь датаграмм (send-обёртка + пост-recvfrom) */
     c2b_g17_apply();        /* 41f-g17: вердикт connectionless-фильтра (enqueue vs drop) */
     c2b_g18_apply();        /* 41f-g18: поиск консьюмера (кольцо нод + слот Free) */
-    c2b_g19_apply();        /* 41f-g19: дамп ноды у свободителя (барьер 'B') */
+    /* c2b_g19_apply();  41f-g19 BISECT run137: disabled - run135/136 connect-flow death suspect (0x2e1ad5 in the connect path) */
     if (!g_gns_u[0]) return;
     for (it = 0; it < 60; it++) {
         if (!g_gns_u2_done) c2b_g5_resolve_copy2();
@@ -8680,7 +8680,7 @@ static void c2b_gns_spew_rearm(void)
         c2b_g16_apply();        /* 41f-g16: одноразово (done-флаг внутри) */
         c2b_g17_apply();        /* 41f-g17: одноразово (done-флаг внутри) */
         c2b_g18_apply();        /* 41f-g18: одноразово (done-флаги внутри) */
-        c2b_g19_apply();        /* 41f-g19: одноразово (done-флаг внутри) */
+        /* c2b_g19_apply();  41f-g19 BISECT run137: disabled */
         usleep(5000000);
     }
     C2B_LOGS("[c2b] GNS: rearm done applied="); C2B_LOGN(applied);
@@ -8716,7 +8716,7 @@ static void *c2b_early_arm_thread(void *arg)
         c2b_g16_apply();
         c2b_g17_apply();
         c2b_g18_apply();
-        c2b_g19_apply();
+        /* c2b_g19_apply();  41f-g19 BISECT run137: disabled */
         usleep(1000000);
     }
     C2B_LOGS("[c2b] EARLY: arm loop exit\n");

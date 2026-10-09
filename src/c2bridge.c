@@ -6153,11 +6153,13 @@ static u8   g_ticket_buf[2048];  /* последний тикет (полный,
  * ChallengeReply->ConnectRequest) прямо в наш лог. */
 static void *g_steamnetutils_obj;   /* ISteamNetworkingUtils*, FUv */
 static u32  g_steamnetutils_seen;
+static volatile u32 g_gns_spew_n;   /* 41f-g7e: живость спью (все копии) */
 
 static void c2b_gns_spew(i32 lvl, const char *msg)
 {
     u32 n = 0;
     if (!msg) return;
+    g_gns_spew_n++;   /* 41f-g7e: счётчик живости (безопасно: потерянные инкременты ок) */
     while (msg[n] && n < 4096u) n++;
     C2B_LOGS("[c2b] GNS["); C2B_LOGN((u32)lvl); C2B_LOGS("] ");
     C2B_LOGS(msg);
@@ -6701,36 +6703,40 @@ static void c2b_g7_client_utils(void)
                         C2B_LOGS("obj="); C2B_LOGH((u32)(uptr)uo);
                         C2B_LOGS("ts_hi="); C2B_LOGN((u32)(ts >> 32));
                         C2B_LOGS("\n");
-                        if (ts < 1000000000000000ull ||
-                            ts > 20000000000000000ull)
-                            continue;
-                        C2B_LOGS("[c2b] GNS g7: UTILS FOUND vt[");
-                        C2B_LOGN(k); C2B_LOGS("] "); C2B_LOGS(vers[v]);
-                        C2B_LOGS("\n");
-                        /* SetDebugOutputFunction = vt[1] (SDK-порядок 004) */
+                        /* 41f-g7e: run 110 показал, что геттеры vt[12..30]
+                         * возвращают КАШИРОВАННЫЙ объект под данным ver
+                         * (разный на user), ts_hi=0x7f0f — эпоха не 1970.
+                         * Ставим спью в КАЖДЫЙ найденный объект (vt[1],
+                         * SEGV-защита); живость меряет g_gns_spew_n. */
                         g_probe_active = 1;
                         if (__sigsetjmp(g_probe_jb, 1) == 0) {
                             c2b_g7_vt_spew(uo, 6, (void *)c2b_gns_spew);
                             g_probe_active = 0;
-                            C2B_LOGS("[c2b] GNS g7: spew(6) copy#2(client) OK\n");
+                            C2B_LOGS("[c2b] GNS g7: spew(6) installed on candidate u=");
+                            C2B_LOGN(try3 ? (u32)ucand[uci] : 0);
+                            C2B_LOGS("\n");
+                            g_gns_u[1] = uo;
+                            g_gns_flat[1] = (void *)c2b_g7_vt_spew;
+                            g_gns_cfg[1] = 0;
+                            g_gns_u2_done = 1;
                         } else {
                             g_probe_active = 0;
-                            C2B_LOGS("[c2b] GNS g7: vt[1] spew segv\n");
-                            continue;
+                            C2B_LOGS("[c2b] GNS g7: candidate vt[1] segv\n");
                         }
-                        /* в rearm: копия#2 = клиентский utils, callable = vtable-санк */
-                        g_gns_u[1] = uo;
-                        g_gns_flat[1] = (void *)c2b_g7_vt_spew;
-                        g_gns_cfg[1] = 0;
-                        g_gns_u2_done = 1;
-                        sigaction(11, &oldsa, (void *)0);
-                        return;
                     }
                 }
             }
         }
     }
-    C2B_LOGS("[c2b] GNS g7: utils not found via IClient vtable scan\n");
+    C2B_LOGS("[c2b] GNS g7: scan done\n");
+    /* 41f-g7e: меряем живость — если спью-кандидат настоящий, за 6с придут
+     * строки (пинги идут постоянно); счётчик инкрементится из любого потока */
+    {
+        u32 before = g_gns_spew_n;
+        usleep(6000000);
+        C2B_LOGS("[c2b] GNS g7: spew lines in 6s = ");
+        C2B_LOGN(g_gns_spew_n - before); C2B_LOGS("\n");
+    }
     sigaction(11, &oldsa, (void *)0);
 }
 

@@ -7760,12 +7760,16 @@ extern void c2b_g48_thunk(void);
  * 0x4dc proto / 0x4b9 0x4c0 0x4c2 0x4c5 байты). Пач = те же 14Б (cmpl 8Б +
  * jne 6Б = PATCH_LEN), cont=0x25a9f6 / rej=0x259f50. */
 static volatile uptr c2b_g49_cont, c2b_g49_rej;
+static volatile uptr c2b_g49_state;   /* g50: ПОЛНЫЙ 64-бит ptr инстанса состояния,
+                                      * захваченный g49-детуром (обработчик 'A'
+                                      * работает на нитке движка ДО cstate-гейта) */
 static u32 c2b_g49_nl;
 
 void c2b_g49_log(uptr state, uptr buf)
 {
     u32 k;
     if (!g_engine_base || !state || !buf) return;
+    c2b_g49_state = state;   /* g50: захват инстанса ДЛЯ ФОРСА cstate */
     if (g_probe_active) return;
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
@@ -7850,6 +7854,35 @@ __asm__(
 ".previous\n"
 );
 extern void c2b_g49_thunk(void);
+
+/* 47f-g50: ФОРС cstate=1 в инстансе состояния диспетчера.
+ * run197 ФАКТ (a2, полный танец kcap=10): и 'A'- и 'B'-кейсы ДОСТИГЛИ
+ * детуров, НО "cstate=0x00000000" В КАЖДОЙ строке g48/g49 — ворота
+ * cmpl $1,0x1a0(%r15) молча отвергают ВСЁ (и fmt-9 'A'-челленджи, и
+ * 'B'-accept, и байты: netadr/echo/ver — ВСЁ корректно: na=3/152.233.
+ * 19.133/28022, echo=0- pass, ver=0x3639=GetClientVersion). cstate
+ * @0x1a0 = signon-состояние (писатели: 0x492349/0x4923b6 ставят 1 в
+ * signon-машине "Received signon %i when at %i"; 0x2917e4/0x2c9528
+ * ставят 2; 0x2270fa/0x256d88 ставят 0) — в песочнице машина signon
+ * НЕ СТАРТУЕТ (нет netchan-канала), cstate застревает в 0. ФАРМА
+ * proving fmt-9: там cstate=1 ставился собственным потоком движка.
+ * ФИКС: мост пишет 1 (sig-guard: ТОЛЬКО если 0) в захваченный g49
+ * инстанс — СИНХРОННО в recvfrom-хуке перед возвратом инжектированного
+ * пакета (минимальное окно гонки: движок обрабатывает датаграмму
+ * сразу после возврата recvfrom). После первого 'A' инстанс захвачен,
+ * каждый следующий 0x21 -> форс -> 'A' проходит ворота -> fmt-9 парс
+ * -> strstr("connect") -> ver==client -> bools=0 -> WIN 25d6b6. */
+static void c2b_g50_force_cstate(void)
+{
+    volatile u32 *cs;
+    uptr st = c2b_g49_state;
+    if (!st) return;
+    cs = (volatile u32 *)(st + 0x1a0);
+    if (*cs == 0) {
+        *cs = 1;
+        C2B_LOGS("[c2b] g50: cstate 0->1 @g49-captured dispatcher state\n");
+    }
+}
 
 static void c2b_g11_apply(void)
 {
@@ -11854,6 +11887,13 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
     }
 }
 
+/* 47f-g50: форвард (тело в non-selftest части; в selftest — no-op) */
+#ifndef C2B_SELFTEST
+static void c2b_g50_force_cstate(void);
+#else
+static void c2b_g50_force_cstate(void) { }
+#endif
+
 __attribute__((visibility("default")))
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
@@ -11960,6 +12000,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                 (u32)r >= 6 && (u32)len >= 40) {
                 u8 *q = (u8 *)buf;
                 u32 hx, pl;
+                c2b_g50_force_cstate();   /* 47f-g50: ворота открыты ДО accept */
                 hx = ((u32)p[2]) | ((u32)p[3] << 8) | ((u32)p[4] << 16) |
                      ((u32)p[5] << 24);          /* ch4 из 0x23 = реальное значение сервера */
                 pl = c2b_clv2_build_kaccept(q, (u32)len, hx);
@@ -11976,6 +12017,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         }
         if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 9 && p[0] == 0x21) {
             /* CLV2 phase A: S2 ChallengeReply -> движку S1 'A'+challenge32 */
+            c2b_g50_force_cstate();   /* 47f-g50: ворота cstate открыты ДО парса */
             u64 ch = 0, ch_ts = 0;
             (void)ch_ts;
             if (c2b_clv2_parse_chalreply(p, (u32)r, g_clv2_conn_id, &ch, &ch_ts)) {

@@ -11255,7 +11255,17 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
          * g51, ноль Msg). 0x00 = «без сплит-потока» — легальный значение,
          * флаг=0 -> 0x4c1=0 -> ПРЯМО на чтение строки @25ab88. Позиция
          * строки НЕ меняется (байт 19 = "connect0x..."). */
-        static const u8 MYSTERY[4] = {0x00, 0x30, 0x01, 0x00};
+        /* 50f-g55: MYSTERY[2] 0x01 -> 0x00. RE 24b5c0/24b675 (SendConnectPacket,
+         * lobby!=0-ветка): 0x4e0 (64-бит value = байты 10..17) проходит бит-чек
+         * ТОЛЬКО при (v>>48) в [0x30,0x3f] (биты 52-55 != 0 AND
+         * ((v>>48)&0xf0)==0x30), иначе vt+0x190(1) + ConMsg "You cannot connect
+         * to this CS:GO server" = ОТКАЗ. С 0x01 в байте 17: v = 0x0100_30...
+         * -> v>>48 = 0x0100 = ВНЕ диапазона -> отказ. 0x00: v = 0x0030_0000_
+         * 00ee0a07 -> v>>48 = 0x30 = gameserver-класс -> чек пройден ->
+         * 24b6a7 (тикет-ветка зарезервированного коннекта). Parse-ветвление
+         * от v НЕ зависит (v только в 0x4e0), позиция строки (байт 19) и
+         * флаг-байт (байт 18 = MYSTERY[3]=0x00) НЕ тронуты. */
+        static const u8 MYSTERY[4] = {0x00, 0x30, 0x00, 0x00};
         u32 i;
         if (cap < 60) return 0;
         out[n++] = (u8)(ch32); out[n++] = (u8)(ch32 >> 8);
@@ -11287,7 +11297,18 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
          * out[46] = b2 = 1, out[47..54] = lobby-id u64 = 0, out[55+] = 0. */
         out[n++] = 0;                  /* pw "" -> NUL @45 */
         out[n++] = 1;                  /* b2 = 1 @46 */
-        while (n < 59) out[n++] = 0;   /* lobby=0, b3/b4=0, пад до 59 */
+        /* 50f-g55: lobby-id u64 = 1 (ar[47..54]). RE 25d2fd: 0x4e8 = ВТОРОЕ
+         * 64-бит чтение 645be0 (хвост после b2) = «lobby id» из lobbies-Msg.
+         * Хвост-диспетчер 25d720: pw==0 && 0x4e8!=0 -> 25d7b5 (strstr-цепочка
+         * модификаторов, НИ ОДИН не матчится) -> 25d8ed: pw==0 -> 25d8e0 ->
+         * 24b520 (SendConnectPacket) НАПРЯМУЮ из нашего парса. Плюс
+         * «Server did not approve grace request» (25d90e, требует 0x4e8==0)
+         * ИСЧЕЗАЕТ — ветка одобрения 25d921/25d8e0. С lobby=0 (run204):
+         * win 0x4b9=1 стрелял, но собственный retry цикл движка читал
+         * 0x4e8==0 -> «did not approve» x30 -> fail. lobby!=0 = RESERVED
+         * connect — серверная вилка поведения. b3/b4 = 0, пад до 59. */
+        out[n++] = 1;                  /* lobby-id lo byte = 1 @47 */
+        while (n < 59) out[n++] = 0;   /* lobby hi = 0, b3/b4=0, пад до 59 */
         break;
     }
     case 8: {                              /* 41e-g: N-агностик — хвост = (reserve)*9 NUL */
@@ -17508,8 +17529,8 @@ static void test_cl(void)
                     CHECK(ar[15]==0x07 && ar[16]==0x0a && ar[17]==0xee &&
                           ar[18]==0x00, "clv2: fmt9 value=steamid-low");
                     CHECK(ar[19]==0 && ar[20]==0x00 && ar[21]==0x30 &&
-                          ar[22]==0x01 && ar[23]==0x00,
-                          "clv2: fmt9 flag+mystry4 (g53: [23]=0x00 = флаг движка=0, без сплит-потока)");
+                          ar[22]==0x00 && ar[23]==0x00,
+                          "clv2: fmt9 flag+mystry4 (g53: [23]=0x00 флаг=0; g55: [22]=0x00 -> 0x4e0=0x0030... v>>48=0x30)");
                     {
                         static const char p9[] = "connect0x00000000";
                         u32 ok9 = 1;
@@ -17523,8 +17544,9 @@ static void test_cl(void)
                           "clv2: fmt9 pw-NUL + b2=1 (g54: win-хвост 25d720 требует b2!=0 -> 0x4b9=1)");
                     {
                         u32 okp = 1;
-                        for (i9 = 47; i9 < 59; i9++) if (ar[i9] != 0) okp = 0;
-                        CHECK(okp, "clv2: fmt9 lobby=0/b3/b4/пад NUL до 59");
+                        for (i9 = 48; i9 < 59; i9++) if (ar[i9] != 0) okp = 0;
+                        CHECK(ar[47] == 1 && okp,
+                              "clv2: fmt9 lobby-id=1 (g55: 0x4e8!=0 -> 25d7b5 -> 24b520 напрямую, без 'did not approve')");
                     }
                     CHECK(c2b_clv2_build_chalreply(ar, 32, 9, 0, 1) == 0,
                           "clv2: fmt9 крошечный буфер -> 0");

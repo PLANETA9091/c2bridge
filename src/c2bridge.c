@@ -10479,15 +10479,29 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                     for (k2 = 0; k2 < (u32)addrlen; k2++) C2B_LOGH(ad[k2]);
                 }
                 C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
-                if (g_clv2_fwdk && g_clv2_dstlen) {
-                    ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
-                                                  (const void *)g_clv2_dst,
-                                                  g_clv2_dstlen);
-                    g_clv2_fwd_k++;
-                    C2B_LOGS("[c2b] CLV2 'k'->target fwd #");
-                    C2B_LOGN(g_clv2_fwd_k);
-                    C2B_LOGS(" len="); C2B_LOGN((u32)len);
-                    C2B_LOGS("\n");
+                if (g_clv2_fwdk) {
+                    /* run169 (fbe6689): fwdk=1 ON, 10 captures, dst= ПРАВИЛЬНЫЙ
+                     * (AF_INET 28022 152.233.19.133!), но fwd НЕ стрелял —
+                     * g_clv2_dstlen=0: qconnect'овский addr >16Б скипнулся.
+                     * ФИКС: приоритет — САМ addr капчура (engine's own sendto
+                     * dst = цель по построению), g_clv2_dst как fallback. */
+                    const void *da = 0;
+                    u32 dl = 0;
+                    if (addr && addrlen && addrlen <= 28) {
+                        da = addr; dl = (u32)addrlen;
+                    } else if (g_clv2_dstlen >= 6) {
+                        da = (const void *)g_clv2_dst; dl = g_clv2_dstlen;
+                    }
+                    if (da && dl) {
+                        ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
+                                                      da, dl);
+                        g_clv2_fwd_k++;
+                        C2B_LOGS("[c2b] CLV2 'k'->target fwd #");
+                        C2B_LOGN(g_clv2_fwd_k);
+                        C2B_LOGS(" len=");
+                        C2B_LOGN((u32)len);
+                        C2B_LOGS("\n");
+                    }
                 }
                 return (ssize_t)len;               /* дроп без отправки */
             }

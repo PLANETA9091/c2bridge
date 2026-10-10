@@ -78,6 +78,7 @@ extern void  siglongjmp(void *buf, i32 val);
 extern i32   sigaction(i32 sig, const void *act, void *oldact);
 extern i32   sigemptyset(void *set);   /* маска sa_mask */
 extern i64   pread(i32 fd, void *buf, uptr n, uptr off);   /* g24 v4.2: ssize_t/size_t/off_t = 64-bit */
+extern i32   vsnprintf(char *s, uptr n, const char *fmt, void *va);   /* g34v2: GNS lib-spew hook */
 
 static int g_logfd = 2;
 
@@ -6254,6 +6255,27 @@ static void c2b_gns_spew(i32 lvl, const char *msg)
     if (n && msg[n - 1] != '\n') C2B_LOGS("\n");
 }
 
+/* 41f-g34v2: хук ЛИБЕЙНОГО спью-канала GNS. RE run178: 0x1fce3a0 — тонкая
+ * обёртка (вариадик-сейв) -> call *0x2c6dcd0; сеттер 0x1fce440 пишет ПАРУ
+ * (level @0x2c6dcc8, fn @0x2c6dcd0). Дефолтный fn = стёамовский логгер
+ * (невидим нам). Сигнатура вызова: fn(rdi=level, rsi=1, rdx=0, rcx=0,
+ * r8=fmt, r9=va_list). Наш хук vsnprintf-ит и пишет в лог. */
+static void c2b_gns_libspew_hook(u32 a, u32 b, void *c, void *d,
+                                 const char *fmt, void *va)
+{
+    char buf[1024];
+    i32 n;
+    (void)b; (void)c; (void)d;
+    if (!fmt) return;
+    g_gns_spew_n++;
+    n = vsnprintf(buf, sizeof(buf) - 2, fmt, va);
+    if (n < 0) return;
+    if (n > 1000) n = 1000;
+    if (buf[n - 1] != '\n') { buf[n] = '\n'; buf[n + 1] = 0; }
+    C2B_LOGS("[c2b] GNSLIB["); C2B_LOGN(a); C2B_LOGS("] ");
+    C2B_LOGS(buf);
+}
+
 static i32 c2b_ver_pfx(const char *ver, const char *pfx)
 {
     u32 i = 0;
@@ -10082,6 +10104,17 @@ static void c2b_g32_drive(void)
                 } else {
                     C2B_LOGS(" -> sig mismatch, skip\n");
                 }
+            }
+            /* 41f-g34v2: подменить ЛИБЕЙНЫЙ спью-фн (0x2c6dcd0, .data RW).
+             * Дефолт = стёамовский логгер (невидим); наш хук vsnprintf-ит
+             * fmt+va в лог. Это канал ВСЕГО establish-спью GNS. */
+            {
+                void *volatile *slot = (void *volatile *)(g_g11_base + 0x2c6dcd0ull);
+                void *oldfn = *slot;
+                *slot = (void *)&c2b_gns_libspew_hook;
+                C2B_LOGS("[c2b] g34v2: libspew fn 0x2c6dcd0 old=");
+                C2B_LOGH((u32)(uptr)oldfn);
+                C2B_LOGS(" -> hook\n");
             }
         } else {
             C2B_LOGS("[c2b] g33: no g11 base in 60s - spew gate skipped\n");

@@ -6213,8 +6213,12 @@ static u64 g_clv2_sid64;         /* legacy_client_steam_id (из 'k' или C2B_
  *   expire32=0 | b1..b4=0 | падд до lastA-длины (хвост не читается).
  * Диагностика: verdict-лог 0x23..0x26 РАСШИРЕН на ВСЕ fd (в run186 0x23 не
  * дошёл до движкового recvfrom — где он теряется, покажет fd-лог). */
-static u32 g_clv2_23_seen;       /* g42: первый 0x23 обработан (one-shot) */
+static u32 g_clv2_23_seen;       /* g42: первый 0x23 обработан / accept выдан (one-shot) */
 static u32 g_clv2_v23_logn;      /* g42: rate-limit расширенного verdict-лога */
+static u64 g_clv2_22_first_ms;   /* g42v3: момент ПЕРВОГО 0x22 (база proactive-accept;
+                                 * cr_last_ms не годится — 0x22 шлют каждые ~1-2с и
+                                 * зазор до следующего 0x21 всегда < 2.5с -> гейт
+                                 * g42v2 на last_ms НИКОГДА не открывается, run189) */
 static u8 g_clv2_cr_priv[32];    /* x25519 priv (variant 2) */
 static u8 g_clv2_cr_pub[32];     /* x25519 pub */
 struct c2b_clv2_chrec { u32 cid; u32 valid; u64 ch, ts, ms; };
@@ -10985,6 +10989,7 @@ static i32 c2b_clv2_send_connreq(int fd, u32 variant, i32 flags,
     ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, da, dl);
     g_clv2_cr_last_ms = now;
     g_clv2_cr_sent++;
+    if (!g_clv2_22_first_ms) g_clv2_22_first_ms = now;   /* g42v3 */
     C2B_LOGS("[c2b] CLV2 0x22 ConnectRequest->target #");
     C2B_LOGN(g_clv2_cr_sent);
     C2B_LOGS(" v="); C2B_LOGN(variant);
@@ -11630,15 +11635,15 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                      * 'B' connect-accept на СЛЕДУЮЩЕМ 0x21 (канал инъекции,
                      * доказанный 'A'-пушем). Прямой 0x23-триггер (выше) имеет
                      * приоритет, если 0x23 всё же долетит. */
-                    if (!g_clv2_23_seen && g_clv2_cr_sent && g_clv2_cr_last_ms &&
+                    if (!g_clv2_23_seen && g_clv2_cr_sent && g_clv2_22_first_ms &&
                         (u32)len >= 40) {
                         u64 now2 = c2b_mono_ms();
-                        if (now2 - g_clv2_cr_last_ms >= 2500u) {
+                        if (now2 - g_clv2_22_first_ms >= 2500u) {
                             u32 pl = c2b_clv2_build_kaccept(q, (u32)len, 0);
                             if (pl) {
                                 g_clv2_23_seen = 1;
-                                C2B_LOGS("[c2b] g42v2: 0x22 sent ");
-                                C2B_LOGN((u32)(now2 - g_clv2_cr_last_ms));
+                                C2B_LOGS("[c2b] g42v3: first 0x22 ");
+                                C2B_LOGN((u32)(now2 - g_clv2_22_first_ms));
                                 C2B_LOGS("ms ago -> engine 'B' connect-accept len=");
                                 C2B_LOGN(pl);
                                 C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);

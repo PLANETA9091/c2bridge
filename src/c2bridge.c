@@ -7998,6 +7998,83 @@ __asm__(
 );
 extern void c2b_g51_thunk(void);
 
+/* ---------- 50g-g56: детур ХВОСТА (engine+0x25d6cc) — дамп полей state
+ * ПОСЛЕ полного парса (r15): 0x4b9/0x4c0/0x4c1/0x4c2/0x4c5/0x4d8/0x4dc/
+ * 0x4e0 u64/0x4e8 u64. МОТИВАЦИЯ: run206 (73c4bf4) эмпирика — lobby=1 в
+ * ar[47] НЕ ДОШЁЛ до 0x4e8 (lobbies-Msg всё ещё "lobby id 0", "did not
+ * approve" цикл не изменился) — фактическую раскладку хвостовых чтений
+ * (ver/expire/pw/b2/lobby — какие байты каждый съедает) знает только
+ * состояние. Сиг = cmpb $0x0,0x4c2(%r15) (8Б) + lea 0x982094,%rax (7Б)
+ * = 15Б; стебл 14Б + 1 сиротский байт lea (не выполняется — возврат
+ * 0x25d6db = mov 0x4e8(%r15),%rcx). Реплика: cmpb (флаги ДЛЯ cmove
+ * @25d6f0!) + mov $0x982094,%eax (константа исходной lea; между
+ * возвратом и cmove ни одна инструкция флагов не трогает). */
+static volatile uptr c2b_g56_cont;
+static u32 c2b_g56_nl;
+
+void c2b_g56_log(uptr state)
+{
+    u32 k;
+    if (!state) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    k = ++c2b_g56_nl;
+    if (k > 24 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g56 tail: b9=");
+    C2B_LOGN((u32)*(volatile u8 *)(state + 0x4b9));
+    C2B_LOGS(" c0="); C2B_LOGN((u32)*(volatile u8 *)(state + 0x4c0));
+    C2B_LOGS(" c1="); C2B_LOGN((u32)*(volatile u8 *)(state + 0x4c1));
+    C2B_LOGS(" c2="); C2B_LOGN((u32)*(volatile u8 *)(state + 0x4c2));
+    C2B_LOGS(" pw0="); C2B_LOGN((u32)*(volatile u8 *)(state + 0x4c5));
+    C2B_LOGS(" chal="); C2B_LOGH(*(volatile u32 *)(state + 0x4d8));
+    C2B_LOGS(" proto="); C2B_LOGH(*(volatile u32 *)(state + 0x4dc));
+    C2B_LOGS(" val=");  C2B_LOGH(*(volatile u32 *)(state + 0x4e0));
+    C2B_LOGS("/");      C2B_LOGH(*(volatile u32 *)(state + 0x4e4));
+    C2B_LOGS(" lob=");  C2B_LOGH(*(volatile u32 *)(state + 0x4e8));
+    C2B_LOGS("/");      C2B_LOGH(*(volatile u32 *)(state + 0x4ec));
+    C2B_LOGS(" exp=");  C2B_LOGH(*(volatile u32 *)(state + 0x8dc4));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g56_thunk\n"
+".type  c2b_g56_thunk,@function\n"
+"c2b_g56_thunk:\n"   /* вход: r15=state; флаги от caller не нужны (реплицируем cmpb) */
+"  endbr64\n"
+"  sub  $0x60,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r15,%rdi\n"
+"  call c2b_g56_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x60,%rsp\n"
+"  cmpb $0x0,0x4c2(%r15)\n"          /* реплика: флаги для cmove @25d6f0 */
+"  mov  $0x982094,%eax\n"           /* реплика lea (абс-константа) */
+"  mov  c2b_g56_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g56_thunk, .-c2b_g56_thunk\n"
+".previous\n"
+);
+extern void c2b_g56_thunk(void);
+
 static void c2b_g11_apply(void)
 {
     static u8 done;
@@ -10628,6 +10705,29 @@ static void c2b_g32_drive(void)
             C2B_LOGH(*(const volatile u32 *)site51);
             C2B_LOGH(*(const volatile u32 *)(site51 + 4));
             C2B_LOGH(*(const volatile u32 *)(site51 + 8));
+            C2B_LOGS("\n");
+        }
+    }
+    /* 50g-g56: детур хвоста @0x25d6cc (мотивация у тунка). */
+    if (g_engine_base) {
+        static const u8 g56_sig[15] = {
+            0x41, 0x80, 0xbf, 0xc2, 0x04, 0x00, 0x00, 0x00,   /* cmpb $0x0,0x4c2(%r15) */
+            0x48, 0x8d, 0x05, 0xb9, 0x49, 0x72, 0x00          /* lea 0x7249b9(%rip),%rax */
+        };
+        volatile u8 *site56 = (volatile u8 *)(g_engine_base + 0x25d6ccull);
+        if (memcmp((const void *)site56, g56_sig, sizeof g56_sig) == 0) {
+            c2b_g56_cont = g_engine_base + 0x25d6dbull;   /* mov 0x4e8(%r15),%rcx */
+            if (c2b_page_protect((uptr)site56, (u32)sizeof g56_sig, 0x07) == 0) {
+                c2b_write_jmp((void *)site56, (const void *)&c2b_g56_thunk);
+                C2B_LOGS("[c2b] g56: detour armed @engine+25d6cc (tail state dump b9/c0/c1/c2/pw0/chal/proto/val/lob/exp)\n");
+            } else {
+                C2B_LOGS("[c2b] g56: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g56: sig mismatch @engine+25d6cc bytes=");
+            C2B_LOGH(*(const volatile u32 *)site56);
+            C2B_LOGH(*(const volatile u32 *)(site56 + 4));
+            C2B_LOGH(*(const volatile u32 *)(site56 + 8));
             C2B_LOGS("\n");
         }
     }

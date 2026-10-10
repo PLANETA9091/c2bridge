@@ -10120,6 +10120,22 @@ static void c2b_g32_drive(void)
             C2B_LOGS("[c2b] g33: no g11 base in 60s - spew gate skipped\n");
         }
     }
+    /* 41f-g36: диагностика fd-бюджета В МОМЕНТ коннекта: lowest-free-fd
+     * (open("/dev/null") даёт наименьший свободный номер) + epoll-проба. */
+    {
+        extern i32 open(const char *, i32, ...);
+        extern i32 close(i32);
+        extern i32 epoll_create1(i32);
+        i32 fdp = open("/dev/null", 0 /*O_RDONLY*/);
+        i32 ep = epoll_create1(0);
+        C2B_LOGS("[c2b] g36: lowest-free-fd=");
+        C2B_LOGN((u32)(fdp < 0 ? 99999u : (u32)fdp));
+        C2B_LOGS(" epoll_create1=");
+        C2B_LOGN((u32)(ep < 0 ? 99999u : (u32)ep));
+        if (ep >= 0) close(ep);
+        if (fdp >= 0) close(fdp);
+        C2B_LOGS("\n");
+    }
     /* парс "a.b.c.d:port" из g_gns_connect_target */
     {
         const char *s = (const char *)g_gns_connect_target;
@@ -12305,6 +12321,28 @@ static void *c2b_poll_thread(void *arg)
 
 i32 c2b_main(void)
 {
+    /* 41f-g36: nofile в САМЫЙ ранний момент (ctor, LD_PRELOAD — до любого
+     * fd-давления движка). run179/180: 'epoll_ctl failed, error 0x9' в GNS
+     * ConnectByIPAddress = fd-бюджет (дефолт 1024): socket() EMFILE -> fd=-1
+     * -> epoll_ctl EBADF. Поднимаем soft до min(hard, 65535); структур
+     * rlimit не тянем: {u64 cur, u64 max} (x86-64 ABI), RLIMIT_NOFILE=7. */
+    {
+        extern i32 getrlimit(i32 res, void *rlim);
+        extern i32 setrlimit(i32 res, const void *rlim);
+        struct { u64 cur, max; } rl;
+        if (getrlimit(7, &rl) == 0) {
+            u64 want = (rl.max < 65535ull) ? rl.max : 65535ull;
+            C2B_LOGS("[c2b] g36: nofile cur="); C2B_LOGN((u32)rl.cur);
+            C2B_LOGS(" max="); C2B_LOGN((u32)rl.max);
+            if (rl.cur < want) {
+                rl.cur = want;
+                C2B_LOGS(setrlimit(7, &rl) == 0 ? " -> raised" : " -> setrlimit FAILED");
+            } else {
+                C2B_LOGS(" -> ok");
+            }
+            C2B_LOGS("\n");
+        }
+    }
     {   /* R30: уровень живого лога: 0=тихо, 1=компактно (по умолчанию),
          * 2=полный дамп на каждый вызов. g_vlevel==2 после статики (selftest),
          * в .so принудительно опускаем до 1 и даём env поднять обратно. */

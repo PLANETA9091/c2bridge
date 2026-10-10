@@ -7636,6 +7636,114 @@ extern void c2b_g11_gather_thunk(void);
 extern void c2b_g11_lag_thunk(void);
 extern void c2b_g11_gate_thunk(void);
 
+/* ---------- 46f-g48: детур входа 'B'-кейса (engine+0x25a8b0) ----------
+ * ЭМПИРИЧЕСКИЙ ответ на "какой тихий гейт режет наш 'B'-accept".
+ * RE (run195, engine 2cd041): 0x259df0 = диспетчер connectionless-пакетов —
+ * виртуальный метод (слот 13) класса-состояния 0x9d498Б (vtable 0xd8d7c8;
+ * ctor 0x2c81c0, инстансы = operator new(0x9d498) x2 в mgr 0x2b4770):
+ * rdi=state->r15, rsi=buf->rbx; пролог push*6 + sub 0xa58 => rsp%16==0 в теле.
+ * Прыжковая таблица @0x938d2c (117 записей): 'B'(0x42)->0x25a8b0 ЕДИНСТВЕННЫЙ
+ * маршрут; 'A'(0x41)->0x25a9e8 (тот же гейт + ОБНОВЛЕНИЕ snap); 105 остальных
+ * -> default 0x25af60. Тело 'B' на входе:
+ *   25a8b0 cmpl $0x1,0x1a0(%r15)   cstate==1          (8Б)
+ *   25a8b8 jne  0x259f50           тихий reject       (6Б) = 14Б = PATCH_LEN
+ *   25a8be mov 0x1c(%rbx),%eax; cmp 0x50c(%r15),%eax  echo: buf[1c]==snap[1c]
+ *          (1..3 или ==0 -> netadr-путь 25cb85); buf u64@0x0c==snap@0x4fc;
+ *          buf u32@0x14==snap@0x504; buf u32@0x18==0==snap@0x508;
+ *   25aa03 cvar-гейт (g47 починен) -> 25aa33: snap <- buf[0..0x1f] (32Б).
+ * Т.о. echo = "buf[0x0c..0x1f] нашего 'B' == buf[0x0c..0x1f] ПОСЛЕДНЕГО 'A'".
+ * ФАКТ run195: g47 сработал (ref REBOUND x3), accept доставлен (g42v3),
+ * 'k' продолжаются — значит reject = ЕЩЕ ОДИН гейт (cstate/echo) ЛИБО наш
+ * 'B' вообще не доходит до диспетчера. Детур логгирует на КАЖДЫЙ 'B':
+ * state rva, cstate@0x1a0, snap@0x4f0..0x50f, buf rva, buf[0x00..0x1f],
+ * data[0..0x0f] (buf+0x38) — расхождение видно напрямую. Реплика cmpl+jne
+ * в тунке, cont=0x25a8be / rej=0x259f50 (r11-косвенные, стиль g11f). */
+static volatile uptr c2b_g48_cont, c2b_g48_rej;
+static u32 c2b_g48_nl;
+
+void c2b_g48_log(uptr state, uptr buf)
+{
+    u32 k;
+    if (!g_engine_base || !state || !buf) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    k = ++c2b_g48_nl;
+    if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g48 B: st=");
+    C2B_LOGH((u32)(state > g_engine_base ? state - g_engine_base : state));
+    C2B_LOGS(" cstate="); C2B_LOGN(*(volatile u32 *)(state + 0x1a0));
+    C2B_LOGS(" buf=");
+    C2B_LOGH((u32)(buf > g_engine_base ? buf - g_engine_base : 0));
+    C2B_LOGS(" na=");
+    C2B_LOGH(*(volatile u32 *)buf);
+    C2B_LOGH(*(volatile u32 *)(buf + 4));
+    C2B_LOGH(*(volatile u32 *)(buf + 8));
+    C2B_LOGS(" b0c="); C2B_LOGH(*(volatile u32 *)(buf + 0x0c));
+    C2B_LOGS(" b14="); C2B_LOGH(*(volatile u32 *)(buf + 0x14));
+    C2B_LOGS(" b18="); C2B_LOGH(*(volatile u32 *)(buf + 0x18));
+    C2B_LOGS(" b1c="); C2B_LOGH(*(volatile u32 *)(buf + 0x1c));
+    C2B_LOGS(" snap=");
+    for (k = 0; k < 0x20; k += 4)
+        C2B_LOGH(*(volatile u32 *)(state + 0x4f0 + k));
+    {
+        uptr dp = *(volatile uptr *)(buf + 0x38);
+        C2B_LOGS(" data=");
+        if (dp) {
+            C2B_LOGH(*(volatile u32 *)dp);
+            C2B_LOGH(*(volatile u32 *)(dp + 4));
+            C2B_LOGH(*(volatile u32 *)(dp + 8));
+            C2B_LOGH(*(volatile u32 *)(dp + 12));
+        } else {
+            C2B_LOGH(0);
+        }
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g48_thunk\n"
+".type  c2b_g48_thunk,@function\n"
+"c2b_g48_thunk:\n"   /* вход: jump-table jmp -> rsp%16==0; r15=state rbx=buf */
+"  endbr64\n"
+"  sub  $0x60,%rsp\n"    /* 96; rsp%16==0 */
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r15,%rdi\n"
+"  mov  %rbx,%rsi\n"
+"  call c2b_g48_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x60,%rsp\n"
+/* реплика 14Б: cmpl $0x1,0x1a0(%r15); jne rej */
+"  cmpl $0x1,0x1a0(%r15)\n"
+"  jne  48f\n"
+"  mov  c2b_g48_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+"48:\n"
+"  mov  c2b_g48_rej(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g48_thunk, .-c2b_g48_thunk\n"
+".previous\n"
+);
+extern void c2b_g48_thunk(void);
+
 static void c2b_g11_apply(void)
 {
     static u8 done;
@@ -10188,6 +10296,33 @@ static void c2b_g32_drive(void)
             }
         } else {
             C2B_LOGS("[c2b] g46: engine_base не появился за 60с\n");
+        }
+    }
+    /* 46f-g48: детур входа 'B'-кейса 0x25a8b0 (полная мотивация — у тунка).
+     * Пач = ровно 14Б (cmpl 8Б + jne 6Б = C2B_PATCH_LEN): тунк реплицирует
+     * cmpl+jne, разводит cont=0x25a8be / rej=0x259f50. Сиг-гард естественный:
+     * после пача байты != сиг, повторная установка невозможна. */
+    if (g_engine_base) {
+        static const u8 g48_sig[14] = {
+            0x41, 0x83, 0xbf, 0xa0, 0x01, 0x00, 0x00, 0x01,   /* cmpl $1,0x1a0(%r15) */
+            0x0f, 0x85, 0x92, 0xf6, 0xff, 0xff                /* jne 0x259f50        */
+        };
+        volatile u8 *site48 = (volatile u8 *)(g_engine_base + 0x25a8b0ull);
+        if (memcmp((const void *)site48, g48_sig, sizeof g48_sig) == 0) {
+            c2b_g48_cont = g_engine_base + 0x25a8beull;
+            c2b_g48_rej  = g_engine_base + 0x259f50ull;
+            if (c2b_page_protect((uptr)site48, (u32)sizeof g48_sig, 0x07) == 0) {
+                c2b_write_jmp((void *)site48, (const void *)&c2b_g48_thunk);
+                C2B_LOGS("[c2b] g48: detour armed @engine+25a8b0 (per-'B' log: st/cstate/snap/buf/data)\n");
+            } else {
+                C2B_LOGS("[c2b] g48: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g48: sig mismatch @engine+25a8b0 (build drift?) bytes=");
+            C2B_LOGH(*(const volatile u32 *)site48);
+            C2B_LOGH(*(const volatile u32 *)(site48 + 4));
+            C2B_LOGH(*(const volatile u32 *)(site48 + 8));
+            C2B_LOGS("\n");
         }
     }
     /* 41f-g33: открыть ГЛОБАЛЬНЫЙ спью-гейт GNS (steamclient+0x2c6dcc8).

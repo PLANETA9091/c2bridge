@@ -10001,10 +10001,11 @@ static void *c2b_auth_thread(void *arg)
     C2B_LOGS("[c2b] AUTH: done calls="); C2B_LOGN(g_ticket_calls);
     C2B_LOGS(" ok="); C2B_LOGN(g_ticket_ok);
     C2B_LOGS("\n");
-    c2b_gns_spew_rearm();   /* 41f-g5/g8/g9: пин спью+конфига (ПЕРВЫМ — патчи) */
-    c2b_g7_client_utils();   /* 41f-g10: ЗАГЛУШЕН (убивал процесс до rearm) */
+    /* 41f-g32a: спавн ДО spew_rearm — rearm НЕ возвращает поток (60x5s цикл;
+     * v3-урок: спавн после него недостижим). Драйвер-поток сам ждёт ничего:
+     * SteamUser уже капчурен (проба тикета выше), env-флаги стоят (init). */
 #ifndef C2B_SELFTEST
-    {   /* 41f-g32a: драйвер в СВОЁМ потоке (spew_rearm НЕ возвращает поток) */
+    {
         void *t32 = 0;
         if (pthread_create(&t32, (const void *)0, c2b_g32_thread,
                            (void *)0) == 0)
@@ -10013,6 +10014,8 @@ static void *c2b_auth_thread(void *arg)
             C2B_LOGS("[c2b] g32: pthread_create failed\n");
     }
 #endif
+    c2b_gns_spew_rearm();   /* 41f-g5/g8/g9: пин спью+конфига (блокирует поток) */
+    c2b_g7_client_utils();   /* 41f-g10: ЗАГЛУШЕН (убивал процесс до rearm) */
     return 0;
 }
 

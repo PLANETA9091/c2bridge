@@ -7457,6 +7457,18 @@ __asm__(
 "  mov  0x30(%rsp),%rdx\n"
 "  mov  0x28(%rsp),%rcx\n"
 "  call c2b_g11_udp_log\n"
+/* 43f-g39 (BUGFIX, run183): ВОССТАНОВИТЬ арг-реги! Пролог 0x1fcd110
+ * читает rcx->r13, rdi->r12, rdx->rbp, esi->rbx (49 89 cd/49 89 fc/
+ * 48 89 d5/48 63 de) и делает test ebx,ebx; jle -> assert "nChunks > 0"
+ * (0x1fcd408, line 415 socketthread.cpp). Логгер (C) затирает
+ * rdi/rsi/rdx/rcx; без рестора пролог жил мусором: assert + мини-дамп +
+ * смерть клиента в КАЖДОЙ попытке (run183 a1-a4), pcap пуст (sendto
+ * с мусорными rbp/r13 падал). g11d/g11e тунки ресторят ПОЛНЫЙ набор —
+ * только g11u терял четыре регистра. */
+"  mov  0x28(%rsp),%rcx\n"
+"  mov  0x30(%rsp),%rdx\n"
+"  mov  0x38(%rsp),%rsi\n"
+"  mov  0x40(%rsp),%rdi\n"
 "  mov  0x00(%rsp),%rax\n"
 "  mov  0x08(%rsp),%r8\n"
 "  mov  0x10(%rsp),%r9\n"

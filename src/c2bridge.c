@@ -11776,6 +11776,66 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
     return r;
 }
 
+/* ---------- 44f-g43: send/recv (СОЕДИНЁННЫЕ сокеты) — делегация в наши ----
+ * sendto/recvfrom. Run188: движок меняет путь сокетов ПО ПРОБАМ — пять
+ * свежих challenge-сокетов (порты 40612/42029/51948/48457/27005, по одному
+ * 0x20 с каждого, 0x21 назад — pcap), НОЛЬ событий в sendto/recvfrom-хуках:
+ * путь = connect()+send()/recv(), НЕ sendto/recvfrom. В run186/187-a1 путь
+ * был sendto — оттуда и вся видимость. Делегация: getpeername даёт пир,
+ * зовём СВОИ sendto/recvfrom (вся CLV2-логика — классификация, переводы,
+ * бейты, g42-accept, дропы — работает как есть); passthrough sendto(fd,.addr)
+ * для соединённого сокета эквивалентен send(fd,.). Дроп-путь (act==DROP)
+ * возвращает len без отправки — движок считает, что послал. */
+typedef ssize_t (*c2b_send1_fn)(int, const void *, size_t, int);
+typedef ssize_t (*c2b_recv1_fn)(int, void *, size_t, int);
+extern int getpeername(int, struct sockaddr *, socklen_t *);
+static void *g_clp_send1, *g_clp_recv1;
+__attribute__((visibility("default")))
+ssize_t send(int fd, const void *buf, size_t len, int flags)
+{
+    if (!g_clp_send1) {
+        void *f = dlsym(C2B_CL_RTLD_NEXT, "send");
+        if (!f) f = (void *)1;
+        g_clp_send1 = f;
+    }
+    if ((uptr)g_clp_send1 == 1) {
+        *__errno_location() = 2;            /* ENOENT */
+        return -1;
+    }
+    {
+        u8 ad[28];
+        socklen_t al = (socklen_t)sizeof(ad);
+        if (getpeername(fd, (struct sockaddr *)ad, &al) == 0 && al >= 6 &&
+            (((const u16 *)(const void *)ad)[0] == C2B_AF_INET ||
+             ((const u16 *)(const void *)ad)[0] == C2B_AF_INET6))
+            return sendto(fd, buf, len, flags, (const struct sockaddr *)ad, al);
+    }
+    return ((c2b_send1_fn)g_clp_send1)(fd, buf, len, flags);
+}
+
+__attribute__((visibility("default")))
+ssize_t recv(int fd, void *buf, size_t len, int flags)
+{
+    if (!g_clp_recv1) {
+        void *f = dlsym(C2B_CL_RTLD_NEXT, "recv");
+        if (!f) f = (void *)1;
+        g_clp_recv1 = f;
+    }
+    if ((uptr)g_clp_recv1 == 1) {
+        *__errno_location() = 2;            /* ENOENT */
+        return -1;
+    }
+    {
+        u8 ad[28];
+        socklen_t al = (socklen_t)sizeof(ad);
+        if (getpeername(fd, (struct sockaddr *)ad, &al) == 0 && al >= 6 &&
+            (((const u16 *)(const void *)ad)[0] == C2B_AF_INET ||
+             ((const u16 *)(const void *)ad)[0] == C2B_AF_INET6))
+            return recvfrom(fd, buf, len, flags, (struct sockaddr *)ad, &al);
+    }
+    return ((c2b_recv1_fn)g_clp_recv1)(fd, buf, len, flags);
+}
+
 /* ---------- t42v2→t42v3: интерпозиция выдачи GC-интерфейса ----------
  * t42v3 FIX: v2 отравлял кэш сентинелом (void*)1 при неудаче dlsym(RTLD_NEXT)
  * — ранний вызов движка до подмапления провайдера -> вызов адреса 0x1 ->

@@ -127,6 +127,47 @@ static void c2b_log_dec(u32 v)   /* R37 (t35): десятичная телеме
 #define C2B_LOGD(v) c2b_log_dec((u32)(v))
 #endif
 
+/* v4.3 (run165): ОБЩИЙ safe-reader — /proc/self/mem pread ЧАНКАМИ 64KB с
+ * дозаполнением после дыр. Замена прямых разыменований ПОСЛЕ
+ * dl_iterate_phdr/maps-снапшота: модуль может анмапиться (steam client
+ * died/reload — run165 a5 steam_state_fatal + SIGSEGV в g9_patch_apply;
+ * run164 — в c2b_g24_find_state) между сбором баз и чтением. 0 на
+ * невалидных адресах — вызывающие проверки просто не совпадут. */
+static u64 c2b_rd64_safe(int fd, uptr *clo, u32 *cn, u8 *buf, uptr a)
+{
+    u64 v;
+    if (a < *clo || a + 8 > *clo + *cn) {
+        uptr c = a & ~((uptr)0xFFFF);
+        u32 got = 0;
+        while (got < 0x10000) {
+            u64 rc = (u64)pread(fd, buf + got, 0x10000 - got, c + got);
+            if (rc == 0 || rc > 0x7FFFFFFFull) break;   /* EOF/EIO/err */
+            got += (u32)rc;
+        }
+        *clo = c;
+        *cn = got;
+    }
+    if (a < *clo || a + 8 > *clo + *cn) return 0;
+    memcpy(&v, buf + (a - *clo), 8);
+    return v;
+}
+/* одноразовый читатель: открыть /proc/self/mem, прочитать u64, закрыть.
+ * Для редких чтений (g8/g9 rearm-проверок); g24-скан держит fd сам. */
+static u64 c2b_rd_once(uptr a)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    int fd = open("/proc/self/mem", 0 /*O_RDONLY*/);
+    uptr clo = 0;
+    u32 cn = 0;
+    u8 buf[65536];
+    u64 v;
+    if (fd < 0) return 0;
+    v = c2b_rd64_safe(fd, &clo, &cn, buf, a);
+    close(fd);
+    return v;
+}
+
 /* R29: tid первого входа в каждый боевой хук. Inline-asm syscall gettid
  * (x86_64=186, i386=224): никаких зависимостей от libc/libpthread.
  * В живом логе [c2b] PM tid=N / [c2b] SNM tid=N дают ФАКТИЧЕСКУЮ
@@ -6807,8 +6848,11 @@ static void c2b_g8_patch_apply(void)
         return;
     }
     slot = (volatile void **)(base + 0x2d1e1b0);
-    old = (uptr)(*slot);
+    /* v4.3: чтение слота через /proc/self/mem (steam client может
+     * анмапиться между phdr-итерацией и чтением — run165 SIGSEGV класс); */
+    old = c2b_rd_once((uptr)slot);
     if (old == (uptr)c2b_gns_spew) { g_g8_armed = 1; return; }
+    if (!old) return;   /* модуль исчез — не патчим */
     *slot = (const volatile void *)c2b_gns_spew;
     g_g8_slot = slot;
     g_g8_armed = 1;
@@ -6877,11 +6921,20 @@ static void c2b_g9_patch_one(uptr base, const struct c2b_g9_build *b)
 {
     uptr entry = base + b->entry_rva;
     volatile u32 *val;
-    if (*(volatile u32 *)entry != 0x17) return;                    /* enum  */
-    if (*(volatile uptr *)(entry + 8) != base + b->name_rva) return; /* name */
-    if (*(volatile i32 *)(entry + 0x18) != b->cfg_off) return;     /* off   */
+    u32 enumv, cfgv, valv;
+    /* v4.3: все чеки через /proc/self/mem (run165: SIGSEGV здесь —
+     * steamclient.so исчез между dl_iterate_phdr и разыменованиями);
+     * 0-чтения просто не совпадут с сигнатурой */
+    enumv = (u32)c2b_rd_once(entry);
+    if (enumv != 0x17) return;                                    /* enum  */
+    {   u64 nameq = c2b_rd_once(entry + 8);
+        if (nameq != (u64)(uptr)(base + b->name_rva)) return; /* имя ptr */
+    }
+    cfgv = (u32)c2b_rd_once(entry + 0x18);
+    if ((i32)cfgv != b->cfg_off) return;                          /* off   */
     val = (volatile u32 *)(entry + 0x30);
-    if (*val != 0) return;        /* 1 = уже наш; прочее = чужой оверрайд */
+    valv = (u32)c2b_rd_once(entry + 0x30);
+    if (valv != 0) return;      /* 1 = уже наш; прочее = чужой оверрайд */
     *val = 1;
     C2B_LOGS("[c2b] GNS g9: IP_AllowWithoutAuth 0->1 build "); C2B_LOGS(b->tag);
     C2B_LOGS("entry="); C2B_LOGH((u32)b->entry_rva); C2B_LOGS("\n");
@@ -9261,28 +9314,8 @@ static u32 c2b_g24_add_state(uptr p)
     g_g24_state[g_g24_nstate++] = p;
     return 1;
 }
-/* v4.2: chunked /proc/self/mem reader — 0 на unmapped/неудачных чтениях
- * (вместо SIGSEGV прямых разыменований); кэш 64KB chunk-а на скан.
- * Дозаполняем chunk ПОСЛЕ дыр (pread короткий/-EIO на unmapped странице
- * -> продолжаем со следующей): без этого — слепые зоны у границ маппингов. */
-static u64 c2b_g24_rd64(int fd, uptr *clo, u32 *cn, u8 *buf, uptr a)
-{
-    u64 v;
-    if (a < *clo || a + 8 > *clo + *cn) {
-        uptr c = a & ~((uptr)0xFFFF);
-        u32 got = 0;
-        while (got < 0x10000) {
-            u64 rc = (u64)pread(fd, buf + got, 0x10000 - got, c + got);
-            if (rc == 0 || rc > 0x7FFFFFFFull) break;   /* EOF/EIO/err */
-            got += (u32)rc;
-        }
-        *clo = c;
-        *cn = got;
-    }
-    if (a < *clo || a + 8 > *clo + *cn) return 0;
-    memcpy(&v, buf + (a - *clo), 8);
-    return v;
-}
+/* v4.2: chunked reader ВЫШЕ (c2b_rd64_safe, общий с g8/g9) — здесь только
+ * макрос доступа со своим fd/кэшем на скан. */
 static void c2b_g24_find_state(void)
 {
     struct c2b_g24_rset rs;
@@ -9303,7 +9336,7 @@ static void c2b_g24_find_state(void)
     u8 cbuf[65536];
 extern i32 open(const char *, i32, ...);
 extern i32 close(i32);
-#define C2B_G24_RD64(a) (c2b_g24_rd64(mfd, &clo, &cn, cbuf, (a)))
+#define C2B_G24_RD64(a) (c2b_rd64_safe(mfd, &clo, &cn, cbuf, (a)))
     if (g_g24_nstate >= 4 || !g_engine_base) return;
     mfd = open("/proc/self/mem", 0 /*O_RDONLY*/);
     if (mfd < 0) return;

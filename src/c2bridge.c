@@ -6190,6 +6190,31 @@ static u32 g_clv2_cr_sent;       /* сколько 0x22 ушло */
 static u64 g_clv2_cr_last_ms;    /* темп: не чаще 1/250ms */
 static u32 g_clv2_cr_pending;    /* 1 = послали 0x20 с 'k'-капчера, ждём 0x21 -> 0x22 */
 static u64 g_clv2_sid64;         /* legacy_client_steam_id (из 'k' или C2B_CLV2_SID) */
+/* ---------- 44f-g42: РЕАЛЬНЫЙ post-'k' accept — S2 0x23 -> движковый 'B' ----------
+ * ПОЛНЫЙ RE 'B'-хендлера (0x25a8b0 + 25bfa3/25cf20/25d26e, engine 2cd041, run187):
+ * payload ПОСЛЕ "ffffffffB" — битстрим (byte-aligned, LSB-first = сырые LE-байты):
+ *   1) byte == '.' (0x2e)                                  [@25a943]
+ *   2) 8 байт "%08X"-hex, sscanf != 0                      [@25b310]
+ *   3) echo-чеки hdr(32Б netpacket) против snap@state+0x4f0
+ *      (netadr from + sockaddr-производные — для ОДНОГО сорса схожи) [@25a8be..25a914]
+ *   4) cstate==1, vt+0x80()==0, snap <- hdr тек. пакета    [@25a9e8..25aa5e]
+ *   5) u32 chal  -> state+0x4d8                            [@25aaa4]
+ *   6) u32 proto -> state+0x4dc; ==3 -> ветка 25c44c (16-бит чек), !=3 -> дальше [@25aaf1]
+ *   7) skip 16 бит, ReadString -> strstr("reserve") -> vt+0x200 [@25ab14..25abd9]
+ *      else strstr("connect") -> НЕ НАЙДЕН = МОЛЧАЛИВЫЙ REJECT [@25cf20..25cf32]
+ *   8) state+0x4c0=1; u32 expire -> state+0x8dc4; 2 тик-чека (514ab0 vs expire:
+ *      оба проходят iff 514ab0()==expire)                  [@25cf38..25d29d]
+ *   9) копия строки в state+0x4c5 (15Б), 4 байт-бул (b1..b4 -> +0x4c2/3/4 + ветка):
+ *      b4==0 -> 25d6b6 = WIN-путь (state+0x4b9=1, Msg, VT+0x1b0-продолжение) [@25d337..25d6b6]
+ * КОРЕНЬ БАРЬЕРА (run186): бейт-'B' = '.'+8hex+НУЛИ -> chal=0, proto=0,
+ * string="" -> strstr("connect") НЕ найден -> reject на 25cf32 → движок
+ * вечно досылает 'k'. Фикс: на ПЕРВЫЙ 0x23 ConnectOK строим ПОЛНЫЙ accept:
+ *   '.' | hex(ch4 0x23 | ch32) | chal32 | proto32=2 | 00 00 | "connect\0" |
+ *   expire32=0 | b1..b4=0 | падд до lastA-длины (хвост не читается).
+ * Диагностика: verdict-лог 0x23..0x26 РАСШИРЕН на ВСЕ fd (в run186 0x23 не
+ * дошёл до движкового recvfrom — где он теряется, покажет fd-лог). */
+static u32 g_clv2_23_seen;       /* g42: первый 0x23 обработан (one-shot) */
+static u32 g_clv2_v23_logn;      /* g42: rate-limit расширенного verdict-лога */
 static u8 g_clv2_cr_priv[32];    /* x25519 priv (variant 2) */
 static u8 g_clv2_cr_pub[32];     /* x25519 pub */
 struct c2b_clv2_chrec { u32 cid; u32 valid; u64 ch, ts, ms; };
@@ -11511,19 +11536,74 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                                           *addrlen, "pending");
             }
         }
-        if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 1 &&
+        if (g_clv2_enable && (u32)r >= 1 &&
             p[0] >= 0x23 && p[0] <= 0x26) {
-            char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
-            u32 dl2 = (u32)r;
-            if (dl2 > 96) dl2 = 96;
-            c2b_cl_hexline(p, dl2, ln, (u32)sizeof(ln));
-            C2B_LOGS("[c2b] CLV2 S2 verdict 0x");
-            C2B_LOGH((u32)p[0]);
-            C2B_LOGS(p[0] == 0x23 ? " (ConnectOK!!) " :
-                     p[0] == 0x24 ? " (ConnectionClosed) " :
-                     p[0] == 0x25 ? " (NoConnection) " : " ");
-            C2B_LOGN((u32)r);
-            C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
+            /* g42: verdict-лог на ВСЕХ fd — в run186 0x23 не дошёл до
+             * движкового recvfrom (ни одной строки при 0x23 в pcap);
+             * fd= покажет, на какой сокет садится ConnectOK. */
+            if (g_clv2_v23_logn < 8) {
+                char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
+                u32 dl2 = (u32)r;
+                if (dl2 > 96) dl2 = 96;
+                c2b_cl_hexline(p, dl2, ln, (u32)sizeof(ln));
+                g_clv2_v23_logn++;
+                C2B_LOGS("[c2b] CLV2 S2 verdict 0x");
+                C2B_LOGH((u32)p[0]);
+                C2B_LOGS(p[0] == 0x23 ? " (ConnectOK!!) fd=" :
+                         p[0] == 0x24 ? " (ConnectionClosed) fd=" :
+                         p[0] == 0x25 ? " (NoConnection) fd=" : " fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS(g_clv2_fd == fd ? " (clv2)" : " (other)");
+                C2B_LOGN((u32)r);
+                C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
+            }
+            /* g42: первый 0x23 ConnectOK -> движку ПОЛНЫЙ 'B' connect-accept
+             * (payload по RE 0x25a8b0/25cf20/25d26e: '.' + 8hex + chal32 +
+             * proto32=2 + 00 00 + "connect\0" + expire32=0 + b1..b4=0). */
+            if (p[0] == 0x23 && !g_clv2_23_seen && fd == g_clv2_fd &&
+                (u32)r >= 6 && (u32)len >= 40) {
+                u8 *q = (u8 *)buf;
+                u32 hx, pl, i7;
+                hx = ((u32)p[2]) | ((u32)p[3] << 8) | ((u32)p[4] << 16) |
+                     ((u32)p[5] << 24);          /* ch4 из 0x23 = реальное значение сервера */
+                if (!hx) hx = g_clv2_ch32;
+                if (!hx) hx = 0x12345678u;       /* sscanf требует nonzero */
+                q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
+                q[4] = 'B';
+                q[5] = '.';                      /* [@25a943] байт 0x2e */
+                {
+                    static const char hxk2[] = "0123456789ABCDEF";
+                    u32 sh2;
+                    for (sh2 = 0; sh2 < 8; sh2++)
+                        q[6 + sh2] = (u8)hxk2[(hx >> (28 - sh2 * 4)) & 0xF];
+                }                                /* [@25b310] 8hex != 0 */
+                q[14] = (u8)(g_clv2_ch32);       /* chal32 -> state+0x4d8 */
+                q[15] = (u8)(g_clv2_ch32 >> 8);
+                q[16] = (u8)(g_clv2_ch32 >> 16);
+                q[17] = (u8)(g_clv2_ch32 >> 24);
+                q[18] = 2; q[19] = 0; q[20] = 0; q[21] = 0; /* proto32=2 (!=3 -> путь 25ab14) */
+                q[22] = 0; q[23] = 0;            /* skip 16 бит */
+                q[24] = 'c'; q[25] = 'o'; q[26] = 'n'; q[27] = 'n';
+                q[28] = 'e'; q[29] = 'c'; q[30] = 't'; q[31] = 0; /* "connect\0" [@25cf20] */
+                q[32] = 0; q[33] = 0; q[34] = 0; q[35] = 0; /* expire32=0 -> state+0x8dc4 */
+                q[36] = 0; q[37] = 0; q[38] = 0; q[39] = 0; /* b1..b4=0 -> WIN-путь 25d6b6 */
+                pl = 40;
+                {                                /* падд до lastA (хвост не читается) */
+                    u32 pl2 = g_clv2_last_A_len;
+                    if (pl2 < 40) pl2 = 40;
+                    if (pl2 > (u32)len) pl2 = (u32)len;
+                    for (i7 = pl; i7 < pl2; i7++) q[i7] = 0;
+                    pl = pl2;
+                }
+                g_clv2_23_seen = 1;
+                C2B_LOGS("[c2b] g42: S2 0x23 ConnectOK -> engine 'B' connect-accept hex=");
+                C2B_LOGN(hx);
+                C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
+                C2B_LOGS(" len="); C2B_LOGN(pl);
+                C2B_LOGS(" lastA="); C2B_LOGN(g_clv2_last_A_len);
+                C2B_LOGS("\n");
+                return (ssize_t)pl;
+            }
         }
         if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 9 && p[0] == 0x21) {
             /* CLV2 phase A: S2 ChallengeReply -> движку S1 'A'+challenge32 */

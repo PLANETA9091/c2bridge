@@ -266,7 +266,10 @@ if ! steam_client_alive; then
   if ! steam_client_alive; then
     log "starting steam client (silent)"
     sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
-      sh -c "nohup '$STEAM_SH' -silent >'$TMPD/steam-start.log' 2>&1 &"
+      sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-start.log' 2>&1 &"
+    # g34v2-урок (run179): 'Cannot create IPv4 connection. epoll_ctl failed,
+    # error 0x9' — fd-бюджет движка исчерпан (дефолт 1024): socket() -> EMFILE
+    # -> fd=-1 -> epoll_ctl EBADF. Поднимаем nofile на старте steam-цепочки.
     STEAM_T0=$(date +%s)
     W=0
     until steam_client_alive; do
@@ -341,7 +344,7 @@ if ! steam_client_stable; then
   sleep 3; pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
   rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
-    sh -c "nohup '$STEAM_SH' -silent >'$TMPD/steam-restart.log' 2>&1 &"
+    sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-restart.log' 2>&1 &"
   W=0
   until steam_client_stable; do
     W=$((W+5)); (( W >= 180 )) && { log "WARNING: steam still unstable after ${W}s"; break; }

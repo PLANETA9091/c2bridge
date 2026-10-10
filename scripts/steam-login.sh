@@ -122,11 +122,13 @@ fi
 # default GPU path can come up BLANK (run 42: webhelper processes alive, Xvfb
 # screenshot empty). Force software rendering everywhere.
 launch_client() {
+  # g34v2-урок (run179): fd-бюджет движка (nofile 1024) -> 'epoll_ctl failed,
+  # error 0x9' в GNS ConnectByIPAddress. ulimit ВНУТРИ sh -c (sudo-сессии
+  # лимиты не делят) + exec, чтобы steam.sh получил лимит как свой.
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
     LIBGL_ALWAYS_SOFTWARE=1 \
     STEAM_FORCE_DESKTOPUI_SOFTWARE_RENDERING=1 \
-    "$STEAM_SH" -login "$STEAM_USER" "$STEAM_PASS" -silent \
-      -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox \
+    sh -c "ulimit -n 65535 2>/dev/null; exec '$STEAM_SH' -login '$STEAM_USER' '$STEAM_PASS' -silent -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox" \
     >"$LOG" 2>&1 &
 }
 launch_client

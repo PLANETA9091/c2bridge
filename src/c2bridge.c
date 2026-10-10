@@ -12348,6 +12348,35 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                      * (эхо qconnect0x). Дифференцирует реакцию движка. */
                     if ((u32)len >= 14) {
                         u32 hx;
+                        u32 pl;
+                        /* 50i-g58: приманка фазы-6 = ПОЛНЫЙ kaccept (g42-формат:
+                         * chal + proto + "connect\0" + expire + pw-NUL + b2 +
+                         * lobby, ВСЕ фиксы g44-версии/g45-47-эхо внутри builder'а)
+                         * вместо тупого '.+8hex+нулей' (корень барьера run186:
+                         * chal=0/proto=0/string='' -> reject @25cf32). ФАКТ
+                         * run209: приманка-40Б ДОСТАВЛЯЕТСЯ движку (g16 recv
+                         * len=0x28 'B. 41 41 41 41' — канал инъекции жив!),
+                         * меняется ТОЛЬКО payload. Хвост kaccept: b2=0 ->
+                         * c2=0 -> НЕТ win -> 25d7b5 -> 25d8ed pw==0 -> 25d8e0
+                         * -> 24b520 SendConnectPacket (0x4c0=1 от "connect")
+                         * -> 24b5c0 lobby==0 -> 24b56b vt+0x198 'k'-SEND, цель
+                         * = netadr snap'а = ИСТОЧНИК 'B' = мост -> sendto-хук
+                         * -> 0x22-трансляция (замкнутый контур). g57-статья
+                         * раскладки хвоста применима: string->expire(4B)->
+                         * pw(NUL)->b2->lobby(8B) — билдер g42-эры уже так
+                         * собран (без "96\0"-сдвига). */
+                        c2b_g50_force_cstate();   /* 47f-g50: cstate=1 ДО 'B'-парса */
+                        pl = c2b_clv2_build_kaccept(q, (u32)len, 0);
+                        if (pl) {
+                            g_clv2_23_seen = 1;   /* one-shot как в g42 */
+                            C2B_LOGS("[c2b] g58: phase6 -> FULL 'B' kaccept len=");
+                            C2B_LOGN(pl);
+                            C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
+                            C2B_LOGS(" ver="); C2B_LOGN(c2b_clv2_client_version());
+                            C2B_LOGS("\n");
+                            return (ssize_t)pl;
+                        }
+                        C2B_LOGS("[c2b] g58: kaccept cap too small, fallback to dumb bait\n");
                         q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
                         q[4] = 'B'; q[5] = '.';
                         hx = (g_clv2_bhex == 1) ? g_clv2_ch32 :

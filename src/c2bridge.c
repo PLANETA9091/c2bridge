@@ -6139,6 +6139,31 @@ static u32 g_clv2_baits;         /* C2B_CLV2_BAITS=1: фазы 2/4/6 ('i'/reserv
                                   * пушами всегда держит consume_gap) */
 static char g_a2s_ver[24] = "1.38.0.4"; /* C2B_A2S_VERSION — версия бандла */
 static u32 g_clv2_bhex;          /* C2B_CLV2_BHEX: хвост 'b' 0=AAAAAAAA 1=challenge 2=qc_val */
+/* ---------- 41f-g31: S2 0x22 ConnectRequest из моста (фаза B, перевод) ----------
+ * Факты (worklog + run168/170): S1 'k' на wire цели ПОЛНОСТЬЮ (513B, snaplen-80
+ * в pcap был артефактом захвата, incl=128) — сервер МОЛЧИТ; 0x20->0x21 работает
+ * (cid-эхо, СВЕЖИЙ challenge на каждый cid, replies парами); 0x22 без crypt/cert
+ * сервер роняет молча (3 варианта 2026-10-04 — НО фрейминг тех проб не
+ * документирован; g31 шлёт канонический фрейминг как у работающего 0x20).
+ * g31: C2B_CLV2_CR=1 bare {1 cid,3 ch,4 ts,5 pv=13,8 steamid}
+ *      C2B_CLV2_CR=2 + f7 crypt = CMsgSteamDatagramSessionCryptInfoSigned
+ *        {1: key_info = CMsgSteamDatagramSessionCryptInfo {1: key_type=1
+ *         CURVE25519, 2: key_data = наш x25519 pubkey (RFC 7748, ключ НАШ —
+ *         пригоден для ECDH, если сервер ответит 0x23)}, signature НЕТ (нет
+ *         серта — серверный IP_AllowWithoutAuth? эксперимент)}
+ * Вердикт-лог: любой 0x23/0x24/0x25 на g_clv2_fd -> hexline (0x23 ConnectOK =
+ * ДЖЕКПОТ; 0x24 Closed = причина = точный оставшийся gap; тишина = нужен
+ * подписной серт -> следующий трек: реальный cert+crypt движка). */
+static u32 g_clv2_cr;            /* C2B_CLV2_CR: 0=off 1=bare 2=+crypt */
+static u32 g_clv2_cr_sent;       /* сколько 0x22 ушло */
+static u64 g_clv2_cr_last_ms;    /* темп: не чаще 1/250ms */
+static u32 g_clv2_cr_pending;    /* 1 = послали 0x20 с 'k'-капчера, ждём 0x21 -> 0x22 */
+static u64 g_clv2_sid64;         /* legacy_client_steam_id (из 'k' или C2B_CLV2_SID) */
+static u8 g_clv2_cr_priv[32];    /* x25519 priv (variant 2) */
+static u8 g_clv2_cr_pub[32];     /* x25519 pub */
+struct c2b_clv2_chrec { u32 cid; u32 valid; u64 ch, ts, ms; };
+static struct c2b_clv2_chrec g_clv2_chrec[4];   /* кольцо свежих ChallengeReply */
+static u32 g_clv2_chrec_i;
 /* 41f-d: длина ПОСЛЕДНЕГО 'A'-пейлоада, отданного движку через recvfrom-хук.
  * RE 'B'-хендлера (0x25a8b0, engine 34a96ae): чеки B[0x1c]==snap[0x1c]∈{1..3},
  * B[0x18]==0&&snap[0x18]==0, B.u64[0x0c]==snap.u64[0x0c], B.u32[0x14]==snap[0x14]
@@ -9938,12 +9963,15 @@ static u32 c2b_clv2_build_chalreq(u8 *out)
     return 512;
 }
 
-/* 0x21 ChallengeReply -> challenge64; требует эхо connection_id == expect */
-static i32 c2b_clv2_parse_chalreply(const u8 *p, u32 n, u32 expect_cid, u64 *ch)
+/* 0x21 ChallengeReply -> challenge64; требует эхо connection_id == expect.
+ * g31: ts_out (опционально) = эхо НАШЕГО my_timestamp (f3 fixed64) —
+ * он же уходит обратно в 0x22 f4, сервер по нему считает RTT. */
+static i32 c2b_clv2_parse_chalreply(const u8 *p, u32 n, u32 expect_cid, u64 *ch,
+                                    u64 *ts_out)
 {
     u32 i = 1;                                 /* p[0] == 0x21 */
     i32 got = 0;
-    u64 v = 0;
+    u64 v = 0, tv = 0;
     if (n < 9 || p[0] != 0x21) return 0;
     while (i < n) {
         u8 tag = p[i++];
@@ -9953,6 +9981,7 @@ static i32 c2b_clv2_parse_chalreply(const u8 *p, u32 n, u32 expect_cid, u64 *ch)
             if (i + 8 > n) return 0;
             for (k = 7; k >= 0; k--) x = (x << 8) | (u64)p[i + k];
             if (f == 2) { v = x; got = 1; }
+            if (f == 3) tv = x;
             i += 8;
         } else if (wt == 5) {
             if (i + 4 > n) return 0;
@@ -9979,7 +10008,218 @@ static i32 c2b_clv2_parse_chalreply(const u8 *p, u32 n, u32 expect_cid, u64 *ch)
     }
     if (!got) return 0;
     *ch = v;
+    if (ts_out) *ts_out = tv;
     return 1;
+}
+
+/* ================= 41f-g31: X25519 (RFC 7748) + 0x22 ConnectRequest =================
+ * Чистый C, без bignum-библиотек: поле 2^255-19 в 5 limb'ах по 51 бит (u128
+ * аккумуляторы). Нужен ТОЛЬКО один скаляр-базу (генерим keypair для f7 crypt).
+ * Векторы RFC 7748 §5.2/§6.1 проверяются в selftest (C2B_SELFTEST). */
+typedef unsigned __int128 c2b_u128;
+
+#define C2B_M51 0x7FFFFFFFFFFFFULL   /* 2^51 - 1 */
+
+/* limb-загрузка: 51-битные окна из 256-бит LE-целого (bit-based, без UB) */
+static void c2b_f51_load(u64 r[5], const u8 *b)
+{
+    u32 i, k;
+    for (i = 0; i < 5; i++) {
+        u64 acc = 0;
+        u32 bitpos = 51 * i, byt = bitpos >> 3, sh = bitpos & 7;
+        for (k = 0; k < 8; k++)
+            if (byt + k < 32) acc |= (u64)b[byt + k] << (8 * k);
+        r[i] = (acc >> sh) & C2B_M51;
+    }
+}
+
+/* limb-выгрузка: биты 0..254 -> 32B LE (вход должен быть канонически приведён) */
+static void c2b_f51_store(u8 out[32], const u64 t[5])
+{
+    u32 bit;
+    for (bit = 0; bit < 32; bit++) out[bit] = 0;
+    for (bit = 0; bit < 255; bit++) {
+        u64 b = (t[bit / 51] >> (bit % 51)) & 1u;
+        if (b) out[bit >> 3] |= (u8)(1u << (bit & 7));
+    }
+}
+
+static void c2b_f51_carry(u64 t[5])
+{
+    u64 c;
+    c = t[0] >> 51; t[0] &= C2B_M51; t[1] += c;
+    c = t[1] >> 51; t[1] &= C2B_M51; t[2] += c;
+    c = t[2] >> 51; t[2] &= C2B_M51; t[3] += c;
+    c = t[3] >> 51; t[3] &= C2B_M51; t[4] += c;
+    c = t[4] >> 51; t[4] &= C2B_M51;
+    t[0] += c * 19;                    /* 2^255 = 19 (mod p) */
+    c = t[0] >> 51; t[0] &= C2B_M51; t[1] += c;
+}
+
+/* schoolbook 5x5 с фолдингом старших limb'ов *19 (donna-c64, входы < 2^54) */
+static void c2b_f51_mul(u64 d[5], const u64 a[5], const u64 b[5])
+{
+    c2b_u128 r0, r1, r2, r3, r4;
+    u64 t[5];
+    c2b_u128 c;
+    r0 = (c2b_u128)a[0] * b[0] + 19 * ((c2b_u128)a[1] * b[4] + (c2b_u128)a[2] * b[3] +
+                                       (c2b_u128)a[3] * b[2] + (c2b_u128)a[4] * b[1]);
+    r1 = (c2b_u128)a[0] * b[1] + (c2b_u128)a[1] * b[0] +
+         19 * ((c2b_u128)a[2] * b[4] + (c2b_u128)a[3] * b[3] + (c2b_u128)a[4] * b[2]);
+    r2 = (c2b_u128)a[0] * b[2] + (c2b_u128)a[1] * b[1] + (c2b_u128)a[2] * b[0] +
+         19 * ((c2b_u128)a[3] * b[4] + (c2b_u128)a[4] * b[3]);
+    r3 = (c2b_u128)a[0] * b[3] + (c2b_u128)a[1] * b[2] + (c2b_u128)a[2] * b[1] +
+         (c2b_u128)a[3] * b[0] + 19 * ((c2b_u128)a[4] * b[4]);
+    r4 = (c2b_u128)a[0] * b[4] + (c2b_u128)a[1] * b[3] + (c2b_u128)a[2] * b[2] +
+         (c2b_u128)a[3] * b[1] + (c2b_u128)a[4] * b[0];
+    /* сборка limb'ов: t[k] = hi(r[k-1]) + lo(r[k]); ПОЛНЫЙ коэффициент при
+     * 2^255 = hi(r4) + ((hi(r3)+lo(r4)) >> 51) — фолдится *19 в t[0] */
+    t[0] = (u64)r0 & C2B_M51;
+    t[1] = (u64)(r0 >> 51) + (u64)(r1 & C2B_M51);
+    t[2] = (u64)(r1 >> 51) + (u64)(r2 & C2B_M51);
+    t[3] = (u64)(r2 >> 51) + (u64)(r3 & C2B_M51);
+    t[4] = (u64)(r3 >> 51) + (u64)(r4 & C2B_M51);
+    c = (c2b_u128)((t[4] >> 51) + (u64)(r4 >> 51));
+    t[4] &= C2B_M51;
+    t[0] += (u64)c * 19;
+    c = t[0] >> 51; t[0] &= C2B_M51; t[1] += (u64)c;
+    c = t[1] >> 51; t[1] &= C2B_M51; t[2] += (u64)c;
+    c = t[2] >> 51; t[2] &= C2B_M51; t[3] += (u64)c;
+    c = t[3] >> 51; t[3] &= C2B_M51; t[4] += (u64)c;
+    c = t[4] >> 51; t[4] &= C2B_M51;
+    t[0] += (u64)c * 19;
+    c = t[0] >> 51; t[0] &= C2B_M51; t[1] += (u64)c;
+    d[0] = t[0]; d[1] = t[1]; d[2] = t[2]; d[3] = t[3]; d[4] = t[4];
+}
+
+static void c2b_f51_sqr(u64 d[5], const u64 a[5]) { c2b_f51_mul(d, a, a); }
+
+static void c2b_f51_add(u64 d[5], const u64 a[5], const u64 b[5])
+{
+    u32 i;
+    for (i = 0; i < 5; i++) d[i] = a[i] + b[i];
+    c2b_f51_carry(d);
+}
+
+/* a - b mod p (без ветвлений по секрету: прибавляем 2p; входы < 2^53) */
+static void c2b_f51_sub(u64 d[5], const u64 a[5], const u64 b[5])
+{
+    static const u64 two_p[5] = {
+        0xFFFFFFFFFFFDAULL * 1ULL, 0xFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFEULL,
+        0xFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFEULL
+    };
+    u32 i;
+    for (i = 0; i < 5; i++) d[i] = a[i] + two_p[i] - b[i];
+    c2b_f51_carry(d);
+}
+
+static void c2b_f51_cswap(u32 sw, u64 a[5], u64 b[5])
+{
+    u64 m = (u64)0 - (u64)(sw & 1u);
+    u32 i;
+    for (i = 0; i < 5; i++) {
+        u64 t = m & (a[i] ^ b[i]);
+        a[i] ^= t; b[i] ^= t;
+    }
+}
+
+/* X25519: out = scalar * u (RFC 7748 ladder, 255 итераций) */
+static void c2b_x25519(u8 out[32], const u8 scalar[32], const u8 uin[32])
+{
+    u8 e[32];
+    u64 x1[5], x2[5], z2[5], x3[5], z3[5];
+    u64 a[5], aa[5], b[5], bb[5], ee[5], c[5], d[5], da[5], cb[5], t0[5], t1[5];
+    static const u64 a24[5] = { 121665, 0, 0, 0, 0 };
+    u32 i, pos, swap = 0;
+    for (i = 0; i < 32; i++) e[i] = scalar[i];
+    e[0] &= 248; e[31] &= 127; e[31] |= 64;
+    c2b_f51_load(x1, uin);
+    x1[4] &= C2B_M51;                  /* MSB (bit 255) off */
+    x2[0] = 1; z2[0] = 0;
+    for (i = 1; i < 5; i++) { x2[i] = 0; z2[i] = 0; }
+    for (i = 0; i < 5; i++) x3[i] = x1[i];   /* RFC: x_3 = u (!), z_3 = 1 */
+    z3[0] = 1;
+    for (i = 1; i < 5; i++) z3[i] = 0;
+    for (pos = 254; ; pos--) {
+        u32 bt = (u32)((e[pos >> 3] >> (pos & 7)) & 1u);
+        swap ^= bt;
+        c2b_f51_cswap(swap, x2, x3);
+        c2b_f51_cswap(swap, z2, z3);
+        swap = bt;
+        c2b_f51_add(a, x2, z2);        /* A = x2 + z2 */
+        c2b_f51_sqr(aa, a);            /* AA = A^2 */
+        c2b_f51_sub(b, x2, z2);        /* B = x2 - z2 */
+        c2b_f51_sqr(bb, b);            /* BB = B^2 */
+        c2b_f51_sub(ee, aa, bb);       /* E = AA - BB */
+        c2b_f51_add(c, x3, z3);        /* C = x3 + z3 */
+        c2b_f51_sub(d, x3, z3);        /* D = x3 - z3 */
+        c2b_f51_mul(da, d, a);         /* DA = D * A */
+        c2b_f51_mul(cb, c, b);         /* CB = C * B */
+        c2b_f51_add(t0, da, cb);
+        c2b_f51_sqr(x3, t0);           /* x3 = (DA + CB)^2 */
+        c2b_f51_sub(t1, da, cb);
+        c2b_f51_sqr(t1, t1);
+        c2b_f51_mul(z3, x1, t1);       /* z3 = x1 * (DA - CB)^2 */
+        c2b_f51_mul(x2, aa, bb);       /* x2 = AA * BB */
+        c2b_f51_mul(t0, ee, a24);      /* 121665 * E */
+        c2b_f51_add(t0, t0, aa);
+        c2b_f51_mul(z2, ee, t0);       /* z2 = E * (AA + a24 * E) */
+        if (pos == 0) break;
+    }
+    c2b_f51_cswap(swap, x2, x3);
+    c2b_f51_cswap(swap, z2, z3);
+    /* out = x2 * z2^(p-2): инверсия square-and-multiply по битам порядка */
+    {
+        u64 zinv[5], zz[5];
+        u32 bit;
+        static const u8 pm2[32] = {    /* p-2 = 2^255 - 21, LE */
+            0xeb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f
+        };
+        u8 eb[32];
+        for (i = 0; i < 32; i++) eb[i] = pm2[i];
+        /* инверсия: z^(p-2) square-and-multiply, биты СТАРШИМ-ВПЕРЁД
+         * (LSB-first с фиксированной базой считал z^reverse(p-2)!) */
+        zinv[0] = 1; for (i = 1; i < 5; i++) zinv[i] = 0;
+        for (bit = 254; ; bit--) {
+            c2b_f51_sqr(zinv, zinv);
+            if ((eb[bit >> 3] >> (bit & 7)) & 1u) {
+                c2b_f51_mul(zinv, zinv, z2);
+            }
+            if (bit == 0) break;
+        }
+        c2b_f51_mul(zz, x2, zinv);
+        /* каноническое приведение: carry пока limb4 не упадёт, затем -p если >= p */
+        {
+            u64 t[5];
+            u32 guard;
+            for (i = 0; i < 5; i++) t[i] = zz[i];
+            for (guard = 0; guard < 4; guard++) {
+                u32 over = 0;
+                for (i = 0; i < 5; i++) if (t[i] >> 51) over = 1;
+                if (!over) break;
+                c2b_f51_carry(t);
+            }
+            /* t < 2p: вычитаем p, если t >= p (t>=p <=> t0+19 >= 2^51 при t1..4 полных) */
+            {
+                static const u64 pp[5] = {
+                    0x7FFFFFFFFFFEDULL, 0x7FFFFFFFFFFFFULL, 0x7FFFFFFFFFFFFULL,
+                    0x7FFFFFFFFFFFFULL, 0x7FFFFFFFFFFFFULL
+                };
+                i64 borrow = 0;
+                u64 res[5];
+                for (i = 0; i < 5; i++) {
+                    i64 d2 = (i64)t[i] - (i64)pp[i] - borrow;
+                    if (d2 < 0) { res[i] = (u64)(d2 + 0x8000000000000LL); borrow = 1; }
+                    else { res[i] = (u64)d2; borrow = 0; }
+                }
+                if (!borrow) for (i = 0; i < 5; i++) t[i] = res[i];
+            }
+            c2b_f51_store(out, t);
+        }
+    }
 }
 
 /* ---------- 41e-d: формат 'A'-ответа движку — МАТРИЦА ЭКСПЕРИМЕНТОВ ----------
@@ -10150,6 +10390,192 @@ static u64 c2b_mono_ms(void)
 #endif
 }
 
+typedef ssize_t (*c2b_sendto_fn)(int, const void *, size_t, int,
+                                 const struct sockaddr *, socklen_t);
+typedef ssize_t (*c2b_recvfrom_fn)(int, void *, size_t, int,
+                                   struct sockaddr *, socklen_t *);
+
+/* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
+ * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
+ * пишут одно и то же значение (x86: выровненный сторов атомарен). */
+static void *g_clp_sendto;
+static void *g_clp_recvfrom;
+
+/* ================= 41f-g31: протокол 0x22 ConnectRequest ================= */
+
+/* нестрогая запись КАЖДОГО 0x21 (без expect-чека — сервер шлёт парами и по
+ * нескольким cid): кольцо (cid, ch, ts, ms) для выбора СВЕЖЕГО challenge.
+ * Окно жизни challenge ~4s (SipHash по адресу источника). */
+static void c2b_clv2_note_reply(const u8 *p, u32 n)
+{
+    u32 i = 1, cid = 0;
+    u64 ch = 0, ts = 0;
+    if (n < 9 || p[0] != 0x21) return;
+    while (i < n) {
+        u8 tag = p[i++];
+        u32 f = (u32)(tag >> 3), wt = tag & 7;
+        if (wt == 1) {
+            u64 x = 0; i32 k;
+            if (i + 8 > n) return;
+            for (k = 7; k >= 0; k--) x = (x << 8) | (u64)p[i + k];
+            if (f == 2) ch = x;
+            if (f == 3) ts = x;
+            i += 8;
+        } else if (wt == 5) {
+            if (i + 4 > n) return;
+            if (f == 1)
+                cid = (u32)p[i] | ((u32)p[i+1] << 8) |
+                      ((u32)p[i+2] << 16) | ((u32)p[i+3] << 24);
+            i += 4;
+        } else if (wt == 0) {
+            while (i < n && p[i] & 0x80) i++;
+            i++;
+        } else if (wt == 2) {
+            u32 ln = 0, sh = 0;
+            while (i < n) {
+                u8 b = p[i++]; ln |= (u32)(b & 0x7f) << sh;
+                if (!(b & 0x80)) break;
+                sh += 7;
+            }
+            i += ln;
+        } else {
+            return;
+        }
+    }
+    if (!cid || !ch) return;
+    {
+        struct c2b_clv2_chrec *r = &g_clv2_chrec[g_clv2_chrec_i];
+        r->cid = cid; r->ch = ch; r->ts = ts;
+        r->ms = c2b_mono_ms(); r->valid = 1;
+        g_clv2_chrec_i = (g_clv2_chrec_i + 1) & 3u;
+    }
+}
+
+/* свежайший challenge (моложе 3500ms); при наличии — наружу (cid, ch, ts) */
+static i32 c2b_clv2_pick_fresh(u32 *cid, u64 *ch, u64 *ts)
+{
+    u32 i;
+    u64 now = c2b_mono_ms();
+    struct c2b_clv2_chrec *best = 0;
+    for (i = 0; i < 4; i++) {
+        struct c2b_clv2_chrec *r = &g_clv2_chrec[i];
+        if (!r->valid || !r->ch) continue;
+        if (now < r->ms || now - r->ms > 3500u) continue;   /* просрочен/часы */
+        if (!best || (i64)(r->ms - best->ms) > 0) best = r;
+    }
+    if (!best) return 0;
+    *cid = best->cid; *ch = best->ch; *ts = best->ts;
+    return 1;
+}
+
+/* g31-вариант 2: keypair x25519 (клэмп по RFC; сид — xorshift от стека) */
+static void c2b_clv2_cr_keygen(void)
+{
+    u32 i;
+    if (g_clv2_cr_pub[0]) return;                /* уже сгенерён */
+    for (i = 0; i < 32; i += 4) {
+        u32 r = c2b_clv2_rand32();
+        g_clv2_cr_priv[i]     = (u8)r;
+        g_clv2_cr_priv[i + 1] = (u8)(r >> 8);
+        g_clv2_cr_priv[i + 2] = (u8)(r >> 16);
+        g_clv2_cr_priv[i + 3] = (u8)(r >> 24);
+    }
+    g_clv2_cr_priv[0] &= 248; g_clv2_cr_priv[31] &= 127; g_clv2_cr_priv[31] |= 64;
+    {
+        u8 base9[32];
+        u32 j;
+        for (j = 0; j < 32; j++) base9[j] = 0;
+        base9[0] = 9;                            /* u-координата базовой точки */
+        c2b_x25519(g_clv2_cr_pub, g_clv2_cr_priv, base9);
+    }
+}
+
+/* [0x22][u16 pb_len LE][pb][zero-pad] = ровно 512 байт; вариант >= 2 добавляет
+ * f7 crypt (SessionCryptInfoSigned без signature: key_info{key_type=1,
+ * key_data=наш pub32}). Содержимое pb:
+ *   f1 fixed32 cid | f3 fixed64 challenge | f4 fixed64 my_timestamp |
+ *   f5 varint 13   | [f7 bytes crypt]     | f8 fixed64 legacy_client_steam_id */
+static u32 c2b_clv2_build_connreq(u8 *out, u32 variant, u32 cid, u64 ch, u64 ts)
+{
+    u8 pb[128];
+    u32 n = 0, i;
+    if (variant >= 2) c2b_clv2_cr_keygen();
+    pb[n++] = 0x0d;                              /* f1 fixed32 connection_id */
+    pb[n++] = (u8)cid; pb[n++] = (u8)(cid >> 8);
+    pb[n++] = (u8)(cid >> 16); pb[n++] = (u8)(cid >> 24);
+    pb[n++] = 0x19;                              /* f3 fixed64 challenge */
+    for (i = 0; i < 8; i++) pb[n++] = (u8)(ch >> (8 * i));
+    pb[n++] = 0x21;                              /* f4 fixed64 my_timestamp */
+    for (i = 0; i < 8; i++) pb[n++] = (u8)(ts >> (8 * i));
+    pb[n++] = 0x28; pb[n++] = 0x0d;              /* f5 varint protocol_version=13 */
+    if (variant >= 2) {
+        /* f7 crypt: SessionCryptInfoSigned{1: key_info{1: 1(CURVE25519),
+         * 2: pub32}}; key_info = 08 01 12 20 <32B> = 36B; crypt =
+         * 0a 24 <36B> = 38B; f7 = 3a 26 <38B>. Итого 8 + 32 байта. */
+        static const u8 hdr[8] = { 0x3a, 38, 0x0a, 36, 0x08, 0x01, 0x12, 32 };
+        u32 k;
+        for (k = 0; k < 8; k++) pb[n++] = hdr[k];
+        for (k = 0; k < 32; k++) pb[n++] = g_clv2_cr_pub[k];
+    }
+    if (g_clv2_sid64) {
+        pb[n++] = 0x41;                          /* f8 fixed64 legacy_client_steam_id */
+        for (i = 0; i < 8; i++) pb[n++] = (u8)(g_clv2_sid64 >> (8 * i));
+    }
+    out[0] = 0x22;                               /* k_ESteamNetworkingUDPMsg_ConnectRequest */
+    out[1] = (u8)n; out[2] = (u8)(n >> 8);
+    for (i = 0; i < n; i++) out[3 + i] = pb[i];
+    for (i = 3 + n; i < 512; i++) out[i] = 0;
+    return 512;
+}
+
+/* отправить 0x22 (по свежему challenge) на da/dl через fd; 1 = ушло */
+static i32 c2b_clv2_send_connreq(int fd, u32 variant, i32 flags,
+                                 const void *da, socklen_t dl, const char *why)
+{
+    u32 cid; u64 ch, ts;
+    u8 out[512];
+    u64 now = c2b_mono_ms();
+    if (!g_clv2_cr) return 0;
+    if (now && g_clv2_cr_last_ms && now - g_clv2_cr_last_ms < 250u) return 0;
+    if (!c2b_clv2_pick_fresh(&cid, &ch, &ts)) return 0;
+    (void)c2b_clv2_build_connreq(out, variant, cid, ch, ts);
+    ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, da, dl);
+    g_clv2_cr_last_ms = now;
+    g_clv2_cr_sent++;
+    C2B_LOGS("[c2b] CLV2 0x22 ConnectRequest->target #");
+    C2B_LOGN(g_clv2_cr_sent);
+    C2B_LOGS(" v="); C2B_LOGN(variant);
+    C2B_LOGS(" cid="); C2B_LOGH(cid);
+    C2B_LOGS(" ch="); C2B_LOGH((u32)(ch >> 32)); C2B_LOGH((u32)ch);
+    C2B_LOGS(" sid="); C2B_LOGH((u32)(g_clv2_sid64 >> 32)); C2B_LOGH((u32)g_clv2_sid64);
+    C2B_LOGS(" why="); C2B_LOGS(why);
+    C2B_LOGS("\n");
+    return 1;
+}
+
+/* legacy_client_steam_id из капчуренного S1 'k': САМАЯ длинная ASCII-цифровая
+ * строка >= 8 цифр = account id (sys-id protobuf-поля; run168: "687168219").
+ * SteamID64 = 0x0110000100000000 | account. */
+static void c2b_clv2_note_sid(const u8 *p, u32 n)
+{
+    u32 best = 0, bs = 0, i = 0;
+    u64 acct = 0;
+    if (g_clv2_sid64) return;                    /* уже распарсен/env задан */
+    while (i < n) {
+        if (p[i] >= '0' && p[i] <= '9') {
+            u32 j = i;
+            while (j < n && p[j] >= '0' && p[j] <= '9') j++;
+            if (j - i > best && j - i >= 8) { best = j - i; bs = i; }
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    if (!best) return;
+    for (i = 0; i < best; i++) acct = acct * 10 + (u64)(p[bs + i] - '0');
+    g_clv2_sid64 = 0x0110000100000000ULL | (acct & 0xFFFFFFFFULL);
+}
+
 /* 41e-m: собрать ферма-формата 'I'-блоб (byte-паритет с fake_s1_server.py
  * sinfo_blob; run 72 CL dn #f4-8: движок ПОТРЕБЛЯЕТ unsolicited 'I'):
  * 'I' prot(0x11) "c2b-bridge\0" "de_dust2\0" "csgo\0"
@@ -10229,16 +10655,7 @@ static u32 c2b_a2s_transform_i(const u8 *in, u32 n, u8 *out, u32 cap)
 }
 
 
-/* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
- * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
- * пишут одно и то же значение (x86: выровненный сторов атомарен). */
-static void *g_clp_sendto;
-static void *g_clp_recvfrom;
-
-typedef ssize_t (*c2b_sendto_fn)(int, const void *, size_t, int,
-                                 const struct sockaddr *, socklen_t);
-typedef ssize_t (*c2b_recvfrom_fn)(int, void *, size_t, int,
-                                   struct sockaddr *, socklen_t *);
+/* ленивый резолв реальных функций: адреса живут выше (g31-секция). */
 
 /* 41f-g15: LIVE recv-loop consumer finder. Run126: g13 доказал, что
  * диспетчер 0x259df0 (engine 34a96ae) НЕ участвует в живом пути потребления
@@ -10503,6 +10920,38 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                         C2B_LOGS("\n");
                     }
                 }
+                if (g_clv2_cr) {
+                    /* g31: перевод — S2 0x22 ConnectRequest из капчуренного 'k'.
+                     * steamid = самая длинная цифра-строка 'k' (sys-id). Затем:
+                     * свежий challenge (<=3.5s) есть -> 0x22 СРАЗУ (тот же fd,
+                     * addr капчура = цель); нет -> 0x20 сейчас + pending (0x22
+                     * уйдёт по reply в recvfrom-хуке). */
+                    c2b_clv2_note_sid(p, (u32)len);
+                    {
+                        const void *da2 = 0;
+                        socklen_t dl2 = 0;
+                        if (addr && addrlen && addrlen <= 28) {
+                            da2 = addr; dl2 = (socklen_t)addrlen;
+                        } else if (g_clv2_dstlen >= 6) {
+                            da2 = (const void *)g_clv2_dst; dl2 = g_clv2_dstlen;
+                        }
+                        if (da2 && dl2) {
+                            if (!c2b_clv2_send_connreq(fd, g_clv2_cr, flags,
+                                                       da2, dl2, "k-capture")) {
+                                u8 out2[512];
+                                u32 cid2 = (c2b_clv2_rand32() | 1u);
+                                g_clv2_conn_id = cid2;
+                                (void)c2b_clv2_build_chalreq(out2);
+                                ((c2b_sendto_fn)g_clp_sendto)(fd, out2, 512,
+                                                              flags, da2, dl2);
+                                g_clv2_cr_pending = 1;
+                                C2B_LOGS("[c2b] CLV2 0x22 arm: no fresh ch -> 0x20 sent (cid=");
+                                C2B_LOGH(cid2);
+                                C2B_LOGS(", 0x22 on reply)\n");
+                            }
+                        }
+                    }
+                }
                 return (ssize_t)len;               /* дроп без отправки */
             }
             i32 act = c2b_cl_filter_uplink(p, (u32)len);
@@ -10579,10 +11028,38 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
         const u8 *p = (const u8 *)buf;
+        /* 41f-g31: фиксация ВСЕХ 0x21 (кольцо для СВЕЖЕГО challenge) +
+         * pending-триггер (reply на наш 0x20 с 'k'-капчера -> 0x22 немедленно)
+         * + ВЕРДИКТ-лог 0x23..0x26 (0x23 ConnectOK = джекпот; 0x24 Closed =
+         * причина = точный оставшийся gap; 0x25 NoConnection). */
+        if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 9 && p[0] == 0x21) {
+            c2b_clv2_note_reply(p, (u32)r);
+            if (g_clv2_cr && g_clv2_cr_pending) {
+                g_clv2_cr_pending = 0;
+                if (addr && *addrlen && *addrlen <= 28)
+                    c2b_clv2_send_connreq(fd, g_clv2_cr, 0, addr,
+                                          *addrlen, "pending");
+            }
+        }
+        if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 1 &&
+            p[0] >= 0x23 && p[0] <= 0x26) {
+            char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
+            u32 dl2 = (u32)r;
+            if (dl2 > 96) dl2 = 96;
+            c2b_cl_hexline(p, dl2, ln, (u32)sizeof(ln));
+            C2B_LOGS("[c2b] CLV2 S2 verdict 0x");
+            C2B_LOGH((u32)p[0]);
+            C2B_LOGS(p[0] == 0x23 ? " (ConnectOK!!) " :
+                     p[0] == 0x24 ? " (ConnectionClosed) " :
+                     p[0] == 0x25 ? " (NoConnection) " : " ");
+            C2B_LOGN((u32)r);
+            C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
+        }
         if (g_clv2_enable && fd == g_clv2_fd && (u32)r >= 9 && p[0] == 0x21) {
             /* CLV2 phase A: S2 ChallengeReply -> движку S1 'A'+challenge32 */
-            u64 ch = 0;
-            if (c2b_clv2_parse_chalreply(p, (u32)r, g_clv2_conn_id, &ch)) {
+            u64 ch = 0, ch_ts = 0;
+            (void)ch_ts;
+            if (c2b_clv2_parse_chalreply(p, (u32)r, g_clv2_conn_id, &ch, &ch_ts)) {
                 u8 *q = (u8 *)buf;
                 u32 rl;
                 g_clv2_ch64 = ch;
@@ -11659,6 +12136,41 @@ i32 c2b_main(void)
                 if (e2 && e2[0] == '1') {
                     g_clv2_fwdk = 1;
                     C2B_LOGS("[c2b] clv2 fwdk=1 ('k'->target raw-forward ON)\n");
+                }
+            }
+            {   /* 41f-g31: C2B_CLV2_CR=1 bare | =2 +crypt(x25519); SID override */
+                const char *e2 = getenv("C2B_CLV2_CR");
+                if (e2 && (e2[0] == '1' || e2[0] == '2')) {
+                    g_clv2_cr = (u32)(e2[0] - '0');
+                    C2B_LOGS("[c2b] clv2 cr=");
+                    C2B_LOGN(g_clv2_cr);
+                    C2B_LOGS(g_clv2_cr == 2 ? " (0x22 +crypt x25519)\n" : " (0x22 bare)\n");
+                }
+                e2 = getenv("C2B_CLV2_SID");
+                if (e2 && e2[0]) {
+                    u64 v = 0;
+                    if (e2[0] == '0' && (e2[1] == 'x' || e2[1] == 'X')) {
+                        u32 k3;
+                        for (k3 = 2; e2[k3]; k3++) {
+                            u8 c = (u8)e2[k3];
+                            u32 d;
+                            if (c >= '0' && c <= '9') d = (u32)(c - '0');
+                            else if (c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+                            else if (c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+                            else break;
+                            v = (v << 4) | (u64)d;
+                        }
+                    } else {
+                        u32 k3;
+                        for (k3 = 0; e2[k3] >= '0' && e2[k3] <= '9'; k3++)
+                            v = v * 10 + (u64)(e2[k3] - '0');
+                    }
+                    if (v) {
+                        g_clv2_sid64 = v;
+                        C2B_LOGS("[c2b] clv2 sid=0x");
+                        C2B_LOGH((u32)(v >> 32)); C2B_LOGH((u32)v);
+                        C2B_LOGS(" (env override)\n");
+                    }
                 }
             }
             e = getenv("C2B_CLV2_FMT");
@@ -15672,17 +16184,18 @@ static void test_cl(void)
                 0x19, 0x21, 0x5b, 0x8b, 0x07, 0xa1, 0x01, 0x00, 0x00, /* f3 your_ts */
                 0x20, 0x0d                                     /* f4 varint 13 */
             };
-            u64 ch = 0;
-            CHECK(c2b_clv2_parse_chalreply(rp, (u32)sizeof(rp), 0xd0da5e01u, &ch) == 1,
+            u64 ch = 0, ts = 0;
+            CHECK(c2b_clv2_parse_chalreply(rp, (u32)sizeof(rp), 0xd0da5e01u, &ch, &ts) == 1,
                   "clv2: ChallengeReply парсится");
             CHECK(ch == 0xe5fee7a559334817ull, "clv2: challenge64 извлечён");
-            CHECK(c2b_clv2_parse_chalreply(rp, (u32)sizeof(rp), 0xdeadbeefu, &ch) == 0,
+            CHECK(ts == 0x000001a1078b5b21ull, "clv2: g31 your_ts эхо извлечено");
+            CHECK(c2b_clv2_parse_chalreply(rp, (u32)sizeof(rp), 0xdeadbeefu, &ch, &ts) == 0,
                   "clv2: чужой connection_id отвергнут");
-            CHECK(c2b_clv2_parse_chalreply(rp, 8, 0xd0da5e01u, &ch) == 0,
+            CHECK(c2b_clv2_parse_chalreply(rp, 8, 0xd0da5e01u, &ch, &ts) == 0,
                   "clv2: усечённый ответ отвергнут");
             {
                 static const u8 rb[] = { 0x20, 0x0d, 0x01 };
-                CHECK(c2b_clv2_parse_chalreply(rb, (u32)sizeof(rb), 0xd0da5e01u, &ch) == 0,
+                CHECK(c2b_clv2_parse_chalreply(rb, (u32)sizeof(rb), 0xd0da5e01u, &ch, &ts) == 0,
                       "clv2: не-0x21 отвергнут");
             }
             /* 41e-d: форматы 'A'-ответа движку (матрица C2B_CLV2_FMT) */
@@ -15834,6 +16347,125 @@ static void test_cl(void)
                                   "ipush: версия бандла + конец (без EDF)");
                         }
                     }
+                }
+                /* 41f-g31: X25519 (RFC 7748 §6.1) + 0x22 ConnectRequest */
+                {
+                    /* векторы §6.1 (hex в RFC = API-байты, little-endian):
+                     * pub_a = X25519(a,9); shared = X25519(a, pub_b) */
+                    static const u8 ka[32] = {
+                        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
+                        0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
+                        0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a,
+                        0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a };
+                    static const u8 paa[32] = {
+                        0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54,
+                        0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e, 0xf7, 0x5a,
+                        0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4,
+                        0xeb, 0xa4, 0xa9, 0x8e, 0xaa, 0x9b, 0x4e, 0x6a };
+                    static const u8 pub_b[32] = {   /* Bob PUBLIC X25519(b,9) */
+                        0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4,
+                        0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35, 0x37,
+                        0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d,
+                        0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88, 0x2b, 0x4f };
+                    static const u8 shx[32] = {     /* shared K */
+                        0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1,
+                        0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35, 0x0f, 0x25,
+                        0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33,
+                        0x76, 0xf0, 0x9b, 0x3c, 0x1e, 0x16, 0x17, 0x42 };
+                    u8 base9[32], pa[32], ss[32];
+                    u32 j, eqa = 1, eqs = 1;
+                    for (j = 0; j < 32; j++) base9[j] = 0;
+                    base9[0] = 9;
+                    c2b_x25519(pa, ka, base9);
+                    for (j = 0; j < 32; j++) if (pa[j] != paa[j]) eqa = 0;
+                    CHECK(eqa, "g31: x25519(a,9) == pub_a (RFC 7748 6.1)");
+                    c2b_x25519(ss, ka, pub_b);
+                    for (j = 0; j < 32; j++) if (ss[j] != shx[j]) eqs = 0;
+                    CHECK(eqs, "g31: x25519(a,pub_b) == shared (RFC 7748 6.1)");
+                }
+                {
+                    /* note_reply/pick_fresh на РЕАЛЬНОМ байте run168 (pcap a1):
+                     * 210d13de469d 11 3cc03e6203ef6335 19 adcedc6f71371796 20 0d
+                     * cid=0x9d46de13 ch=0x3563ef03623ec03c ts=0x961737716fdccead */
+                    static const u8 r168[] = {
+                        0x21, 0x0d, 0x13, 0xde, 0x46, 0x9d, 0x11,
+                        0x3c, 0xc0, 0x3e, 0x62, 0x03, 0xef, 0x63, 0x35,
+                        0x19, 0xad, 0xce, 0xdc, 0x6f, 0x71, 0x37, 0x17, 0x96,
+                        0x20, 0x0d };
+                    u32 fc; u64 fch, fts;
+                    u32 qi;
+                    for (qi = 0; qi < 4; qi++) g_clv2_chrec[qi].valid = 0;
+                    g_clv2_chrec_i = 0;
+                    c2b_clv2_note_reply(r168, (u32)sizeof(r168));
+                    CHECK(c2b_clv2_pick_fresh(&fc, &fch, &fts) == 1,
+                          "g31: свежий challenge найден (run168 сэмпл)");
+                    CHECK(fc == 0x9d46de13u, "g31: cid эхо = 0x9d46de13");
+                    CHECK(fch == 0x3563ef03623ec03cull,
+                          "g31: challenge = 0x3563ef03623ec03c (run168 wire)");
+                    CHECK(fts == 0x961737716fdcceadull,
+                          "g31: ts-эхо = 0x961737716fdccead (LE run168)");
+                    CHECK(g_clv2_chrec[0].ms > 0, "g31: ms-метка записи стоит");
+                }
+                {
+                    /* note_sid: самая длинная цифра-строка 'k' -> account id */
+                    u8 fakek[64];
+                    u32 qi;
+                    for (qi = 0; qi < 64; qi++) fakek[qi] = 0;
+                    fakek[0] = 0xff; fakek[1] = 0xff; fakek[2] = 0xff; fakek[3] = 0xff;
+                    fakek[4] = 'k';
+                    fakek[40] = '6'; fakek[41] = '8'; fakek[42] = '7';
+                    fakek[43] = '1'; fakek[44] = '6'; fakek[45] = '8';
+                    fakek[46] = '2'; fakek[47] = '1'; fakek[48] = '9';
+                    g_clv2_sid64 = 0;
+                    c2b_clv2_note_sid(fakek, (u32)sizeof(fakek));
+                    CHECK(g_clv2_sid64 == (0x0110000100000000ULL | 687168219ull),
+                          "g31: note_sid -> steamid64 = public|account");
+                }
+                {
+                    /* build_connreq: фрейминг v1 (bare) и v2 (+crypt) */
+                    u8 cr[512];
+                    u32 pl2, qi;
+                    g_clv2_sid64 = 0x0110000100000000ULL | 687168219ull;
+                    pl2 = c2b_clv2_build_connreq(cr, 1, 0x12345678u,
+                                                 0x1122334455667788ull,
+                                                 0x0102030405060708ull);
+                    CHECK(pl2 == 512, "g31: 0x22 = 512 байт (pad)");
+                    CHECK(cr[0] == 0x22, "g31: msgid 0x22");
+                    pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
+                    CHECK(pl2 == 34, "g31: v1 pb-длина = 34 (f1+f3+f4+f5+f8)");
+                    CHECK(cr[3] == 0x0d && cr[4] == 0x78 && cr[7] == 0x12,
+                          "g31: f1 cid LE = 0x12345678");
+                    CHECK(cr[8] == 0x19 && cr[9] == 0x88 && cr[16] == 0x11,
+                          "g31: f3 challenge LE");
+                    CHECK(cr[17] == 0x21 && cr[18] == 0x08 && cr[25] == 0x01,
+                          "g31: f4 my_timestamp LE");
+                    CHECK(cr[26] == 0x28 && cr[27] == 0x0d,
+                          "g31: f5 protocol_version=13");
+                    CHECK(cr[28] == 0x41 && cr[33] == 0x01 && cr[36] == 0x01,
+                          "g31: f8 steamid64 LE (0x01100001...: byte4+byte7=01)");
+                    CHECK(cr[3 + pl2] == 0 && cr[511] == 0, "g31: паддинг NUL");
+                    g_clv2_cr_pub[0] = 0;      /* форс keygen в v2 */
+                    pl2 = c2b_clv2_build_connreq(cr, 2, 0x12345678u,
+                                                 0x1122334455667788ull,
+                                                 0x0102030405060708ull);
+                    pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
+                    CHECK(pl2 == 74, "g31: v2 pb-длина = 74 (+40 crypt)");
+                    CHECK(cr[28] == 0x3a && cr[29] == 38, "g31: f7 crypt tag+len 38");
+                    CHECK(cr[30] == 0x0a && cr[31] == 36,
+                          "g31: key_info len=36");
+                    CHECK(cr[32] == 0x08 && cr[33] == 0x01,
+                          "g31: key_type=1 (CURVE25519)");
+                    CHECK(cr[34] == 0x12 && cr[35] == 32,
+                          "g31: key_data len=32");
+                    CHECK(cr[36] != 0, "g31: x25519 pub сгенерён (nonzero)");
+                    CHECK(cr[68] == 0x41, "g31: f8 после crypt");
+                    {
+                        u32 okz = 1;
+                        for (qi = 68; qi < 512; qi++)
+                            if (qi > 76 && cr[qi] != 0) okz = 0;
+                        CHECK(okz, "g31: v2 хвост = sid(8) + NUL-паддинг");
+                    }
+                    g_clv2_sid64 = 0;            /* не протекает в другие тесты */
                 }
             }
         }

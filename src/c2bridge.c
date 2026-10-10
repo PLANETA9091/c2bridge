@@ -7085,8 +7085,10 @@ static void c2b_g9_flat_set(void)
  * (CRawUDPSocketImpl, RE vtable 0x2bd38c8/[0]=0x1fc7c80). Сигнатура совпадает
  * с call-site 0x1fd622a: (self, nChunks, pChunks, adr, efDontRoute).
  * Точки ТИХОГО ДРОПА до sendto (все молча возвращают успех):
- *  1) *(u32*)0x2cbb900 = счётчик открытых raw-UDP-сокетов; <=0 -> fake-success
- *     ret 1 (0x1fc7d1d) — ЛУЧШИЙ кандидат на барьер (0x22 исчезает бесследно);
+ *  1) *(u32*)0x2cbb900 — ВНИМАНИЕ (RE run181): это счётчик ИНИЦИАЛИЗАЦИИ
+ *     низкоуровневого GNS (BSteamNetworkingSocketsLowLevelAddRef), НЕ трогать
+ *     (стор 1 -> s_hEpoll=-1 -> epoll_ctl EBADF -> h=0); в BSendPacketGather
+ *     он же читается как sockcnt (0x1fc7cb5), но при живом AddRef > 0;
  *  2) FakeRateLimit_Send_Rate (int, entry 0x2cb8ae0+0x40) > 0 -> лимит-ветка;
  *  3) FakePacketLoss_Send (float, 0x2cb8f00+0x40) 0<f<1e9 -> ролл лосса;
  *  4) FakePacketLag_Send (0x2cb8e40+0x40) / FakePacketReorder_Send
@@ -7182,7 +7184,6 @@ static u8 *g_g11_udp_tramp_mem;
 /* 41f-g32: relay капчуренного 0x22 (гейт C2B_GNS_RELAY) + драйвер-флаги */
 static u32 g_gns_relay;                 /* C2B_GNS_RELAY=1 */
 static u32 g_gns_relay_sent;            /* сколько 0x22 ушло через relay */
-static u32 g_gns_udpcnt;                /* C2B_GNS_UDPCNT=1: *(base+0x2cbb900)=1 */
 static u8  g_gns_connect_target[24];    /* C2B_GNS_CONNECT=ip:port (ascii) */
 static u32 g_gns_connect_go;            /* драйвер вооружён */
 static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
@@ -7608,14 +7609,17 @@ static void c2b_g11_apply(void)
     c2b_g11_null_addr = base + C2B_G11_NULL_RVA;
     g_g11_base = base;                              /* ДО пача сайта */
     c2b_write_jmp((void *)site, (const void *)&c2b_g11_xport_thunk);
-    if (g_gns_udpcnt) {
-        /* 41f-g32b: байпас кандидата-барьера g11d — счётчик открытых
-         * raw-UDP-сокетов (BSendPacketGather: <=0 -> fake-success ret 1
-         * @0x1fc7d1d). Выровненный 4-байтовый стор в .data — безопасен. */
-        volatile u32 *cnt = (volatile u32 *)(base + 0x2cbb900ull);
-        C2B_LOGS("[c2b] g32: udpcnt "); C2B_LOGN(*cnt); C2B_LOGS(" -> 1\n");
-        *cnt = 1u;
-    }
+    /* 43f-g37 (RE run181, scripts/re_epoll_site*.py): СТОР в 0x2cbb900
+     * УДАЛЁН навсегда. Этот глобал — НЕ "счётчик raw-UDP-сокетов" для
+     * g11d-барьера, а СЧЁТЧИК ИНИЦИАЛИЗАЦИИ низкоуровневого слоя
+     * (BSteamNetworkingSocketsLowLevelAddRef @0x1fca760: guard-mov @0x1fca784
+     * читает его; !=0 -> ВЕСЬ init пропущен: wake-socketpair + ГЛОБАЛЬНЫЙ
+     * epoll_create1 (s_hEpoll @0x2c6dcb8) НЕ создаются; ==0 -> полный init).
+     * Наш стор 1 -> при Connect AddRef скипал init -> s_hEpoll = -1 ->
+     * epoll_ctl(-1, ADD, sock) -> EBADF 0x9 -> "Cannot create IPv4 connection.
+     * epoll_ctl failed, error 0x9" -> h=0 (runs 172-181). С реальным refcount
+     * AddRef сам создаёт epoll при первом коннекте — барьер <=0 в
+     * BSendPacketGather проходит естественно. */
     /* g11b: udp-обёртка (трамплин = копия пролога + jmp-хвост) */
     tr = (uptr)mmap(0, 4096, 0x07, 0x22 /*PRIVATE|ANON*/, -1, 0);
     if (tr == (uptr)-1) { done = 1; return; }
@@ -12459,11 +12463,6 @@ i32 c2b_main(void)
         if (e2 && e2[0] == '1') {
             g_gns_relay = 1;
             C2B_LOGS("[c2b] g32: relay=1 (captured 0x22 -> engine fd -> target)\n");
-        }
-        e2 = getenv("C2B_GNS_UDPCNT");
-        if (e2 && e2[0] == '1') {
-            g_gns_udpcnt = 1;
-            C2B_LOGS("[c2b] g32: udpcnt=1 (raw-socket counter barrier bypass candidate)\n");
         }
     }
 #endif  /* C2B_SELFTEST (g32-env: статики в real-build регионе) */

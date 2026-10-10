@@ -554,7 +554,11 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   MODES=""
   # 41e-j: версия бандла для трансформа A2S 'I' (извлекается РАНЬШЕ, перед
   # рестартом клиента с шимом — см. блок 41e-k выше; здесь просто прокидываем)
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_GNS_UDPCNT=1"
+  # 43f-g37: C2B_GNS_UDPCNT УДАЛЁН — его стор *(steamclient+0x2cbb900)=1
+  # отравлял счётчик инициализации BSteamNetworkingSocketsLowLevelAddRef
+  # (скип init -> s_hEpoll=-1 -> epoll_ctl EBADF -> ConnectByIPAddress h=0,
+  # RE run181); больше не выставлять ни в каких MODES.
+  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1"
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"

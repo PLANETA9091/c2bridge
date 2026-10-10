@@ -5912,6 +5912,19 @@ typedef ssize_t (*c2b_sendto_fn)(int, const void *, size_t, int,
                                  const struct sockaddr *, socklen_t);
 typedef ssize_t (*c2b_recvfrom_fn)(int, void *, size_t, int,
                                    struct sockaddr *, socklen_t *);
+/* 43f-g40: ABI-копия glibc msghdr/iovec (x86-64) для хука sendmsg —
+ * GNS-путь nChunks!=1 шлёт через sendmsg (PLT 0xd9dfc0 @0x1fcd1ee). */
+struct c2b_iovec { void *iov_base; size_t iov_len; };
+struct c2b_msghdr {
+    void *msg_name;
+    socklen_t msg_namelen;
+    struct c2b_iovec *msg_iov;
+    size_t msg_iovlen;
+    void *msg_control;
+    size_t msg_controllen;
+    int msg_flags;
+};
+typedef ssize_t (*c2b_sendmsg_fn)(int, const struct c2b_msghdr *, int);
 
 /* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
  * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
@@ -11103,6 +11116,59 @@ static void c2b_g15_note(uptr ra, const char *tag)
 
 /* libc-совместимые сигнатуры; visibility default обязателен: файл собирается
  * с -fvisibility=hidden, а перехват работает только с глобальным символом. */
+
+/* 43f-g40 (run184): ДИАГНОСТИКА СУДЬБЫ ПАКЕТА GNS. Факты: ConnectByIPAddress
+ * h!=0 (g37), соединение ЖИВО (AuthStatus OK, ретрансмиты ConnectRequest
+ * каждые ~2с через 0x1fcd110 -> sendto@plt 0x1fcd3f4, nChunks==1 путь),
+ * НО pcap ЧИСТ (0 датаграмм к цели) — sendto выполняется и МОЛЧА НЕ ИДЁТ
+ * на провод. sendto@plt steamclient резолвится в ЭТОТ хук (LD_PRELOAD
+ * первый в глобальном скоупе), значит каждое отправление проходит здесь:
+ * логируем fd/len/dst/ret/errno всех "интересных" отправок (len>=400 —
+ * 512Б ConnectRequest'ы GNS — или dst = цель C2B_GNS_CONNECT). Решение
+ * принимаем по ret/errno: -1+EPERM/EPERM/EBADF/EAFNOSUPPORT = ядро
+ * отвергло; ret==len = ушло (тогда вопрос к pcap); хук не увидел =
+ * raw-syscall путь. */
+static u32 g_g40_n;
+static void c2b_g40_sdt_note(i32 fd, u32 len, const void *addr, ssize_t r)
+{
+#ifndef C2B_SELFTEST
+    const u8 *p = (const u8 *)addr;
+    const struct sockaddr *sa = (const struct sockaddr *)addr;
+    u32 ip0 = 0;
+    i32 e;
+    if (!g_gns_connect_go) return;
+    g_g40_n++;
+    if (g_g40_n > 48 && (g_g40_n & 0x1F) != 1) return;
+    if (p && len >= 8) {
+        ip0 = ((u32)p[4] << 24) | ((u32)p[5] << 16) | ((u32)p[6] << 8) | (u32)p[7];
+    }
+    /* фильтр: длинные пакеты (GNS 512Б) ИЛИ отправки на цель env */
+    if (len < 400) {
+        u32 tip;
+        if (!p || sa->sa_family != 2 || g_gns_dstlen < 8) return;
+        tip = ((u32)g_gns_dst[4] << 24) | ((u32)g_gns_dst[5] << 16) |
+              ((u32)g_gns_dst[6] << 8) | (u32)g_gns_dst[7];
+        if (ip0 != tip) return;
+    }
+    e = *__errno_location();
+    C2B_LOGS("[c2b] g40 sdt: fd="); C2B_LOGN((u32)fd);
+    C2B_LOGS(" len="); C2B_LOGN(len);
+    C2B_LOGS(" dst=");
+    if (p && sa->sa_family == 2) {
+        C2B_LOGN((u32)p[4]); C2B_LOGS("."); C2B_LOGN((u32)p[5]); C2B_LOGS(".");
+        C2B_LOGN((u32)p[6]); C2B_LOGS("."); C2B_LOGN((u32)p[7]);
+        C2B_LOGS(":"); C2B_LOGN(((u32)p[2] << 8) | (u32)p[3]);
+    } else {
+        C2B_LOGH(ip0);
+    }
+    C2B_LOGS(" ret="); C2B_LOGN((u32)(i64)r);
+    C2B_LOGS(" errno="); C2B_LOGN((u32)e);
+    C2B_LOGS("\n");
+#else
+    (void)fd; (void)len; (void)addr; (void)r;
+#endif
+}
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
@@ -11298,7 +11364,40 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             if (act == C2B_CL_DROP) return (ssize_t)len;   /* v2: дроп без отправки */
         }
     }
-    return ((c2b_sendto_fn)g_clp_sendto)(fd, buf, len, flags, addr, addrlen);
+    /* 43f-g40: diag всех passthrough-отправок (см. комментарий выше) */
+    {
+        ssize_t r = ((c2b_sendto_fn)g_clp_sendto)(fd, buf, len, flags, addr, addrlen);
+        c2b_g40_sdt_note(fd, (u32)len, addr, r);
+        return r;
+    }
+}
+
+/* 43f-g40: sendmsg-хук — passthrough + тот же diag (путь nChunks!=1 GNS).
+ * msghdr — НАША ABI-копия (совместима с glibc x86-64); dest из msg_name. */
+static void *g_clp_sendmsg;
+__attribute__((visibility("default")))
+ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
+{
+    if (!g_clp_sendmsg) {
+        void *f = dlsym(C2B_CL_RTLD_NEXT, "sendmsg");
+        if (!f) f = (void *)1;
+        g_clp_sendmsg = f;
+    }
+    if ((uptr)g_clp_sendmsg == 1) {
+        *__errno_location() = 2;            /* ENOENT */
+        return -1;
+    }
+    {
+        ssize_t r = ((c2b_sendmsg_fn)g_clp_sendmsg)(fd, msg, flags);
+        u32 tot = 0;
+        if (msg && msg->msg_iov && msg->msg_iovlen && msg->msg_iovlen < 64) {
+            u32 k;
+            for (k = 0; k < (u32)msg->msg_iovlen; k++)
+                tot += (u32)msg->msg_iov[k].iov_len;
+        }
+        c2b_g40_sdt_note(fd, tot ? tot : 1u, msg ? msg->msg_name : 0, r);
+        return r;
+    }
 }
 
 __attribute__((visibility("default")))

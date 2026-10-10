@@ -8137,6 +8137,9 @@ void c2b_g62_log(uptr state, uptr buf, uptr mbase)
     C2B_LOGS(" dend="); C2B_LOGH(*(volatile u32 *)(buf + 0x60));
     C2B_LOGS(" dp0=");  C2B_LOGH(*(volatile u32 *)(buf + 0x38));
     C2B_LOGS(" b40=");  C2B_LOGN((u32)*(volatile u8 *)(buf + 0x40));
+    C2B_LOGS(" na=");   C2B_LOGH(*(volatile u32 *)buf);
+    C2B_LOGH(*(volatile u32 *)(buf + 4));
+    C2B_LOGH(*(volatile u32 *)(buf + 8));
     C2B_LOGS("\n");
     g_probe_active = 0;
 }
@@ -8185,6 +8188,158 @@ __asm__(
 ".previous\n"
 );
 extern void c2b_g62_thunk(void);
+
+/* ---------- 50m-g64/g66: 'B' ХЕКС-ПАРС + УСПЕХ (run215 forensics) ----------
+ * ФАКТЫ run215 (g62/g63): ВСЕ 6 g58-бэйтoв ДОШЛИ до точки-чека (g62 x6,
+ * byte=0x2e во ВСЕХ дампах — точка-чек ПРОЙДЕН!), но 39 g63-self-push'ей
+ * (na=127.0.0.1) ОТКЛОНЕНЫ @25cb94 CompareAdr (buf.na != snap.na: снап =
+ * ПОСЛЕДНИЙ 'A' = h21-перевод с na=реального сервера; g58-бэйты na=реал
+ * == снап → прошли). Читатель: старт payload+3, word_0=ff 42 2e h0,
+ * после ff+'B' → bits=16, word=0x0000h0 2e — ВСЕ дампы консистентны.
+ * СМЕРТЬ ПОСЛЕ точки: строка-луп (8 символов, refills @25b1d0/25a9bb) —
+ * или 25b310 (гейт 0x510: !=0 → sscanf; ==0 → 25bd69 → b1c==0 → 25c652 →
+ * 65ea60-чтение СТРОКИ из читателя + 679540-lookup (cmpw 0xffff → r12 =
+ * ненулевой-флаг!) → sscanf("%08X") — при r12=0 и ненулевом hex =
+ * REJECT @25b363!) — или успех vt+0x170 (0x2c95f0 = accept-хендлер:
+ * сброс 0x8fd0/0x8e3c = -1, обход списка @e10000).
+ * G64 @25b310 (16Б: mov 0x510→r13d + mov $1→r12d + test): лог 0x510/b1c/
+ * строка(8Б @rbp-0x4f0)/bits/word/na — реплика mov+mov+test, ret 25b320
+ * (je решает по МОИМ флагам). G66 @25b369 (20Б: mov (r15)→rax + mov
+ * rbx→rsi + mov r15→rdi + call *0x170(%rax) + jmp 259f50): лог-файр,
+ * реплика call нативно, ret 259f50. */
+static volatile uptr c2b_g64_cont;
+static u32 c2b_g64_nl;
+
+void c2b_g64_log(uptr state, uptr buf, uptr frame)
+{
+    u32 k;
+    char s8[9];
+    if (!g_engine_base || !state || !buf) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    k = ++c2b_g64_nl;
+    if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    for (k = 0; k < 8; k++)
+        s8[k] = (char)*(volatile u8 *)(frame - 0x4f0 + k);
+    s8[8] = 0;
+    C2B_LOGS("[c2b] g64 Bhex: c510=");
+    C2B_LOGN(*(volatile u32 *)(state + 0x510));
+    C2B_LOGS(" b1c="); C2B_LOGN((u32)*(volatile u8 *)(buf + 0x1c));
+    C2B_LOGS(" str8='"); C2B_LOGS(s8); C2B_LOGS("'");
+    C2B_LOGH(*(volatile u32 *)(frame - 0x4f0));
+    C2B_LOGH(*(volatile u32 *)(frame - 0x4ec));
+    C2B_LOGS(" bits="); C2B_LOGN(*(volatile u32 *)(buf + 0x54));
+    C2B_LOGS(" word="); C2B_LOGH(*(volatile u32 *)(buf + 0x50));
+    C2B_LOGS(" na="); C2B_LOGH(*(volatile u32 *)buf);
+    C2B_LOGH(*(volatile u32 *)(buf + 4));
+    C2B_LOGH(*(volatile u32 *)(buf + 8));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g64_thunk\n"
+".type  c2b_g64_thunk,@function\n"
+"c2b_g64_thunk:\n"   /* вход: r15=state rbx=buf rbp=фрейм; rsp%16==0 */
+"  endbr64\n"
+"  sub  $0x60,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r15,%rdi\n"
+"  mov  %rbx,%rsi\n"
+"  mov  %rbp,%rdx\n"
+"  call c2b_g64_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x60,%rsp\n"
+/* реплика 16Б: r13d=[r15+0x510]; r12d=1; test (флаги для je @25b320) */
+"  mov  0x510(%r15),%r13d\n"
+"  mov  $0x1,%r12d\n"
+"  test %r13d,%r13d\n"
+"  mov  c2b_g64_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g64_thunk, .-c2b_g64_thunk\n"
+".previous\n"
+);
+extern void c2b_g64_thunk(void);
+
+static volatile uptr c2b_g66_exit;
+static u32 c2b_g66_nl;
+
+void c2b_g66_log(uptr state, uptr buf)
+{
+    u32 k;
+    if (!g_engine_base || !state || !buf) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    k = ++c2b_g66_nl;
+    if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g66 Bsuccess: st=");
+    C2B_LOGH((u32)(state > g_engine_base ? state - g_engine_base : state));
+    C2B_LOGS(" na="); C2B_LOGH(*(volatile u32 *)buf);
+    C2B_LOGH(*(volatile u32 *)(buf + 4));
+    C2B_LOGH(*(volatile u32 *)(buf + 8));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g66_thunk\n"
+".type  c2b_g66_thunk,@function\n"
+"c2b_g66_thunk:\n"   /* вход: r15=state rbx=buf; rsp%16==0 */
+"  endbr64\n"
+"  sub  $0x60,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r15,%rdi\n"
+"  mov  %rbx,%rsi\n"
+"  call c2b_g66_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x60,%rsp\n"
+/* реплика 20Б: rax=[r15]; rsi=rbx; rdi=r15; call *0x170(%rax); jmp 259f50 */
+"  mov  (%r15),%rax\n"
+"  mov  %rbx,%rsi\n"
+"  mov  %r15,%rdi\n"
+"  call *0x170(%rax)\n"
+"  mov  c2b_g66_exit(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g66_thunk, .-c2b_g66_thunk\n"
+".previous\n"
+);
+extern void c2b_g66_thunk(void);
 
 static void c2b_g11_apply(void)
 {
@@ -10920,6 +11075,56 @@ static void c2b_g32_drive(void)
             C2B_LOGS("\n");
         }
     }
+    /* 50m-g64: детур хекс-парса 'B' @0x25b310 (мотивация у тунка). */
+    if (g_engine_base) {
+        static const u8 g64_sig[16] = {
+            0x41, 0x8b, 0xaf, 0x10, 0x05, 0x00, 0x00,   /* mov 0x510(%r15),%r13d */
+            0x41, 0xbc, 0x01, 0x00, 0x00, 0x00,         /* mov $0x1,%r12d */
+            0x45, 0x85, 0xed                            /* test %r13d,%r13d */
+        };
+        volatile u8 *site64 = (volatile u8 *)(g_engine_base + 0x25b310ull);
+        if (memcmp((const void *)site64, g64_sig, sizeof g64_sig) == 0) {
+            c2b_g64_cont = g_engine_base + 0x25b320ull;   /* je 25bd69 (флаги мои) */
+            if (c2b_page_protect((uptr)site64, (u32)sizeof g64_sig, 0x07) == 0) {
+                c2b_write_jmp((void *)site64, (const void *)&c2b_g64_thunk);
+                C2B_LOGS("[c2b] g64: detour armed @engine+25b310 (B hex-parse entry dump c510/b1c/str8/bits/word/na)\n");
+            } else {
+                C2B_LOGS("[c2b] g64: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g64: sig mismatch @engine+25b310 bytes=");
+            C2B_LOGH(*(const volatile u32 *)site64);
+            C2B_LOGH(*(const volatile u32 *)(site64 + 4));
+            C2B_LOGH(*(const volatile u32 *)(site64 + 8));
+            C2B_LOGS("\n");
+        }
+    }
+    /* 50m-g66: детур успеха 'B' (vt+0x170) @0x25b369 (мотивация у тунка). */
+    if (g_engine_base) {
+        static const u8 g66_sig[20] = {
+            0x49, 0x8b, 0x07,                     /* mov (%r15),%rax */
+            0x48, 0x89, 0xde,                     /* mov %rbx,%rsi */
+            0x4c, 0x89, 0xff,                     /* mov %r15,%rdi */
+            0xff, 0x90, 0x70, 0x01, 0x00, 0x00,   /* call *0x170(%rax) */
+            0xe9, 0xd3, 0xeb, 0xff, 0xff          /* jmp 259f50 */
+        };
+        volatile u8 *site66 = (volatile u8 *)(g_engine_base + 0x25b369ull);
+        if (memcmp((const void *)site66, g66_sig, sizeof g66_sig) == 0) {
+            c2b_g66_exit = g_engine_base + 0x259f50ull;
+            if (c2b_page_protect((uptr)site66, (u32)sizeof g66_sig, 0x07) == 0) {
+                c2b_write_jmp((void *)site66, (const void *)&c2b_g66_thunk);
+                C2B_LOGS("[c2b] g66: detour armed @engine+25b369 (B success vt+0x170 fire log)\n");
+            } else {
+                C2B_LOGS("[c2b] g66: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g66: sig mismatch @engine+25b369 bytes=");
+            C2B_LOGH(*(const volatile u32 *)site66);
+            C2B_LOGH(*(const volatile u32 *)(site66 + 4));
+            C2B_LOGH(*(const volatile u32 *)(site66 + 8));
+            C2B_LOGS("\n");
+        }
+    }
     /* 50g-g56: детур хвоста @0x25d6cc (мотивация у тунка). */
     if (g_engine_base) {
         static const u8 g56_sig[15] = {
@@ -12464,6 +12669,26 @@ static void *c2b_g63_thread(void *arg)
             u32 alen;
             ssize_t sr;
             usleep(3000000);
+            if (!g_clv2_fd || !g_clv2_ch32) continue;
+            /* g63v2 (run215): 'A' ПЕРЕД 'B' — self-push 'A' (na=127.0.0.1)
+             * обновляет снап @25aa33 (снап = ПОСЛЕДНИЙ 'A'), после чего
+             * следующий 'B' (тот же источник) проходит CompareAdr @25cb94
+             * (run215: 39/39 self-push-'B' ОТКЛОНЕНЫ — снап = реал-сервер
+             * от h21-переводных 'A'; г58-бэйты na=реал проходили 6/6). */
+            c2b_g50_force_cstate();
+            alen = c2b_clv2_build_chalreply(
+                blob, (u32)sizeof(blob), g_clv2_fmt,
+                g_clv2_qc_val, g_clv2_ch32);
+            if (alen && g_clp_sendto && (uptr)g_clp_sendto != 1) {
+                sr = ((c2b_sendto_fn)g_clp_sendto)(
+                    g_clv2_fd, blob, alen, 0,
+                    (const struct sockaddr *)la, 16);
+                C2B_LOGS("[c2b] g63: self-push 'A-pre' len=");
+                C2B_LOGN(alen);
+                C2B_LOGS(" rc="); C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+                C2B_LOGS("\n");
+            }
+            usleep(300000);           /* 300мс: движок съедает 'A' (снап) */
             if (!g_clv2_fd || !g_clv2_ch32) continue;
             c2b_g50_force_cstate();   /* ворота cstate=1 ДО 'B'-парса */
             alen = c2b_clv2_build_kaccept(blob, (u32)sizeof(blob), 0);

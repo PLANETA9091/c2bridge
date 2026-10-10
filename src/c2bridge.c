@@ -10145,6 +10145,27 @@ static void c2b_g32_drive(void)
                 C2B_LOGH((u32)(uptr)oldfn);
                 C2B_LOGS(" -> hook\n");
             }
+            /* 43f-g41b: пропустить КАНОНИЧЕСКУЮ mapped-форму через классификатор.
+             * 0x1ef41c2: cmp $0x1,%eax (83 f8 01); jle 0x1ef42d0 — ret=3
+             * (mapped-v4, не fake) падал в опшенс-путь -> h=0. Меняем
+             * imm8 01 -> 03 (1 байт): принимаются 1 (raw, старое поведение)
+             * и 3 (канон, новый путь). ret=2 (fake-range) нам не встречается
+             * (цель не 169.254.248.0/22). Сиг-чек обязателен. */
+            {
+                volatile u8 *p41 = (volatile u8 *)(g_g11_base + 0x1ef41c2ull);
+                C2B_LOGS("[c2b] g41: sig@0x1ef41c2=");
+                C2B_LOGH(p41[0]); C2B_LOGH(p41[1]); C2B_LOGH(p41[2]); C2B_LOGH(p41[3]);
+                if (p41[0] == 0x83 && p41[1] == 0xf8 && p41[2] == 0x01 && p41[3] == 0x0f) {
+                    if (c2b_page_protect((uptr)p41, 4, 0x07) == 0) {
+                        p41[2] = 0x03;
+                        C2B_LOGS(" -> patched (accept mapped-v4)\n");
+                    } else {
+                        C2B_LOGS(" -> mprotect failed\n");
+                    }
+                } else {
+                    C2B_LOGS(" -> sig mismatch, skip\n");
+                }
+            }
             /* 43f-g38 (RE run181): состояние НИЗКОУРОВНЕВОГО инита перед
              * Connect — refcount 0x2cbb900, s_hEpoll 0x2c6dcb8, wake-fd
              * 0x2c6dcbc/0x2c6dcc0. Здоровая картина: refcount>=1 (наш
@@ -10222,7 +10243,18 @@ static void c2b_g32_drive(void)
         C2B_LOGS("\n");
     }
     for (k = 0; k < sizeof(addr); k++) addr[k] = 0;
-    addr[0] = (u8)a[0]; addr[1] = (u8)a[1]; addr[2] = (u8)a[2]; addr[3] = (u8)a[3];
+    /* 43f-g41 (RE run185): КАНОНИЧЕСКАЯ IPv4-MAPPED форма! Конвертер
+     * sockaddr (0x22487a0: family=AF_INET6 прематчится, затем джамп-таблица
+     * по TYPE @obj+0x14) для raw-формы {ip@0-3, нули, port@16} даёт
+     * type=IPv6 -> sockaddr_in6 ::98e9:1385 -> sendto ENETUNREACH (0x65,
+     * g40: ret=-1, семейство !=2, dst=0) — пакеты НЕ идут на провод.
+     * Канон: байты 0-9=0, 10-11=ff ff (IsIPv4!), 12-15=ip, port@16 ->
+     * тип=IPv4 -> AF_INET -> пакеты идут. ПРИМЕЧАНИЕ: классификатор
+     * 0x1fed370 для канона вернёт 3 (>=mapped-v4) — патчим сравнение
+     * вызывающего (см. g41b ниже), чтобы коннект-путь принял форму 3. */
+    addr[10] = 0xff; addr[11] = 0xff;
+    addr[12] = (u8)a[0]; addr[13] = (u8)a[1];
+    addr[14] = (u8)a[2]; addr[15] = (u8)a[3];
     addr[16] = (u8)(port & 0xff); addr[17] = (u8)(port >> 8);   /* m_port LE (host=x86) */
     {
         static const char *const vers[2] = {

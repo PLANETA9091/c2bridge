@@ -5902,6 +5902,23 @@ typedef unsigned long  size_t;
 typedef unsigned int   socklen_t;
 #endif
 
+/* g32: типы хуков + ленивые резолвы — безусловно (нужны и selftest-хукам,
+ * и .so-ветке; стоят ПОСЛЕ блока типов выше). ВАЖНО: struct sockaddr
+ * объявляется НА ФАЙЛОВОМ СКОУПЕ ДО typedef — впервые-в-parameter-list
+ * тип скоупится в прототип и не совпадает с файловым (урок сборки g32). */
+struct sockaddr;
+typedef ssize_t (*c2b_sendto_fn)(int, const void *, size_t, int,
+                                 const struct sockaddr *, socklen_t);
+typedef ssize_t (*c2b_recvfrom_fn)(int, void *, size_t, int,
+                                   struct sockaddr *, socklen_t *);
+
+/* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
+ * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
+ * пишут одно и то же значение (x86: выровненный сторов атомарен). */
+static void *g_clp_sendto;
+static void *g_clp_recvfrom;
+static void *g_clp_fouif;       /* SteamInternal_FindOrCreateUserInterface (g32a) */
+
 /* ABI-совместимое с glibc описание (netpacket-адрес приходит из движка) */
 struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 #define C2B_AF_INET   2
@@ -6204,6 +6221,8 @@ static u32 g_a2s_seen_t;         /* 'T' замечен — peer валиден *
  * (universe/public + account) — иначе индекс-модель неверна и тикет НЕ
  * зовём (защита от вызова мусора). */
 static void *g_steamuser_obj;    /* ISteamUser*, капчурится в FUv */
+static int g_steamuser_user;     /* g32: HSteamUser из того же FOUIF-вызова */
+static void *g_steamnetsock_obj; /* g32: ISteamNetworkingSockets*, капчур в FUv */
 static u32  g_steamuser_seen;    /* капчур случился */
 static u32  g_ticket_calls;      /* вызовов GetAuthSessionTicket */
 static u32  g_ticket_ok;         /* с ненулевым handle */
@@ -7138,8 +7157,17 @@ static void *volatile c2b_g11_udp_tramp = 0;
 static void *volatile c2b_g11_gather_cont = 0;
 static void *volatile c2b_g11_lag_cont = 0;
 static u8 *g_g11_udp_tramp_mem;
+/* 41f-g32: relay капчуренного 0x22 (гейт C2B_GNS_RELAY) + драйвер-флаги */
+static u32 g_gns_relay;                 /* C2B_GNS_RELAY=1 */
+static u32 g_gns_relay_sent;            /* сколько 0x22 ушло через relay */
+static u32 g_gns_udpcnt;                /* C2B_GNS_UDPCNT=1: *(base+0x2cbb900)=1 */
+static u8  g_gns_connect_target[24];    /* C2B_GNS_CONNECT=ip:port (ascii) */
+static u32 g_gns_connect_go;            /* драйвер вооружён */
 
-void c2b_g11_xport_log(uptr wrap)
+/* 41f-g32a: fwd decl — драйвер определяется ниже, зовётся из auth-потока */
+static void c2b_g32_drive(void);
+
+void c2b_g11_xport_log(uptr wrap, uptr orsp)
 {
     uptr xport, inner, vt0, conn;
     u32 n;
@@ -7169,6 +7197,36 @@ void c2b_g11_xport_log(uptr wrap)
         C2B_LOGN(*(volatile u32 *)(conn + 0x9e8));
         C2B_LOGS(" bytes=");
         C2B_LOGN(*(volatile u32 *)(conn + 0xa00));
+    }
+    /* 41f-g32: СЕГМЕНТ-КАПЧЕР — at orsp (rsp@0x1fd61f0): +0x10 = {ptr,len}
+    * единственного 16Б сегмента (disasm: mov %r13,0x10(%rsp); mov %rbp,0x18(%rsp);
+    * lea 0x10(%rsp),%rdx @0x1fd61fb). Это СЫРОЙ пакет 0x22 (cert+crypt движка!).
+    * fd = *(inner+0x1c) — CRawUDPSocketImpl (вериф. cmpl $-1,0x1c(%rdi) @0x1fcd140). */
+    {
+        uptr sptr = orsp ? *(volatile uptr *)(orsp + 0x10) : 0;
+        uptr slen = orsp ? *(volatile uptr *)(orsp + 0x18) : 0;
+        i32  fd   = inner ? *(volatile i32 *)(inner + 0x1c) : -2;
+        u32  k;
+        C2B_LOGS(" fd="); C2B_LOGN((u32)fd);
+        C2B_LOGS(" seg.len="); C2B_LOGN((u32)slen);
+        if (sptr && slen >= 16 && slen <= 1500) {
+            C2B_LOGS(" seg[96B]=");
+            for (k = 0; k < 96 && (uptr)k < slen; k++)
+                C2B_LOGH(*(volatile u8 *)(sptr + k));
+            C2B_LOGS(" p0="); C2B_LOGH(*(volatile u8 *)sptr);
+            /* 41f-g32 RELAY: послать капчуренный 0x22 САМИМИ — fd движка
+             * (source addr = биндинг challenge!), dst = g_clv2_dst (цель).
+             * Гейт C2B_GNS_RELAY=1 (двойная отправка безвредна: сервер
+             * уже молчит на транспортный путь). */
+            if (g_gns_relay && fd > 0 && fd < 1024 && g_clv2_dstlen >= 6 &&
+                *(volatile u8 *)sptr == 0x22 && g_clp_sendto) {
+                ((c2b_sendto_fn)g_clp_sendto)(fd, (const void *)sptr, (u32)slen,
+                                              0, (const void *)g_clv2_dst,
+                                              g_clv2_dstlen);
+                g_gns_relay_sent++;
+                C2B_LOGS(" RELAYED#"); C2B_LOGN(g_gns_relay_sent);
+            }
+        }
     }
     C2B_LOGS("\n");
     g_probe_active = 0;
@@ -7323,6 +7381,7 @@ __asm__(
 "  and  $0xfffffffffffffff0,%rsp\n"
 "  mov  %r10,0x00(%rsp)\n"  /* якорь rsp в памяти (call его не тронет) */
 "  mov  %r12,%rdi\n"
+"  mov  %r10,%rsi\n"        /* g32: arg2 = rsp@0x1fd61f0 (сегменты на +0x10/+0x18) */
 "  call c2b_g11_xport_log\n"
 "  mov  0x00(%rsp),%r10\n"
 "  mov  %r10,%rsp\n"
@@ -7518,6 +7577,14 @@ static void c2b_g11_apply(void)
     c2b_g11_null_addr = base + C2B_G11_NULL_RVA;
     g_g11_base = base;                              /* ДО пача сайта */
     c2b_write_jmp((void *)site, (const void *)&c2b_g11_xport_thunk);
+    if (g_gns_udpcnt) {
+        /* 41f-g32b: байпас кандидата-барьера g11d — счётчик открытых
+         * raw-UDP-сокетов (BSendPacketGather: <=0 -> fake-success ret 1
+         * @0x1fc7d1d). Выровненный 4-байтовый стор в .data — безопасен. */
+        volatile u32 *cnt = (volatile u32 *)(base + 0x2cbb900ull);
+        C2B_LOGS("[c2b] g32: udpcnt "); C2B_LOGN(*cnt); C2B_LOGS(" -> 1\n");
+        *cnt = 1u;
+    }
     /* g11b: udp-обёртка (трамплин = копия пролога + jmp-хвост) */
     tr = (uptr)mmap(0, 4096, 0x07, 0x22 /*PRIVATE|ANON*/, -1, 0);
     if (tr == (uptr)-1) { done = 1; return; }
@@ -9927,8 +9994,120 @@ static void *c2b_auth_thread(void *arg)
     C2B_LOGS("\n");
     c2b_gns_spew_rearm();   /* 41f-g5/g8/g9: пин спью+конфига (ПЕРВЫМ — патчи) */
     c2b_g7_client_utils();   /* 41f-g10: ЗАГЛУШЕН (убивал процесс до rearm) */
+#ifndef C2B_SELFTEST
+    c2b_g32_drive();        /* 41f-g32a: ConnectByIPAddress-драйвер (если env) */
+#endif
     return 0;
 }
+
+#ifndef C2B_SELFTEST
+/* ================= 41f-g32a: GNS ConnectByIPAddress-драйвер =================
+ * Цель — заставить steamclient-овский GNS СОЗДАТЬ реальное соединение к
+ * CS2-цели: его 0x20/0x21 обмен + ПОСТРОЕННЫЙ 0x22 (его cert+crypt, подпись
+ * живая) капчурится g11a-тунком (сегмент-дамп) и РЕЛЕится мостом
+ * (C2B_GNS_RELAY=1) с fd движка (биндинг challenge по адресу сохранён).
+ * Путь: SteamInternal_FindOrCreateUserInterface(g_steamuser_user,
+ * "SteamNetworkingSockets006" | 009) -> vt[1] ConnectByIPAddress(iface,
+ * &SteamNetworkingIPAddr{a.b.c.d,0..,port}, 0, NULL). SEGV-гвард g7. */
+static void c2b_g32_drive(void)
+{
+    u32 a[4], pr = 0;
+    u16 port = 0;
+    u8 addr[20];
+    u32 k;
+    void *clp;
+    struct c2b_sigaction sa, oldsa;
+    if (!g_gns_connect_go || !g_clp_fouif || !g_steamuser_seen) {
+        C2B_LOGS("[c2b] g32: not armed (env/ifactory/user missing)\n");
+        return;
+    }
+    /* парс "a.b.c.d:port" из g_gns_connect_target */
+    {
+        const char *s = (const char *)g_gns_connect_target;
+        u32 i = 0;
+        for (k = 0; k < 4; k++) {
+            u32 v = 0;
+            while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (u32)(s[i] - '0'); i++; }
+            a[k] = v & 255u;
+            if (k < 3 && s[i] == '.') i++;
+        }
+        if (s[i] == ':') {
+            i++;
+            while (s[i] >= '0' && s[i] <= '9') { port = (u16)(port * 10 + (u16)(s[i] - '0')); i++; }
+        }
+        pr = (a[0] | a[1] | a[2] | a[3]) ? 1u : 0u;
+    }
+    if (!pr || !port) {
+        C2B_LOGS("[c2b] g32: bad C2B_GNS_CONNECT value\n");
+        return;
+    }
+    /* g32: ждём qconnect-цель (g_clv2_dst из CLV2-капчера) ДО вызова —
+     * relay капчуренного 0x22 требует g_clv2_dstlen>=6; GNS-обмен 0x20/0x21
+     * стартует ПОСЛЕ ConnectByIPAddress, так что окно не теряется.
+     * Таймаут 240с (2 попытки движка по ~60с); по таймауту драйвер всё
+     * равно сработает (капчер сегментов работает и без relay). */
+    {
+        u32 wt;
+        for (wt = 0; wt < 240 && g_clv2_dstlen < 6; wt++) usleep(1000000);
+        C2B_LOGS("[c2b] g32: dst wait done len=");
+        C2B_LOGN(g_clv2_dstlen);
+        C2B_LOGS("\n");
+    }
+    for (k = 0; k < sizeof(addr); k++) addr[k] = 0;
+    addr[0] = (u8)a[0]; addr[1] = (u8)a[1]; addr[2] = (u8)a[2]; addr[3] = (u8)a[3];
+    addr[16] = (u8)(port & 0xff); addr[17] = (u8)(port >> 8);   /* m_port LE (host=x86) */
+    {
+        static const char *const vers[2] = {
+            "SteamNetworkingSockets006", "SteamNetworkingSockets009" };
+        u32 vi;
+        for (k = 0; k < sizeof(sa); k++) ((u8 *)&sa)[k] = 0;
+        for (k = 0; k < sizeof(oldsa); k++) ((u8 *)&oldsa)[k] = 0;
+        sa.handler = (uptr)c2b_probe_segv;
+        sa.flags = 4;
+        sigemptyset(sa.mask);
+        if (sigaction(11, &sa, &oldsa) != 0) return;
+        clp = g_clp_fouif;
+        for (vi = 0; vi < 2; vi++) {
+            void *iface = 0;
+            uptr h = 0;
+            void **vt;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                iface = ((void *(*)(int, const char *))clp)(
+                    g_steamuser_user, vers[vi]);
+                g_probe_active = 0;
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g32: factory SEGV ver=");
+                C2B_LOGS(vers[vi]); C2B_LOGS("\n");
+                continue;
+            }
+            if (!iface) {
+                C2B_LOGS("[c2b] g32: no iface ver=");
+                C2B_LOGS(vers[vi]); C2B_LOGS("\n");
+                continue;
+            }
+            C2B_LOGS("[c2b] g32: iface ver="); C2B_LOGS(vers[vi]);
+            C2B_LOGS(" ok\n");
+            vt = *(void ***)iface;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                h = ((uptr (*)(void *, void *, i32, void *))vt[1])(
+                    iface, addr, 0, (void *)0);
+                g_probe_active = 0;
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g32: ConnectByIPAddress SEGV\n");
+                break;
+            }
+            C2B_LOGS("[c2b] g32: ConnectByIPAddress h="); C2B_LOGN((u32)h);
+            C2B_LOGS("\n");
+            break;   /* первая сработавшая версия */
+        }
+        sigaction(11, &oldsa, (void *)0);
+    }
+}
+#endif  /* C2B_SELFTEST (g32a-драйвер: real-build only) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */
 static u32 c2b_clv2_rand32(void)
@@ -10389,17 +10568,6 @@ static u64 c2b_mono_ms(void)
     return (u64)ts.sec * 1000ull + (u64)ts.nsec / 1000000ull;
 #endif
 }
-
-typedef ssize_t (*c2b_sendto_fn)(int, const void *, size_t, int,
-                                 const struct sockaddr *, socklen_t);
-typedef ssize_t (*c2b_recvfrom_fn)(int, void *, size_t, int,
-                                   struct sockaddr *, socklen_t *);
-
-/* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
- * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
- * пишут одно и то же значение (x86: выровненный сторов атомарен). */
-static void *g_clp_sendto;
-static void *g_clp_recvfrom;
 
 /* ================= 41f-g31: протокол 0x22 ConnectRequest ================= */
 
@@ -11327,7 +11495,16 @@ void *SteamInternal_FindOrCreateUserInterface(int user, const char *ver)
     if (r && !g_steamuser_seen && c2b_ver_pfx(ver, "SteamUser0")) {
         g_steamuser_obj = r;
         g_steamuser_seen = 1;
+        g_steamuser_user = user;
         C2B_LOGS("[c2b] AUTH: SteamUser captured\n");
+    }
+    /* 41f-g32: капчур ISteamNetworkingSockets* (та же фабрика, что и SteamUser)
+     * для драйвера ConnectByIPAddress — трек (A): реальный cert+crypt движка. */
+    if (r && !g_steamnetsock_obj && c2b_ver_pfx(ver, "SteamNetworkingSockets")) {
+        g_steamnetsock_obj = r;
+        C2B_LOGS("[c2b] g32: SteamNetworkingSockets iface captured (ver=");
+        C2B_LOGS(ver ? ver : "?");
+        C2B_LOGS(")\n");
     }
     /* 41f-f: капчур ISteamNetworkingUtils + спью-callback (vt[1],
      * SEGV-защита как в 41f-c; vt[0] = GetTimestamp — безобиден).
@@ -12117,6 +12294,33 @@ i32 c2b_main(void)
             }
         }
     }
+#ifndef C2B_SELFTEST
+    /* 41f-g32: C2B_GNS_CONNECT=ip:port | C2B_GNS_RELAY=1 | C2B_GNS_UDPCNT=1
+     * (вне гейта C2B_CL_V2: драйвер GNS-connect независим от CLV2) */
+    {
+        const char *e2 = getenv("C2B_GNS_CONNECT");
+        if (e2 && e2[0]) {
+            u32 k3;
+            for (k3 = 0; e2[k3] && k3 < sizeof(g_gns_connect_target) - 1; k3++)
+                g_gns_connect_target[k3] = (u8)e2[k3];
+            g_gns_connect_target[k3] = 0;
+            g_gns_connect_go = 1;
+            C2B_LOGS("[c2b] g32: connect driver armed -> ");
+            C2B_LOGS((const char *)g_gns_connect_target);
+            C2B_LOGS("\n");
+        }
+        e2 = getenv("C2B_GNS_RELAY");
+        if (e2 && e2[0] == '1') {
+            g_gns_relay = 1;
+            C2B_LOGS("[c2b] g32: relay=1 (captured 0x22 -> engine fd -> target)\n");
+        }
+        e2 = getenv("C2B_GNS_UDPCNT");
+        if (e2 && e2[0] == '1') {
+            g_gns_udpcnt = 1;
+            C2B_LOGS("[c2b] g32: udpcnt=1 (raw-socket counter barrier bypass candidate)\n");
+        }
+    }
+#endif  /* C2B_SELFTEST (g32-env: статики в real-build регионе) */
     {   /* 41e-a: connectionless-слой v1; C2B_CL_VERBOSE=1 -> hexdump каждого
          * connless-пакета (иначе первые 32; см. блок 41e-a выше) */
         const char *e = getenv("C2B_CL_VERBOSE");

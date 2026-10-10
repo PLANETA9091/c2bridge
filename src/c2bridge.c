@@ -10109,6 +10109,14 @@ static void *c2b_g32_thread(void *arg)
     return 0;
 }
 
+/* 44f-g47: фейк-объект для гейта @25aa03 — vtable моста, слот 0x80 = ret0.
+ * Вызов движка: rax=[rdi] (vtable); call [rax+0x80](rdi) — наш ret0 вернёт 0,
+ * test eax; jne reject -> ПРОВАЛ НЕ ПРОИСХОДИТ. Массив 18 слотов (0x90):
+ * 0x80/8 = 16. Остальные слоты не читаются этим путём; заполняем 0 (bss). */
+static i32 c2b_g47_ret0(uptr self) { (void)self; return 0; }
+static uptr c2b_g47_vt[18];
+static uptr c2b_g47_obj[1];
+
 /* ================= 41f-g32a: GNS ConnectByIPAddress-драйвер =================
  * Цель — заставить steamclient-овский GNS СОЗДАТЬ реальное соединение к
  * CS2-цели: его 0x20/0x21 обмен + ПОСТРОЕННЫЙ 0x22 (его cert+crypt, подпись
@@ -10134,11 +10142,14 @@ static void c2b_g32_drive(void)
      *   if (rdi == engine+0xe10bc0) -> альтернативный путь 25cf0a =
      *      тест (u32@(engine+0xe10c18) ^ r12d) — адресная-хэш-ловушка,
      *      ВСЕГДА reject (bss=0 xor addr != 0);
-     *   else eax = vt+0x80(rdi)    — ConVar::GetBool/GetInt;
-     *   test eax; jne 259f50       — CVAR ДОЛЖЕН БЫТЬ 0, иначе ТИХИЙ reject.
-     * Плечо без записи: читаем ptr, имя (char* @+8 — классика ConVar),
-     * первые 0x40 байт объекта. Имя назовёт cvar -> следующий шаг = валить
-     * его в 0 из моста. */
+     *   else eax = vt+0x80(rdi)    — GetBool-делегатор (224f30: rdx=[rdi+0x38],
+     *      self -> XOR-ловушка, иначе хвост-зовёт делегата vt+0x80);
+     *   test eax; jne 259f50       — ИТОГ ДОЛЖЕН БЫТЬ 0, иначе ТИХИЙ reject.
+     * 44f-g47: run193 ФАКТ: ref НЕ РАЗРЕШЁН (= sentinel cl_failremotecons-
+     * nections) -> каждый 'B'/'A' reject через альт-путь. ФИКС: в бридже
+     * статический фейк-объект {vtbl -> наш слот 0x80 = ret0}: переприсваиваем
+     * ref на фейк — цепочка вызова заканчивается НАШЕЙ функцией, вернёт 0,
+     * гейт ПРОЙДЕН. Сиг-гард: пишем ТОЛЬКО если ref ещё = sentinel. */
     {
         u32 wt;
         for (wt = 0; wt < 600 && !g_engine_base; wt++) usleep(100000);
@@ -10148,7 +10159,12 @@ static void c2b_g32_drive(void)
             C2B_LOGS("[c2b] g46: gate ref @engine+e10bf8 -> ");
             C2B_LOGH((u32)(cv >> 32)); C2B_LOGH((u32)cv);
             if (cv == g_engine_base + 0xe10bc0ull) {
-                C2B_LOGS(" == SENTINEL cl_failremoteconnections (альт-путь = always-reject)\n");
+                C2B_LOGS(" == SENTINEL cl_failremoteconnections\n");
+                /* g47: переброс на фейк-объект моста */
+                c2b_g47_vt[16] = (uptr)&c2b_g47_ret0;   /* слот 0x80 */
+                c2b_g47_obj[0] = (uptr)c2b_g47_vt;
+                *(volatile uptr *)refp = (uptr)c2b_g47_obj;
+                C2B_LOGS("[c2b] g47: ref REBOUND -> bridge stub obj (vt slot 0x80 = ret0) — cvar gate neutralized\n");
             } else if (cv) {
                 const char *nm = *(const volatile char *const *)(cv + 8);
                 u32 i5;

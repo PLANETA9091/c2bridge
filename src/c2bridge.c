@@ -7168,6 +7168,7 @@ static socklen_t g_gns_dstlen;          /* 0 = не собран */
 
 /* 41f-g32a: fwd decl — драйвер определяется ниже, зовётся из auth-потока */
 static void c2b_g32_drive(void);
+static void *c2b_g32_thread(void *arg);
 
 void c2b_g11_xport_log(uptr wrap, uptr orsp)
 {

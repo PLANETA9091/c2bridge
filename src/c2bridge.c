@@ -7770,6 +7770,19 @@ void c2b_g49_log(uptr state, uptr buf)
     u32 k;
     if (!g_engine_base || !state || !buf) return;
     c2b_g49_state = state;   /* g50: захват инстанса ДЛЯ ФОРСА cstate */
+    /* 48f-g52: ENTRY-ФОРС cstate — run199 a1 ФАКТ: fmt-9 'A' (первый 'A'
+     * каждого challenge-раунда) приходил с cstate=0 ДАЖЕ после g50-форса в
+     * recvfrom: между форсом и парсом движок обрабатывает ДРУГИе инжектиро-
+     * ванные датаграммы ('i'-бейт фазы 3 / 'B'-бейты) — их кейсы СБРАСЫВАЮТ
+     * cstate в 0. Резервные-'A' (фаза 4, строка "reserve") успевали: строка
+     * g49 c cstate=1 + chal обновлён = ЭТО резервные-'A' (vt+0x200, до
+     * 25cf20 не доходят — g51 молчит). ФИКС: пишем 1 ПРЯМО ЗДЕСЬ — на нитке
+     * движка, в детуре 'A'-входа, за наносекунды до реплицированного cmpl —
+     * гонка ИСКЛЮЧЕНА АППАРАТНО (один поток, один пакет). */
+    if (*(volatile u32 *)(state + 0x1a0) == 0) {
+        *(volatile u32 *)(state + 0x1a0) = 1;
+        C2B_LOGS("[c2b] g52: cstate 0->1 @'A' entry (pre-gate, engine thread)\n");
+    }
     if (g_probe_active) return;
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }

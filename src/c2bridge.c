@@ -8101,8 +8101,13 @@ extern void c2b_g56_thunk(void);
  *                                бит-позиция читателя не выровнены
  *   далее строка 8Б -> hex @25b310 -> chal/proto -> строка -> strstr.
  * Детур ЛОГИТ state читателя ДО ветвления: bits/word/mask/byte(=word&mask)/
- * dcur/dend/cstate — по дампу вычисляется исход точки-чека (byte==0x2e?) и
- * факт ухода на refill (bits<=7). Сиг = точные 15Б, реплика mov+cmp+ручной
+ * dcur/dend/dp0/b40/cstate — по дампу вычисляется исход точки-чека (byte==
+ * 0x2e?) и факт ухода на refill (bits<=7). RE refill @25c707: r13 = БАЗА
+ * ТАБЛИЦЫ МАСК ([r13+idx*4]; [r13+0x20]=table[8]=0xFF для bits>7), refill
+ * собирает байт из остатка слова + топ-битов нового (or/shl), НО @25c72f
+ * ЕЩЕ ОДИН тихий гейт: cmpb $0x0,0x40(%rbx); jne 259f50 — b40!=0 = reject!
+ * (b40 ставится 1 в string-loop refill @25a9d2/25cb75 — если 'B' приходит
+ * с неперечищенным флагом, refill-путь умирает молча ДО точки-чека). Сиг = точные 15Б, реплика mov+cmp+ручной
  * jle (флаги наружу не живут: 25a929 sub ставит свои; t==0-ветка 25cb85
  * ревходит сюда через jne 25a91a — тот же контраст регистров, rsp%16==0).
  * Входы: r15=state rbx=buf(читатель) r13=база маски ([r13+0x20]). */
@@ -8131,6 +8136,7 @@ void c2b_g62_log(uptr state, uptr buf, uptr mbase)
     C2B_LOGS(" dcur="); C2B_LOGH(*(volatile u32 *)(buf + 0x58));
     C2B_LOGS(" dend="); C2B_LOGH(*(volatile u32 *)(buf + 0x60));
     C2B_LOGS(" dp0=");  C2B_LOGH(*(volatile u32 *)(buf + 0x38));
+    C2B_LOGS(" b40=");  C2B_LOGN((u32)*(volatile u8 *)(buf + 0x40));
     C2B_LOGS("\n");
     g_probe_active = 0;
 }

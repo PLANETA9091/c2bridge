@@ -9057,10 +9057,40 @@ static u32 g_g24_nstate;
  *  @0x24b56b: rdi=state, rsi=&snap(0x4f0), edx=chal, ecx=proto, r8=val
  *  u64, r9d=u8@0x4c1): тикет-путь исполняет сам движок. Рефрактерность
  *  2с, кап 10, C2B_G28=0 выкл. (b) не трогаем: na-зона логируется в
- *  dumpone, адрес сравнения — решающие данные следующего ранa. */
+ *  dumpone, адрес сравнения — решающие данные следующего ранa.
+ * ---- g29 (RE 0907, /tmp/engine.asm): КОРЕНЬ [I:0:0]:0 ----
+ *  Identity-строитель 0x248010 (вызывается из SendConnectPacket @0x24aebc
+ *  c arg4=snap=state+0x4f0; рump 0x24b56e передаёт ТОТ ЖЕ объект):
+ *   [snap+0x1c]!=0 -> ветки SteamID/пустого identity; ==0 -> ЧИСТЫЙ путь:
+ *   ip=bswap(u32@[snap+4]) через 65ec30, port=rol8(u16@[snap+8]) через
+ *   65ec10 — CNetAdr СТАРОГО класса {type@0, ip BE @+4, port BE @+8}
+ *   (семейство 65eb70 IsLoopback(ip==127.0.0.1@+4) / 65eb80 type==1 /
+ *   65eb90 Clear / 65ebc0 SetIP4 / 65ebe0 SetIP(bswap@+4) / 65ebf0
+ *   SetType@0 / 65ec00 GetType / 65ec20 GetIP / 65ec30 GetIP_host).
+ *   ЖИВОЙ приёмник пишет NEW-style {type=3@0, pad=0, ip@8, port BE @0xc,
+ *   0@0x10..0x1f} -> старые чтения: ip=bswap(u32@+4)=0, port=u16@+8=
+ *   первые 2 байта ip -> identity [I:0:0]:0 ЭМПИРИКА ОБЪЯСНЕНА.
+ *  ОТПРАВКА (send-layer 0x4bae20, Warning @0x4bb618):
+ *   [netadr+0x1c]!=0 -> ad-hoc маршрут -> нет steam net connection ->
+ *   "Can't send ad-hoc to address %s" -> DROP (10:10 корреляция с g28);
+ *   ==0 -> IsLoopback/IsType1 проверки -> 4b7da0(fd,buf,len,snap,..):
+ *   GetType(snap)!=0 -> PLAIN-UDP OOB send -> "UDP -> %s: sz=%d OOB" —
+ *   НА ПРОВОДЕ. g26 писал snap[0x1c]=1 -> САМ вгонял в ad-hoc drop!
+ *  ЧЕК (b) при snap[0x1c]==0 НЕ падает: 0x248330 @0x248376 test eax;
+ *   je 0x2483b0 — alt-путь: 65e930(snap, el+0x48, 0) = netadr== старого
+ *   класса (type@0, port u16@+8, ip u32@+4). СОВПАДЕНИЕ требует OLD-
+ *   зеркал в ОБОИХ объектах: snap {ip BE @st+0x4f4, port BE @st+0x4f8}
+ *   и el {ip BE @el+0x4c, port BE @el+0x50} — источники: NEW-копия
+ *   приёмника (ip bytes @st+0x4f8, port BE @st+0x4fc).
+ *  ИТОГ g29: snap[0x1c]->0 (НЕ 1!), OLD-зеркала ip/port в snap+el,
+ *  auth-proto=3 (старое g26), g28 без изменений -> чеки a/b/c проходят,
+ *  identity=IPv4(цель:28022), отправка по 4b7da0 = UDP OOB НА ПРОВОДЕ.
+ *  C2B_G29=0 — откат к старой стратегии (snap[0x1c]=1 + выравнивание
+ *  g26v2 под primary-путь чека (b)). */
 static u32 g_g28_sends;
 static u32 g_g28_last_it;
 static u32 g_g28_en = 1;
+static u32 g_g29_en = 1;
 /* v3 (run144/145 post-mortem: g24 v1/v2 = dl_iterate_phdr КАЖДЫЕ 5с по 2мин +
  * rescan каждые 64с -> КОНКУРЕНЦИЯ за loader-lock с auth-тредом, чей rearm
  * (g8/g9/g13/modmap) ТОЖЕ зовёт dl_iterate_phdr: run144 a2 backtrace = auth
@@ -9375,6 +9405,10 @@ static void *c2b_g24_thread(void *arg)
         if (e && e[0] == '0') { g_g28_en = 0;
             C2B_LOGS("[c2b] g28: disabled by env\n"); }
     }
+    {   const char *e = getenv("C2B_G29");
+        if (e && e[0] == '0') { g_g29_en = 0;
+            C2B_LOGS("[c2b] g29: disabled by env\n"); }
+    }
     for (it = 0; it < 600 && !g_engine_base; it++) usleep(1000000);
     for (i = 0; i < 4; i++) { last_c[i] = 0xffffffffu; last_h[i] = 0; }
     /* v3.9.1: скан #1 через 45с после базы (движок встал, стейт создан,
@@ -9431,9 +9465,10 @@ static void *c2b_g24_thread(void *arg)
                 u32 ap = *(volatile u32 *)(st + 0x8dc4);
                 uptr arr = *(volatile const uptr *)(st + 0x148);
                 u32 cnt = *(volatile const u32 *)(st + 0x158);
-                if (s1c == 0) {
-                    *(volatile u32 *)(st + 0x50c) = 1;
-                    C2B_LOGS("[c2b] g26: snap[0x1c] 0->1 st=");
+                if (s1c != (g_g29_en ? 0u : 1u)) {
+                    *(volatile u32 *)(st + 0x50c) = (g_g29_en ? 0u : 1u);
+                    C2B_LOGS(g_g29_en ? "[c2b] g29: snap[0x1c]->0 st="
+                                      : "[c2b] g26: snap[0x1c]->1 st=");
                     C2B_LOGH((u32)st); C2B_LOGS("\n");
                 }
                 if (ap == 0) {
@@ -9442,63 +9477,122 @@ static void *c2b_g24_thread(void *arg)
                     C2B_LOGH((u32)st); C2B_LOGS("\n");
                 }
                 if (arr && cnt) {
-                    u32 ei, matched = 0;
-                    for (ei = 0; ei < cnt && ei < 8 && !matched; ei++) {
-                        uptr el = arr + (uptr)ei * 0x68;
-                        u32 e64 = *(volatile const u32 *)(el + 0x64);
-                        if (e64 >= 1 && e64 <= 3) {
-                            u32 e60 = *(volatile const u32 *)(el + 0x60);
-                            u64 e54 = *(volatile const u64 *)(el + 0x54);
-                            u32 e5c = *(volatile const u32 *)(el + 0x5c);
-                            matched = 1;
-                            if (s1c != e64) {
-                                *(volatile u32 *)(st + 0x50c) = e64;
-                                C2B_LOGS("[c2b] g26v2: snap[0x1c]->el64 el=");
+                    if (!g_g29_en) {
+                        /* ---- СТАРАЯ СТРАТЕГИЯ g26v2 (откат): snap[0x1c]=1
+                         * + выравнивание snap под элемент (primary-путь
+                         * чека (b): el->0x64==snap[0x1c]∈{1..3} и т.д.) */
+                        u32 ei, matched = 0;
+                        for (ei = 0; ei < cnt && ei < 8 && !matched; ei++) {
+                            uptr el = arr + (uptr)ei * 0x68;
+                            u32 e64 = *(volatile const u32 *)(el + 0x64);
+                            if (e64 >= 1 && e64 <= 3) {
+                                u32 e60 = *(volatile const u32 *)(el + 0x60);
+                                u64 e54 = *(volatile const u64 *)(el + 0x54);
+                                u32 e5c = *(volatile const u32 *)(el + 0x5c);
+                                matched = 1;
+                                if (s1c != e64) {
+                                    *(volatile u32 *)(st + 0x50c) = e64;
+                                    C2B_LOGS("[c2b] g26v2: snap[0x1c]->el64 el=");
+                                    C2B_LOGH((u32)el);
+                                    C2B_LOGS("v=");
+                                    C2B_LOGH(e64); C2B_LOGS("\n");
+                                }
+                                if (e60 != 0) {
+                                    *(volatile u32 *)(el + 0x60) = 0;
+                                    C2B_LOGS("[c2b] g26v2: el->0x60 ->0 el=");
+                                    C2B_LOGH((u32)el); C2B_LOGS("\n");
+                                }
+                                {   u64 s0c = *(volatile const u64 *)(st + 0x4fc);
+                                    if (s0c != e54) {
+                                        *(volatile u64 *)(st + 0x4fc) = e54;
+                                        C2B_LOGS("[c2b] g26v2: snap[0x0c..0x13]->el54 v=");
+                                        C2B_LOGH((u32)(e54 >> 32));
+                                        C2B_LOGH((u32)e54); C2B_LOGS("\n");
+                                    }
+                                    if (*(volatile const u32 *)(st + 0x504) != e5c) {
+                                        *(volatile u32 *)(st + 0x504) = e5c;
+                                        C2B_LOGS("[c2b] g26v2: snap[0x14]->el5c v=");
+                                        C2B_LOGH(e5c); C2B_LOGS("\n");
+                                    }
+                                }
+                                C2B_LOGS("[c2b] g26v2: channel match built el=");
                                 C2B_LOGH((u32)el);
-                                C2B_LOGS("v=");
-                                C2B_LOGH(e64); C2B_LOGS("\n");
+                                C2B_LOGS("e64=");
+                                C2B_LOGH(e64);
+                                C2B_LOGS("\n");
                             }
-                            if (e60 != 0) {
-                                *(volatile u32 *)(el + 0x60) = 0;
-                                C2B_LOGS("[c2b] g26v2: el->0x60 ->0 el=");
-                                C2B_LOGH((u32)el); C2B_LOGS("\n");
-                            }
-                            {   u64 s0c = *(volatile const u64 *)(st + 0x4fc);
-                                if (s0c != e54) {
-                                    *(volatile u64 *)(st + 0x4fc) = e54;
-                                    C2B_LOGS("[c2b] g26v2: snap[0x0c..0x13]->el54 v=");
-                                    C2B_LOGH((u32)(e54 >> 32));
-                                    C2B_LOGH((u32)e54); C2B_LOGS("\n");
-                                }
-                                if (*(volatile const u32 *)(st + 0x504) != e5c) {
-                                    *(volatile u32 *)(st + 0x504) = e5c;
-                                    C2B_LOGS("[c2b] g26v2: snap[0x14]->el5c v=");
-                                    C2B_LOGH(e5c); C2B_LOGS("\n");
-                                }
-                            }
-                            C2B_LOGS("[c2b] g26v2: channel match built el=");
+                        }
+                        if (!matched) {   /* хирургия элемента[0] под snap */
+                            uptr el = arr;
+                            C2B_LOGS("[c2b] g26v2: no el64 1..3, surgery el=");
                             C2B_LOGH((u32)el);
                             C2B_LOGS("e64=");
-                            C2B_LOGH(e64);
+                            C2B_LOGH(*(volatile const u32 *)(el + 0x64));
+                            C2B_LOGS("e60=");
+                            C2B_LOGH(*(volatile const u32 *)(el + 0x60));
                             C2B_LOGS("\n");
+                            *(volatile u32 *)(el + 0x64) = 1;
+                            *(volatile u32 *)(el + 0x60) = 0;
+                            *(volatile u64 *)(el + 0x54) =
+                                *(volatile const u64 *)(st + 0x4fc);
+                            *(volatile u32 *)(el + 0x5c) =
+                                *(volatile const u32 *)(st + 0x504);
+                            *(volatile u32 *)(st + 0x50c) = 1;
                         }
-                    }
-                    if (!matched) {   /* хирургия элемента[0] под snap */
+                    } else {
+                        /* ---- g29: OLD-зеркала netadr в ОБЕ стороны ----
+                         * snap[0x1c]=0 -> чек (b) по alt-пути 0x2483b0:
+                         * 65e930(snap, el+0x48, 0) — netadr== старого
+                         * класса {type@0, ip BE @+4, port BE @+8}.
+                         * Источники — NEW-копия приёмника: ip bytes
+                         * @st+0x4f8, port BE @st+0x4fc. Пишем в snap
+                         * (+0x4f4/+0x4f8) и el (+0x4c/+0x50) ОДИНАКОВЫЕ
+                         * OLD-значения -> 65e930=true, identity строится
+                         * ЧИСТЫМ путём (65ec30/65ec10) = IPv4(цель). */
                         uptr el = arr;
-                        C2B_LOGS("[c2b] g26v2: no el64 1..3, surgery el=");
-                        C2B_LOGH((u32)el);
-                        C2B_LOGS("e64=");
-                        C2B_LOGH(*(volatile const u32 *)(el + 0x64));
-                        C2B_LOGS("e60=");
-                        C2B_LOGH(*(volatile const u32 *)(el + 0x60));
-                        C2B_LOGS("\n");
-                        *(volatile u32 *)(el + 0x64) = 1;
-                        *(volatile u32 *)(el + 0x60) = 0;
-                        *(volatile u64 *)(el + 0x54) =
-                            *(volatile const u64 *)(st + 0x4fc);
-                        *(volatile u32 *)(el + 0x5c) =
-                            *(volatile const u32 *)(st + 0x504);
-                        *(volatile u32 *)(st + 0x50c) = 1;
+                        u32 ei;
+                        for (ei = 0; ei < cnt && ei < 8; ei++) {
+                            uptr e = arr + (uptr)ei * 0x68;
+                            if (*(volatile const u32 *)(e + 0x48) == 3) {
+                                el = e; break;
+                            }
+                        }
+                        {   u32 ipb = *(volatile const u32 *)(st + 0x4f8);
+                            u16 ptb = *(volatile const u16 *)(st + 0x4fc);
+                            if (ipb != 0 && ptb != 0) {
+                                if (*(volatile const u32 *)(st + 0x4f4) != ipb) {
+                                    *(volatile u32 *)(st + 0x4f4) = ipb;
+                                    C2B_LOGS("[c2b] g29: snap.ip<-recv st=");
+                                    C2B_LOGH((u32)st);
+                                    C2B_LOGS("v=");
+                                    C2B_LOGH(ipb); C2B_LOGS("\n");
+                                }
+                                if (*(volatile const u16 *)(st + 0x4f8) != ptb) {
+                                    *(volatile u16 *)(st + 0x4f8) = ptb;
+                                    C2B_LOGS("[c2b] g29: snap.port<-recv v=");
+                                    C2B_LOGH(ptb); C2B_LOGS("\n");
+                                }
+                                if (*(volatile const u32 *)(el + 0x4c) != ipb) {
+                                    *(volatile u32 *)(el + 0x4c) = ipb;
+                                    C2B_LOGS("[c2b] g29: el.ip el=");
+                                    C2B_LOGH((u32)el);
+                                    C2B_LOGS("v=");
+                                    C2B_LOGH(ipb); C2B_LOGS("\n");
+                                }
+                                if (*(volatile const u16 *)(el + 0x50) != ptb) {
+                                    *(volatile u16 *)(el + 0x50) = ptb;
+                                    C2B_LOGS("[c2b] g29: el.port v=");
+                                    C2B_LOGH(ptb); C2B_LOGS("\n");
+                                }
+                                C2B_LOGS("[c2b] g29: old-mirrors built el=");
+                                C2B_LOGH((u32)el);
+                                C2B_LOGS("ip=");
+                                C2B_LOGH(ipb);
+                                C2B_LOGS("pt=");
+                                C2B_LOGH(ptb);
+                                C2B_LOGS("\n");
+                            }
+                        }
                     }
                 }
                 /* g28: прямой вызов vt+0x198 SendConnectPacket(state,&snap,

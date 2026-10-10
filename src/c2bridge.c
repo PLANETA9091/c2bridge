@@ -10061,6 +10061,28 @@ static void c2b_g32_drive(void)
         if (g_g11_base) {
             *(volatile u32 *)(g_g11_base + 0x2c6dcc8ull) = 6;
             C2B_LOGS("[c2b] g33: global spew gate 0x2c6dcc8 -> 6\n");
+            /* 41f-g34: ПРИНУДИТЬ спью отказа ConnectByIPAddress —
+             * 0x1ef431c: 7e 16 (jle, скипает spew "Cannot create IPv4
+             * connection. %s" при гейте <=1) -> 90 90 (nop nop): errMsg
+             * из стека ПЕЧАТАЕТСЯ всегда. Гейт g33 выше уже открыт,
+             * но спью не шёл — вероятен второй фильтр ниже по потоку;
+             * патч 2 байт убирает саму ветку. Сиг-чек 7e 16 обязателен. */
+            {
+                volatile u8 *p34 = (volatile u8 *)(g_g11_base + 0x1ef431cull);
+                u8 b0 = *p34, b1 = *(p34 + 1);
+                C2B_LOGS("[c2b] g34: sig@0x1ef431c=");
+                C2B_LOGH(b0); C2B_LOGH(b1);
+                if (b0 == 0x7e && b1 == 0x16) {
+                    if (c2b_page_protect((uptr)p34, 2, 0x07) == 0) {
+                        *p34 = 0x90; *(p34 + 1) = 0x90;
+                        C2B_LOGS(" -> noped (spew forced)\n");
+                    } else {
+                        C2B_LOGS(" -> mprotect failed\n");
+                    }
+                } else {
+                    C2B_LOGS(" -> sig mismatch, skip\n");
+                }
+            }
         } else {
             C2B_LOGS("[c2b] g33: no g11 base in 60s - spew gate skipped\n");
         }

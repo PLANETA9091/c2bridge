@@ -11274,8 +11274,20 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
             for (j = 0; j < 8; j++) out[n++] = (u8)hx[(v >> (28 - 4 * j)) & 15];
             out[n++] = 0;
         }
-        out[n++] = '9'; out[n++] = '6'; out[n++] = 0;  /* "96\0" */
-        while (n < 59) out[n++] = 0;   /* payload до 55 (итого 59, байт-в-байт ферма) */
+        out[n++] = '9'; out[n++] = '6'; out[n++] = 0;  /* "96\0" — ver u32 = 0x3639 */
+        /* 49f-g54: b2 = 1. WIN-хвост 25d720: (lobby==0) && (b2!=0) &&
+         * (pw-чек: e103e9.0x10 не задан -> rax=*(e103f8)+0x48 = строка
+         * cl_password cvar = пустая в песочнице -> cmpb $0 прошёл) ->
+         * 25d766: state+0x4b9 = 1 = НАСТОЯЩЕЕ ПОДКЛЮЧЕНИЕ + 332e80() +
+         * vt+0x160-нотификатор. С b2=0 поток уходил в strstr-цепочку
+         * (connect-retry/matchmaking-only/lan-only/granted — НИ ОДИН не
+         * матчится с "connect0x...") -> тихий возврат: run202 — lobbies-
+         * Msg печатался, 0x4b9 оставался 0, "Retrying public..." крутился.
+         * Раскладка: out[45] = NUL pw-строки (""), out[46] = b2 = 1,
+         * out[47..54] = lobby-id u64 = 0, out[55+] = b3/b4/пад = 0. */
+        while (n < 45) out[n++] = 0;   /* pw-строка "" -> NUL @45 */
+        out[n++] = 1;                  /* b2 = 1 @46 */
+        while (n < 59) out[n++] = 0;   /* lobby=0, b3/b4=0, пад до 59 */
         break;
     }
     case 8: {                              /* 41e-g: N-агностик — хвост = (reserve)*9 NUL */
@@ -17507,10 +17519,12 @@ static void test_cl(void)
                     }
                     CHECK(ar[41]==0 && ar[42]=='9' && ar[43]=='6' && ar[44]==0,
                           "clv2: fmt9 NUL строки + '96'");
+                    CHECK(ar[45]==0 && ar[46]==1,
+                          "clv2: fmt9 pw-NUL + b2=1 (g54: win-хвост 25d720 требует b2!=0 -> 0x4b9=1)");
                     {
                         u32 okp = 1;
-                        for (i9 = 45; i9 < 59; i9++) if (ar[i9] != 0) okp = 0;
-                        CHECK(okp, "clv2: fmt9 хвостовой паддинг NUL до 59");
+                        for (i9 = 47; i9 < 59; i9++) if (ar[i9] != 0) okp = 0;
+                        CHECK(okp, "clv2: fmt9 lobby=0/b3/b4/пад NUL до 59");
                     }
                     CHECK(c2b_clv2_build_chalreply(ar, 32, 9, 0, 1) == 0,
                           "clv2: fmt9 крошечный буфер -> 0");

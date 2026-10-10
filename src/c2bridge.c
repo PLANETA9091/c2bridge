@@ -11234,6 +11234,39 @@ static void c2b_g32_drive(void)
             C2B_LOGS("\n");
         }
     }
+    /* 50o-g68: NOP je-25bd69 @0x25b320 — СМЕРТЬ 'B' УСТРАНЕНА.
+     * run217 (g64/g67/g66): g62→g64→g67 1:1 (x35/35/35 — точка-чек,
+     * строка-луп, sscanf-вход ВСЕ ПРОЙДЕНЫ; str8='22BC3FEE' ИДЕАЛЬЕН),
+     * g66=0. Дамп g67: r12=0x525b4f00 = младший байт 0 = setne-флаг 0 =
+     * путь 25c652 (0x510==0 && b1c==0 — c510=0 во ВСЕХ дампах: вин 'A'
+     * обнуляет 0x510 @25d6b6): 65ea60 читает ХВОСТ payload после 8 hex
+     * (байты chal = бинарный мусор) -> 679540-lookup -> 0xffff ->
+     * r12=0 -> ненулевой-hex vs r12=0 -> REJECT @25b363. ФИКС: NOP je
+     * (0f 84 43 0a 00 00 @25b320; единственный прыгун на 25b310 =
+     * строка-луп @25a9ad — путь только-'B'): ВСЕ 'B' идут напрямую в
+     * sscanf с r12=1 (@25b317 через g64-тунк) -> ненулевой hex проходит
+     * -> vt+0x170 = ACCEPT. r13d=[r15+0x510]=0 после NOP — не читается
+     * до 25b369 (проверено дизасмом 25b320..25b378). */
+    if (g_engine_base) {
+        static const u8 g68_sig[6] = {
+            0x0f, 0x84, 0x43, 0x0a, 0x00, 0x00          /* je 25bd69 @25b320 */
+        };
+        volatile u8 *s68 = (volatile u8 *)(g_engine_base + 0x25b320ull);
+        if (memcmp((const void *)s68, g68_sig, sizeof g68_sig) == 0) {
+            if (c2b_page_protect((uptr)s68, 6, 0x07) == 0) {
+                u32 i68;
+                for (i68 = 0; i68 < 6; i68++) s68[i68] = 0x90;
+                C2B_LOGS("[c2b] g68: je-25bd69 NOPED @engine+25b320 (the B hex-parse goes DIRECT to sscanf r12=1 -> vt+0x170 accept)\n");
+            } else {
+                C2B_LOGS("[c2b] g68: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g68: sig mismatch @engine+25b320 bytes=");
+            C2B_LOGH(*(const volatile u32 *)s68);
+            C2B_LOGH(*(const volatile u16 *)(s68 + 4));
+            C2B_LOGS("\n");
+        }
+    }
     /* 50g-g56: детур хвоста @0x25d6cc (мотивация у тунка). */
     if (g_engine_base) {
         static const u8 g56_sig[15] = {

@@ -11395,20 +11395,21 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
          * Msg печатался, 0x4b9 оставался 0, "Retrying public..." крутился.
          * Раскладка (n=45 уже после "96\0"): out[45] = NUL pw-строки (""),
          * out[46] = b2 = 1, out[47..54] = lobby-id u64 = 0, out[55+] = 0. */
-        out[n++] = 0;                  /* pw "" -> NUL @45 */
-        out[n++] = 1;                  /* b2 = 1 @46 */
-        /* 50f-g55: lobby-id u64 = 1 (ar[47..54]). RE 25d2fd: 0x4e8 = ВТОРОЕ
-         * 64-бит чтение 645be0 (хвост после b2) = «lobby id» из lobbies-Msg.
-         * Хвост-диспетчер 25d720: pw==0 && 0x4e8!=0 -> 25d7b5 (strstr-цепочка
-         * модификаторов, НИ ОДИН не матчится) -> 25d8ed: pw==0 -> 25d8e0 ->
-         * 24b520 (SendConnectPacket) НАПРЯМУЮ из нашего парса. Плюс
-         * «Server did not approve grace request» (25d90e, требует 0x4e8==0)
-         * ИСЧЕЗАЕТ — ветка одобрения 25d921/25d8e0. С lobby=0 (run204):
-         * win 0x4b9=1 стрелял, но собственный retry цикл движка читал
-         * 0x4e8==0 -> «did not approve» x30 -> fail. lobby!=0 = RESERVED
-         * connect — серверная вилка поведения. b3/b4 = 0, пад до 59. */
-        out[n++] = 1;                  /* lobby-id lo byte = 1 @47 */
-        while (n < 59) out[n++] = 0;   /* lobby hi = 0, b3/b4=0, пад до 59 */
+        out[n++] = 0;                  /* @45: 4-й байт expire-u32 ("96\0"+пад)
+         * 50h-g57: ВСЯ раскладка хвоста после "96\0" была СДВИНУТА на +2 —
+         * g56-дамп (run208) доказал: exp=0x3639 = ar[42..45] (u32 СЪЕДАЕТ
+         * 45-й), pw-ReadString НАЧИНАЕТСЯ с ar[46] (g54-шный "b2=1" @46
+         * читался КАК PW-СТРОКА "\x01\x01" -> pw0=1 -> хвост 25d712 шёл в
+         * pw!=0-ветку 25d866 -> 25d7b5 -> 25d8ed -> "did not approve"
+         * x30 — ЭТО и был весь цикл run204-207; win 0x4b9=1 НЕ СТРЕЛЯЛ
+         * НИКОГДА (c2=0 в g56 и fb=0,0,0,1 в g49). С pw="" (NUL @46)
+         * анкоры сдвигаются: b2 = ar[47], lobby-u64 = ar[48..55]. */
+        out[n++] = 0;                  /* @46: pw NUL (pw="") — ИСТИННЫЙ pw */
+        out[n++] = 0xFF;               /* @47: ИСТИННЫЙ b2 (setne-маска 0x20(r13)
+         * неизвестна -> 0xFF даёт c2=1 при ЛЮБОЙ ненулевой маске) */
+        while (n < 59) out[n++] = 0;   /* @48..58: lobby u64 @48..55 = 0 (win-
+         * путь 25d720: pw==0 && lobby==0 && c2!=0 && pw-cvar пуст ->
+         * 25d766 0x4b9=1 + 332e80()), b3/b4=0, пад до 59 */
         break;
     }
     case 8: {                              /* 41e-g: N-агностик — хвост = (reserve)*9 NUL */
@@ -17640,13 +17641,13 @@ static void test_cl(void)
                     }
                     CHECK(ar[41]==0 && ar[42]=='9' && ar[43]=='6' && ar[44]==0,
                           "clv2: fmt9 NUL строки + '96'");
-                    CHECK(ar[45]==0 && ar[46]==1,
-                          "clv2: fmt9 pw-NUL + b2=1 (g54: win-хвост 25d720 требует b2!=0 -> 0x4b9=1)");
+                    CHECK(ar[45]==0 && ar[46]==0 && ar[47]==0xFF,
+                          "clv2: fmt9 хвост (g57: expire@42..45 съедает 45-й, pw@46=NUL, ИСТИННЫЙ b2@47=0xFF — g56-дамп run208)");
                     {
                         u32 okp = 1;
                         for (i9 = 48; i9 < 59; i9++) if (ar[i9] != 0) okp = 0;
-                        CHECK(ar[47] == 1 && okp,
-                              "clv2: fmt9 lobby-id=1 (g55: 0x4e8!=0 -> 25d7b5 -> 24b520 напрямую, без 'did not approve')");
+                        CHECK(okp,
+                              "clv2: fmt9 lobby=0@48..55 (win-путь) + b3/b4/пад NUL до 59 (g57)");
                     }
                     CHECK(c2b_clv2_build_chalreply(ar, 32, 9, 0, 1) == 0,
                           "clv2: fmt9 крошечный буфер -> 0");

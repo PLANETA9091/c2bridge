@@ -11283,9 +11283,9 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
          * (connect-retry/matchmaking-only/lan-only/granted — НИ ОДИН не
          * матчится с "connect0x...") -> тихий возврат: run202 — lobbies-
          * Msg печатался, 0x4b9 оставался 0, "Retrying public..." крутился.
-         * Раскладка: out[45] = NUL pw-строки (""), out[46] = b2 = 1,
-         * out[47..54] = lobby-id u64 = 0, out[55+] = b3/b4/пад = 0. */
-        while (n < 45) out[n++] = 0;   /* pw-строка "" -> NUL @45 */
+         * Раскладка (n=45 уже после "96\0"): out[45] = NUL pw-строки (""),
+         * out[46] = b2 = 1, out[47..54] = lobby-id u64 = 0, out[55+] = 0. */
+        out[n++] = 0;                  /* pw "" -> NUL @45 */
         out[n++] = 1;                  /* b2 = 1 @46 */
         while (n < 59) out[n++] = 0;   /* lobby=0, b3/b4=0, пад до 59 */
         break;

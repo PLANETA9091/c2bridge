@@ -45,6 +45,7 @@ typedef unsigned int   uptr;
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <time.h>
 static void c2b_segv(int sig, siginfo_t *si, void *uc)
@@ -76,6 +77,7 @@ extern i32   __sigsetjmp(void *buf, i32 savemask);   /* 41f-c: SEGV-защита
 extern void  siglongjmp(void *buf, i32 val);
 extern i32   sigaction(i32 sig, const void *act, void *oldact);
 extern i32   sigemptyset(void *set);   /* маска sa_mask */
+extern i64   pread(i32 fd, void *buf, uptr n, uptr off);   /* g24 v4.2: ssize_t/size_t/off_t = 64-bit */
 
 static int g_logfd = 2;
 
@@ -9259,19 +9261,59 @@ static u32 c2b_g24_add_state(uptr p)
     g_g24_state[g_g24_nstate++] = p;
     return 1;
 }
+/* v4.2: chunked /proc/self/mem reader — 0 на unmapped/неудачных чтениях
+ * (вместо SIGSEGV прямых разыменований); кэш 64KB chunk-а на скан.
+ * Дозаполняем chunk ПОСЛЕ дыр (pread короткий/-EIO на unmapped странице
+ * -> продолжаем со следующей): без этого — слепые зоны у границ маппингов. */
+static u64 c2b_g24_rd64(int fd, uptr *clo, u32 *cn, u8 *buf, uptr a)
+{
+    u64 v;
+    if (a < *clo || a + 8 > *clo + *cn) {
+        uptr c = a & ~((uptr)0xFFFF);
+        u32 got = 0;
+        while (got < 0x10000) {
+            u64 rc = (u64)pread(fd, buf + got, 0x10000 - got, c + got);
+            if (rc == 0 || rc > 0x7FFFFFFFull) break;   /* EOF/EIO/err */
+            got += (u32)rc;
+        }
+        *clo = c;
+        *cn = got;
+    }
+    if (a < *clo || a + 8 > *clo + *cn) return 0;
+    memcpy(&v, buf + (a - *clo), 8);
+    return v;
+}
 static void c2b_g24_find_state(void)
 {
     struct c2b_g24_rset rs;
     u32 i, found = 0;
     uptr p;
+    /* v4.2 (run164 a2): SIGSEGV в c2b_g24_find_state — прямые
+     * разыменования *(volatile uptr*)p по ranges из maps-СНАПШОТА гонятся
+     * с concurrent munmap движка (панорама/asset loading маппит/анмапит
+     * постоянно); ресканы каждые ~45с (nstate=3<4) -> рано или поздно
+     * chunk исчезает между collect_ranges и сканом -> CRASH (run164 a2,
+     * ~8-я минута, весь прогон убит). ФИКС: чтение ЧАНКАМИ 64KB через
+     * /proc/self/mem pread — unmapped chunk = EIO -> skip, ноль крашей;
+     * 2.4GB скан = ~37k pread + ин-буферное чтение (скорость ок).
+     * Чтение 0 на невалидных адресах просто не совпадёт с константами. */
+    int mfd;
+    uptr clo = 0;
+    u32 cn = 0;
+    u8 cbuf[65536];
+extern i32 open(const char *, i32, ...);
+extern i32 close(i32);
+#define C2B_G24_RD64(a) (c2b_g24_rd64(mfd, &clo, &cn, cbuf, (a)))
     if (g_g24_nstate >= 4 || !g_engine_base) return;
+    mfd = open("/proc/self/mem", 0 /*O_RDONLY*/);
+    if (mfd < 0) return;
     c2b_g24_collect_ranges(&rs);
-    if (!rs.n) return;
+    if (!rs.n) { close(mfd); return; }
     /* канал B: vptr-пара (0xd78bb8@0 + 0xd78de8@8) */
     for (i = 0; i < rs.n && g_g24_nstate < 4; i++) {
         for (p = rs.r[i].lo; p + 16 <= rs.r[i].hi && g_g24_nstate < 4; p += 8) {
-            if (*(volatile uptr *)p == g_engine_base + C2B_G24_VPTR1 &&
-                *(volatile uptr *)(p + 8) == g_engine_base + C2B_G24_VPTR2) {
+            if (C2B_G24_RD64(p) == g_engine_base + C2B_G24_VPTR1 &&
+                C2B_G24_RD64(p + 8) == g_engine_base + C2B_G24_VPTR2) {
                 if (c2b_g24_add_state(p)) found++;
             }
         }
@@ -9279,7 +9321,7 @@ static void c2b_g24_find_state(void)
     /* канал A: живые слоты accept -> vtbase=V-0x200 -> инстансы с vptr==vtbase */
     for (i = 0; i < rs.n && g_g24_nstate < 4; i++) {
         for (p = rs.r[i].lo; p + 8 <= rs.r[i].hi && g_g24_nstate < 4; p += 8) {
-            uptr v = *(volatile uptr *)p;
+            uptr v = C2B_G24_RD64(p);
             if (v == g_engine_base + C2B_G21_GATE_RVA) {
                 uptr vtbase = p - 0x200;
                 u32 k;
@@ -9291,7 +9333,7 @@ static void c2b_g24_find_state(void)
                 for (k = 0; k < rs.n && g_g24_nstate < 4; k++) {
                     uptr q;
                     for (q = rs.r[k].lo; q + 8 <= rs.r[k].hi && g_g24_nstate < 4; q += 8)
-                        if (*(volatile uptr *)q == vtbase && c2b_g24_add_state(q))
+                        if (C2B_G24_RD64(q) == vtbase && c2b_g24_add_state(q))
                             found++;
                 }
             }
@@ -9301,14 +9343,15 @@ static void c2b_g24_find_state(void)
     for (i = 0; i < rs.n && g_g24_nstate < 4; i++) {
         for (p = rs.r[i].lo; p + 0x520 <= rs.r[i].hi && g_g24_nstate < 4; p += 8) {
             uptr vp;
-            if (*(volatile const u32 *)(p + 0x1a0) != 1) continue;
-            if (*(volatile const u32 *)(p + 0x4dc) != 3) continue;
-            if (*(volatile const u32 *)(p + 0x4d8) == 0) continue;
-            vp = *(volatile uptr *)p;
+            if ((u32)C2B_G24_RD64(p + 0x1a0) != 1) continue;
+            if ((u32)C2B_G24_RD64(p + 0x4dc) != 3) continue;
+            if ((u32)C2B_G24_RD64(p + 0x4d8) == 0) continue;
+            vp = C2B_G24_RD64(p);
             if (vp < g_engine_base || vp >= g_engine_base + 0x4000000) continue;
             if (c2b_g24_add_state(p)) found++;
         }
     }
+    close(mfd);
     C2B_LOGS("[c2b] g24: state scan ranges=");
     C2B_LOGN(rs.n);
     C2B_LOGS("tot=");
@@ -9327,6 +9370,7 @@ static void c2b_g24_find_state(void)
         C2B_LOGH((u32)(g_g24_state[i] >> 32)); C2B_LOGH((u32)g_g24_state[i]);
     }
     C2B_LOGS("\n");
+#undef C2B_G24_RD64
 }
 static void c2b_g24_dumpone(u32 i, u32 cs)
 {

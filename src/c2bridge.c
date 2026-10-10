@@ -10740,11 +10740,14 @@ static i32 c2b_clv2_pick_fresh(u32 *cid, u64 *ch, u64 *ts)
     return 1;
 }
 
-/* g31-вариант 2: keypair x25519 (клэмп по RFC; сид — xorshift от стека) */
+/* g31-вариант 2: keypair x25519 (клэмп по RFC; сид — xorshift от стека).
+ * Готовость — ФЛАГ (не pub[0]!=0: первый байт ключа легитимно бывает 0 —
+ * урон CI 180, флак 1/256). */
+static u32 g_clv2_cr_have;
 static void c2b_clv2_cr_keygen(void)
 {
     u32 i;
-    if (g_clv2_cr_pub[0]) return;                /* уже сгенерён */
+    if (g_clv2_cr_have) return;                  /* уже сгенерён */
     for (i = 0; i < 32; i += 4) {
         u32 r = c2b_clv2_rand32();
         g_clv2_cr_priv[i]     = (u8)r;
@@ -10760,6 +10763,7 @@ static void c2b_clv2_cr_keygen(void)
         base9[0] = 9;                            /* u-координата базовой точки */
         c2b_x25519(g_clv2_cr_pub, g_clv2_cr_priv, base9);
     }
+    g_clv2_cr_have = 1;
 }
 
 /* [0x22][u16 pb_len LE][pb][zero-pad] = ровно 512 байт; вариант >= 2 добавляет
@@ -16752,7 +16756,8 @@ static void test_cl(void)
                     CHECK(cr[28] == 0x41 && cr[33] == 0x01 && cr[36] == 0x01,
                           "g31: f8 steamid64 LE (0x01100001...: byte4+byte7=01)");
                     CHECK(cr[3 + pl2] == 0 && cr[511] == 0, "g31: паддинг NUL");
-                    g_clv2_cr_pub[0] = 0;      /* форс keygen в v2 */
+                    g_clv2_cr_have = 0;          /* форс keygen в v2 */
+                    for (qi = 0; qi < 32; qi++) g_clv2_cr_pub[qi] = 0;
                     pl2 = c2b_clv2_build_connreq(cr, 2, 0x12345678u,
                                                  0x1122334455667788ull,
                                                  0x0102030405060708ull);
@@ -16765,7 +16770,11 @@ static void test_cl(void)
                           "g31: key_type=1 (CURVE25519)");
                     CHECK(cr[34] == 0x12 && cr[35] == 32,
                           "g31: key_data len=32");
-                    CHECK(cr[36] != 0, "g31: x25519 pub сгенерён (nonzero)");
+                    {
+                        u32 nz = 0;
+                        for (qi = 36; qi < 68; qi++) if (cr[qi]) nz = 1;
+                        CHECK(nz, "g31: x25519 pub сгенерён (не все нули)");
+                    }
                     CHECK(cr[68] == 0x41, "g31: f8 после crypt");
                     {
                         u32 okz = 1;

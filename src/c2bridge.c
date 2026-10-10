@@ -7163,6 +7163,8 @@ static u32 g_gns_relay_sent;            /* сколько 0x22 ушло чере
 static u32 g_gns_udpcnt;                /* C2B_GNS_UDPCNT=1: *(base+0x2cbb900)=1 */
 static u8  g_gns_connect_target[24];    /* C2B_GNS_CONNECT=ip:port (ascii) */
 static u32 g_gns_connect_go;            /* драйвер вооружён */
+static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
+static socklen_t g_gns_dstlen;          /* 0 = не собран */
 
 /* 41f-g32a: fwd decl — драйвер определяется ниже, зовётся из auth-потока */
 static void c2b_g32_drive(void);
@@ -7218,13 +7220,19 @@ void c2b_g11_xport_log(uptr wrap, uptr orsp)
              * (source addr = биндинг challenge!), dst = g_clv2_dst (цель).
              * Гейт C2B_GNS_RELAY=1 (двойная отправка безвредна: сервер
              * уже молчит на транспортный путь). */
-            if (g_gns_relay && fd > 0 && fd < 1024 && g_clv2_dstlen >= 6 &&
-                *(volatile u8 *)sptr == 0x22 && g_clp_sendto) {
-                ((c2b_sendto_fn)g_clp_sendto)(fd, (const void *)sptr, (u32)slen,
-                                              0, (const void *)g_clv2_dst,
-                                              g_clv2_dstlen);
-                g_gns_relay_sent++;
-                C2B_LOGS(" RELAYED#"); C2B_LOGN(g_gns_relay_sent);
+            if (g_gns_relay && fd > 0 && fd < 1024 && g_clp_sendto) {
+                /* dst: СОБСТВЕННЫЙ sockaddr_in g32 (из env, собран драйвером)
+                 * -> fallback g_clv2_dst (CLV2-капчер). fd движка держит
+                 * биндинг challenge; Env-цель = та же, что и challenge. */
+                const void *rd = (g_gns_dstlen >= 6) ? (const void *)g_gns_dst
+                                                     : (const void *)g_clv2_dst;
+                socklen_t rl = (g_gns_dstlen >= 6) ? g_gns_dstlen : g_clv2_dstlen;
+                if (rl >= 6 && *(volatile u8 *)sptr == 0x22) {
+                    ((c2b_sendto_fn)g_clp_sendto)(fd, (const void *)sptr,
+                                                  (u32)slen, 0, rd, rl);
+                    g_gns_relay_sent++;
+                    C2B_LOGS(" RELAYED#"); C2B_LOGN(g_gns_relay_sent);
+                }
             }
         }
     }
@@ -10041,16 +10049,21 @@ static void c2b_g32_drive(void)
         C2B_LOGS("[c2b] g32: bad C2B_GNS_CONNECT value\n");
         return;
     }
-    /* g32: ждём qconnect-цель (g_clv2_dst из CLV2-капчера) ДО вызова —
-     * relay капчуренного 0x22 требует g_clv2_dstlen>=6; GNS-обмен 0x20/0x21
-     * стартует ПОСЛЕ ConnectByIPAddress, так что окно не теряется.
-     * Таймаут 240с (2 попытки движка по ~60с); по таймауту драйвер всё
-     * равно сработает (капчер сегментов работает и без relay). */
+    /* g32 v2: БЕЗ ожидания g_clv2_dstlen (run172: 240s-ждатель пережил
+     * попытку — драйвер не дошёл до Connect). Релей использует СОБСТВЕННЫЙ
+     * sockaddr_in из env (g_gns_dst), капчер работает всегда. */
     {
-        u32 wt;
-        for (wt = 0; wt < 240 && g_clv2_dstlen < 6; wt++) usleep(1000000);
-        C2B_LOGS("[c2b] g32: dst wait done len=");
-        C2B_LOGN(g_clv2_dstlen);
+        for (k = 0; k < 16; k++) g_gns_dst[k] = 0;
+        g_gns_dst[0] = 2;                              /* AF_INET (LE) */
+        g_gns_dst[2] = (u8)(port >> 8);                /* sin_port BE */
+        g_gns_dst[3] = (u8)(port & 0xff);
+        g_gns_dst[4] = (u8)a[0]; g_gns_dst[5] = (u8)a[1];
+        g_gns_dst[6] = (u8)a[2]; g_gns_dst[7] = (u8)a[3];
+        g_gns_dstlen = 16;
+        C2B_LOGS("[c2b] g32: relay dst built 02 00 ");
+        C2B_LOGH(g_gns_dst[2]); C2B_LOGH(g_gns_dst[3]);
+        C2B_LOGH(g_gns_dst[4]); C2B_LOGH(g_gns_dst[5]);
+        C2B_LOGH(g_gns_dst[6]); C2B_LOGH(g_gns_dst[7]);
         C2B_LOGS("\n");
     }
     for (k = 0; k < sizeof(addr); k++) addr[k] = 0;

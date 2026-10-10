@@ -10941,6 +10941,28 @@ static u32 c2b_clv2_build_connreq(u8 *out, u32 variant, u32 cid, u64 ch, u64 ts)
     return 512;
 }
 
+/* g44: КЛИЕНТСКАЯ ВЕРСИЯ движка — поле после "connect\0" в 'B'-accept — это
+ * НЕ expire, а ВЕРСИЯ СЕРВЕРА: 514ab0 = GetClientVersion (sig 55 8b 05 f1 d0
+ * c0 03 48 89 e5 5d c3 — читает u32 @engine+0x4121ba8); чеки @25cfa0/25d26e
+ * = "Server is running a newer/older version, client %d, server %d" — ОБА
+ * проходят iff client == server ТОЧНО. expire32=0 (g42) = "server older" ->
+ * reject (run190: accept доставлен, 'k' ещё x7, движок ушёл в LanSearch).
+ * Читаем глобал напрямую (sig-гард), 0 = проба не удалась (диаг Msg). */
+static u32 g_clv2_cli_ver;
+static u32 c2b_clv2_client_version(void)
+{
+    static const u8 vsig[] = {0x55, 0x8B, 0x05, 0xF1, 0xD0, 0xC0, 0x03,
+                              0x48, 0x89, 0xE5, 0x5D, 0xC3};
+    if (!g_clv2_cli_ver && g_engine_base) {
+        if (memcmp((const void *)(g_engine_base + 0x514ab0), vsig,
+                   sizeof vsig) == 0) {
+            u32 v = *(const volatile u32 *)(g_engine_base + 0x4121ba8);
+            if (v) g_clv2_cli_ver = v;
+        }
+    }
+    return g_clv2_cli_ver;
+}
+
 /* g42: строитель движкового 'B' connect-accept — payload по ПОЛНОМУ RE
  * 0x25a8b0/25bfa3/25cf20/25d26e (см. блок 44f-g42 выше): '.' + 8hex + chal32
  * + proto32=2 + 00 00 + "connect\0" + expire32=0 + b1..b4=0, падд до lastA. */
@@ -10965,7 +10987,11 @@ static u32 c2b_clv2_build_kaccept(u8 *q, u32 cap, u32 hx)
     q[22] = 0; q[23] = 0;                  /* skip 16 бит */
     q[24] = 'c'; q[25] = 'o'; q[26] = 'n'; q[27] = 'n';
     q[28] = 'e'; q[29] = 'c'; q[30] = 't'; q[31] = 0;  /* "connect\0" [@25cf20] */
-    q[32] = 0; q[33] = 0; q[34] = 0; q[35] = 0;  /* expire32=0 -> state+0x8dc4 */
+    {
+        u32 ver = c2b_clv2_client_version();   /* g44: server==client иначе reject */
+        q[32] = (u8)ver; q[33] = (u8)(ver >> 8);
+        q[34] = (u8)(ver >> 16); q[35] = (u8)(ver >> 24);
+    }
     q[36] = 0; q[37] = 0; q[38] = 0; q[39] = 0;  /* b1..b4=0 -> WIN-путь 25d6b6 */
     pl = 40;
     pl2 = g_clv2_last_A_len;               /* падд до lastA (хвост не читается) */
@@ -11647,6 +11673,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                                 C2B_LOGS("ms ago -> engine 'B' connect-accept len=");
                                 C2B_LOGN(pl);
                                 C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
+                                C2B_LOGS(" ver="); C2B_LOGN(c2b_clv2_client_version());
                                 C2B_LOGS("\n");
                                 return (ssize_t)pl;
                             }

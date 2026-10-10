@@ -10708,6 +10708,81 @@ static void c2b_g32_drive(void)
             C2B_LOGS("\n");
         }
     }
+    /* 50j-g60: 'B'-кейс ЭХО-ЧЕКИ NOPED @0x25a8c8..25a914. ПОЛНЫЙ RE цепочки
+     * (engine 2cd041, run211): cmpl cstate@25a8b0 (гейт ОСТАЁТСЯ — g50/g52
+     * форсы) затем 5 x "jne 259f50" = МОЛЧАЛИВЫЙ reject: (1) @25a8c8
+     * hdr[0x1c]==snap[0x50c] (netadr-тип); (2) @25a8eb hdr[0x18]+snap[0x508]
+     * ==0; (3) @25a8f3 hdr[0x18]==0; (4) @25a904 hdr.u64@0x0c==snap.u64@0x4fc
+     * (размер! run190: 'B' len=14 vs 'A' len=59 -> фейл); (5) @25a914
+     * hdr.u32@0x14==snap[0x504] (порт!). КОРЕНЬ run211: snap = ПОСЛЕДНИЙ
+     * распарсенный пакет — реальный h21-keepalive (26B, ИЗ 28022 НАПРЯМУЮ)
+     * или наша 'A' (от моста) — наш 'B' (от моста, 40B) НЕ совпадает по
+     * порт/размеру с h21-снапом -> reject ДО 25cf20 (g51 ноль 'connect'
+     * строк, g48 = вход был). NOP 5x6Б: сравнения side-effect-free (читают
+     * hdr/snap, флаги/регистры дальше не живут — test/cmp после каждого
+     * читают СВОИ поля), cstate-гейт и type==0-ветка (je 25cb85) НЕ тронуты.
+     * Сиг = точные 30Б (дисплейсменты билд-специфичны). */
+    if (g_engine_base) {
+        /* три сегмента: (A) 25a8c8..25a8de = jne+test/je+cmp+ja (NOP только
+         * jne@25a8c8 и ja@25a8d9); (B) 25a8eb..25a8f8 = jne+test+jne (NOP
+         * оба jne, test жив); (C) 25a904..25a919 = jne+mov/cmp+jne (NOP оба
+         * jne, mov/cmp живы). Сиги = точные байты, патчи = точечные 6Б. */
+        static const u8 g60_sigA[23] = {
+            0x0f, 0x85, 0x82, 0xf6, 0xff, 0xff,   /* jne 259f50 @25a8c8 */
+            0x85, 0xc0,                           /* test %eax,%eax     */
+            0x0f, 0x84, 0xaf, 0x22, 0x00, 0x00,   /* je 25cb85          */
+            0x83, 0xf8, 0x03,                     /* cmp $0x3,%eax      */
+            0x0f, 0x87, 0x71, 0xf6, 0xff, 0xff    /* ja 259f50 @25a8d9  */
+        };
+        static const u8 g60_jneA[6] = {0x0f, 0x85, 0x82, 0xf6, 0xff, 0xff};
+        static const u8 g60_jaA[6]  = {0x0f, 0x87, 0x71, 0xf6, 0xff, 0xff};
+        static const u8 g60_sigB[14] = {
+            0x0f, 0x85, 0x5f, 0xf6, 0xff, 0xff,   /* jne 259f50 @25a8eb */
+            0x85, 0xc0,                           /* test %eax,%eax     */
+            0x0f, 0x85, 0x57, 0xf6, 0xff, 0xff    /* jne 259f50 @25a8f3 */
+        };
+        static const u8 g60_jneB1[6] = {0x0f, 0x85, 0x5f, 0xf6, 0xff, 0xff};
+        static const u8 g60_jneB2[6] = {0x0f, 0x85, 0x57, 0xf6, 0xff, 0xff};
+        static const u8 g60_sigC[22] = {
+            0x0f, 0x85, 0x46, 0xf6, 0xff, 0xff,   /* jne 259f50 @25a904 */
+            0x41, 0x8b, 0x87, 0x04, 0x05, 0x00, 0x00, /* mov 0x504(%r15),%eax */
+            0x39, 0x43, 0x14,                     /* cmp %eax,0x14(%rbx) */
+            0x0f, 0x85, 0x36, 0xf6, 0xff, 0xff    /* jne 259f50 @25a914 */
+        };
+        static const u8 g60_jneC1[6] = {0x0f, 0x85, 0x46, 0xf6, 0xff, 0xff};
+        static const u8 g60_jneC2[6] = {0x0f, 0x85, 0x36, 0xf6, 0xff, 0xff};
+        volatile u8 *sA = (volatile u8 *)(g_engine_base + 0x25a8c8ull);
+        volatile u8 *sB = (volatile u8 *)(g_engine_base + 0x25a8ebull);
+        volatile u8 *sC = (volatile u8 *)(g_engine_base + 0x25a904ull);
+        if (memcmp((const void *)sA, g60_sigA, sizeof g60_sigA) == 0 &&
+            memcmp((const void *)sB, g60_sigB, sizeof g60_sigB) == 0 &&
+            memcmp((const void *)sC, g60_sigC, sizeof g60_sigC) == 0) {
+            if (c2b_page_protect((uptr)sA, 23, 0x07) == 0 &&
+                c2b_page_protect((uptr)sB, 14, 0x07) == 0 &&
+                c2b_page_protect((uptr)sC, 22, 0x07) == 0) {
+                u32 i60;
+                for (i60 = 0; i60 < 6; i60++) {
+                    sA[i60] = 0x90;                       /* jne @25a8c8 */
+                    sA[17 + i60] = 0x90;                  /* ja  @25a8d9 */
+                    sB[i60] = 0x90;                       /* jne @25a8eb */
+                    sB[8 + i60] = 0x90;                   /* jne @25a8f3 */
+                    sC[i60] = 0x90;                       /* jne @25a904 */
+                    sC[16 + i60] = 0x90;                  /* jne @25a914 */
+                }
+                (void)g60_jneA; (void)g60_jaA; (void)g60_jneB1;
+                (void)g60_jneB2; (void)g60_jneC1; (void)g60_jneC2;
+                C2B_LOGS("[c2b] g60: 'B' echo-chain NOPED @engine+25a8c8/25a8d9/25a8eb/25a8f3/25a904/25a914 (type/zero/size/port rejects off; cstate gate kept)\n");
+            } else {
+                C2B_LOGS("[c2b] g60: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g60: sig mismatch @engine+25a8c8 bytes=");
+            C2B_LOGH(*(const volatile u32 *)sA);
+            C2B_LOGH(*(const volatile u32 *)(sA + 4));
+            C2B_LOGH(*(const volatile u32 *)(sA + 8));
+            C2B_LOGS("\n");
+        }
+    }
     /* 50g-g56: детур хвоста @0x25d6cc (мотивация у тунка). */
     if (g_engine_base) {
         static const u8 g56_sig[15] = {

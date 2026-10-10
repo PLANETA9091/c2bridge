@@ -10120,6 +10120,25 @@ static void c2b_g32_drive(void)
                 C2B_LOGH((u32)(uptr)oldfn);
                 C2B_LOGS(" -> hook\n");
             }
+            /* 43f-g38 (RE run181): состояние НИЗКОУРОВНЕВОГО инита перед
+             * Connect — refcount 0x2cbb900, s_hEpoll 0x2c6dcb8, wake-fd
+             * 0x2c6dcbc/0x2c6dcc0. Здоровая картина: refcount>=1 (наш
+             * коннект уже AddRef'нулся? НЕТ — читаем ДО Connect, так что
+             * 0, если движок сам низкоуровневый слой не поднимал) и
+             * s_hEpoll=-1 ДО коннекта — норма; ключевой маркер — что
+             * ПОСЛЕ коннекта (см. дублируемый лог ниже). */
+            {
+                volatile u32 *refc = (volatile u32 *)(g_g11_base + 0x2cbb900ull);
+                volatile i32 *pep = (volatile i32 *)(g_g11_base + 0x2c6dcb8ull);
+                volatile i32 *prd = (volatile i32 *)(g_g11_base + 0x2c6dcbcull);
+                volatile i32 *pwr = (volatile i32 *)(g_g11_base + 0x2c6dcc0ull);
+                C2B_LOGS("[c2b] g38: pre-connect lowlevel refcnt=");
+                C2B_LOGN(*refc);
+                C2B_LOGS(" s_hEpoll="); C2B_LOGN((u32)*pep);
+                C2B_LOGS(" wakeR="); C2B_LOGN((u32)*prd);
+                C2B_LOGS(" wakeW="); C2B_LOGN((u32)*pwr);
+                C2B_LOGS("\n");
+            }
         } else {
             C2B_LOGS("[c2b] g33: no g11 base in 60s - spew gate skipped\n");
         }
@@ -10226,6 +10245,18 @@ static void c2b_g32_drive(void)
             }
             C2B_LOGS("[c2b] g32: ConnectByIPAddress h="); C2B_LOGN((u32)h);
             C2B_LOGS("\n");
+            /* 43f-g38b: состояние НИЗКОУРОВНЕВОГО слоя ПОСЛЕ коннекта:
+             * если AddRef отработал с полным инитом, s_hEpoll != -1 и
+             * refcnt вырос; s_hEpoll=-1 при живом refcnt = init был
+             * СКИПНУТ (чужой стор в 0x2cbb900 — см. g37) */
+            if (g_g11_base) {
+                volatile u32 *refc = (volatile u32 *)(g_g11_base + 0x2cbb900ull);
+                volatile i32 *pep = (volatile i32 *)(g_g11_base + 0x2c6dcb8ull);
+                C2B_LOGS("[c2b] g38: post-connect lowlevel refcnt=");
+                C2B_LOGN(*refc);
+                C2B_LOGS(" s_hEpoll="); C2B_LOGN((u32)*pep);
+                C2B_LOGS("\n");
+            }
             break;   /* первая сработавшая версия */
         }
         sigaction(11, &oldsa, (void *)0);

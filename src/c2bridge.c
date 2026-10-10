@@ -10003,12 +10003,28 @@ static void *c2b_auth_thread(void *arg)
     c2b_gns_spew_rearm();   /* 41f-g5/g8/g9: пин спью+конфига (ПЕРВЫМ — патчи) */
     c2b_g7_client_utils();   /* 41f-g10: ЗАГЛУШЕН (убивал процесс до rearm) */
 #ifndef C2B_SELFTEST
-    c2b_g32_drive();        /* 41f-g32a: ConnectByIPAddress-драйвер (если env) */
+    {   /* 41f-g32a: драйвер в СВОЁМ потоке (spew_rearm НЕ возвращает поток) */
+        void *t32 = 0;
+        if (pthread_create(&t32, (const void *)0, c2b_g32_thread,
+                           (void *)0) == 0)
+            C2B_LOGS("[c2b] g32: driver thread started\n");
+        else
+            C2B_LOGS("[c2b] g32: pthread_create failed\n");
+    }
 #endif
     return 0;
 }
 
 #ifndef C2B_SELFTEST
+/* g32a-обёртка для pthread: spew_rearm держит auth-поток в 60x5s цикле
+ * (run173: драйвер ПОСЛЕ rearm недостижим — попытка кончается раньше) */
+static void *c2b_g32_thread(void *arg)
+{
+    (void)arg;
+    c2b_g32_drive();
+    return 0;
+}
+
 /* ================= 41f-g32a: GNS ConnectByIPAddress-драйвер =================
  * Цель — заставить steamclient-овский GNS СОЗДАТЬ реальное соединение к
  * CS2-цели: его 0x20/0x21 обмен + ПОСТРОЕННЫЙ 0x22 (его cert+crypt, подпись

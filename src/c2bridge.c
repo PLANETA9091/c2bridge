@@ -6247,6 +6247,18 @@ static u8 g_ipush_abuf[128];     /* 41e-o: буфер fmt9-'A' для черед
 static u8 g_a2s_peer[16];        /* sockaddr, куда движок послал A2S 'T' */
 static socklen_t g_a2s_peerlen;
 static u32 g_a2s_seen_t;         /* 'T' замечен — peer валиден */
+/* 50k-g61: прямой push-сокет — пишем fmt9-'A' ПРЯМО в приёмную очередь
+ * движкового сокета (getsockname(fd) -> sendto(local)). ПОЧЕМУ: ipush-меха-
+ * низм = замена ВОЗВРАТА recvfrom-хука — работает ТОЛЬКО если движок
+ * ЗОВЁТ recvfrom, а его poll видит ПУСТУЮ очередь (мы ничего не писали в
+ * сокет) -> recvfrom не зовётся -> ДЕДЛОК (мертвые попытки run206-213:
+ * 7 challenge-запросов, НОЛЬ recvfrom, очередь моста не дренируется).
+ * Здоровые попытки = реальные h21-keepalive'ы с 28022 будили read-цикл.
+ * Движковый сокет = UNCONNECTED (LanSearch-броадкасты с него же) -> push
+ * с любого источника принимается; echo-чейны 'B' = NOPED (g60), сstate =
+ * гейт с форсами; цель 'k' (24b520) = netadr снапа = источник push-сокета
+ * -> мост видит 'k' своим recv'ом/или через sendto-хук. */
+static int g_clv2_pushsock = -1;
 
 /* ---------- 41f-a: AUTH-TICKET CAPTURE (SteamUser022) ----------
  * Run 62 lesson: 'k'-connect требует Steam auth session ticket. Run 93:
@@ -12098,6 +12110,43 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 C2B_LOGS(" fmt="); C2B_LOGN(g_clv2_fmt);
                 C2B_LOGS("\n");
                 ((c2b_sendto_fn)g_clp_sendto)(fd, out, 512, flags, addr, addrlen);
+                /* 50k-g61v2: мгновенный прямой push fmt9-'A' в приёмную оче-
+                 * редь движкового сокета — БЕЗ ожидания реального 0x21-раунд-
+                 * трипа (флейк-дедлок run206-213: poll движка = пусто = ноль
+                 * recvfrom, ipush-замена возврата не срабатывает). Механика:
+                 * РЕАЛЬНЫЙ sendto (g_clp_sendto, не хук!) НА ТОМ ЖЕ fd с dst
+                 * = 127.0.0.1:27005 — клиентский порт движка (проверен pcap
+                 * всех прогонов) — ядро маршрутизирует в loopback и кладёт
+                 * пакет в ПРИЁМНУЮ очередь того же сокета (UDP self-send).
+                 * Сокет движка UNCONNECTED (LanSearch-броадкасты с него же)
+                 * -> источник = его собственный адрес — принимается; g60
+                 * снял echo-чейн 'B'; сstate = форсы; chal = наш g_clv2_ch32
+                 * (движок эхо-ит его в 'k' -> трансляция 0x22). */
+                {
+                    u8 la61[16];
+                    u8 ablob61[128];
+                    u32 alen61;
+                    ssize_t sr61;
+                    u32 z61;
+                    for (z61 = 0; z61 < sizeof(la61); z61++) la61[z61] = 0;
+                    la61[0] = 2;             /* AF_INET (LE) */
+                    la61[2] = 0x69; la61[3] = 0x7D;   /* порт 27005 BE */
+                    la61[4] = 127; la61[5] = 0; la61[6] = 0; la61[7] = 1;
+                    alen61 = c2b_clv2_build_chalreply(
+                        ablob61, (u32)sizeof(ablob61), g_clv2_fmt,
+                        g_clv2_qc_val, g_clv2_ch32);
+                    if (alen61 && g_clp_sendto &&
+                        (uptr)g_clp_sendto != 1) {
+                        sr61 = ((c2b_sendto_fn)g_clp_sendto)(
+                            fd, ablob61, alen61, 0,
+                            (const struct sockaddr *)la61, 16);
+                        C2B_LOGS("[c2b] g61: self-push 'A' len=");
+                        C2B_LOGN(alen61);
+                        C2B_LOGS(" rc=");
+                        C2B_LOGN((u32)(sr61 < 0 ? (u32)-1 : (u32)sr61));
+                        C2B_LOGS("\n");
+                    }
+                }
                 return (ssize_t)len;               /* движку обычный rc */
             }
             if (g_clv2_enable && cls == C2B_CLQ_JOIN) {

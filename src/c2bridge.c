@@ -17496,7 +17496,8 @@ static void test_cl(void)
                     CHECK(ar[15]==0x07 && ar[16]==0x0a && ar[17]==0xee &&
                           ar[18]==0x00, "clv2: fmt9 value=steamid-low");
                     CHECK(ar[19]==0 && ar[20]==0x00 && ar[21]==0x30 &&
-                          ar[22]==0x01 && ar[23]==0x01, "clv2: fmt9 flag+mystry4");
+                          ar[22]==0x01 && ar[23]==0x00,
+                          "clv2: fmt9 flag+mystry4 (g53: [23]=0x00 = флаг движка=0, без сплит-потока)");
                     {
                         static const char p9[] = "connect0x00000000";
                         u32 ok9 = 1;

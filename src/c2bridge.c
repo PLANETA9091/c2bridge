@@ -6123,6 +6123,7 @@ static i32 g_clv2_fd = -1;       /* fd, с которым связан обме�
 static u64 g_clv2_ch64;          /* challenge сервера */
 static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
 static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
+static u32 g_clv2_fwdk, g_clv2_fwd_k;   /* g30: 'k'->target raw-forward exp */
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
 static u32 g_clv2_phase;         /* 0=idle 1='A' 2=ждём reply для 'i' 3='i' доставлен
@@ -10457,14 +10458,37 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             }
             if (g_clv2_enable && cls == C2B_CLQ_CONNECT) {
                 /* CLV2 phase A: S1 connect капчерим и ДРОПАЕМ (без перевода
-                 * его нельзя слать в CS2; фаза B построит ConnectRequest) */
+                 * его нельзя слать в CS2; фаза B построит ConnectRequest).
+                 * g30 (run168 PROBE): 'k' ТЕПЕРЬ ДОХОДИТ СЮДА ЦЕЛЫМ (g28+g29
+                 * сломали адхок-дроп движка — 10 капчурей/attempt, 0x201
+                 * байт, chal+имя+прото). РЕШАЮЩИЙ ЭКСПЕРИМЕНТ:
+                 * C2B_CLV2_FWDK=1 — форвард СЫРОГО S1 'k' в РЕАЛЬНУЮ ЦЕЛЬ
+                 * (g_clv2_dst из qconnect; fd = движковый — порт-источник
+                 * всего потока). Ответ цели ('B'/reject/тишина) = данные
+                 * для фазы B. Дампим и dst движка (identity-конверсия!). */
                 char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
                 c2b_cl_hexline(p, (u32)len, ln, (u32)sizeof(ln));
                 g_clv2_cap_connect++;
                 C2B_LOGS("[c2b] CLV2 S1 connect captured #");
                 C2B_LOGN(g_clv2_cap_connect);
                 C2B_LOGS(" len="); C2B_LOGN((u32)len);
+                if (addr && addrlen && addrlen <= 16) {
+                    const u8 *ad = (const u8 *)addr;
+                    u32 k2;
+                    C2B_LOGS(" dst=");
+                    for (k2 = 0; k2 < (u32)addrlen; k2++) C2B_LOGH(ad[k2]);
+                }
                 C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
+                if (g_clv2_fwdk && g_clv2_dstlen) {
+                    ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
+                                                  (const void *)g_clv2_dst,
+                                                  g_clv2_dstlen);
+                    g_clv2_fwd_k++;
+                    C2B_LOGS("[c2b] CLV2 'k'->target fwd #");
+                    C2B_LOGN(g_clv2_fwd_k);
+                    C2B_LOGS(" len="); C2B_LOGN((u32)len);
+                    C2B_LOGS("\n");
+                }
                 return (ssize_t)len;               /* дроп без отправки */
             }
             i32 act = c2b_cl_filter_uplink(p, (u32)len);
@@ -11617,6 +11641,12 @@ i32 c2b_main(void)
         if (e && e[0] == '1') {
             g_clv2_enable = 1;
             C2B_LOGS("[c2b] clv2=1 (qconnect->S2 ChallengeRequest, 'A'+challenge -> engine)\n");
+            {   const char *e2 = getenv("C2B_CLV2_FWDK");
+                if (e2 && e2[0] == '1') {
+                    g_clv2_fwdk = 1;
+                    C2B_LOGS("[c2b] clv2 fwdk=1 ('k'->target raw-forward ON)\n");
+                }
+            }
             e = getenv("C2B_CLV2_FMT");
             if (e && e[0] >= '0' && e[0] <= '9') {
                 g_clv2_fmt = (u32)(e[0] - '0');

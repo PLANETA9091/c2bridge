@@ -5519,6 +5519,12 @@ static void c2b_up_obs_note(i32 t, void *msg, u32 rel, u32 voi)
 
 /* диспетчер аплинка: вызывается из c2b_up_hook_thunk (боевой) и из
  * selftest'а напрямую. Возвращает rv, который движок увидит из SendNetMsg. */
+#ifndef C2B_SELFTEST
+/* 50p-g69 fwd: SEGV-гарда примитивы (определения в non-selftest части ниже,
+ * у auth-probe; хэндлер ставится перманентно c2b_segv_guard_install) */
+static u8  g_probe_jb[512] __attribute__((aligned(16)));
+static u8  g_probe_active;
+#endif
 u64 c2b_up_dispatch(const void *blk)
 {
     const uptr *b = (const uptr *)blk;
@@ -5557,12 +5563,68 @@ u64 c2b_up_dispatch(const void *blk)
     }
     u32 done = 0;
     i32 rv = 1;
+    /* 50p-g69: тип-фильтр + SEGV-гарды. Run218: ПЕРВЫЙ живой аплинк-месседж
+     * (CCLCMsg_LoadingProgress, t=15, up2{t0,bsz,tr}=0 во ВСЕХ прошлых
+     * прогонах — аплинк впервые дожил до знакона) крашнул процесс:
+     * захардкоженный ByteSizeLong @1ef9f0 = ByteSizeLong ДРУГОГО
+     * protobuf-класса — у LoadingProgress поле obj+0x18 = NULL -> SEGV
+     * (1efa75: mov 0x18(%r12),%r13; mov 0x0(%r13),%rax; бэктрейс
+     * engine<-c2b_up_dispatch). Фильтр: сериализация ТОЛЬКО для типов
+     * карты translate (0..13,15,18,20 — Home-домен известных раскладок);
+     * 14/16/17 = fake-OK дроп (карта всё равно дропает); неизвестные ->
+     * passthrough orig (наблюдаемость сырых кадров на проводе). bsz/ser
+     * под SEGV-гардой (g_probe_jb): фолт -> деградация в passthrough.
+     * Хэндлер SIGSEGV теперь перманентный (auth-probe tail + standalone
+     * c2b_segv_guard_install в c2b_main). */
     {
+        static const u8 g_up_map_ok[21] = {
+            1, 1, 1, 1, 1, 1, 1, 1,   /* 0..7 = NET identity */
+            1, 1, 1, 1, 1, 1, 0, 1,   /* 8 ci, 9 move, 10 voice, 11 base,
+                                         12 listen, 13 cvar, 14 drop, 15 loading */
+            0, 0, 1, 1                /* 16/17 drop, 18 cmdkey, 19 unk, 20 hltv */
+        };
+        if (t > 20 || g_up_map_ok[t] == 0) {
+            /* 14/16/17 + неизвестные: карта дропает — fake-OK БЕЗ сериализации
+             * (старое поведение translate-дропа; obs_note выше уже залогил
+             * тип — наблюдаемость сохранена, крах невозможен) */
+            g_up_drop++;
+            __atomic_store_n(&g2_busy, 0u, __ATOMIC_RELEASE);
+            return 1;
+        }
+        {
         c2b_e_bytesize_t  bsz = (c2b_e_bytesize_t)(const void *)g2e_bytesize_p;
         c2b_e_serialize_t ser = (c2b_e_serialize_t)(const void *)g2e_serialize_p;
-        u32 n = (bsz && ser) ? bsz(msg + 8) : 0;
+        u32 n = 0;
+        u32 sok = 0;
+        if (bsz && ser) {
+#ifndef C2B_SELFTEST
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                n = bsz(msg + 8);
+            } else {
+                n = 0;                       /* фолт ByteSizeLong -> passthrough */
+            }
+            g_probe_active = 0;
+#else
+            n = bsz(msg + 8);                /* selftest: стабы без гарды */
+#endif
+        }
         if (n > 0 && n <= C2B_UP_SIN_CAP && ser) {
+#ifndef C2B_SELFTEST
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                ser(msg + 8, g_up_sbuf);
+                sok = 1;
+            } else {
+                sok = 0;                     /* фолт Serialize -> passthrough */
+            }
+            g_probe_active = 0;
+#else
             ser(msg + 8, g_up_sbuf);
+            sok = 1;
+#endif
+        }
+        if (n > 0 && n <= C2B_UP_SIN_CAP && sok) {
             u32 sl = 0;
             sl += c2b_write_varint(g_up_sframe + sl, (u32)t);
             sl += c2b_write_varint(g_up_sframe + sl, n);
@@ -5593,6 +5655,7 @@ u64 c2b_up_dispatch(const void *blk)
             }
             /* rc != 0 (trunc/капа) — не ожидается на 1 сообщении: passthrough */
         }
+        }   /* 50p-g69: inner decls block */
     }
     __atomic_store_n(&g2_busy, 0u, __ATOMIC_RELEASE);
     if (!done) rv = orig(chan, msg, rel_a, voice);
@@ -6362,6 +6425,7 @@ struct c2b_sigaction {          /* glibc x86-64 layout */
 };
 static u8  g_probe_jb[512] __attribute__((aligned(16)));
 static u8  g_probe_active;
+static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен перманентно */
 
 static void c2b_probe_segv(i32 sig, void *si, void *uc)
 {
@@ -6473,12 +6537,35 @@ static void c2b_auth_ticket_probe(void)
             usleep(5000000);
         }
     }
-    if (have_old) sigaction(11, &oldsa, (void *)0);
+    /* 50p-g69: хэндлер остаётся НАВСЕГДА (не восстанавливаем oldsa):
+     * гард-тунки детуров (g_probe_jb) + аплинк-гарды g69 в dispatch живут
+     * весь процесс — контейнмент фолтов важнее честного краша движка. */
+    sigaction(11, &sa, (void *)0);
+    g_segv_guard_on = 1;
 }
 #else
 static u32 g_auth_vtidx = 13;
 static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
 #endif  /* C2B_SELFTEST */
+
+/* 50p-g69: перманентная установка SEGV-хэндлера (если auth-probe ещё не
+ * ставил). Вызывается из c2b_main ДО тредов. Идемпотентен. */
+#ifndef C2B_SELFTEST
+static void c2b_segv_guard_install(void)
+{
+    struct c2b_sigaction sa;
+    u32 t;
+    if (g_segv_guard_on) return;
+    for (t = 0; t < sizeof(sa); t++) ((u8 *)&sa)[t] = 0;
+    sa.handler = (uptr)c2b_probe_segv;
+    sa.flags = 4;                                  /* SA_SIGINFO */
+    sigemptyset(sa.mask);
+    sigaction(11, &sa, (void *)0);
+    g_segv_guard_on = 1;
+}
+#else
+static void c2b_segv_guard_install(void) { }
+#endif
 
 #ifndef C2B_SELFTEST
 /* 41f-g: установка спью БЕЗ FUv — движок берёт NetworkingUtils через прямой
@@ -14316,6 +14403,9 @@ i32 c2b_main(void)
      * a time in later rounds. */
     i32 r;
 #ifndef C2B_SELFTEST
+    {   /* 50p-g69: перманентная SEGV-гарда (аплинк bsz/ser + гард-тунки) */
+        c2b_segv_guard_install();
+    }
     {   /* 41f-g24: снап-вотчер стейта — пассивные чтения, свой тред */
         void *t24 = 0;
         pthread_create(&t24, 0, c2b_g24_thread, 0);

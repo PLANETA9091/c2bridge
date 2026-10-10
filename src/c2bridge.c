@@ -10129,6 +10129,51 @@ static void c2b_g32_drive(void)
         C2B_LOGS("[c2b] g32: not armed (env/ifactory/user missing)\n");
         return;
     }
+    /* 44f-g46: ПРОБА CVAR-ГЕЙТА 'B'-хендлера (@25aa03). Движковый код:
+     *   rdi = *(engine+0xe10bf8)   — статический ConVarRef (m_pConVar);
+     *   if (rdi == engine+0xe10bc0) -> альтернативный путь 25cf0a =
+     *      тест (u32@(engine+0xe10c18) ^ r12d) — адресная-хэш-ловушка,
+     *      ВСЕГДА reject (bss=0 xor addr != 0);
+     *   else eax = vt+0x80(rdi)    — ConVar::GetBool/GetInt;
+     *   test eax; jne 259f50       — CVAR ДОЛЖЕН БЫТЬ 0, иначе ТИХИЙ reject.
+     * Плечо без записи: читаем ptr, имя (char* @+8 — классика ConVar),
+     * первые 0x40 байт объекта. Имя назовёт cvar -> следующий шаг = валить
+     * его в 0 из моста. */
+    {
+        u32 wt;
+        for (wt = 0; wt < 600 && !g_engine_base; wt++) usleep(100000);
+        if (g_engine_base) {
+            const volatile uptr refp = g_engine_base + 0xe10bf8ull;
+            uptr cv = *(const volatile uptr *)refp;
+            C2B_LOGS("[c2b] g46: gate ref @engine+e10bf8 -> ");
+            C2B_LOGH((u32)(cv >> 32)); C2B_LOGH((u32)cv);
+            if (cv == g_engine_base + 0xe10bc0ull) {
+                C2B_LOGS(" == SENTINEL cl_failremoteconnections (альт-путь = always-reject)\n");
+            } else if (cv) {
+                const char *nm = *(const volatile char *const *)(cv + 8);
+                u32 i5;
+                char nb[50];
+                C2B_LOGS(" name='");
+                if (nm) {
+                    for (i5 = 0; i5 < 48; i5++) {
+                        char c = nm[i5];
+                        if (!c) break;
+                        nb[i5] = c;
+                    }
+                    nb[i5] = 0;
+                    C2B_LOGS(nb);
+                }
+                C2B_LOGS("' obj[0..0x3f]:");
+                for (i5 = 0; i5 < 0x40; i5 += 4)
+                    C2B_LOGH(*(const volatile u32 *)(cv + i5));
+                C2B_LOGS("\n");
+            } else {
+                C2B_LOGS(" NULL (ref не разрешён)\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g46: engine_base не появился за 60с\n");
+        }
+    }
     /* 41f-g33: открыть ГЛОБАЛЬНЫЙ спью-гейт GNS (steamclient+0x2c6dcc8).
      * RE run177: это глобальный уровень спью (гейты cmpl $4/$5/$6 по всему
      * коннект-коду); дефолт <=1 РЕЖЕТ verbose-спью включая ПРИЧИНУ отказа

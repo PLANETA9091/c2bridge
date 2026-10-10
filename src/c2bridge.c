@@ -7884,6 +7884,107 @@ static void c2b_g50_force_cstate(void)
     }
 }
 
+/* ---------- 47f-g51: детур САЙТА strstr("connect") (engine+0x25cf20) ----------
+ * run198 ФАКТ (a3, kcap=10): g50 работает — 6/9 'A' вошли с cstate=1, парс
+ * РЕАЛЬНО идёт (chal/proto в state обновляются каждую строку g49!), но
+ * lobbies-Msg НЕТ и 0x4c0=0 на каждом входе. Слепая зона: ReadString
+ * @25abaf при переполнении читает МОЛЧА ("" или мусор) -> reserve-strstr
+ * fail -> 25cf20 -> connect-strstr fail -> SILENT reject @25cf32 — БЕЗ
+ * какого-либо Msg. g51 = детур на 25cf20 (перед strstr("connect")): лог-
+ * гит СТРОКУ (r12, до 48Б), бит-позицию читателя (buf+0x50/0x54), chal/
+ * proto/flag/value из state — ОПРЕДЕЛЯЕТ: (a) строка = "connect0x..." и
+ * биты сходятся -> reject ДАЛЬШЕ (cstate-recheck/ver) — смотреть туда;
+ * (b) строка пуста/мусор -> 645be0 съел НЕ 32 бита на нашем payload ->
+ * чинить ВЫРАВНИВАНИЕ fmt-9 (филлер). Пач = 14Б: lea rsi,"connect" (7Б) +
+ * mov rdi,r12 (3Б) + call strstr (первые 4Б; 5-й байт = сирота, не
+ * исполняется — jmp уводит поток). Тунк: лог + реплика
+ * rsi=needle/rdi=r12/call strstr -> cont 0x25cf2f (test rax,rax). */
+static volatile uptr c2b_g51_cont;
+static volatile uptr c2b_g51_needle, c2b_g51_strstr;
+static u32 c2b_g51_nl;
+
+void c2b_g51_log(uptr str, uptr buf, uptr state)
+{
+    u32 k;
+    if (!g_engine_base || !str) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    k = ++c2b_g51_nl;
+    if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    C2B_LOGS("[c2b] g51 A.str='");
+    {
+        const volatile char *s = (const volatile char *)str;
+        u32 i;
+        char nb[49];
+        for (i = 0; i < 48; i++) {
+            char c = s[i];
+            if (!c) break;
+            nb[i] = (c >= 0x20 && c < 0x7f) ? c : '.';
+        }
+        nb[i] = 0;
+        C2B_LOGS(nb);
+    }
+    C2B_LOGS("' bits=");
+    if (buf) {
+        C2B_LOGN(*(volatile u32 *)(buf + 0x50));
+        C2B_LOGN(*(volatile u32 *)(buf + 0x54));
+    } else {
+        C2B_LOGN(0); C2B_LOGN(0);
+    }
+    if (state) {
+        C2B_LOGS(" chal="); C2B_LOGH(*(volatile u32 *)(state + 0x4d8));
+        C2B_LOGS(" proto="); C2B_LOGH(*(volatile u32 *)(state + 0x4dc));
+        C2B_LOGS(" flag="); C2B_LOGN((u32)*(volatile u8 *)(state + 0x4c1));
+        C2B_LOGS(" val=");  C2B_LOGH(*(volatile u32 *)(state + 0x4e0));
+        C2B_LOGS(" c0=");   C2B_LOGN((u32)*(volatile u8 *)(state + 0x4c0));
+    }
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g51_thunk\n"
+".type  c2b_g51_thunk,@function\n"
+"c2b_g51_thunk:\n"   /* вход: call-пач c2b_write_jmp; r12=строка rbx=buf r15=state */
+"  endbr64\n"
+"  sub  $0x60,%rsp\n"    /* 96; rsp%16==0 */
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r12,%rdi\n"
+"  mov  %rbx,%rsi\n"
+"  mov  %r15,%rdx\n"
+"  call c2b_g51_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x60,%rsp\n"
+/* реплика: rsi="connect" (абс), rdi=r12, call strstr, -> test rax,rax */
+"  mov  c2b_g51_needle(%rip),%rsi\n"
+"  mov  %r12,%rdi\n"
+"  mov  c2b_g51_strstr(%rip),%rax\n"
+"  call *%rax\n"
+"  mov  c2b_g51_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g51_thunk, .-c2b_g51_thunk\n"
+".previous\n"
+);
+extern void c2b_g51_thunk(void);
+
 static void c2b_g11_apply(void)
 {
     static u8 done;
@@ -10487,6 +10588,33 @@ static void c2b_g32_drive(void)
             C2B_LOGH(*(const volatile u32 *)site49);
             C2B_LOGH(*(const volatile u32 *)(site49 + 4));
             C2B_LOGH(*(const volatile u32 *)(site49 + 8));
+            C2B_LOGS("\n");
+        }
+    }
+    /* 47f-g51: детур сайта strstr("connect") @0x25cf20 (мотивация у тунка).
+     * Сиг = lea rsi,"connect" + mov rdi,r12 + call strstr (первые 14Б). */
+    if (g_engine_base) {
+        static const u8 g51_sig[14] = {
+            0x48, 0x8d, 0x35, 0xb6, 0x14, 0x71, 0x00,   /* lea 0x96e3dd,%rsi   */
+            0x4c, 0x89, 0xe7,                           /* mov %r12,%rdi       */
+            0xe8, 0x71, 0x2a, 0x40                      /* call 65f9a0 (4/5)   */
+        };
+        volatile u8 *site51 = (volatile u8 *)(g_engine_base + 0x25cf20ull);
+        if (memcmp((const void *)site51, g51_sig, sizeof g51_sig) == 0) {
+            c2b_g51_cont   = g_engine_base + 0x25cf2full;   /* test %rax,%rax */
+            c2b_g51_needle = g_engine_base + 0x96e3ddull;   /* "connect"      */
+            c2b_g51_strstr = g_engine_base + 0x65f9a0ull;   /* strstr         */
+            if (c2b_page_protect((uptr)site51, (u32)sizeof g51_sig, 0x07) == 0) {
+                c2b_write_jmp((void *)site51, (const void *)&c2b_g51_thunk);
+                C2B_LOGS("[c2b] g51: detour armed @engine+25cf20 (per-connect-strstr: str/bits/chal/proto)\n");
+            } else {
+                C2B_LOGS("[c2b] g51: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g51: sig mismatch @engine+25cf20 bytes=");
+            C2B_LOGH(*(const volatile u32 *)site51);
+            C2B_LOGH(*(const volatile u32 *)(site51 + 4));
+            C2B_LOGH(*(const volatile u32 *)(site51 + 8));
             C2B_LOGS("\n");
         }
     }

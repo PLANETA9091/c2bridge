@@ -10049,6 +10049,22 @@ static void c2b_g32_drive(void)
         C2B_LOGS("[c2b] g32: not armed (env/ifactory/user missing)\n");
         return;
     }
+    /* 41f-g33: открыть ГЛОБАЛЬНЫЙ спью-гейт GNS (steamclient+0x2c6dcc8).
+     * RE run177: это глобальный уровень спью (гейты cmpl $4/$5/$6 по всему
+     * коннект-коду); дефолт <=1 РЕЖЕТ verbose-спью включая ПРИЧИНУ отказа
+     * BInitConnect (0x1fd13d0 ->errMsg -> 0x1fce3a0(level2) скипается на
+     * 0x1ef4312: cmpl $1; jle). Ждём базу от g11_apply (спавн ДО rearm —
+     * гонка на старте) и пишем 6. FD: тот же лог через g8-колбек. */
+    {
+        u32 wt;
+        for (wt = 0; wt < 600 && !g_g11_base; wt++) usleep(100000);
+        if (g_g11_base) {
+            *(volatile u32 *)(g_g11_base + 0x2c6dcc8ull) = 6;
+            C2B_LOGS("[c2b] g33: global spew gate 0x2c6dcc8 -> 6\n");
+        } else {
+            C2B_LOGS("[c2b] g33: no g11 base in 60s - spew gate skipped\n");
+        }
+    }
     /* парс "a.b.c.d:port" из g_gns_connect_target */
     {
         const char *s = (const char *)g_gns_connect_target;

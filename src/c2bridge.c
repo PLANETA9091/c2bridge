@@ -8087,6 +8087,99 @@ __asm__(
 );
 extern void c2b_g56_thunk(void);
 
+/* ---------- 50j-g62: детур МИД-ПАТА 'B' (engine+0x25a91a) — дамп читателя бит
+ * ЭМПИРИЧЕСКИЙ ответ на "где умирает 'B'-парс" (run214: g48 x6 — вход есть,
+ * cstate=1, эхо-чейн NOPED (g60) — но ZERO g51-строк: смерть МЕЖДУ входом
+ * и strstr("connect")). Окно смерти 25a91a..25cf20:
+ *   25a91a mov 0x54(%rbx),%ecx   bits-left читателя (u32)
+ *   25a91d cmp $0x7,%ecx
+ *   25a920 jle 25c707            bits<=7 -> refill-путь (данные из [0x58])
+ *   25a926 mov 0x50(%rbx),%edx   текущее слово
+ *   25a929 sub $0x8,%ecx; ... and %edx,%eax  байт = word & [r13+0x20]
+ *   25a943 cmp $0x2e,%eax        ТОЧКА-чек: первый байт = '.' (0x2e)
+ *   25a946 jne 259f50            ДЕТЕРМИНИРОВАННАЯ смерть, если маска/
+ *                                бит-позиция читателя не выровнены
+ *   далее строка 8Б -> hex @25b310 -> chal/proto -> строка -> strstr.
+ * Детур ЛОГИТ state читателя ДО ветвления: bits/word/mask/byte(=word&mask)/
+ * dcur/dend/cstate — по дампу вычисляется исход точки-чека (byte==0x2e?) и
+ * факт ухода на refill (bits<=7). Сиг = точные 15Б, реплика mov+cmp+ручной
+ * jle (флаги наружу не живут: 25a929 sub ставит свои; t==0-ветка 25cb85
+ * ревходит сюда через jne 25a91a — тот же контраст регистров, rsp%16==0).
+ * Входы: r15=state rbx=buf(читатель) r13=база маски ([r13+0x20]). */
+static volatile uptr c2b_g62_cont, c2b_g62_refill;
+static u32 c2b_g62_nl;
+
+void c2b_g62_log(uptr state, uptr buf, uptr mbase)
+{
+    u32 k, bits, word, mask, byte;
+    if (!g_engine_base || !state || !buf) return;
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+    k = ++c2b_g62_nl;
+    if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    bits = *(volatile u32 *)(buf + 0x54);
+    word = *(volatile u32 *)(buf + 0x50);
+    mask = mbase ? *(volatile u32 *)(mbase + 0x20) : 0;
+    byte = word & mask;
+    C2B_LOGS("[c2b] g62 Bmid: cstate=");
+    C2B_LOGN(*(volatile u32 *)(state + 0x1a0));
+    C2B_LOGS(" bits="); C2B_LOGN(bits);
+    C2B_LOGS(" word="); C2B_LOGH(word);
+    C2B_LOGS(" mask="); C2B_LOGH(mask);
+    C2B_LOGS(" byte="); C2B_LOGH(byte);
+    C2B_LOGS(" dcur="); C2B_LOGH(*(volatile u32 *)(buf + 0x58));
+    C2B_LOGS(" dend="); C2B_LOGH(*(volatile u32 *)(buf + 0x60));
+    C2B_LOGS(" dp0=");  C2B_LOGH(*(volatile u32 *)(buf + 0x38));
+    C2B_LOGS("\n");
+    g_probe_active = 0;
+}
+
+__asm__(
+".text\n"
+".globl c2b_g62_thunk\n"
+".type  c2b_g62_thunk,@function\n"
+"c2b_g62_thunk:\n"   /* вход: fall-through/jne; rsp%16==0; r15=state rbx=buf r13=mask-base */
+"  endbr64\n"
+"  sub  $0x60,%rsp\n"    /* 96; rsp%16==0 */
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  mov  %r15,%rdi\n"
+"  mov  %rbx,%rsi\n"
+"  mov  %r13,%rdx\n"
+"  call c2b_g62_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x60,%rsp\n"
+/* реплика 15Б: bits=[rbx+0x54]; bits>7 ? (edx=[rbx+0x50]; cont) : refill */
+"  mov  0x54(%rbx),%ecx\n"
+"  cmp  $0x7,%ecx\n"
+"  jg   62f\n"
+"  mov  c2b_g62_refill(%rip),%r11\n"
+"  jmp  *%r11\n"
+"62:\n"
+"  mov  0x50(%rbx),%edx\n"
+"  mov  c2b_g62_cont(%rip),%r11\n"
+"  jmp  *%r11\n"
+".size c2b_g62_thunk, .-c2b_g62_thunk\n"
+".previous\n"
+);
+extern void c2b_g62_thunk(void);
+
 static void c2b_g11_apply(void)
 {
     static u8 done;
@@ -10795,6 +10888,32 @@ static void c2b_g32_drive(void)
             C2B_LOGS("\n");
         }
     }
+    /* 50j-g62: детур мид-пата 'B' @0x25a91a (мотивация у тунка). */
+    if (g_engine_base) {
+        static const u8 g62_sig[15] = {
+            0x8b, 0x4b, 0x54,                     /* mov 0x54(%rbx),%ecx */
+            0x83, 0xf9, 0x07,                     /* cmp $0x7,%ecx */
+            0x0f, 0x8e, 0xe1, 0x1d, 0x00, 0x00,   /* jle 25c707 */
+            0x8b, 0x53, 0x50                      /* mov 0x50(%rbx),%edx */
+        };
+        volatile u8 *site62 = (volatile u8 *)(g_engine_base + 0x25a91aull);
+        if (memcmp((const void *)site62, g62_sig, sizeof g62_sig) == 0) {
+            c2b_g62_cont   = g_engine_base + 0x25a929ull;  /* sub $0x8,%ecx */
+            c2b_g62_refill = g_engine_base + 0x25c707ull;  /* refill-путь */
+            if (c2b_page_protect((uptr)site62, (u32)sizeof g62_sig, 0x07) == 0) {
+                c2b_write_jmp((void *)site62, (const void *)&c2b_g62_thunk);
+                C2B_LOGS("[c2b] g62: detour armed @engine+25a91a (B mid-path dump bits/word/mask/byte/dcur/dend)\n");
+            } else {
+                C2B_LOGS("[c2b] g62: page_protect failed\n");
+            }
+        } else {
+            C2B_LOGS("[c2b] g62: sig mismatch @engine+25a91a bytes=");
+            C2B_LOGH(*(const volatile u32 *)site62);
+            C2B_LOGH(*(const volatile u32 *)(site62 + 4));
+            C2B_LOGH(*(const volatile u32 *)(site62 + 8));
+            C2B_LOGS("\n");
+        }
+    }
     /* 50g-g56: детур хвоста @0x25d6cc (мотивация у тунка). */
     if (g_engine_base) {
         static const u8 g56_sig[15] = {
@@ -12303,6 +12422,63 @@ static void c2b_g50_force_cstate(void);
 static void c2b_g50_force_cstate(void) { }
 #endif
 
+#ifndef C2B_SELFTEST
+/* ---------- 50l-g63: периодический self-push 'B' kaccept (тред) ----------
+ * run214 ФАКТ: 'B'-бейты доставляются ТОЛЬКО по приходе РЕАЛЬНОГО 0x21
+ * (гейт g58 в recvfrom-хуке) + one-shot g_clv2_23_seen — сэмплов 'B'-парса
+ * мало (a2: 6). Механика g61 ('A'-self-push через loopback на СВОЙ fd,
+ * dst=127.0.0.1:27005) применима и к 'B': build_kaccept (g42-формат,
+ * chal=g_clv2_ch32, b2=0) + g50-force cstate ДО парса + РЕАЛЬНЫЙ sendto
+ * на движковый fd -> ядро кладёт пакет в приёмную очередь того же сокета
+ * -> poll будится -> recvfrom -> хук -> диспетчер -> 'B'-парс (g48/g62).
+ * Цикл: пачка 6 пушей x 3с, пауза 20с, бесконечно (эхо-чейн NOPED g60,
+ * источник не важен; независимость от 0x21 = сэмплы даже в мёртвые атяпы). */
+static u32 g63_pushes;
+static void *c2b_g63_thread(void *arg)
+{
+    u8 la[16], blob[128];
+    u32 i, w;
+    (void)arg;
+    for (i = 0; i < sizeof(la); i++) la[i] = 0;
+    la[0] = 2;                        /* AF_INET (LE) */
+    la[2] = 0x69; la[3] = 0x7D;       /* порт 27005 BE */
+    la[4] = 127; la[5] = 0; la[6] = 0; la[7] = 1;
+    for (w = 0; w < 2400; w++) {      /* предусловия: до 240с */
+        if (g_clv2_fd && g_clv2_ch32 && g_clv2_baits && g_clv2_last_A_len) break;
+        usleep(100000);
+    }
+    if (!g_clv2_fd || !g_clv2_baits) return 0;
+    C2B_LOGS("[c2b] g63: thread live (fd=");
+    C2B_LOGN((u32)g_clv2_fd);
+    C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
+    C2B_LOGS(" lastA="); C2B_LOGN(g_clv2_last_A_len);
+    C2B_LOGS(")\n");
+    for (;;) {
+        for (w = 0; w < 6; w++) {
+            u32 alen;
+            ssize_t sr;
+            usleep(3000000);
+            if (!g_clv2_fd || !g_clv2_ch32) continue;
+            c2b_g50_force_cstate();   /* ворота cstate=1 ДО 'B'-парса */
+            alen = c2b_clv2_build_kaccept(blob, (u32)sizeof(blob), 0);
+            if (!alen || !g_clp_sendto || (uptr)g_clp_sendto == 1) continue;
+            sr = ((c2b_sendto_fn)g_clp_sendto)(
+                g_clv2_fd, blob, alen, 0,
+                (const struct sockaddr *)la, 16);
+            g63_pushes++;
+            C2B_LOGS("[c2b] g63: self-push 'B' #");
+            C2B_LOGN(g63_pushes);
+            C2B_LOGS(" len="); C2B_LOGN(alen);
+            C2B_LOGS(" rc="); C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+            C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
+            C2B_LOGS("\n");
+        }
+        usleep(20000000);             /* пауза между пачками */
+    }
+    return 0;
+}
+#endif
+
 __attribute__((visibility("default")))
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
@@ -13770,6 +13946,10 @@ i32 c2b_main(void)
     {   /* 41f-g24: снап-вотчер стейта — пассивные чтения, свой тред */
         void *t24 = 0;
         pthread_create(&t24, 0, c2b_g24_thread, 0);
+    }
+    {   /* 50l-g63: периодический self-push 'B' kaccept (гейт = g_clv2_baits) */
+        void *t63 = 0;
+        pthread_create(&t63, 0, c2b_g63_thread, 0);
     }
 #endif
     r = c2b_try_install();

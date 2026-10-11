@@ -15192,6 +15192,47 @@ static void *c2b_g101_thread(void *arg)
                 C2B_LOGH((u32)((uptr)tgt >> 32));
                 C2B_LOGH((u32)(uptr)tgt);
                 C2B_LOGS("\n");
+                /* v14c: селф-чек — read-back патча + верификация call-сайта
+                 * KDF (base+0xe55fe = call 0x64710) */
+                {
+                    u8 rb[20];
+                    i32 fdm3 = open("/proc/self/mem", 0);
+                    i32 gr;
+                    if (fdm3 < 0) return (void *)0;
+                    gr = (i32)pread(fdm3, rb, 14, (i64)tgt);
+                    u32 z;
+                    C2B_LOGS("[c2b] g101: readback=");
+                    if (gr == 14) {
+                        for (z = 0; z < 14; z++) {
+                            char bb[2];
+                            bb[0] = c2b_g100_hx[rb[z] >> 4];
+                            bb[1] = c2b_g100_hx[rb[z] & 15];
+                            c2b_out(bb, 2);
+                        }
+                    } else {
+                        C2B_LOGS("pread-fail");
+                    }
+                    C2B_LOGS("\n");
+                    {
+                        u8 cs[5];
+                        i32 gc = (i32)pread(fdm3, cs, 5,
+                                            (i64)(base + 0xe55fe));
+                        if (gc == 5 && cs[0] == 0xe8) {
+                            i32 rel = (i32)((u32)cs[1] |
+                                            ((u32)cs[2] << 8) |
+                                            ((u32)cs[3] << 16) |
+                                            ((u32)cs[4] << 24));
+                            uptr tgtc = base + 0xe55fe + 5 + (uptr)rel;
+                            C2B_LOGS("[c2b] g101: kdfsite target=");
+                            C2B_LOGH((u32)(tgtc >> 32));
+                            C2B_LOGH((u32)tgtc);
+                            C2B_LOGS("\n");
+                        } else {
+                            C2B_LOGS("[c2b] g101: kdfsite read fail\n");
+                        }
+                    }
+                    close(fdm3);
+                }
                 return (void *)0;
             }
         }

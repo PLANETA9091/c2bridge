@@ -14852,7 +14852,35 @@ static void c2b_g100_scan(void)
             segn += (u32)got;
         }
     }
-    nfl[0] = c2b_g100_harvest(seg, segn, fr[0], 1024);
+    /* v13 (run280-урок): СЕМЯ = СОБСТВЕННЫЕ интерфейс-указатели моста —
+     * g_gns_conn_iface (g32 = СОБСТВЕННИК коннекта!) + g_steamnetsock_obj
+     * (FUv-капчур). Детерминированный путь: iface -> map/таблицы ->
+     * connection -> m_pCryptContext* -> EVP/sodium state. Либные сегменты
+     * (20KB) = вторичным харвестом в хвост фронтира. */
+    nfl[0] = 0;
+    {
+        uptr seeds[2];
+        u32 ns = 0, k;
+        if (g_gns_conn_iface) seeds[ns++] = (uptr)g_gns_conn_iface;
+        if (g_steamnetsock_obj && (uptr)g_steamnetsock_obj != (uptr)g_gns_conn_iface)
+            seeds[ns++] = (uptr)g_steamnetsock_obj;
+        for (k = 0; k < ns && !c2b_g100_out; k++) {
+            i64 got = pread(fdm, c2b_g100_obj, sizeof(c2b_g100_obj) - 256,
+                            (i64)seeds[k]);
+            if (got <= 0) continue;
+            if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, seeds[k], &hits))
+                break;
+            nfl[0] += c2b_g100_harvest(c2b_g100_obj, (u32)got,
+                                       fr[0] + nfl[0],
+                                       (u32)(1024 - nfl[0]));
+            if (nfl[0] > 900) nfl[0] = 900;
+        }
+        C2B_LOGS("[c2b] g100: seeds=");
+        C2B_LOGN(ns);
+    }
+    if (nfl[0] < 900 && !c2b_g100_out)
+        nfl[0] += c2b_g100_harvest(seg, segn, fr[0] + nfl[0],
+                                   (u32)(1024 - nfl[0]));
     C2B_LOGS("[c2b] g100: sns seg=");
     C2B_LOGN(segn);
     C2B_LOGS(" hits1=");

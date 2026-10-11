@@ -13902,6 +13902,61 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     }
 }
 
+/* 58f-g98a2: sendmsg-хук КАНАЛЬНЫЙ дамп — run260-урок: 37 loopback
+ * датаграмм движка (127.0.0.1:27005) на wire, sendto-дамп = НОЛЬ —
+ * сигнон-стрим движка идёт через sendmsg (netchan-путь). Дамп = тот же
+ * g98a-формат (не-connectionless, полный hex 400B, rate 1/8, кап 480).
+ * NOTE: addr = msg_name (может быть NULL для connected-сокетов — скип
+ * лога dst, дамп байтов остаётся). */
+static void c2b_g98_sendmsg_dump(const struct c2b_msghdr *msg, ssize_t r)
+{
+    static volatile u32 n98m;
+    u32 c98m;
+    u32 k98, h98, tot = 0, j98;
+    const u8 *p98 = 0;
+    const u8 *ad98 = 0;
+    u32 al98 = 0;
+    if (!msg || !msg->msg_iov || !msg->msg_iovlen || msg->msg_iovlen > 16)
+        return;
+    for (j98 = 0; j98 < (u32)msg->msg_iovlen; j98++) {
+        if (!msg->msg_iov[j98].iov_base || !msg->msg_iov[j98].iov_len) continue;
+        if (!p98) {
+            p98 = (const u8 *)msg->msg_iov[j98].iov_base;
+            tot = (u32)msg->msg_iov[j98].iov_len;
+        } else {
+            tot += (u32)msg->msg_iov[j98].iov_len;
+        }
+    }
+    if (!p98 || tot < 4) return;
+    if (p98[0] == 0xff && p98[1] == 0xff && p98[2] == 0xff && p98[3] == 0xff)
+        return;
+    if (msg->msg_name && msg->msg_namelen >= 4) {
+        ad98 = (const u8 *)msg->msg_name;
+        al98 = (u32)msg->msg_namelen;
+    }
+    c98m = ++n98m;
+    if ((c98m & 0x07) != 1 || c98m > 480) return;
+    C2B_LOGS("[c2b] g98: chn-sendm #");
+    C2B_LOGN(c98m);
+    C2B_LOGS(" len=");
+    C2B_LOGN(tot);
+    if (ad98 && al98 >= 8) {
+        C2B_LOGS(" dst=");
+        C2B_LOGH(((u32)ad98[4] << 24) | ((u32)ad98[5] << 16) |
+                 ((u32)ad98[6] << 8) | (u32)ad98[7]);
+        C2B_LOGS(":");
+        C2B_LOGN(((u32)ad98[2] << 8) | (u32)ad98[3]);
+    }
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(r < 0 ? (u32)-1 : (u32)r));
+    C2B_LOGS(" hex=");
+    h98 = tot;
+    if (h98 > 400) h98 = 400;
+    for (k98 = 0; k98 < h98; k98++)
+        C2B_LOGH(p98[k98]);
+    C2B_LOGS("\n");
+}
+
 /* 43f-g40: sendmsg-хук — passthrough + тот же diag (путь nChunks!=1 GNS).
  * msghdr — НАША ABI-копия (совместима с glibc x86-64); dest из msg_name. */
 static void *g_clp_sendmsg;
@@ -13926,6 +13981,7 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
                 tot += (u32)msg->msg_iov[k].iov_len;
         }
         c2b_g40_sdt_note(fd, tot ? tot : 1u, msg ? msg->msg_name : 0, r);
+        c2b_g98_sendmsg_dump(msg, r);
         return r;
     }
 }
@@ -14501,7 +14557,7 @@ static void *c2b_g98_thread(void *arg)
                        ((u32)ma96[2] << 16) | ((u32)ma96[3] << 24);
             }
             if (w8 == 0 || w8 == 4 || w8 == 7 || w8 == 11 || w8 == 19 ||
-                w8 == 29 || rc96 != 1 || st96 != 2u) {
+                w8 == 29 || st96 != 2u || (rc96 != 0 && rc96 != 1)) {
                 C2B_LOGS("[c2b] g98: t+");
                 C2B_LOGN(w8 + 1);
                 C2B_LOGS("s conninfo rc=");
@@ -14510,10 +14566,16 @@ static void *c2b_g98_thread(void *arg)
                 C2B_LOGN(st96);
                 C2B_LOGS("\n");
             }
-            if (rc96 != 1 || (st96 != 2u && st96 != 0xFFFFFFFFu)) {
+            /* 58f-g98b (run260-урок): rc=0 = слот-3 пустой на wrapper-iface
+             * (не смерть!). Смерть = rc=3 (dead handle) или rc=1+state!=2.
+             * rc=0 = молча продолжаем — probe#2 НЕ гейтится на conninfo
+             * (стреляет по таймеру t+8s всегда). */
+            if (rc96 == 3 || (rc96 == 1 && st96 != 2u)) {
                 C2B_LOGS("[c2b] g98: session reaction at t+");
                 C2B_LOGN(w8 + 1);
-                C2B_LOGS("s (state=");
+                C2B_LOGS("s (rc=");
+                C2B_LOGN((u32)(i32)rc96);
+                C2B_LOGS(" state=");
                 C2B_LOGN(st96);
                 C2B_LOGS(") — verdict via g97 end-debug + pcap\n");
                 break;

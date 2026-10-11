@@ -14637,14 +14637,12 @@ static i32 c2b_g100_deadline(void)
     return 0;
 }
 
-/* v7 (run271-урок): BULK-скан = mmap_sem-голодание на ЛЮБОЙ активной фазе
- * движка (v1 t+33, v6 t+6 = застряли; v4/v5 t+45 idle = 1.3GB/s, но смерть
- * клиента = переменная t+25..75 = окно не гарантировано). РЕШЕНИЕ:
- * НАПРАВЛЕННЫЙ ОБХОД: (1) rw-сегменты самой SNS-либы (~0.5MB, пара pread);
- * (2) харвест указателей из них (heap-указатели) -> pread 2KB -> скан
- * расписания + харвест второго уровня (connection obj -> m_pCryptContext* ->
- * EVP ctx с AES_KEY). Всего ~2-5с мелких pread = storm-tolerant. Фильтр
- * двухдоменный (v5). Лог: sns seg= hits1= ptrs1= + финальный done. */
+/* v8 (run272-урок): v7-обход = чисто (без wedge: sns seg=20KB, ptrs1=52,
+ * done быстро), НО hits=0 — цепочка ГЛУЖЕ: lib.bss -> узел CUtlMap ->
+ * connection obj -> m_pCryptContextSend/Recv -> EVP ctx (3-4 хопа).
+ * v8 = BFS В ГЛУБИНУ 3 с глобальным dedup (visited 4096, линейный) и
+ * капами (фронтир 800/уровень, <=2000 pread, deadline 25s). Каждый объект
+ * 4KB сканируется двухдоменным фильтром. ~8MB pread = storm-tolerant. */
 static u32 c2b_g100_harvest(const u8 *p, u32 n, uptr *out, u32 max)
 {
     u32 i, cnt = 0, k;
@@ -14720,6 +14718,19 @@ static u32 c2b_g100_scan_buf(const u8 *buf, u32 n, uptr base, u32 *hits)
     return 0;
 }
 
+static u8 c2b_g100_obj[4096];
+static uptr c2b_g100_vis[4096];
+static u32 c2b_g100_nvis;
+
+static i32 c2b_g100_seen(uptr v)
+{
+    u32 k;
+    for (k = 0; k < c2b_g100_nvis; k++)
+        if (c2b_g100_vis[k] == v) return 1;
+    if (c2b_g100_nvis < 4096) c2b_g100_vis[c2b_g100_nvis++] = v;
+    return 0;
+}
+
 static void c2b_g100_scan(void)
 {
     extern i32 open(const char *, i32, ...);
@@ -14727,12 +14738,13 @@ static void c2b_g100_scan(void)
     extern i64 read(i32, void *, u64);
     static char mp[262144];
     static u8 seg[1 << 20];           /* SNS lib rw-сегменты */
-    static u8 obj[4096];
-    static uptr ptrs1[512];
-    static uptr ptrs2[512];
+    static uptr fr[2][1024];
+    u32 nfl[2] = {0, 0};
     i64 n = 0;
     u32 hits = 0;
     u32 segn = 0;
+    u32 preads = 0;
+    u32 depth;
     char *p, *e;
     i32 fdm;
     struct { i64 s, n; } ts0;
@@ -14770,8 +14782,9 @@ static void c2b_g100_scan(void)
     c2b_g100_t0s = ts0.s;
     c2b_g100_t0n = ts0.n;
     c2b_g100_out = 0;
+    c2b_g100_nvis = 0;
     C2B_LOGS("[c2b] g100: scan start\n");
-    /* 1. собрать и прочитать rw-сегменты SNS-либы */
+    /* 1. rw-сегменты SNS-либы + их указатели = стартовый фронтир */
     p = mp;
     e = mp + n;
     while (p < e && !c2b_g100_out) {
@@ -14813,7 +14826,6 @@ static void c2b_g100_scan(void)
         pathbuf[pl] = 0;
         if (p < e) p++;
         if (!wr || hi <= lo) continue;
-        /* путь = хвост строки после inode; ищем имя либы */
         for (ps = 0; ps + 25 < pl; ps++) {
             if (pathbuf[ps] == 'l' &&
                 pathbuf[ps + 1] == 'i' && pathbuf[ps + 2] == 'b' &&
@@ -14837,46 +14849,57 @@ static void c2b_g100_scan(void)
             segn += (u32)got;
         }
     }
+    nfl[0] = c2b_g100_harvest(seg, segn, fr[0], 1024);
     C2B_LOGS("[c2b] g100: sns seg=");
     C2B_LOGN(segn);
     C2B_LOGS(" hits1=");
     C2B_LOGN(hits);
+    C2B_LOGS(" frontier=");
+    C2B_LOGN(nfl[0]);
     C2B_LOGS("\n");
-    /* 2. харвест указателей из сегментов SNS -> depth-1 */
-    if (hits < 32 && segn > 64 && !c2b_g100_out) {
-        u32 np1 = c2b_g100_harvest(seg, segn, ptrs1, 512);
-        u32 i1;
-        C2B_LOGS("[c2b] g100: ptrs1=");
-        C2B_LOGN(np1);
-        C2B_LOGS("\n");
-        for (i1 = 0; i1 < np1 && hits < 32 && !c2b_g100_out; i1++) {
+    /* 2. BFS глубиной 3 с dedup */
+    for (depth = 0; depth < 3 && hits < 32 && !c2b_g100_out; depth++) {
+        u32 cur = depth & 1, nxt = cur ^ 1;
+        u32 i;
+        nfl[nxt] = 0;
+        for (i = 0; i < nfl[cur] && hits < 32 && !c2b_g100_out; i++) {
+            uptr a = fr[cur][i];
             i64 got;
-            u32 np2, i2;
+            u32 np;
+            if (c2b_g100_seen(a)) continue;
+            if (preads >= 2000) { c2b_g100_out = 1; break; }
             if (c2b_g100_deadline()) { c2b_g100_out = 1; break; }
-            got = pread(fdm, obj, sizeof(obj) - 256, (i64)ptrs1[i1]);
+            preads++;
+            got = pread(fdm, c2b_g100_obj, sizeof(c2b_g100_obj) - 256,
+                        (i64)a);
             if (got <= 0) continue;
-            if (c2b_g100_scan_buf(obj, (u32)got, ptrs1[i1], &hits))
+            if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, a, &hits))
                 break;
-            /* depth-2: указатели из объекта */
-            np2 = c2b_g100_harvest(obj, (u32)got, ptrs2, 512);
-            for (i2 = 0; i2 < np2 && hits < 32 && !c2b_g100_out; i2++) {
-                static u8 obj2[2048];
-                i64 got2;
-                if (c2b_g100_deadline()) {
-                    c2b_g100_out = 1;
-                    break;
+            if (depth < 2) {
+                /* харвест + dedup на пуше (иначе дубли заполняют фронтир) */
+                u32 base_i = nfl[nxt];
+                u32 k2;
+                np = c2b_g100_harvest(c2b_g100_obj, (u32)got,
+                                      fr[nxt] + nfl[nxt],
+                                      (u32)(1024 - nfl[nxt]));
+                nfl[nxt] += np;
+                /* компакция: убрать уже-виденные */
+                for (k2 = base_i; k2 < nfl[nxt]; k2++) {
+                    if (c2b_g100_seen(fr[nxt][k2])) {
+                        fr[nxt][k2] = fr[nxt][nfl[nxt] - 1];
+                        nfl[nxt]--;
+                        k2--;
+                    }
                 }
-                got2 = pread(fdm, obj2, sizeof(obj2), (i64)ptrs2[i2]);
-                if (got2 <= 0) continue;
-                if (c2b_g100_scan_buf(obj2, (u32)got2, ptrs2[i2], &hits))
-                    break;
+                if (nfl[nxt] > 800) nfl[nxt] = 800;
             }
-            if (hits >= 32 || c2b_g100_out) break;
         }
     }
     close(fdm);
     C2B_LOGS("[c2b] g100: scan done hits=");
     C2B_LOGN(hits);
+    C2B_LOGS(" preads=");
+    C2B_LOGN(preads);
     if (c2b_g100_out) C2B_LOGS(" TIMECUT");
     C2B_LOGS("\n");
 }

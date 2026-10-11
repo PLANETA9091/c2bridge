@@ -15015,9 +15015,24 @@ static u8 c2b_g101_tramp[64] __attribute__((aligned(16)));
 static u32 c2b_g101_got;
 static u32 c2b_g101_installed;
 
+static u32 c2b_g101_calls;
 static void c2b_g101_detour(const void *data, u32 len, const void *key,
                             u32 keylen, void *out)
 {
+    /* v14b: перепись первых 8 вызовов (len,keylen) — фильтр (16,32) = не
+     * сработал в run284, СМ. фактические размеры */
+    {
+        u32 n = __atomic_add_fetch(&c2b_g101_calls, 1, __ATOMIC_RELAXED);
+        if (n <= 8) {
+            C2B_LOGS("[c2b] g101: call#");
+            C2B_LOGN(n);
+            C2B_LOGS(" len=");
+            C2B_LOGN(len);
+            C2B_LOGS(" klen=");
+            C2B_LOGN(keylen);
+            C2B_LOGS("\n");
+        }
+    }
     if (len == 16 && keylen == 32 && !c2b_g101_got) {
         c2b_g101_got = 1;
         C2B_LOGS("[c2b] g101: salt=");

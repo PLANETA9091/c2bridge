@@ -16829,6 +16829,202 @@ static void *c2b_g106w_thread(void *arg)
     return (void *)0;
 }
 
+/* ---------- 59m-g106w2: FD-INODE SOCKET MAP (the port-filter-free tap) ----------
+ * run295-урок: SDR-flow на wire ЕСТЬ (64 pkts 10.1.1.127:58023->28022), а
+ * udp28022-вотчер = НОЛЬ переходов => фильтр rem==28022 = МИМО: гипотеза =
+ * A2S-DNAT правила (harness: --dport 28022, owner!=root) переписывают dst
+ * локальному релею => в /proc/net/udp rem = НЕ :28022. g106w2 = БЕЗ
+ * порт-фильтра: fd-иноды ИГРЫ + steam-pids -> lookup в /proc/net/udp ->
+ * лог (pid, local, rem) RAW-строками; дедуп по (pid,ino). 6s-каденс x 30. */
+
+static u32 c2b_g106w2_seen[160][2];
+static u32 c2b_g106w2_nseen;
+
+static void c2b_g106w2_sockmap(void)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 syscall(i64, ...);
+    extern i64 readlink(const char *, char *, u64);
+    extern i32 getpid(void);
+    static char ub[131072];
+    char db[8192], pb[96], lb[256], mb[96], cb2[64];
+    u32 targets[16];
+    u32 ntp = 0, mypid = (u32)getpid(), ti;
+    i32 fd;
+    i64 off;
+    u32 un;
+    /* мишени = мы + steam-pids (быстрый comm-скан) */
+    targets[ntp++] = mypid;
+    fd = open("/proc", 0x10000);
+    if (fd >= 0) {
+        for (;;) {
+            i64 n2 = syscall((i64)217, (i64)fd, db, (i64)sizeof(db));
+            if (n2 <= 0) break;
+            off = 0;
+            while (off + 19 <= n2 && ntp < 14) {
+                u16 reclen = *(const u16 *)(const void *)(db + off + 16);
+                const char *nm = db + off + 19;
+                u32 fl = 0, pv = 0, k;
+                while (off + 19 + fl < (u32)n2 && nm[fl]) fl++;
+                if (fl && fl < 8 && nm[0] >= '0' && nm[0] <= '9') {
+                    for (k = 0; k < fl; k++) {
+                        if (nm[k] < '0' || nm[k] > '9') { pv = 0; break; }
+                        pv = pv * 10 + (u32)(nm[k] - '0');
+                    }
+                    if (pv && pv != mypid) {
+                        u32 cn;
+                        c2b_g106_path(mb, "/proc/", pv, "/comm");
+                        cn = c2b_g106_read_file(mb, cb2, sizeof(cb2));
+                        while (cn && (cb2[cn - 1] == '\n' ||
+                                      cb2[cn - 1] == 0))
+                            cn--;
+                        if (cn && c2b_g106_has(cb2, cn, "steam"))
+                            targets[ntp++] = pv;
+                    }
+                }
+                if (reclen == 0 || off + (i64)reclen > n2) break;
+                off += (i64)reclen;
+            }
+            if (ntp >= 14) break;
+        }
+        close(fd);
+    }
+    un = c2b_g106_read_file("/proc/net/udp", ub, sizeof(ub));
+    if (!un) return;
+    for (ti = 0; ti < ntp; ti++) {
+        i32 fdd;
+        c2b_g106_path(pb, "/proc/", targets[ti], "/fd");
+        fdd = open(pb, 0x10000);
+        if (fdd < 0) continue;
+        for (;;) {
+            i64 fn2 = syscall((i64)217, (i64)fdd, db, (i64)sizeof(db));
+            i64 o2 = 0;
+            if (fn2 <= 0) break;
+            while (o2 + 19 <= fn2) {
+                u16 rl2 = *(const u16 *)(const void *)(db + o2 + 16);
+                const char *nm2 = db + o2 + 19;
+                u32 fl2 = 0;
+                while (o2 + 19 + fl2 < (u32)fn2 && nm2[fl2]) fl2++;
+                if (fl2 && fl2 < 12 && nm2[0] >= '0' && nm2[0] <= '9') {
+                    u32 pl = c2b_g106_path(pb, "/proc/", targets[ti], "/fd/");
+                    u32 k2;
+                    for (k2 = 0; k2 < fl2 && pl + k2 < sizeof(pb) - 1; k2++)
+                        pb[pl + k2] = nm2[k2];
+                    pb[pl + k2] = 0;
+                    {
+                        i64 rl = readlink(pb, lb, sizeof(lb) - 1);
+                        if (rl > 8 && lb[0] == 's' && lb[1] == 'o' &&
+                            lb[2] == 'c') {
+                            u64 xino = 0;
+                            u32 q3, du = 0;
+                            for (q3 = 8; q3 < (u32)rl && lb[q3] != ']'; q3++)
+                                if (lb[q3] >= '0' && lb[q3] <= '9')
+                                    xino = xino * 10 + (u64)(lb[q3] - '0');
+                            if (xino) {
+                                for (du = 0; du < c2b_g106w2_nseen; du++)
+                                    if (c2b_g106w2_seen[du][0] ==
+                                            targets[ti] &&
+                                        c2b_g106w2_seen[du][1] ==
+                                            (u32)xino)
+                                    break;
+                                if (du == c2b_g106w2_nseen &&
+                                    c2b_g106w2_nseen < 160) {
+                                    /* новый (pid,ino): lookup в ub */
+                                    char *lp2 = ub, *e2 = ub + un;
+                                    u32 fdn = 0, fdv = 0, k3;
+                                    for (k3 = 0; k3 < fl2; k3++)
+                                        fdv = fdv * 10 + (u32)(nm2[k3] - '0');
+                                    fdn = fdv;
+                                    while (lp2 < e2) {
+                                        char *le = lp2;
+                                        while (le < e2 && *le != '\n') le++;
+                                        {
+                                            /* inode = поле 9: быстрый скан
+                                             * по токенам через ' ' */
+                                            char *q4 = lp2;
+                                            u32 f4 = 0, m4 = 0;
+                                            u64 inol = 0;
+                                            while (q4 < le) {
+                                                char *ts;
+                                                while (q4 < le && *q4 == ' ')
+                                                    q4++;
+                                                if (q4 >= le) break;
+                                                ts = q4;
+                                                while (q4 < le && *q4 != ' ')
+                                                    q4++;
+                                                if (f4 == 9) {
+                                                    for (; ts < q4; ts++)
+                                                        if (*ts >= '0' &&
+                                                            *ts <= '9')
+                                                            inol = inol * 10 +
+                                                                (u64)(*ts -
+                                                                      '0');
+                                                    break;
+                                                }
+                                                f4++;
+                                            }
+                                            if (inol == xino) m4 = 1;
+                                            if (m4) {
+                                                u32 lnl = (u32)(le - lp2);
+                                                if (lnl > 96) lnl = 96;
+                                                c2b_g106w2_seen
+                                                    [c2b_g106w2_nseen][0] =
+                                                    targets[ti];
+                                                c2b_g106w2_seen
+                                                    [c2b_g106w2_nseen][1] =
+                                                    (u32)xino;
+                                                c2b_g106w2_nseen++;
+                                                C2B_LOGS("[c2b] g106w2: p");
+                                                C2B_LOGD(targets[ti]);
+                                                C2B_LOGS("fd=");
+                                                C2B_LOGD(fdn);
+                                                C2B_LOGS("ino=");
+                                                C2B_LOGH((u32)xino);
+                                                C2B_LOGS("udp=");
+                                                {
+                                                    u32 lnl2 = lnl;
+                                                    if (lnl2 > 2 &&
+                                                        lp2[lnl2 - 1] ==
+                                                        '\r')
+                                                        lnl2--;
+                                                    c2b_out(lp2, lnl2);
+                                                }
+                                                C2B_LOGS("\n");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (rl2 == 0 || o2 + (i64)rl2 > fn2) break;
+                o2 += (i64)rl2;
+            }
+        }
+        close(fdd);
+    }
+}
+
+static void *c2b_g106w2_thread(void *arg)
+{
+    u32 it;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G106W2");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g106w2: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (it = 0; it < 30; it++) {           /* ~180s @6s */
+        usleep(6000000);
+        c2b_g106w2_sockmap();
+    }
+    return (void *)0;
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -18659,6 +18855,10 @@ i32 c2b_main(void)
     {   /* 59m-g106w: the udp28022 transition watcher (the SDR-socket owner) */
         void *t106w = 0;
         pthread_create(&t106w, 0, c2b_g106w_thread, 0);
+    }
+    {   /* 59m-g106w2: the fd-inode socket map (the port-filter-free tap) */
+        void *t106w2 = 0;
+        pthread_create(&t106w2, 0, c2b_g106w2_thread, 0);
     }
 #endif
     r = c2b_try_install();

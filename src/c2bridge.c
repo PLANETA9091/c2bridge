@@ -17358,6 +17358,15 @@ static void *c2b_g107_thread(void *arg)
         close(fdm);
         if (n <= 0) return (void *)0;
         mp[n] = 0;
+        if (c2b_g107_nscan < 3) {
+            C2B_LOGS("[c2b] g107: tick");
+            C2B_LOGN(c2b_g107_nscan);
+            C2B_LOGS("maps_n=");
+            C2B_LOGN((u32)n);
+            C2B_LOGS("nb=");
+            C2B_LOGN(c2b_g107_nbase);
+            C2B_LOGS("\n");
+        }
         p = mp;
         e2 = mp + n;
         while (p < e2 && ncand < 8) {
@@ -17409,6 +17418,11 @@ static void *c2b_g107_thread(void *arg)
                     break;
                 }
             }
+        }
+        if (c2b_g107_nscan < 3) {
+            C2B_LOGS("[c2b] g107: cands=");
+            C2B_LOGN(ncand);
+            C2B_LOGS("\n");
         }
         for (ci = 0; ci < ncand; ci++) {
             u32 du;

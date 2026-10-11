@@ -14878,37 +14878,35 @@ static void c2b_g100_scan(void)
             if (got <= 0) { fails++; continue; }
             if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, a, &hits))
                 break;
-            /* v11-DEBUG: дамп ПЕРВЫХ двух handle-содержащих объектов
-             * (офлайн: найти офсеты m_pCryptContext* вручную) */
+            /* v12-DEBUG: дамп ПЕРВЫХ 3 L1-объектов (с >=1 heap-ptr):
+             * хэндл в объектах ОТСУТСТВУЕТ (run279: hbobj=0 — GNS = табличный
+             * индекс в .bss, не поле connection) — connection* = среди L0-
+             * харвеста; офлайн-RE дампа = офсеты m_pCryptContext* -> v13 =
+             * прямая цепочка. */
             {
-                u8 hb2[4];
-                u32 hv2 = (u32)g_gns_conn_h;
-                hb2[0] = (u8)hv2; hb2[1] = (u8)(hv2 >> 8);
-                hb2[2] = (u8)(hv2 >> 16); hb2[3] = (u8)(hv2 >> 24);
-                if (hv2) {
-                    u32 hx2;
-                    for (hx2 = 0; hx2 + 4 <= (u32)got; hx2 += 4) {
-                        if (c2b_g100_obj[hx2] == hb2[0] &&
-                            c2b_g100_obj[hx2 + 1] == hb2[1] &&
-                            c2b_g100_obj[hx2 + 2] == hb2[2] &&
-                            c2b_g100_obj[hx2 + 3] == hb2[3]) {
-                            if (g100_dumped < 2) {
-                                C2B_LOGS("[c2b] g100: hbobj @");
-                                C2B_LOGH((u32)(a >> 32));
-                                C2B_LOGH((u32)a);
-                                C2B_LOGS(" len=");
-                                C2B_LOGN((u32)got);
-                                C2B_LOGS(" hex=");
-                                c2b_g100_hexs(c2b_g100_obj, (u32)got);
-                                C2B_LOGS("\n");
-                                g100_dumped++;
-                            }
-                            break;
-                        }
+                u32 anyptr = 0, qx;
+                uptr tv;
+                for (qx = 0; qx + 8 <= (u32)got; qx += 8) {
+                    memcpy(&tv, c2b_g100_obj + qx, 8);
+                    if (tv >= ((uptr)0x1000000) &&
+                        tv < ((uptr)0x800000000000ull) && !(tv & 7)) {
+                        anyptr++;
+                        if (anyptr >= 3) break;
                     }
                 }
+                if (anyptr >= 3 && g100_dumped < 3) {
+                    C2B_LOGS("[c2b] g100: l1obj @");
+                    C2B_LOGH((u32)(a >> 32));
+                    C2B_LOGH((u32)a);
+                    C2B_LOGS(" len=");
+                    C2B_LOGN((u32)got);
+                    C2B_LOGS(" hex=");
+                    c2b_g100_hexs(c2b_g100_obj, (u32)got);
+                    C2B_LOGS("\n");
+                    g100_dumped++;
+                }
             }
-            /* v9: handle-фильтр — GNS кладёт хэндл внутрь узлов карты и
+                        /* v9: handle-фильтр — GNS кладёт хэндл внутрь узлов карты и
              * connection-объекта (m_hSelf); фронтир = ТОЛЬКО содержащие
              * хэндл -> путь к контекстам = короткий и точный. */
             {

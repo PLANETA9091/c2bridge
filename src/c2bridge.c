@@ -6475,6 +6475,8 @@ static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен п
                                * (процесс-глобальный: install-once, НЕ TLS) */
 static u8  g_segv_foreign_logged; /* 58f-g77: last-gasp латч — ОДНОКРАТНЫЙ
                                * дамп RIP чужого (либового) фолта */
+static volatile uptr g_lg_lo, g_lg_hi; /* 58f-g90a: регион фолта из maps */
+static volatile u32  g_lg_anon;        /* 1 = не файловый (anon/blob) */
 
 static void c2b_probe_segv(i32 sig, void *si, void *uc)
 {
@@ -6593,9 +6595,13 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                                 *w88 = 0;
                                 c2b_log(path88);
                                 *w88 = sv88;
+                                g_lg_anon = 0;
                             } else {
                                 c2b_log("(anon)");
+                                g_lg_anon = 1;
                             }
+                            g_lg_lo = lo88;
+                            g_lg_hi = hi88;
                             c2b_log("\n");
                             break;
                         }
@@ -6622,11 +6628,26 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                 for (k89 = 0; k89 < 32; k89++)
                     C2B_LOGH(cp89[k89]);
                 c2b_log("\n");
+                /* 58f-g90a: anon-регион = ПРОЛОГ БАЗЫ (32B @lo) + размер =
+                 * офлайн-идентификация relocated-копии (run243: blob 200KB,
+                 * engine+0x650770-эквивалент; база = начало маппинга —
+                 * ELF-header/мемпры/выравнивающий паддинг) */
+                if (g_lg_anon && g_lg_lo) {
+                    const volatile u8 *bp89 = (const volatile u8 *)g_lg_lo;
+                    i32 b89;
+                    C2B_LOGS("[c2b] g90a BASE-32@anon-lo=");
+                    for (b89 = 0; b89 < 32; b89++) C2B_LOGH(bp89[b89]);
+                    c2b_log("\n");
+                    C2B_LOGS("[c2b] g90a ANON size=0x");
+                    C2B_LOGH((u32)((g_lg_hi - g_lg_lo) >> 32));
+                    C2B_LOGH((u32)(g_lg_hi - g_lg_lo));
+                    C2B_LOGS("\n");
+                }
                 {
                     const volatile uptr *sp89 = (const volatile uptr *)rsp77;
                     i32 w89;
-                    C2B_LOGS("[c2b] g89 STACK@rsp=");
-                    for (w89 = 0; w89 < 6; w89++) {
+                    C2B_LOGS("[c2b] g90a STACK16@rsp=");
+                    for (w89 = 0; w89 < 16; w89++) {
                         uptr v89 = sp89[w89];
                         C2B_LOGH((u32)(v89 >> 32)); C2B_LOGH((u32)v89);
                     }
@@ -11281,6 +11302,19 @@ static void *c2b_auth_thread(void *arg)
 static u8  g_kcap[2048];
 static u32 g_kcap_len;
 static u32 g_kcap_n;
+/* 58f-g90: ПОЛНЫЙ 'k'-пакет движка (in-channel relay) + синхронизация с
+ * триггер-тредом. g49-стейт ('A'-парс, run243: st=0x369bc478, chal/proto/val
+ * живые) + прямой вызов vt+0x198 SendConnectPacket (проверен run168/190/195:
+ * kcap=10/attempt, 513B С РЕАЛЬНЫМ auth-blob) -> полный 'k' капчурится
+ * sendto-хуком СИНХРОННО -> релей В GNS-КАНАЛ (slot 11/10, reliable) =
+ * materialization 'k'-барьера in-channel. */
+static u8  g_kfull[1200];
+static u32 g_kfull_len;
+static volatile u32 g_kfull_n;
+static volatile u32 g_kfull_rel;
+static volatile u32 g_g90_A_seq;
+static volatile u32 g_g90_A_chal;
+static u32 g_g90_last_seq;
 
 #ifndef C2B_SELFTEST
 /* 58f-g82: ReceiveMessages DETOUR (vtable slot 12 — ИСПРАВЛЕННАЯ карта).
@@ -11373,7 +11407,7 @@ static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 t
             break;
         }
         if (rc7 > 0 && ma[0]) c2b_g71_dumpmsg((void *)ma[0]);
-        /* 58f-g77: тик каждые 4с = сетка таймлайна для сверения с pcap */
+        /* 58f-g90: тик каждые 4с = сетка таймлайна для сверения с pcap */
         if ((tick7 % 20) == 19) {
             C2B_LOGS("[c2b] g84: tick="); C2B_LOGN(tick7);
             C2B_LOGS(" rxn="); C2B_LOGN(g_gns_rx_n);
@@ -12409,6 +12443,19 @@ static i32 c2b_g71_dumpmsg(void *mp)
         C2B_LOGS(" d=");
         if (pd) for (k = 0; k < 64 && k < msz; k++) C2B_LOGH(pd[k]);
         C2B_LOGS("\n");
+        /* 58f-g90: in-channel 'A'-детект: ff×4+'A' -> chal le32@5 -> g90
+         * выстрел №2 берёт chal сервера (перечеллендж после 'k') */
+        if (pd && msz >= 25 && pd[0] == 0xff && pd[1] == 0xff &&
+            pd[2] == 0xff && pd[3] == 0xff && pd[4] == 0x41) {
+            g_g90_A_chal = (u32)pd[5] | ((u32)pd[6] << 8) |
+                           ((u32)pd[7] << 16) | ((u32)pd[8] << 24);
+            g_g90_A_seq++;
+            C2B_LOGS("[c2b] g90: in-channel 'A' seq=");
+            C2B_LOGN(g_g90_A_seq);
+            C2B_LOGS(" chal=");
+            C2B_LOGH(g_g90_A_chal);
+            C2B_LOGS("\n");
+        }
     } else {
         g_gns_rx_n++;
         C2B_LOGS("[c2b] g71: msg#"); C2B_LOGN(g_gns_rx_n);
@@ -13589,6 +13636,22 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                  * для фазы B. Дампим и dst движка (identity-конверсия!). */
                 char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
                 c2b_cl_hexline(p, (u32)len, ln, (u32)sizeof(ln));
+                /* 58f-g90: ПОЛНЫЙ 'k' в буфер для in-channel релея (g70b
+                 * капчурит только byte 17+; тут = ЦЕЛИКОМ, ff×4+'k'+...) */
+                if (len > 4 && len <= sizeof(g_kfull)) {
+                    u32 k8;
+                    memcpy(g_kfull, p, (u32)len);
+                    g_kfull_len = (u32)len;
+                    g_kfull_n++;
+                    C2B_LOGS("[c2b] g90: full 'k' captured #");
+                    C2B_LOGN(g_kfull_n);
+                    C2B_LOGS(" len=");
+                    C2B_LOGN(g_kfull_len);
+                    C2B_LOGS(" head=");
+                    for (k8 = 0; k8 < 24 && k8 < g_kfull_len; k8++)
+                        C2B_LOGH(g_kfull[k8]);
+                    C2B_LOGS("\n");
+                }
                 g_clv2_cap_connect++;
                 C2B_LOGS("[c2b] CLV2 S1 connect captured #");
                 C2B_LOGN(g_clv2_cap_connect);
@@ -13728,6 +13791,124 @@ static void c2b_g50_force_cstate(void) { }
 #endif
 
 #ifndef C2B_SELFTEST
+/* ---------- 58f-g90: триггер+релей 'k' in-channel (тред) ----------
+ * run243 ФАКТЫ: g49-детур захватил стейт (st=0x369bc478) c ЖИВЫМИ полями
+ * (chal=0x82f6b2ef от S2-'A', proto=3, val=0x00ee0a07, strstr("connect0x…")
+ * достигнут = 'A'-парс полон); GNS-сессия жива (h, iface); сервер шлёт
+ * in-channel 'A' (case-9 форма, chal=0). Механика: (1) прямой вызов
+ * vt+0x198 SendConnectPacket(st, &snap@0x4f0, chal@0x4d8, proto@0x4dc,
+ * val@0x4e0, authbyte@0x4c1) — движок САМ строит ПОЛНЫЙ 'k' (513B, С
+ * РЕАЛЬНЫМ GetAuthSessionTicket-blob — BLoggedOn=1, тикеты капчурятся
+ * AUTH-пробой тут же в процессе) и шлёт его через sendto-хук; (2) полный
+ * 'k' капчурится g90-сайтом СИНХРОННО; (3) релей В GNS-КАНАЛ через
+ * SendMessageToConnection (slot 11 на 006 / 10 на 009, reliable) —
+ * сервер получает 'k' in-channel = фаза-B (b)/(d) materialized.
+ * 2 выстрела: №1 = chal стейта; №2 (через 15с) = если сервер перечелленд-
+ * жил in-channel (g90 'A'-детект) — пишем ЕГО chal в стейт и повторяем.
+ * Killswitch C2B_G90=0. SEGV-гарда на обоих вызовах. */
+static void *c2b_g90_thread(void *arg)
+{
+    u32 it, shot;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G90");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g90: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (it = 0; it < 1200; it++) {
+        if (c2b_g49_state && g_gns_conn_h && g_gns_conn_iface) break;
+        usleep(500000);
+    }
+    if (!c2b_g49_state || !g_gns_conn_h || !g_gns_conn_iface) {
+        C2B_LOGS("[c2b] g90: no state/session in 10min — exit\n");
+        return (void *)0;
+    }
+    C2B_LOGS("[c2b] g90: armed st=");
+    C2B_LOGH((u32)c2b_g49_state);
+    C2B_LOGS(" h=");
+    C2B_LOGH((u32)g_gns_conn_h);
+    C2B_LOGS("\n");
+    for (shot = 0; shot < 2; shot++) {
+        uptr st, vt, fn;
+        u32 chal, proto, k9;
+        u32 n0 = g_kfull_n;
+        i32 rc9 = -999;
+        i64 out9 = -1;
+        u32 send_slot;
+        void **vt9;
+        if (shot) usleep(15000000);
+        st = (uptr)c2b_g49_state;
+        if (shot && g_g90_A_seq != g_g90_last_seq) {
+            *(volatile u32 *)(st + 0x4d8) = g_g90_A_chal;
+            g_g90_last_seq = g_g90_A_seq;
+            C2B_LOGS("[c2b] g90: chal <- in-channel 'A' ");
+            C2B_LOGH(g_g90_A_chal);
+            C2B_LOGS("\n");
+        }
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            if (*(volatile u32 *)(st + 0x8dc4) == 0)
+                *(volatile u32 *)(st + 0x8dc4) = 3;
+            chal = *(volatile const u32 *)(st + 0x4d8);
+            proto = *(volatile const u32 *)(st + 0x4dc);
+            vt = *(volatile const uptr *)st;
+            fn = vt ? *(volatile const uptr *)(vt + 0x198) : 0;
+            if (!fn || !g_engine_base || fn - g_engine_base >= 0x4000000ull) {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g90: fn rejected vt=");
+                C2B_LOGH((u32)(vt >> 32)); C2B_LOGH((u32)vt);
+                C2B_LOGS(" fn=");
+                C2B_LOGH((u32)(fn >> 32)); C2B_LOGH((u32)fn);
+                C2B_LOGS("\n");
+                continue;
+            }
+            C2B_LOGS("[c2b] g90: scp call #");
+            C2B_LOGN(shot + 1);
+            C2B_LOGS(" chal=");
+            C2B_LOGH(chal);
+            C2B_LOGS(" proto=");
+            C2B_LOGH(proto);
+            C2B_LOGS("\n");
+            ((void (*)(uptr, const void *, u32, u32, u64, u32))fn)(
+                st, (const void *)(st + 0x4f0), chal, proto,
+                *(volatile const u64 *)(st + 0x4e0),
+                *(volatile const u8 *)(st + 0x4c1));
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g90: scp call FAULT\n");
+            continue;
+        }
+        for (k9 = 0; k9 < 20 && g_kfull_n == n0; k9++) usleep(100000);
+        if (g_kfull_n == n0 || !g_kfull_len) {
+            C2B_LOGS("[c2b] g90: no 'k' captured after scp call\n");
+            continue;
+        }
+        vt9 = *(void ***)g_gns_conn_iface;
+        send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc9 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt9[send_slot])(
+                g_gns_conn_iface, g_gns_conn_h, g_kfull, g_kfull_len, 1, &out9);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g90: SendMessageToConnection SEGV\n");
+        }
+        C2B_LOGS("[c2b] g90: 'k' relay in-channel len=");
+        C2B_LOGN(g_kfull_len);
+        C2B_LOGS(" slot=");
+        C2B_LOGN(send_slot);
+        C2B_LOGS(" rc=");
+        C2B_LOGN((u32)(i32)rc9);
+        C2B_LOGS("\n");
+        if (rc9 == 1) g_kfull_rel++;
+    }
+    return (void *)0;
+}
+
 /* ---------- 50l-g63: периодический self-push 'B' kaccept (тред) ----------
  * run214 ФАКТ: 'B'-бейты доставляются ТОЛЬКО по приходе РЕАЛЬНОГО 0x21
  * (гейт g58 в recvfrom-хуке) + one-shot g_clv2_23_seen — сэмплов 'B'-парса
@@ -15367,6 +15548,10 @@ i32 c2b_main(void)
     {   /* 50l-g63: периодический self-push 'B' kaccept (гейт = g_clv2_baits) */
         void *t63 = 0;
         pthread_create(&t63, 0, c2b_g63_thread, 0);
+    }
+    {   /* 58f-g90: триггер+релей 'k' in-channel (SendConnectPacket-materialization) */
+        void *t90 = 0;
+        pthread_create(&t90, 0, c2b_g90_thread, 0);
     }
 #endif
     r = c2b_try_install();

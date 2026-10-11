@@ -11161,6 +11161,36 @@ static u32 g_kcap_len;
 static u32 g_kcap_n;
 
 #ifndef C2B_SELFTEST
+/* 58f-g81: ReceiveMessages DETOUR (vtable slot 13). Эмпирика run222-234:
+ * слот 11 = Send (g76 работает), слот 12 = rc=0 ВСЕГДА (полл rxn=0 вечность)
+ * = Flush, НЕ Receive — карта ЭТОГО билда СДВИНУТА +1 vs SDK-008
+ * (10=?, 11=Send, 12=Flush, 13=ReceiveMessagesOnConnection). run234: либа
+ * ЧИТАЕТ сессионные данные (fd 0x58, g77-тап), но полл по 12 пуст. Детур =
+ * passthrough + дамп ВСЕХ возвращённых сообщений = каптур расшифрованного
+ * in-channel протокола НЕЗАВИСИМО от дрейнера (наш полл или собственный
+ * насос движка — инстанс либы один = vtable общая). Установка =
+ * mprotect+патч vtable ифейса (один раз, идемпотентно), киллисвитч C2B_G81=0. */
+static void *g_clp_orig_recv13;
+static u32 g_gns_rxdet_n;
+static i32 c2b_g71_dumpmsg(void *mp); /* fwd (тело ниже, g71b) */
+static i32 c2b_g81_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
+{
+    i32 rc = ((i32 (*)(void *, uptr, void **, i32))g_clp_orig_recv13)(
+        self, connH, pMsgs, nMax);
+    if (rc > 0 && pMsgs) {
+        i32 k81;
+        for (k81 = 0; k81 < rc && k81 < 8; k81++) {
+            if (!pMsgs[k81]) continue;
+            g_gns_rxdet_n++;
+            C2B_LOGS("[c2b] g81 rx#"); C2B_LOGN(g_gns_rxdet_n);
+            C2B_LOGS(" conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
+            C2B_LOGS("\n");
+            (void)c2b_g71_dumpmsg(pMsgs[k81]);
+        }
+    }
+    return rc;
+}
+
 /* g32a-обёртка для pthread: spew_rearm держит auth-поток в 60x5s цикле
  * (run173: драйвер ПОСЛЕ rearm недостижим — попытка кончается раньше) */
 static void *c2b_g32_thread(void *arg)
@@ -11780,6 +11810,29 @@ static void c2b_g32_drive(void)
             g_gns_conn_iface = iface;
             g_gns_conn_h = h;
             g_gns_conn_ver = vi;
+            /* 58f-g81: ДЕТУР ReceiveMessages (слот 13) — каптур расшифрованных
+             * сообщений независимо от дрейнера; карта слотов = сдвинута
+             * (11=Send, 12=Flush, 13=Receive — см. коммент у детура) */
+            {
+                const char *e81 = getenv("C2B_G81");
+                if (e81 && e81[0] == '0') {
+                    C2B_LOGS("[c2b] g81: disabled (C2B_G81=0)\n");
+                } else {
+                    void **vt81 = *(void ***)iface;
+                    if (vt81[13] == (void *)&c2b_g81_recv_detour) {
+                        C2B_LOGS("[c2b] g81: already armed\n");
+                    } else if (c2b_page_protect((uptr)&vt81[13], 8, 0x07) == 0) {
+                        g_clp_orig_recv13 = vt81[13];
+                        vt81[13] = (void *)&c2b_g81_recv_detour;
+                        C2B_LOGS("[c2b] g81: slot 13 DETOURED orig=0x");
+                        C2B_LOGH((u32)((uptr)g_clp_orig_recv13 >> 32));
+                        C2B_LOGH((u32)(uptr)g_clp_orig_recv13);
+                        C2B_LOGS("\n");
+                    } else {
+                        C2B_LOGS("[c2b] g81: mprotect failed\n");
+                    }
+                }
+            }
             /* 43f-g38b: состояние НИЗКОУРОВНЕВОГО слоя ПОСЛЕ коннекта:
              * если AddRef отработал с полным инитом, s_hEpoll != -1 и
              * refcnt вырос; s_hEpoll=-1 при живом refcnt = init был
@@ -11963,8 +12016,13 @@ static void c2b_g32_drive(void)
              * rc>0+валидный дамп = приёмник; rc==0 = пустая очередь —
              * поллим на нём (сервер молчит до первого байта клиента —
              * C2S_CONNECT, следующий раунд). rc<0/фолт = слот не тот. */
-            cs[0] = 12u;
-            cs[1] = 11u;
+            /* g81: КАРТА СЛОТОВ СДВИНУТА (run222-234 эмпирика): 11=Send
+             * (g76 доставляет), 12=Flush (rc=0 всегда = ложный 'empty-queue'),
+             * 13=ReceiveMessagesOnConnection. Кандидаты теперь {13, 12}:
+             * rc>0+дамп = приёмник; rc==0 = пустая очередь/флаш.
+             * Слот 11 УБРАН из кандидатов (g71b-урок: это Send — крэш). */
+            cs[0] = 13u;
+            cs[1] = 12u;
             /* g71c→g74a: зонд/полл теперь ВКЛЮЧЁН ПО УМОЛЧАНИЮ (run227:
              * сессия жива после g73 — полл = наблюдатель in-channel
              * протокола; runs 223/224 A/B доказали безопасность полла,

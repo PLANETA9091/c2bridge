@@ -12110,6 +12110,7 @@ static void c2b_g32_drive(void)
             if (ch7 && ciface && cs[0]) {
                 i32 rx_slot = -1;
                 u32 ci2;
+                u32 found85 = 0;   /* g86: поход нашёл приёмник в ЭТОЙ попытке */
                 vt7 = *(void ***)ciface;
                 for (ci2 = 0; ci2 < 2 && rx_slot < 0; ci2++) {
                     u64 ma[128];
@@ -12206,11 +12207,13 @@ static void c2b_g32_drive(void)
                             if (rc83 > 0 && ma83[0] >= 0x10000000000ull) {
                                 /* правдоподобный heap-ptr = кандидат-приёмник */
                                 if (c2b_g71_dumpmsg((void *)ma83[0]) == 0) {
-                                    g_gns_walk_slot = s83;
-                                    C2B_LOGS("[c2b] g85: RX SLOT FOUND=");
-                                    C2B_LOGN(s83);
-                                    C2B_LOGS(" — drain-poll 100s now\n");
-                                    c2b_g84_pollslot(vt7, ciface, ch7, s83, 100u * 5u);
+                                    if (!found85) {
+                                        found85 = 1;
+                                        g_gns_walk_slot = s83;
+                                        C2B_LOGS("[c2b] g86: RX SLOT FOUND=");
+                                        C2B_LOGN(s83);
+                                        C2B_LOGS(" (main poll switches)\n");
+                                    }
                                 }
                             } else if (rc83 >= 64 && rc83 <= 4095) {
                                 /* size-query (detailed status) -> реальный вызов */
@@ -12250,9 +12253,18 @@ static void c2b_g32_drive(void)
                         }
                     }
                 }
+                /* g86: находка похода СЕЙЧАС = главный полл идёт на НЕГО
+                 * (run239: слот 14 дал rc=1 + реальный heap-ptr + дамп 'A'
+                 *ChallengeRequest in-channel — 12 = красная селёдка-геттер) */
+                if (found85 && g_gns_walk_slot) {
+                    C2B_LOGS("[c2b] g86: main poll switched to walk slot=");
+                    C2B_LOGN(g_gns_walk_slot);
+                    C2B_LOGS("\n");
+                    rx_slot = (i32)g_gns_walk_slot;
+                }
                 if (rx_slot >= 0) {
-                    /* g85: полл ВСЕГДА полный 240с (поход = до полла, под
-                     * гейтом знака; находка похода уже отработана доливом) */
+                    /* g85/g86: полл ВСЕГДА полный 240с (поход = до полла, под
+                     * гейтом знака; находка = переключение полла на приёмник) */
                     c2b_g84_pollslot(vt7, ciface, ch7, (u32)rx_slot, 240u * 5u);
                 } else {
                     C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");

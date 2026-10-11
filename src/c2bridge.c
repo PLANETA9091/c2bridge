@@ -6572,14 +6572,18 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                             p88++;
                         }
                         if (rip77 >= lo88 && rip77 < hi88) {
-                            /* путь = после 4-го пробела perms/offset/dev/inode */
+                            /* путь = после 5-го пробела (maps: addr perms
+                             * offset dev inode PATH — g88 брал 4-й = inode
+                             * -> файловые модули печатались как (anon),
+                             * blob-детектив run243-247: "anon ELF 332KB" =
+                             * на самом деле libvstdlib_client.so!) */
                             char *path88 = p88;
                             u32 sp88 = 0;
                             char *w88 = p88;
                             while (w88 < e88 && *w88 != '\n') {
                                 if (*w88 == ' ') {
                                     sp88++;
-                                    if (sp88 == 4) path88 = w88 + 1;
+                                    if (sp88 == 5) path88 = w88 + 1;
                                 }
                                 w88++;
                             }
@@ -13885,33 +13889,59 @@ static void *c2b_g90_thread(void *arg)
             uptr arr = *(volatile const uptr *)(st + 0x148);
             u32 cnt = *(volatile const u32 *)(st + 0x158);
             u32 ei;
+            uptr el_pick = 0;
             if (arr && cnt) {
+                /* 58f-g90v5: КАРТА el (первые 4: {0x64, ip@0x4c, pt@0x50}) —
+                 * run247: ни одного el с 0x64∈{1..3} -> зеркало не выбралось;
+                 * карта = данные для правильного выбора/полей */
+                C2B_LOGS("[c2b] g90v5: els cnt=");
+                C2B_LOGN(cnt);
+                C2B_LOGS("\n");
+                for (ei = 0; ei < cnt && ei < 4; ei++) {
+                    uptr el = arr + (uptr)ei * 0x68;
+                    u32 e64 = *(volatile const u32 *)(el + 0x64);
+                    u32 eip = *(volatile const u32 *)(el + 0x4c);
+                    u16 ept = *(volatile const u16 *)(el + 0x50);
+                    C2B_LOGS("[c2b] g90v5: el[");
+                    C2B_LOGN(ei);
+                    C2B_LOGS("] @");
+                    C2B_LOGH((u32)el);
+                    C2B_LOGS(" e64=");
+                    C2B_LOGN(e64);
+                    C2B_LOGS(" ip=");
+                    C2B_LOGH(eip);
+                    C2B_LOGS(" pt=");
+                    C2B_LOGH(ept);
+                    C2B_LOGS("\n");
+                }
+                /* выбор: первый живои (0x64∈{1..3}), иначе el[0] (бестшот-
+                 * зеркало: ALT-сравнение 65e930 по OLd-зеркалам — тип у обоих
+                 * NEW-style=3, сравнятся ip/port) */
                 for (ei = 0; ei < cnt && ei < 8; ei++) {
                     uptr el = arr + (uptr)ei * 0x68;
                     u32 e64 = *(volatile const u32 *)(el + 0x64);
-                    if (e64 >= 1u && e64 <= 3u) {
-                        u32 eip = *(volatile const u32 *)(el + 0x4c);
-                        u16 ept = *(volatile const u16 *)(el + 0x50);
-                        u32 sip = *(volatile const u32 *)(st + 0x4f4);
-                        u16 spt = *(volatile const u16 *)(st + 0x4f8);
-                        if (sip != eip)
-                            *(volatile u32 *)(st + 0x4f4) = eip;
-                        if (spt != ept)
-                            *(volatile u16 *)(st + 0x4f8) = ept;
-                        C2B_LOGS("[c2b] g90v4: snap<-el mirrors el=");
-                        C2B_LOGH((u32)el);
-                        C2B_LOGS(" e64=");
-                        C2B_LOGN(e64);
-                        C2B_LOGS(" ip=");
-                        C2B_LOGH(eip);
-                        C2B_LOGS(" pt=");
-                        C2B_LOGH(ept);
-                        C2B_LOGS(" (was ");
-                        C2B_LOGH(sip);
-                        C2B_LOGH(spt);
-                        C2B_LOGS(")\n");
-                        break;
-                    }
+                    if (e64 >= 1u && e64 <= 3u) { el_pick = el; break; }
+                }
+                if (!el_pick) el_pick = arr;
+                {
+                    u32 eip = *(volatile const u32 *)(el_pick + 0x4c);
+                    u16 ept = *(volatile const u16 *)(el_pick + 0x50);
+                    u32 sip = *(volatile const u32 *)(st + 0x4f4);
+                    u16 spt = *(volatile const u16 *)(st + 0x4f8);
+                    if (sip != eip)
+                        *(volatile u32 *)(st + 0x4f4) = eip;
+                    if (spt != ept)
+                        *(volatile u16 *)(st + 0x4f8) = ept;
+                    C2B_LOGS("[c2b] g90v5: snap<-el mirrors pick=@");
+                    C2B_LOGH((u32)el_pick);
+                    C2B_LOGS(" ip=");
+                    C2B_LOGH(eip);
+                    C2B_LOGS(" pt=");
+                    C2B_LOGH(ept);
+                    C2B_LOGS(" (was ");
+                    C2B_LOGH(sip);
+                    C2B_LOGH(spt);
+                    C2B_LOGS(")\n");
                 }
             }
         }

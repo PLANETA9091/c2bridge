@@ -16891,6 +16891,13 @@ static void c2b_g106w2_sockmap(void)
         close(fd);
     }
     un = c2b_g106_read_file("/proc/net/udp", ub, sizeof(ub));
+    if (!c2b_g106w2_nseen) {
+        C2B_LOGS("[c2b] g106w2: udp-read n=");
+        C2B_LOGD(un);
+        C2B_LOGS("targets=");
+        C2B_LOGD(ntp);
+        C2B_LOGS("\n");
+    }
     if (!un) return;
     for (ti = 0; ti < ntp; ti++) {
         i32 fdd;
@@ -16930,12 +16937,19 @@ static void c2b_g106w2_sockmap(void)
                                     break;
                                 if (du == c2b_g106w2_nseen &&
                                     c2b_g106w2_nseen < 160) {
-                                    /* новый (pid,ino): lookup в ub */
+                                    /* дедуп: пишем (pid,ino) СРАЗУ (и миссы
+                                     * тоже — tcp-иноды не ресканим); лог =
+                                     * только если inode найден в /proc/net/udp */
                                     char *lp2 = ub, *e2 = ub + un;
                                     u32 fdn = 0, fdv = 0, k3;
                                     for (k3 = 0; k3 < fl2; k3++)
                                         fdv = fdv * 10 + (u32)(nm2[k3] - '0');
                                     fdn = fdv;
+                                    c2b_g106w2_seen
+                                        [c2b_g106w2_nseen][0] = targets[ti];
+                                    c2b_g106w2_seen
+                                        [c2b_g106w2_nseen][1] = (u32)xino;
+                                    c2b_g106w2_nseen++;
                                     while (lp2 < e2) {
                                         char *le = lp2;
                                         while (le < e2 && *le != '\n') le++;
@@ -16991,8 +17005,10 @@ static void c2b_g106w2_sockmap(void)
                                                     c2b_out(lp2, lnl2);
                                                 }
                                                 C2B_LOGS("\n");
+                                                break;   /* строка найдена */
                                             }
                                         }
+                                        lp2 = (le < e2) ? le + 1 : le;
                                     }
                                 }
                             }

@@ -7502,6 +7502,8 @@ static u32 g_gns_connect_go;            /* драйвер вооружён */
 static u32 g_gns_conn_ver;              /* g71: версия сработавшего интерфейса (0=006 1=009) */
 static void *g_gns_conn_iface;          /* g71: iface сработавшего коннекта */
 static uptr  g_gns_conn_h;              /* g71: хэндл GNS-соединения */
+static u32   g_gns_walk_slot;           /* g84: слот-приёмник, найденный походом 14..27 (0=нет) */
+static u8    g_gns_stbuf[4352];         /* g84: буфер detailed-status текста (4KB + запас) */
 static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
 static socklen_t g_gns_dstlen;          /* 0 = не собран */
 
@@ -11215,6 +11217,51 @@ static i32 c2b_g47_ret0(uptr self) { (void)self; return 0; }
 static uptr c2b_g47_vt[18];
 static uptr c2b_g47_obj[1];
 
+/* 58f-g84: полл GNS-очереди на фиксированном слоте (фактор из g71):
+ * 200мс тик, каждая проверка под SEGV-гардой, rc<0 = конец сессии,
+ * rc>0+ma[0] = дамп сообщения, тик-лог каждые 4с. */
+static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 ticks)
+{
+    u32 tick7;
+    C2B_LOGS("[c2b] g84: poll slot="); C2B_LOGN(slot);
+    C2B_LOGS(" ticks="); C2B_LOGN(ticks);
+    C2B_LOGS("\n");
+    for (tick7 = 0; tick7 < ticks; tick7++) {
+        u64 ma[128];
+        i32 rc7 = -999;
+        usleep(200000);
+        ma[0] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc7 = ((i32 (*)(void *, uptr, void **, i32))vt7[slot])(
+                ciface, ch7, (void **)ma, 1);
+        } else {
+            rc7 = -998;
+        }
+        g_probe_active = 0;
+        /* 58f-g77: rc==-998 = фолт НАШЕГО потока — печатаем и продолжаем */
+        if (rc7 == -998) {
+            C2B_LOGS("[c2b] g84: rx FAULT @tick=");
+            C2B_LOGN(tick7);
+            C2B_LOGS(" — continuing\n");
+            continue;
+        }
+        if (rc7 < 0) {
+            C2B_LOGS("[c2b] g84: session end @tick="); C2B_LOGN(tick7);
+            C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
+            C2B_LOGS("\n");
+            break;
+        }
+        if (rc7 > 0 && ma[0]) c2b_g71_dumpmsg((void *)ma[0]);
+        /* 58f-g77: тик каждые 4с = сетка таймлайна для сверения с pcap */
+        if ((tick7 % 20) == 19) {
+            C2B_LOGS("[c2b] g84: tick="); C2B_LOGN(tick7);
+            C2B_LOGS(" rxn="); C2B_LOGN(g_gns_rx_n);
+            C2B_LOGS("\n");
+        }
+    }
+}
+
 /* ================= 41f-g32a: GNS ConnectByIPAddress-драйвер =================
  * Цель — заставить steamclient-овский GNS СОЗДАТЬ реальное соединение к
  * CS2-цели: его 0x20/0x21 обмен + ПОСТРОЕННЫЙ 0x22 (его cert+crypt, подпись
@@ -12029,6 +12076,19 @@ static void c2b_g32_drive(void)
              * rc==0 = пустая очередь. Слот 11 УБРАН (g71b: Send — крэш). */
             cs[0] = 12u;
             cs[1] = 13u;
+            /* g84: поход g83/g84 (post-poll) нашёл приёмник на ПРЕДЫДУЩЕМ
+             * заходе — фиксируем его ПЕРВЫМ кандидатом (полл уйдёт на него;
+             * run237 эмпирика: слот 20 = ReceiveMessagesOnListenSocket —
+             * ИМЯ подтверждено GNSLIB-lock-warning; 18 = detailed-status
+             * size-query rc=1978; 16/17 = struct-геттеры; 20-фолт = 4-арг
+             * на listen-сокетном приёмнике). */
+            if (g_gns_walk_slot >= 14u && g_gns_walk_slot <= 27u) {
+                cs[0] = g_gns_walk_slot;
+                cs[1] = 12u;
+                C2B_LOGS("[c2b] g84: poll candidate from walk slot=");
+                C2B_LOGN(g_gns_walk_slot);
+                C2B_LOGS("\n");
+            }
             /* g71c→g74a: зонд/полл теперь ВКЛЮЧЁН ПО УМОЛЧАНИЮ (run227:
              * сессия жива после g73 — полл = наблюдатель in-channel
              * протокола; runs 223/224 A/B доказали безопасность полла,
@@ -12077,29 +12137,47 @@ static void c2b_g32_drive(void)
                     }
                     /* rc7 < 0 / фолт -> следующий кандидат */
                 }
-                /* 58f-g83: ПОХОД ПО СЛОТАМ 14..20 (ма-безопасные 4-арг пробы).
-                 * run236 вывод: Receive(12) дрейнят ТОЛЬКО два НАШИХ call-site
-                 * (g15-note: rva=0x25ca4/0x26bb4), rc=0 всегда — очередь
-                 * никогда не наполняется (стена ВНУТРИ либы). Модель (a):
-                 * приёмник = слот >= 14 в приватной карте (в открытом SDK-009
-                 * 14..17 = GetQuickConnectionStatus/GetDetailedConnectionStatus/
-                 * GetListenSocketInfo/CreateSocketPair — геттеры, ма-безопасные
-                 * при 1КБ ma). Сигнатура каждой пробы = rc + ma[0] (+ дамп под
-                 * гардой при rc>0+ma[0]); rc>0+валидный дамп = КАНДИДАТ-
-                 * ПРИЁМНИК -> слот полла ПЕРЕЗАПИСЫВАЕТСЯ (сообщения пойдут!).
-                 * rc<0 = код конца (сигнатура границы карты). 150мс пауза.
-                 * Киллисвитч C2B_G83=0. */
+                if (rx_slot >= 0) {
+                    /* g84: слот-приёмник уже найден походом на пред. заходе =
+                     * полный полл 240с; иначе 50с (ответ+signon укладываются
+                     * в ~5с после C2S_CONNECT — окно освобождаем для похода) */
+                    c2b_g84_pollslot(vt7, ciface, ch7, (u32)rx_slot,
+                                     g_gns_walk_slot ? 240u * 5u : 50u * 5u);
+                } else {
+                    C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");
+                }
+                /* 58f-g84: ПОХОД ПО СЛОТАМ 14..27 — после 50-с полла (урок
+                 * run237: pre-poll поход на a4 ДЕРЖАЛ GNS-lock 173мс (slot 20
+                 * = ReceiveMessagesOnListenSocket — имя из GNSLIB-lock-
+                 * warning!) + assert-спам — 77B-ответ сервера, пришедший В
+                 * ОКНО ПОХОДА, не обработан движком (SNM не было, PASS
+                 * сорван). Теперь: ответ/signon (~5с) завершаются в 50-с
+                 * полле, поход = ПОСЛЕ. Слот 20 ИСКЛЮЧЁН (лок-хог, сигнатура
+                 * уже известна). ГЕЙТ ДАМПА: только ma0 >= 2^40 (правдоп.
+                 * heap-ptr; run237: ma0=0x8_00000010/0xaf_00000003 =
+                 * struct-геттеры, мусорные дампы = шум). Находка =
+                 * g_gns_walk_slot (след. заход = полный полл на нём) +
+                 * ДОЛИВ-ПОЛЛ 100с СЕЙЧАС. НОВОЕ: rc в [64..4095] =
+                 * size-query (18: rc=1978) -> повторный вызов с 4KB буфером
+                 * + ТЕКСТОВЫЙ дамп = detailed status (очереди байт, пакеты,
+                 * ошибки дешифра) = ПРЯМАЯ СУДЬБА 77B. Киллисвитч C2B_G83=0. */
                 {
                     const char *e83 = getenv("C2B_G83");
-                    if (e83 && e83[0] == '0') {
-                        C2B_LOGS("[c2b] g83: walk disabled (C2B_G83=0)\n");
+                    if (g_gns_walk_slot) {
+                        C2B_LOGS("[c2b] g84: receiver known, walk skipped\n");
+                    } else if (e83 && e83[0] == '0') {
+                        C2B_LOGS("[c2b] g84: walk disabled (C2B_G83=0)\n");
                     } else {
                         u32 s83;
-                        for (s83 = 14u; s83 <= 20u; s83++) {
+                        for (s83 = 14u; s83 <= 27u; s83++) {
                             u64 ma83[128];
                             i32 rc83 = -999;
+                            if (s83 == 20u) {
+                                C2B_LOGS("[c2b] g84 walk slot=20 SKIP (ListenSocket-recv, lock-hog)\n");
+                                continue;
+                            }
                             if ((uptr)vt7[s83] < 0x1000u) {
-                                C2B_LOGS("[c2b] g83 walk slot="); C2B_LOGN(s83);
+                                C2B_LOGS("[c2b] g84 walk slot="); C2B_LOGN(s83);
                                 C2B_LOGS(" SKIP (ptr<0x1000)\n");
                                 continue;
                             }
@@ -12113,71 +12191,58 @@ static void c2b_g32_drive(void)
                                 rc83 = -998;         /* фолт слота */
                             }
                             g_probe_active = 0;
-                            C2B_LOGS("[c2b] g83 walk slot="); C2B_LOGN(s83);
+                            C2B_LOGS("[c2b] g84 walk slot="); C2B_LOGN(s83);
                             C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc83);
                             C2B_LOGS(" ma0=");
                             C2B_LOGH((u32)(ma83[0] >> 32));
                             C2B_LOGH((u32)(ma83[0] & 0xffffffffu));
                             C2B_LOGS("\n");
-                            if (rc83 > 0 && ma83[0]) {
+                            if (rc83 > 0 && ma83[0] >= 0x10000000000ull) {
+                                /* правдоподобный heap-ptr = кандидат-приёмник */
                                 if (c2b_g71_dumpmsg((void *)ma83[0]) == 0) {
-                                    rx_slot = (i32)s83;
-                                    C2B_LOGS("[c2b] g83: RX SLOT FOUND=");
-                                    C2B_LOGN((u32)rx_slot);
-                                    C2B_LOGS(" (poll switched)\n");
+                                    g_gns_walk_slot = s83;
+                                    C2B_LOGS("[c2b] g84: RX SLOT FOUND=");
+                                    C2B_LOGN(s83);
+                                    C2B_LOGS(" — drain-poll 100s now\n");
+                                    c2b_g84_pollslot(vt7, ciface, ch7, s83, 100u * 5u);
+                                }
+                            } else if (rc83 >= 64 && rc83 <= 4095) {
+                                /* size-query (detailed status) -> реальный вызов */
+                                i32 rc84 = -999;
+                                g_gns_stbuf[0] = 0;
+                                g_probe_active = 1;
+                                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                                    rc84 = ((i32 (*)(void *, uptr, void *, i32))vt7[s83])(
+                                        ciface, ch7, g_gns_stbuf, 4096);
+                                } else {
+                                    rc84 = -998;
+                                }
+                                g_probe_active = 0;
+                                if (rc84 > 0 && rc84 <= 4351) {
+                                    u32 off, e84 = (u32)rc84;
+                                    C2B_LOGS("[c2b] g84 STATUS slot="); C2B_LOGN(s83);
+                                    C2B_LOGS(" len="); C2B_LOGN(e84);
+                                    C2B_LOGS("\n");
+                                    g_gns_stbuf[e84] = 0;
+                                    for (off = 0; off < e84; off += 224) {
+                                        u32 cl = e84 - off; char sv;
+                                        if (cl > 224) cl = 224;
+                                        sv = g_gns_stbuf[off + cl];
+                                        g_gns_stbuf[off + cl] = 0;
+                                        c2b_log((const char *)&g_gns_stbuf[off]);
+                                        c2b_log("\n");
+                                        g_gns_stbuf[off + cl] = sv;
+                                    }
+                                } else {
+                                    C2B_LOGS("[c2b] g84 STATUS slot="); C2B_LOGN(s83);
+                                    C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc84);
+                                    C2B_LOGS(" (no text)\n");
                                 }
                             }
-                            /* rc83 == 0 = геттер/пусто — просто сигнатура;
-                             * rc83 < 0/-998 = граница карты/фолт — сигнатура */
+                            /* rc83 == 0 = геттер/пусто; rc83 < 0/-998 =
+                             * граница карты/фолт — сигнатуры для карты */
                         }
                     }
-                }
-                if (rx_slot >= 0) {
-                    u32 tick7;
-                    C2B_LOGS("[c2b] g71: poll 240s on slot=");
-                    C2B_LOGN((u32)rx_slot);
-                    C2B_LOGS("\n");
-                    for (tick7 = 0; tick7 < 240u * 5u; tick7++) {
-                        u64 ma[128];
-                        i32 rc7 = -999;
-                        usleep(200000);
-                        ma[0] = 0;
-                        g_probe_active = 1;
-                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                            rc7 = ((i32 (*)(void *, uptr, void **, i32))vt7[rx_slot])(
-                                ciface, ch7, (void **)ma, 1);
-                        } else {
-                            rc7 = -998;
-                        }
-                        g_probe_active = 0;
-                        /* 58f-g77: rc==-998 = фолт НАШЕГО потока, пойманный
-                         * гардой — печатаем и ПРОДОЛЖАЕМ (раньше: -998<0
-                         * молча триггерил 'session end'+break — фолт
-                         * маскировался под конец сессии, rxn оставался 0,
-                         * диагноз был невозможен). */
-                        if (rc7 == -998) {
-                            C2B_LOGS("[c2b] g71: rx FAULT @tick=");
-                            C2B_LOGN(tick7);
-                            C2B_LOGS(" — continuing\n");
-                            continue;
-                        }
-                        if (rc7 < 0) {
-                            C2B_LOGS("[c2b] g71: session end @tick="); C2B_LOGN(tick7);
-                            C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
-                            C2B_LOGS("\n");
-                            break;
-                        }
-                        if (rc7 > 0 && ma[0]) c2b_g71_dumpmsg((void *)ma[0]);
-                        /* 58f-g77: тик каждые 4с (было 40с) = мелкая
-                         * сетка таймлайна смерть/ответ для сверения с pcap */
-                        if ((tick7 % 20) == 19) {
-                            C2B_LOGS("[c2b] g71: tick="); C2B_LOGN(tick7);
-                            C2B_LOGS(" rxn="); C2B_LOGN(g_gns_rx_n);
-                            C2B_LOGS("\n");
-                        }
-                    }
-                } else {
-                    C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");
                 }
             }
         }

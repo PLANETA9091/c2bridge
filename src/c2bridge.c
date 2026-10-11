@@ -15158,8 +15158,10 @@ static void *c2b_g101_thread(void *arg)
                 tp = c2b_g101_tramp + 17;
                 tp[0] = 0xe9;
                 {
+                    /* rel32: RIP = АДРЕС СЛЕД. ИНСТРУКЦИИ = tramp+22
+                     * (e9@17, disp@18..21); было +21 = off-by-one-латент */
                     i32 rel = (i32)((uptr)(tgt + 17) -
-                                    ((uptr)c2b_g101_tramp + 21));
+                                    ((uptr)c2b_g101_tramp + 22));
                     tp[1] = (u8)rel;
                     tp[2] = (u8)(rel >> 8);
                     tp[3] = (u8)(rel >> 16);
@@ -15236,6 +15238,253 @@ static void *c2b_g101_thread(void *arg)
                 return (void *)0;
             }
         }
+    }
+}
+
+/* ---------- 59i-g102: AESNI_SET_ENCRYPT_KEY SESSION-KEY CAPTURE ----------
+ * РЕ-ФАКТ (run286-парадокс: KDF-сайт 0x64710 не файрит в live; оффлайн
+ * скан либы __cb0ca8): AESKEYGENASSIST (66 0f 3a df) = 31 хит, кластеры
+ * @0x2781cd-0x2784f5. Функция-владелец = OpenSSL aesni_set_encrypt_key:
+ * ENTRY @0x278160 = 48 83 ec 08 | 48 c7 c0 ff ff ff ff | 48 85 ff
+ * (sub $8,rsp; mov $-1,rax; test rdi,rdi = 14B позиционно-независимых),
+ * @0x27816e = je rel32 (НЕ релоцируем). Свитч bits: 0x100 -> 0x278450
+ * (AES-256, rounds=13, двоенные aeskeygenassist), 0xc0 -> 0x278340,
+ * 0x80 -> AES-128; ia32cap-ветка 0x278250 (aesenclast-гибрид) = ВНУТРИ
+ * той же функции — ENTRY-хук покрывает ВСЕ пути. Патч 14B = ТОЧНО в
+ * размер выреза (до je). SysV: rdi=userKey, esi=bits, rdx=AES_KEY*;
+ * AES_KEY = {u32 rd_key[60]; int rounds;} -> rounds @+240; rd_key[0..3]
+ * = ключ как LE-u32 (кросс-чек против rdi-байт). Детур: naked-стаб
+ * (mov (%rsp),rcx = ИСХОДНЫЙ retaddr ДО пролога) -> C-детур
+ * (key,bits,rk,ra); реестр {base,tramp}: матч ra-base < 0x600000
+ * (ra = в вызывающей либе = СВОЯ инстанса). Тред патчит ВСЕ базы
+ * libsteam* с двойной верификацией (пролог @+0x278160 + маркер
+ * cmp $0x100,%esi = 81 fe 00 01 00 00 @+0x278194) — 0-calls
+ * run284-286 = возможно патчился не тот инстанс. Ре-скан 2s = живой
+ * (поздние dlopen'ы). Idempotent: readback ff 25 = skip. Killswitch
+ * C2B_G102=0. */
+extern void c2b_g102_stub(void);
+__asm__(
+    ".text\n"
+    ".globl c2b_g102_stub\n"
+    ".type c2b_g102_stub, @function\n"
+    "c2b_g102_stub:\n"
+    "  movq (%rsp), %rcx\n"       /* rcx = исходный retaddr (до пролога) */
+    "  jmp  c2b_g102_detour_c\n"  /* rdi=key rsi=bits rdx=rk rcx=ra */
+);
+static void c2b_g102_detour_c(const void *key, int bits, void *rk, void *ra)
+    __attribute__((used));
+static u8   c2b_g102_tramp[4][64] __attribute__((aligned(16)));
+static uptr c2b_g102_base[4];
+static u32  c2b_g102_nbase;
+static u32  c2b_g102_got;
+static u32  c2b_g102_calls;
+static void c2b_g102_detour_c(const void *key, int bits, void *rk, void *ra)
+{
+    int rc = -3;
+    int (*tramp)(const void *, int, void *) = 0;
+    u32 i, n;
+    for (i = 0; i < c2b_g102_nbase; i++) {
+        uptr d = (uptr)ra - c2b_g102_base[i];
+        if (d < 0x600000u) {          /* ra в пределах инстанса либы */
+            tramp = (int (*)(const void *, int, void *))c2b_g102_tramp[i];
+            break;
+        }
+    }
+    n = __atomic_add_fetch(&c2b_g102_calls, 1, __ATOMIC_RELAXED);
+    if (n <= 8) {
+        C2B_LOGS("[c2b] g102: call#");
+        C2B_LOGN(n);
+        C2B_LOGS(" bits=");
+        C2B_LOGN((u32)bits);
+        C2B_LOGS("\n");
+    }
+    if (bits == 0x100 && c2b_g102_got < 4) {
+        u32 gi = __atomic_add_fetch(&c2b_g102_got, 1, __ATOMIC_RELAXED);
+        C2B_LOGS("[c2b] g102: KEY");
+        C2B_LOGN(gi);
+        C2B_LOGS("= ");
+        c2b_g100_hexs((const u8 *)key, 32);
+        if (i < c2b_g102_nbase) {
+            C2B_LOGS("co= ");          /* caller offset в либе */
+            C2B_LOGH((u32)((uptr)ra - c2b_g102_base[i]));
+        } else {
+            C2B_LOGS("ra= ");
+            C2B_LOGH((u32)((uptr)ra >> 32));
+            C2B_LOGH((u32)(uptr)ra);
+        }
+        C2B_LOGS("\n");
+    }
+    if (tramp) rc = tramp(key, bits, rk);
+    if (bits == 0x100 && rc == 0 && rk) {
+        const u32 *rdk = (const u32 *)rk;
+        C2B_LOGS("[c2b] g102: rd=");
+        C2B_LOGH(rdk[0]);
+        C2B_LOGH(rdk[1]);
+        C2B_LOGH(rdk[2]);
+        C2B_LOGH(rdk[3]);
+        C2B_LOGS("rounds=");
+        C2B_LOGN((u32)*(const volatile int *)((const u8 *)rk + 240));
+        C2B_LOGS("\n");
+    }
+    (void)rc;
+}
+
+static void *c2b_g102_thread(void *arg)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    (void)arg;
+    for (;;) {
+        static const u8 pro[14] = {
+            0x48, 0x83, 0xec, 0x08, 0x48, 0xc7, 0xc0, 0xff,
+            0xff, 0xff, 0xff, 0x48, 0x85, 0xff
+        };
+        static const u8 mk[6] = { 0x81, 0xfe, 0x00, 0x01, 0x00, 0x00 };
+        i32 fdm = open("/proc/self/maps", 0);
+        i64 n = 0;
+        static char mp[262144];
+        char *p, *e2;
+        uptr cand[24];
+        u32 ncand = 0, ci;
+        {
+            const char *e102 = getenv("C2B_G102");
+            if (e102 && e102[0] == '0') {
+                C2B_LOGS("[c2b] g102: disabled by env\n");
+                return (void *)0;
+            }
+        }
+        if (fdm < 0) return (void *)0;
+        for (;;) {
+            i64 r = read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i64)sizeof(mp) - 1) break;
+        }
+        close(fdm);
+        if (n <= 0) return (void *)0;
+        mp[n] = 0;
+        p = mp;
+        e2 = mp + n;
+        while (p < e2 && ncand < 24) {
+            uptr lo = 0, hi = 0;
+            i32 c;
+            char pb[512];
+            u32 pl = 0, ps;
+            while (p < e2 && *p == '\n') p++;
+            if (p >= e2) break;
+            while (p < e2 && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != '-') break;
+            p++;
+            while (p < e2 && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != ' ') break;
+            p++;
+            while (p < e2 && *p != '\n') {
+                if (pl < sizeof(pb) - 1) pb[pl++] = *p;
+                p++;
+            }
+            pb[pl] = 0;
+            if (p < e2) p++;
+            if (hi <= lo || pl < 26) continue;
+            for (ps = 0; ps + 25 < pl; ps++) {
+                if (pb[ps] == 'l' && pb[ps + 1] == 'i' &&
+                    pb[ps + 2] == 'b' && pb[ps + 3] == 's' &&
+                    pb[ps + 4] == 't' && pb[ps + 5] == 'e' &&
+                    pb[ps + 6] == 'a' && pb[ps + 7] == 'm') {
+                    u32 du;
+                    for (du = 0; du < ncand; du++)
+                        if (cand[du] == lo) break;
+                    if (du == ncand) cand[ncand++] = lo;
+                    break;
+                }
+            }
+        }
+        for (ci = 0; ci < ncand; ci++) {
+            u8 *tgt = (u8 *)(cand[ci] + 0x278160);
+            u8 *mkp = (u8 *)(cand[ci] + 0x278194);
+            u32 k, ok = 1;
+            for (k = 0; k < 14; k++)
+                if (tgt[k] != pro[k]) { ok = 0; break; }
+            if (ok)
+                for (k = 0; k < 6; k++)
+                    if (mkp[k] != mk[k]) { ok = 0; break; }
+            if (!ok) continue;
+            if (tgt[0] == 0xff && tgt[1] == 0x25) continue; /* уже наш патч */
+            if (c2b_g102_nbase >= 4) break;
+            {
+                u8 *tp = c2b_g102_tramp[c2b_g102_nbase];
+                i32 rel;
+                for (k = 0; k < 14; k++) tp[k] = tgt[k];
+                tp[14] = 0xe9;
+                /* rel32: RIP = АДРЕС СЛЕД. ИНСТРУКЦИИ = tp+19 (e9@14,
+                 * disp@15..18). +18 = off-by-one (g101-латент) */
+                rel = (i32)((uptr)(tgt + 14) - ((uptr)tp + 19));
+                tp[15] = (u8)rel;
+                tp[16] = (u8)(rel >> 8);
+                tp[17] = (u8)(rel >> 16);
+                tp[18] = (u8)(rel >> 24);
+                c2b_g102_base[c2b_g102_nbase] = cand[ci];
+                c2b_g102_nbase++;          /* реестр ДО патча */
+            }
+            if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)), 0x2000,
+                         3 /*RW*/) != 0) {
+                C2B_LOGS("[c2b] g102: mprotect fail\n");
+                c2b_g102_nbase--;
+                continue;
+            }
+            {
+                u8 pat[14];
+                uptr da = (uptr)&c2b_g102_stub;
+                pat[0] = 0xff; pat[1] = 0x25; pat[2] = 0;
+                pat[3] = 0; pat[4] = 0; pat[5] = 0;
+                for (k = 0; k < 8; k++) pat[6 + k] = (u8)(da >> (8 * k));
+                for (k = 0; k < 14; k++) tgt[k] = pat[k];
+            }
+            if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)), 0x2000,
+                         5 /*RX*/) != 0)
+                C2B_LOGS("[c2b] g102: mprotect RX fail\n");
+            C2B_LOGS("[c2b] g102: hook installed base=");
+            C2B_LOGH((u32)(cand[ci] >> 32));
+            C2B_LOGH((u32)cand[ci]);
+            C2B_LOGS("\n");
+            {
+                u8 rb[14];
+                i32 fdm3 = open("/proc/self/mem", 0);
+                i32 gr;
+                u32 z;
+                if (fdm3 >= 0) {
+                    gr = (i32)pread(fdm3, rb, 14, (i64)tgt);
+                    C2B_LOGS("[c2b] g102: readback=");
+                    if (gr == 14) {
+                        for (z = 0; z < 14; z++) {
+                            char bb[2];
+                            bb[0] = c2b_g100_hx[rb[z] >> 4];
+                            bb[1] = c2b_g100_hx[rb[z] & 15];
+                            c2b_out(bb, 2);
+                        }
+                    } else {
+                        C2B_LOGS("pread-fail");
+                    }
+                    C2B_LOGS("\n");
+                    close(fdm3);
+                }
+            }
+        }
+        usleep(2000000);   /* ре-скан: поздние dlopen новых инстанс */
     }
 }
 
@@ -17044,6 +17293,11 @@ i32 c2b_main(void)
          * до коннекта — KDF = при ConnectOK, до арма g98) */
         void *t101 = 0;
         pthread_create(&t101, 0, c2b_g101_thread, 0);
+    }
+    {   /* 59i-g102: aesni_set_encrypt_key session-key capture (ранняя,
+         * до коннекта — keygen = при EVP-init, до арма g98) */
+        void *t102 = 0;
+        pthread_create(&t102, 0, c2b_g102_thread, 0);
     }
 #endif
     r = c2b_try_install();

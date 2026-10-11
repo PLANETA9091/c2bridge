@@ -352,6 +352,7 @@ static struct g_fini2 {
     u32 rt_str, rt_ge, rt_aov;
     u32 ba_p, ba_s, ba_nt;
     u32 up2_t0, up2_bsz, up2_tr;
+    u32 up2_gf;                     /* g70c: фолты SEGV-гарды bsz/ser */
     u32 dn2_fc;
 } g_fini2;
 
@@ -5603,6 +5604,7 @@ u64 c2b_up_dispatch(const void *blk)
                 n = bsz(msg + 8);
             } else {
                 n = 0;                       /* фолт ByteSizeLong -> passthrough */
+                g_fini2.up2_gf++;            /* g70c: счётчик фолтов гарды */
             }
             g_probe_active = 0;
 #else
@@ -5617,6 +5619,7 @@ u64 c2b_up_dispatch(const void *blk)
                 sok = 1;
             } else {
                 sok = 0;                     /* фолт Serialize -> passthrough */
+                g_fini2.up2_gf++;            /* g70c: счётчик фолтов гарды */
             }
             g_probe_active = 0;
 #else
@@ -12197,22 +12200,47 @@ static void c2b_clv2_cr_keygen(void)
 
 /* [0x22][u16 pb_len LE][pb][zero-pad] = ровно 512 байт; вариант >= 2 добавляет
  * f7 crypt (SessionCryptInfoSigned без signature: key_info{key_type=1,
- * key_data=наш pub32}). Содержимое pb:
- *   f1 fixed32 cid | f3 fixed64 challenge | f4 fixed64 my_timestamp |
- *   f5 varint 13   | [f7 bytes crypt]     | f8 fixed64 legacy_client_steam_id */
+ * key_data=наш pub32}).
+ * g70 (20261011) ПОЛНЫЙ RE ДЕСКРИПТОРА: CMsgSteamSockets_UDP_ConnectRequest
+ * (steamnetworkingsockets_messages_udp.proto; steamclient.so__5b08b7,
+ * сериализованный FileDescriptorProto @0xd002f7 — численные номера полей
+ * из FieldDescriptorProto, НЕ порядок объявления; сверено с открытым SDK):
+ *   f1 fixed32 client_connection_id
+ *   f2 fixed64 challenge                 <- РАНЬШЕ ШЛИ В f3 (MIS-RE!)
+ *   f3 fixed64 legacy_client_steam_id    <- РАНЬШЕ СЮДА ПОПАДАЛ challenge
+ *   f4 bytes   cert (CertificateSigned)  <- РАНЬШЕ f4 fixed64 ts (wire-mismatch)
+ *   f5 fixed64 my_timestamp              <- РАНЬШЕ f5 varint 13 (wire-mismatch)
+ *   f6 varint  ping_est_ms
+ *   f7 bytes   crypt SessionCryptInfoSigned
+ *   f8 varint  legacy_protocol_version   <- РАНЬШЕ f8 fixed64 sid (wire-mismatch)
+ *   f9 bytes   legacy_identity_binary (LegacyBinary{f16 steam_id fixed64,
+ *              f2 generic_bytes, f3 generic_string, f4 ipv6_and_port})
+ *   f10 string identity_string
+ * СТАРЫЙ БИЛДЕР БЫЛ НЕПРАВИЛЬНЫЙ (f3 chal/f4 ts/f5 ver/f8 sid): protobuf-парсер
+ * ключуется на (номер, wire-type); challenge вообще НЕ попадал в f2 -> сервер
+ * молча дропал ConnectRequest (challenge отсутствует -> нет 0x23). g59-теория
+ * "нет auth-ticket" — преждевременная: В ConnectRequest НЕТ ticket-поля;
+ * 'steam2_auth_ticket' @0xd4d453 steamclient = поле CMsgClientLogon (Steam-
+ * сеть, не игровой сервер). Ticket-zone 'k' (byte 17+) капчерится g70
+ * отдельно — пригодится ВНУТРИ зашифрованной сессии (game-level auth). */
 static u32 c2b_clv2_build_connreq(u8 *out, u32 variant, u32 cid, u64 ch, u64 ts)
 {
     u8 pb[128];
     u32 n = 0, i;
     if (variant >= 2) c2b_clv2_cr_keygen();
-    pb[n++] = 0x0d;                              /* f1 fixed32 connection_id */
+    pb[n++] = 0x0d;                              /* f1 fixed32 client_connection_id */
     pb[n++] = (u8)cid; pb[n++] = (u8)(cid >> 8);
     pb[n++] = (u8)(cid >> 16); pb[n++] = (u8)(cid >> 24);
-    pb[n++] = 0x19;                              /* f3 fixed64 challenge */
+    pb[n++] = 0x12;                              /* f2 fixed64 challenge (g70 FIX) */
     for (i = 0; i < 8; i++) pb[n++] = (u8)(ch >> (8 * i));
-    pb[n++] = 0x21;                              /* f4 fixed64 my_timestamp */
+    if (g_clv2_sid64) {
+        pb[n++] = 0x19;                          /* f3 fixed64 legacy_client_steam_id */
+        for (i = 0; i < 8; i++) pb[n++] = (u8)(g_clv2_sid64 >> (8 * i));
+    }
+    pb[n++] = 0x29;                              /* f5 fixed64 my_timestamp */
     for (i = 0; i < 8; i++) pb[n++] = (u8)(ts >> (8 * i));
-    pb[n++] = 0x28; pb[n++] = 0x0d;              /* f5 varint protocol_version=13 */
+    pb[n++] = 0x30; pb[n++] = 20;                /* f6 varint ping_est_ms */
+    pb[n++] = 0x40; pb[n++] = 0x0d;              /* f8 varint legacy_protocol_version=13 */
     if (variant >= 2) {
         /* f7 crypt: SessionCryptInfoSigned{1: key_info{1: 1(CURVE25519),
          * 2: pub32}}; key_info = 08 01 12 20 <32B> = 36B; crypt =
@@ -12221,10 +12249,6 @@ static u32 c2b_clv2_build_connreq(u8 *out, u32 variant, u32 cid, u64 ch, u64 ts)
         u32 k;
         for (k = 0; k < 8; k++) pb[n++] = hdr[k];
         for (k = 0; k < 32; k++) pb[n++] = g_clv2_cr_pub[k];
-    }
-    if (g_clv2_sid64) {
-        pb[n++] = 0x41;                          /* f8 fixed64 legacy_client_steam_id */
-        for (i = 0; i < 8; i++) pb[n++] = (u8)(g_clv2_sid64 >> (8 * i));
     }
     out[0] = 0x22;                               /* k_ESteamNetworkingUDPMsg_ConnectRequest */
     out[1] = (u8)n; out[2] = (u8)(n >> 8);
@@ -12787,6 +12811,27 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                      * addr капчура = цель); нет -> 0x20 сейчас + pending (0x22
                      * уйдёт по reply в recvfrom-хуке). */
                     c2b_clv2_note_sid(p, (u32)len);
+                    /* g70b: ticket-zone 'k' (byte 17+ = после ff×4+'k'+proto+
+                     * authproto+chal) в буфер — сырьё для будущего in-channel
+                     * auth (В 0x22 ticket-поля НЕТ — дескриптор g70). Лог:
+                     * длина + первые 32 байта hex. */
+                    if (len > 17) {
+                        static u8 g_kcap[2048];
+                        static u32 g_kcap_len, g_kcap_n;
+                        u32 cl = len - 17, k7;
+                        if (cl > sizeof(g_kcap)) cl = sizeof(g_kcap);
+                        memcpy(g_kcap, p + 17, cl);
+                        g_kcap_len = cl;
+                        g_kcap_n++;
+                        C2B_LOGS("[c2b] g70: k-ticket captured #");
+                        C2B_LOGN(g_kcap_n);
+                        C2B_LOGS(" len=");
+                        C2B_LOGN(g_kcap_len);
+                        C2B_LOGS(" head=");
+                        for (k7 = 0; k7 < 32 && k7 < g_kcap_len; k7++)
+                            C2B_LOGH(g_kcap[k7]);
+                        C2B_LOGS("\n");
+                    }
                     {
                         const void *da2 = 0;
                         socklen_t dl2 = 0;
@@ -14509,6 +14554,7 @@ static void c2b_print_fini2(void)
     C2B_LOGS("} up2{t0=");  C2B_LOGN(g_fini2.up2_t0);
     C2B_LOGS(" bsz=");  C2B_LOGN(g_fini2.up2_bsz);
     C2B_LOGS(" tr=");   C2B_LOGN(g_fini2.up2_tr);
+    C2B_LOGS(" gf=");   C2B_LOGN(g_fini2.up2_gf);   /* g70c */
     C2B_LOGS("} dn2{fc="); C2B_LOGN(g_fini2.dn2_fc);
     C2B_LOGS("}\n");
 }
@@ -18607,7 +18653,9 @@ static void test_cl(void)
                           "g31: note_sid -> steamid64 = public|account");
                 }
                 {
-                    /* build_connreq: фрейминг v1 (bare) и v2 (+crypt) */
+                    /* build_connreq: g70-фрейминг v1 (bare) и v2 (+crypt).
+                     * v1 pb: f1 cid(5) f2 ch(9) f3 sid(9) f5 ts(9) f6 ping(2)
+                     * f8 ver(2) = 36B. v2 = +40 crypt = 76B. */
                     u8 cr[512];
                     u32 pl2, qi;
                     g_clv2_sid64 = 0x0110000100000000ULL | 687168219ull;
@@ -18617,17 +18665,19 @@ static void test_cl(void)
                     CHECK(pl2 == 512, "g31: 0x22 = 512 байт (pad)");
                     CHECK(cr[0] == 0x22, "g31: msgid 0x22");
                     pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
-                    CHECK(pl2 == 34, "g31: v1 pb-длина = 34 (f1+f3+f4+f5+f8)");
+                    CHECK(pl2 == 36, "g70: v1 pb-длина = 36 (f1+f2+f3+f5+f6+f8)");
                     CHECK(cr[3] == 0x0d && cr[4] == 0x78 && cr[7] == 0x12,
-                          "g31: f1 cid LE = 0x12345678");
-                    CHECK(cr[8] == 0x19 && cr[9] == 0x88 && cr[16] == 0x11,
-                          "g31: f3 challenge LE");
-                    CHECK(cr[17] == 0x21 && cr[18] == 0x08 && cr[25] == 0x01,
-                          "g31: f4 my_timestamp LE");
-                    CHECK(cr[26] == 0x28 && cr[27] == 0x0d,
-                          "g31: f5 protocol_version=13");
-                    CHECK(cr[28] == 0x41 && cr[33] == 0x01 && cr[36] == 0x01,
-                          "g31: f8 steamid64 LE (0x01100001...: byte4+byte7=01)");
+                          "g70: f1 cid LE = 0x12345678");
+                    CHECK(cr[8] == 0x12 && cr[9] == 0x88 && cr[16] == 0x11,
+                          "g70: f2 challenge LE (0x1122334455667788)");
+                    CHECK(cr[17] == 0x19 && cr[25] == 0x01,
+                          "g70: f3 steamid64 LE (0x01100001...: byte7=01)");
+                    CHECK(cr[26] == 0x29 && cr[27] == 0x08 && cr[34] == 0x01,
+                          "g70: f5 my_timestamp LE");
+                    CHECK(cr[35] == 0x30 && cr[36] == 20,
+                          "g70: f6 ping_est_ms=20");
+                    CHECK(cr[37] == 0x40 && cr[38] == 0x0d,
+                          "g70: f8 legacy_protocol_version=13");
                     CHECK(cr[3 + pl2] == 0 && cr[511] == 0, "g31: паддинг NUL");
                     g_clv2_cr_have = 0;          /* форс keygen в v2 */
                     for (qi = 0; qi < 32; qi++) g_clv2_cr_pub[qi] = 0;
@@ -18635,25 +18685,24 @@ static void test_cl(void)
                                                  0x1122334455667788ull,
                                                  0x0102030405060708ull);
                     pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
-                    CHECK(pl2 == 74, "g31: v2 pb-длина = 74 (+40 crypt)");
-                    CHECK(cr[28] == 0x3a && cr[29] == 38, "g31: f7 crypt tag+len 38");
-                    CHECK(cr[30] == 0x0a && cr[31] == 36,
-                          "g31: key_info len=36");
-                    CHECK(cr[32] == 0x08 && cr[33] == 0x01,
-                          "g31: key_type=1 (CURVE25519)");
-                    CHECK(cr[34] == 0x12 && cr[35] == 32,
-                          "g31: key_data len=32");
+                    CHECK(pl2 == 76, "g70: v2 pb-длина = 76 (+40 crypt)");
+                    CHECK(cr[39] == 0x3a && cr[40] == 38, "g70: f7 crypt tag+len 38");
+                    CHECK(cr[41] == 0x0a && cr[42] == 36,
+                          "g70: key_info len=36");
+                    CHECK(cr[43] == 0x08 && cr[44] == 0x01,
+                          "g70: key_type=1 (CURVE25519)");
+                    CHECK(cr[45] == 0x12 && cr[46] == 32,
+                          "g70: key_data len=32");
                     {
                         u32 nz = 0;
-                        for (qi = 36; qi < 68; qi++) if (cr[qi]) nz = 1;
+                        for (qi = 47; qi < 79; qi++) if (cr[qi]) nz = 1;
                         CHECK(nz, "g31: x25519 pub сгенерён (не все нули)");
                     }
-                    CHECK(cr[68] == 0x41, "g31: f8 после crypt");
                     {
                         u32 okz = 1;
-                        for (qi = 68; qi < 512; qi++)
-                            if (qi > 76 && cr[qi] != 0) okz = 0;
-                        CHECK(okz, "g31: v2 хвост = sid(8) + NUL-паддинг");
+                        for (qi = 79; qi < 512; qi++)
+                            if (cr[qi] != 0) okz = 0;
+                        CHECK(okz, "g70: v2 хвост = NUL-паддинг");
                     }
                     g_clv2_sid64 = 0;            /* не протекает в другие тесты */
                 }

@@ -14587,8 +14587,17 @@ static void *c2b_g98_thread(void *arg)
         const char *e9 = getenv("C2B_G99");
         if (e9 && e9[0] == '0') g99_on = 0;
         {
+            /* g99v3 (run263-урок): S2 CConVar-синтетика поднята на уровень
+             * треда — используется И как translate для тапнутого t=6 (S1-body
+             * [08 varint] = death-suspect #1), И как fallback @t+9s, если
+             * живого t=6-тапа не было (дедуп: не дублируем SetConVar). */
+            static const u8 sc99[] = {
+                0x0a, 0x12,                         /* field1, len 18 */
+                0x0a, 0x09, 'c', 'l', '_', 'i', 'n', 't', 'e', 'r', 'p',
+                0x12, 0x05, '0', '.', '0', '3', '1'
+            };
             i32 rc1 = c2b_g98_send_probe(msg, frm, 1);
-            u32 w8, alt = msg ^ 1u, fired2 = 0;
+            u32 w8, alt = msg ^ 1u, fired2 = 0, t6_relayed = 0;
             (void)rc1;
             /* 58f-g98c (run261-урок): conninfo (слот 3) = ненадёжен на wrapper
              * (rc=0 нулевой ИЛИ SEGV) — watch = ТОЛЬКО таймер. Смерть/реакция
@@ -14599,20 +14608,25 @@ static void *c2b_g98_thread(void *arg)
                 if (!g_gns_conn_h || !g_gns_conn_iface) break;
                 if (w8 == 7 && !fired2) {
                     fired2 = 1;
-                    (void)c2b_g98_send_probe(alt, frm, 2);
+                    if (msg == 0) {
+                        /* g99v3 (run262/263-урок): probe#2 = ДУБЛЬ type-7
+                         * {08 02} — COUNT-vs-CONTENT бисект: убивает дубль =
+                         * протокольное нарушение счёта; живёт = прежние смерти
+                         * = КОНТЕНТ (S1-тела t=15/t=6) -> drop-list/translate
+                         * (эти ветки ниже). Старое поведение (type-8 пустой)
+                         * = msg=1 (probe#1 = 8, alt = 7) — сохранено. */
+                        u8 b2[2];
+                        b2[0] = 0x08; b2[1] = 0x02;
+                        (void)c2b_g98_send_msg(7, b2, 2, frm, 2);
+                    } else {
+                        (void)c2b_g98_send_probe(alt, frm, 2);
+                    }
                 }
-                /* 58f-g99v2 (run262-урок): тап в dispatch = мёртв (bsz @1EF9F0
-                 * = wrong-class -> fault -> n=0 -> ser не доходит). Пока ser не
-                 * починен (RE lite-vtable = след. раунд) — СИНТЕТИЧЕСКИЙ
-                 * SetConVar (t=6, S1/S2 identity, валидный минимальный proto):
-                 * CNETMsg_SetConVar{ convars{ name="cl_interp",
-                 * value="0.031" } } @t+9s. */
-                if (w8 == 9) {
-                    static const u8 sc99[] = {
-                        0x0a, 0x12,                         /* field1, len 18 */
-                        0x0a, 0x09, 'c', 'l', '_', 'i', 'n', 't', 'e', 'r', 'p',
-                        0x12, 0x05, '0', '.', '0', '3', '1'
-                    };
+                /* 58f-g99v3: fallback-синтетика SetConVar только если тапнутый
+                 * t=6 ещё НЕ ушёл в релей (иначе = дубль = новая переменная
+                 * бисекта). run263: синтетика rc=3 = сессия уже мертва к t+9s
+                 * — тело так и не проверено на ЖИВОЙ сессии. */
+                if (w8 == 9 && !t6_relayed) {
                     (void)c2b_g98_send_msg(6, sc99, (u32)sizeof(sc99), 0, 99);
                 }
                 if (!g99_on) continue;
@@ -14623,10 +14637,46 @@ static void *c2b_g98_thread(void *arg)
                     {
                         u32 s99 = ri99 & (C2B_G99_RCAP - 1);
                         u32 mt = g_g99_t[s99], ml = g_g99_len[s99];
-                        i32 r99 = c2b_g98_send_msg(mt, g_g99_body[s99], ml,
-                                                   0, ri99 + 1);
+                        i32 r99;
+                        if (mt == 15) {
+                            /* g99v3 (run263): t=15 LoadingProgress = S2-only
+                             * NET, тело S1-формы = death-suspect #2 — DROP из
+                             * релей-сета (тап остаётся в логе). */
+                            C2B_LOGS("[c2b] g99: skip t=15 (drop-list) idx=");
+                            C2B_LOGN(ri99 + 1);
+                            C2B_LOGS("\n");
+                            __atomic_store_n(&g_g99_ri, ri99 + 1,
+                                             __ATOMIC_RELEASE);
+                            continue;
+                        }
+                        if (mt == 6 && (ml == 0 || g_g99_body[s99][0] != 0x0a)) {
+                            /* g99v3 (run263): S1 SetConVar-тело [08 varint] ≠
+                             * S2 repeated-CConVar [0a ...] — релей сырого S1-
+                             * тела = death-suspect #1 (сервер молчит-умирает,
+                             * 0x24 нет). Translate: S2 CConVar-синтетика вместо
+                             * S1-тела (бисект контента). Если тело УЖЕ в S2-
+                             * форме (0x0a) — релей as-is. */
+                            C2B_LOGS("[c2b] g99: t=6 S1-body len=");
+                            C2B_LOGN(ml);
+                            C2B_LOGS(" -> S2 CConVar synthetic\n");
+                            r99 = c2b_g98_send_msg(6, sc99,
+                                                   (u32)sizeof(sc99), 0,
+                                                   ri99 + 1);
+                            __atomic_store_n(&g_g99_ri, ri99 + 1,
+                                             __ATOMIC_RELEASE);
+                            t6_relayed = 1;
+                            if (r99 != 1) {
+                                C2B_LOGS("[c2b] g99: relay rc!=1 — stop drain\n");
+                                break;
+                            }
+                            usleep(400000);
+                            continue;
+                        }
+                        r99 = c2b_g98_send_msg(mt, g_g99_body[s99], ml,
+                                               0, ri99 + 1);
                         __atomic_store_n(&g_g99_ri, ri99 + 1,
                                          __ATOMIC_RELEASE);
+                        if (mt == 6) t6_relayed = 1;
                         if (r99 != 1) {
                             C2B_LOGS("[c2b] g99: relay rc!=1 — stop drain\n");
                             break;

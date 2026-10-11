@@ -15893,6 +15893,246 @@ static void *c2b_g104_thread(void *arg)
     }
 }
 
+/* ---------- 59l-g105: CHACHA20_SSSE3 HOOK (the OpenSSL multi-ISA
+ * chacha entry) ----------
+ * ФАКТ-ЦЕПОЧКА (run 38166823354): g104 = EVP-chacha-init = installed,
+ * ZERO calls => EVP = НЕ путь; chacha = через CCrypto->EVP do-cipher
+ * цепочку, вызывающую chacha20_ssse3 НАПРЯМУЮ (OpenSSL asm, ONE export
+ * с внутренними ISA-ветками: movdqa sigma @0x369787/0x3699a7/0x369cdb
+ * = SSE, vmovdqa @0x36a6cd, vbroadcasti128 @0x36ae11 = AVX/AVX2 — все
+ * внутри той же функции!). FN @0x3693e0 (после ".org>"-строки @0x369380
+ * + nop-pad): prolog = 41 54 41 55 41 56 41 57 48 83 ec 58 = 12B +
+ * movdqu (%rcx),%xmm1 (4B) = 16B cut, ALL position-independent; патч
+ * 14B (ff25+abs) + 2x90 = 16B. Сигнатура OpenSSL chacha20_ssse3:
+ * (rdi=out, rsi=in, rdx=len, RCX=KEY[32B], R8=ICTX=[u32 ctr, u32
+ * nonce[3] = ПЕР-ПАКЕТНЫЙ IV!]) — movdqu (%rcx)/movdqu (%r8) в прологе
+ * = ПОДТВЕРЖДЕНИЕ аргов. r9 = свободен = ra-слот стаба. Детур капчит
+ * key (dedupe) + первые ICTX (эволюция IV = база-декод). Killswitch
+ * C2B_G105=0. */
+extern void c2b_g105_stub(void);
+__asm__(
+    ".text\n"
+    ".globl c2b_g105_stub\n"
+    ".type c2b_g105_stub, @function\n"
+    "c2b_g105_stub:\n"
+    "  movq (%rsp), %r9\n"       /* r9 = исходный retaddr (до пролога) */
+    "  jmp  c2b_g105_detour_c\n" /* rdi=out rsi=in rdx=len rcx=key r8=ictx */
+);
+static void c2b_g105_detour_c(const void *out, const void *in, u64 len,
+                              const void *key, const void *ictx, void *ra)
+    __attribute__((used));
+static u8   c2b_g105_tramp[4][64] __attribute__((aligned(16)));
+static uptr c2b_g105_base[4];
+static u32  c2b_g105_nbase;
+static u32  c2b_g105_keys;
+static u32  c2b_g105_ictx;
+static u32  c2b_g105_calls;
+static u8   c2b_g105_key0[32];
+static void c2b_g105_detour_c(const void *out, const void *in, u64 len,
+                              const void *key, const void *ictx, void *ra)
+{
+    int (*tramp)(const void *, const void *, u64, const void *,
+                 const void *) = 0;
+    u32 i, n;
+    (void)out;
+    (void)in;
+    for (i = 0; i < c2b_g105_nbase; i++) {
+        uptr d = (uptr)ra - c2b_g105_base[i];
+        if (d < 0x600000u) {
+            tramp = (int (*)(const void *, const void *, u64,
+                             const void *, const void *))
+                c2b_g105_tramp[i];
+            break;
+        }
+    }
+    n = __atomic_add_fetch(&c2b_g105_calls, 1, __ATOMIC_RELAXED);
+    if (n == 1) {
+        u32 z;
+        for (z = 0; z < 32; z++) c2b_g105_key0[z] = ((const u8 *)key)[z];
+    }
+    if (n <= 12) {
+        C2B_LOGS("[c2b] g105: call#");
+        C2B_LOGN(n);
+        C2B_LOGS(" len=");
+        C2B_LOGN((u32)len);
+        C2B_LOGS("\n");
+    }
+    if (key && c2b_g105_keys < 2) {
+        u32 same = 0;
+        u32 z;
+        for (z = 0; z < 32; z++)
+            same |= (u32)(c2b_g105_key0[z] ^ ((const u8 *)key)[z]);
+        if (!same || c2b_g105_keys == 0) {
+            c2b_g105_keys++;
+            C2B_LOGS("[c2b] g105: KEY");
+            C2B_LOGN(c2b_g105_keys);
+            C2B_LOGS(" len=");
+            C2B_LOGN((u32)len);
+            C2B_LOGS(" key=");
+            c2b_g100_hexs((const u8 *)key, 32);
+            C2B_LOGS(" ictx=");
+            c2b_g100_hexs((const u8 *)ictx, 16);
+            if (i < c2b_g105_nbase) {
+                C2B_LOGS("co= ");
+                C2B_LOGH((u32)((uptr)ra - c2b_g105_base[i]));
+            } else {
+                C2B_LOGS("ra= ");
+                C2B_LOGH((u32)((uptr)ra >> 32));
+                C2B_LOGH((u32)(uptr)ra);
+            }
+            C2B_LOGS("\n");
+            for (z = 0; z < 32; z++) c2b_g105_key0[z] = ((const u8 *)key)[z];
+        }
+    } else if (ictx && c2b_g105_ictx < 6) {
+        u32 gi = __atomic_add_fetch(&c2b_g105_ictx, 1, __ATOMIC_RELAXED);
+        C2B_LOGS("[c2b] g105: ICTX");
+        C2B_LOGN(gi);
+        C2B_LOGS(" len=");
+        C2B_LOGN((u32)len);
+        C2B_LOGS(" ictx=");
+        c2b_g100_hexs((const u8 *)ictx, 16);
+        C2B_LOGS("\n");
+    }
+    if (tramp) tramp(out, in, len, key, ictx);
+}
+
+static void *c2b_g105_thread(void *arg)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    static const u8 pro[16] = {
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x83, 0xec, 0x58, 0xf3, 0x0f, 0x6f, 0x09
+    };
+    static const u8 mk[5] = { 0xf3, 0x0f, 0x6f, 0x51, 0x10 };
+    (void)arg;
+    for (;;) {
+        i32 fdm = open("/proc/self/maps", 0);
+        i64 n = 0;
+        static char mp[262144];
+        char *p, *e2;
+        uptr cand[24];
+        u32 ncand = 0, ci;
+        {
+            const char *e105 = getenv("C2B_G105");
+            if (e105 && e105[0] == '0') {
+                C2B_LOGS("[c2b] g105: disabled by env\n");
+                return (void *)0;
+            }
+        }
+        if (fdm < 0) return (void *)0;
+        for (;;) {
+            i64 r = read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i64)sizeof(mp) - 1) break;
+        }
+        close(fdm);
+        if (n <= 0) return (void *)0;
+        mp[n] = 0;
+        p = mp;
+        e2 = mp + n;
+        while (p < e2 && ncand < 24) {
+            uptr lo = 0, hi = 0;
+            i32 c;
+            char pb[512];
+            u32 pl = 0, ps;
+            while (p < e2 && *p == '\n') p++;
+            if (p >= e2) break;
+            while (p < e2 && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != '-') break;
+            p++;
+            while (p < e2 && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != ' ') break;
+            p++;
+            while (p < e2 && *p != '\n') {
+                if (pl < sizeof(pb) - 1) pb[pl++] = *p;
+                p++;
+            }
+            pb[pl] = 0;
+            if (p < e2) p++;
+            if (hi <= lo || pl < 26) continue;
+            for (ps = 0; ps + 25 < pl; ps++) {
+                if (pb[ps] == 'l' && pb[ps + 1] == 'i' &&
+                    pb[ps + 2] == 'b' && pb[ps + 3] == 's' &&
+                    pb[ps + 4] == 't' && pb[ps + 5] == 'e' &&
+                    pb[ps + 6] == 'a' && pb[ps + 7] == 'm') {
+                    u32 du;
+                    for (du = 0; du < ncand; du++)
+                        if (cand[du] == lo) break;
+                    if (du == ncand) cand[ncand++] = lo;
+                    break;
+                }
+            }
+        }
+        for (ci = 0; ci < ncand; ci++) {
+            u8 *tgt = (u8 *)(cand[ci] + 0x3693e0);
+            u8 *mkp = (u8 *)(cand[ci] + 0x3693f0);
+            u32 k, ok = 1;
+            for (k = 0; k < 16; k++)
+                if (tgt[k] != pro[k]) { ok = 0; break; }
+            if (ok)
+                for (k = 0; k < 5; k++)
+                    if (mkp[k] != mk[k]) { ok = 0; break; }
+            if (!ok) continue;
+            if (tgt[0] == 0xff && tgt[1] == 0x25) continue;
+            if (c2b_g105_nbase >= 4) break;
+            {
+                u8 *tp = c2b_g105_tramp[c2b_g105_nbase];
+                i32 rel;
+                for (k = 0; k < 16; k++) tp[k] = tgt[k];
+                tp[16] = 0xe9;
+                rel = (i32)((uptr)(tgt + 16) - ((uptr)tp + 21));
+                tp[17] = (u8)rel;
+                tp[18] = (u8)(rel >> 8);
+                tp[19] = (u8)(rel >> 16);
+                tp[20] = (u8)(rel >> 24);
+                c2b_g105_base[c2b_g105_nbase] = cand[ci];
+                c2b_g105_nbase++;
+            }
+            if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)), 0x2000,
+                         3 /*RW*/) != 0) {
+                C2B_LOGS("[c2b] g105: mprotect fail\n");
+                c2b_g105_nbase--;
+                continue;
+            }
+            {
+                u8 pat[16];
+                uptr da = (uptr)&c2b_g105_stub;
+                pat[0] = 0xff; pat[1] = 0x25; pat[2] = 0;
+                pat[3] = 0; pat[4] = 0; pat[5] = 0;
+                for (k = 0; k < 8; k++) pat[6 + k] = (u8)(da >> (8 * k));
+                pat[14] = 0x90;
+                pat[15] = 0x90;
+                for (k = 0; k < 16; k++) tgt[k] = pat[k];
+            }
+            if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)), 0x2000,
+                         5 /*RX*/) != 0)
+                C2B_LOGS("[c2b] g105: mprotect RX fail\n");
+            C2B_LOGS("[c2b] g105: hook installed base=");
+            C2B_LOGH((u32)(cand[ci] >> 32));
+            C2B_LOGH((u32)cand[ci]);
+            C2B_LOGS("\n");
+        }
+        usleep(2000000);
+    }
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -17711,6 +17951,10 @@ i32 c2b_main(void)
     {   /* 59k-g104: EVP_chacha20_poly1305 init hook (key+IV capture) */
         void *t104 = 0;
         pthread_create(&t104, 0, c2b_g104_thread, 0);
+    }
+    {   /* 59l-g105: chacha20_ssse3 hook (key+per-packet-ictx capture) */
+        void *t105 = 0;
+        pthread_create(&t105, 0, c2b_g105_thread, 0);
     }
 #endif
     r = c2b_try_install();

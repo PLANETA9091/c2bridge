@@ -14619,25 +14619,104 @@ static void c2b_g100_hexs(const u8 *p, u32 n)
     }
 }
 
+/* run267-урок: 25с не хватило (time budget out @hits=0) и кап региона
+ * 256MB скипнул tcmalloc-арены (там EVP-контексты). v3: ДВЕ ПРОХОДКИ —
+ * сперва малые регионы <=16MB (вероятные арены аллокатора), потом большие
+ * <=1GB; потолок 45с, лог скачанного MB + регионов (калибровка скорости). */
+static u8 c2b_g100_buf[1 << 20];
+static i64 c2b_g100_t0s, c2b_g100_t0n;
+static i32 c2b_g100_out;   /* 0 = иди, 1 = потолок времени */
+
+static i32 c2b_g100_deadline(void)
+{
+    struct { i64 s, n; } ts;
+    clock_gettime(1, &ts);
+    if (ts.s > c2b_g100_t0s + 45 ||
+        (ts.s == c2b_g100_t0s + 45 && ts.n >= c2b_g100_t0n))
+        return 1;
+    return 0;
+}
+
+/* скан одного региона (прямыми 256KB-чанками под SEGV-гвардом) */
+static void c2b_g100_scan_range(uptr lo, uptr hi, u32 *hits,
+                                long long *scanned)
+{
+    uptr a = lo;
+    while (a < hi && *hits < 32) {
+        uptr want = hi - a;
+        uptr got;
+        u64 off;
+        if (c2b_g100_deadline()) {
+            c2b_g100_out = 1;
+            return;
+        }
+        if (want > sizeof(c2b_g100_buf)) want = sizeof(c2b_g100_buf);
+        if (want > ((uptr)256 << 10)) want = (uptr)256 << 10;
+        *scanned += (long long)want;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            memcpy(c2b_g100_buf, (const void *)a, want);
+            got = want;
+        } else {
+            got = 0;                    /* фолт = unmapped — скип региона */
+        }
+        g_probe_active = 0;
+        if (got == 0) return;
+        for (off = 512; off + 64 <= got; off += 4) {
+            const u32 *w = (const u32 *)(c2b_g100_buf + off);
+            u32 t = (w[7] << 8) | (w[7] >> 24);   /* RotWord */
+            u32 s8 = c2b_g100_subw(t) ^ 0x01000000u;
+            /* FIPS-197 AES-256: SubWord ТОЛЬКО на i%8==0;
+             * w[9]/w[10] = прямые XOR (эмпирика-фикс) */
+            if ((w[0] ^ s8) != w[8]) continue;
+            if ((w[1] ^ w[8]) != w[9]) continue;
+            if ((w[2] ^ w[9]) != w[10]) continue;
+            /* HIT */
+            {
+                u8 kb[32];
+                u32 k;
+                u64 s2, en;
+                C2B_LOGS("[c2b] g100: aes256ks @");
+                C2B_LOGH((u32)((a + off) >> 32));
+                C2B_LOGH((u32)(a + off));
+                C2B_LOGS("keybe=");
+                for (k = 0; k < 8; k++) {
+                    kb[k * 4 + 0] = (u8)(w[k] >> 24);
+                    kb[k * 4 + 1] = (u8)(w[k] >> 16);
+                    kb[k * 4 + 2] = (u8)(w[k] >> 8);
+                    kb[k * 4 + 3] = (u8)(w[k]);
+                }
+                c2b_g100_hexs(kb, 32);
+                C2B_LOGS(" win=");
+                s2 = off >= 512 ? off - 512 : 0;
+                en = off + 512;
+                if (en > got) en = got;
+                c2b_g100_hexs(c2b_g100_buf + s2, (u32)(en - s2));
+                C2B_LOGS("\n");
+                (*hits)++;
+                if (*hits >= 32) break;
+            }
+        }
+        if (got < want) return;
+        a += got - 1024;      /* перекрытие чанков (расписания на границе) */
+    }
+}
+
 static void c2b_g100_scan(void)
 {
     extern i32 open(const char *, i32, ...);
     extern i32 close(i32);
     extern i64 read(i32, void *, u64);
-    /* run266-урок: pread(/proc/self/mem) = READ mmap_sem, движок постоянно
-     * mmap/munmap (WRITE sem) -> скан = slow-motion (1.5GB не прошёл за 40с,
-     * лог застрял). v2 = ПРЯМОЕ чтение под SEGV-гвардом (паттерн g71/g84:
-     * __sigsetjmp + g_probe_active) — mmap_sem НЕ нужен, unmapping = фолт =
-     * скип чанка. Бюджеты: 25с wall-clock (clock_gettime на чанке), 3GB,
-     * <=32 хитов. Скан = в НАЧАЛЕ g98 (ключи валидны сразу после fc). */
-    extern i32 clock_gettime(i32 clk, void *ts);
+    /* run267-урок: 25с не хватило (time budget out @hits=0) и кап региона
+     * 256MB скипнул tcmalloc-арены (там EVP-контексты). v3: ДВЕ ПРОХОДКИ —
+     * сперва малые регионы <=16MB (вероятные арены аллокатора), потом все
+     * остальные <=1GB; потолок 45с wall-clock; в конце лог скачанного MB. */
     static char mp[262144];
-    static u8 buf[1 << 20];
     i64 n = 0;
     u32 hits = 0;
-    long long budget = 0;
+    long long scanned = 0;
     char *p, *e;
-    i64 t0s, t0n, tns, tnn;
+    struct { i64 s, n; } ts0;
     {
         const char *e100 = getenv("C2B_G100");
         if (e100 && e100[0] == '0') {
@@ -14663,22 +14742,22 @@ static void c2b_g100_scan(void)
         return;
     }
     mp[n] = 0;
-    {
-        struct { i64 s, n; } ts0;
-        clock_gettime(1, &ts0);
-        t0s = ts0.s;
-        t0n = ts0.n;
-    }
+    clock_gettime(1, &ts0);
+    c2b_g100_t0s = ts0.s;
+    c2b_g100_t0n = ts0.n;
+    c2b_g100_out = 0;
     C2B_LOGS("[c2b] g100: scan start\n");
+    /* проход 1: малые регионы (<=16MB) */
     p = mp;
     e = mp + n;
-    while (p < e && hits < 32) {
+    while (p < e && hits < 32 && !c2b_g100_out) {
         uptr lo = 0, hi = 0;
         i32 wr = 0;
         i32 c;
-        uptr a;
+        char *ls;
         while (p < e && *p == '\n') p++;
         if (p >= e) break;
+        ls = p;
         while (p < e && *p != '-') {
             c = *p;
             if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
@@ -14699,88 +14778,60 @@ static void c2b_g100_scan(void)
         }
         if (p >= e || *p != ' ') break;
         p++;
-        /* perms: r?-w? */
         if (p < e && *p == 'r') { p++; }
         if (p < e && *p == 'w') { wr = 1; p++; }
         else if (p < e && *p == '-') { p++; }
         while (p < e && *p != '\n') p++;
         if (p < e) p++;
         if (!wr || hi <= lo) continue;
-        if (hi - lo > ((uptr)256 << 20)) continue;    /* гигантские скип */
-        budget += (long long)(hi - lo);
-        if (budget > (long long)3000 << 20) break;    /* бюджет 3GB */
-        a = lo;
-        while (a < hi && hits < 32) {
-            uptr want = (uptr)(hi - a);
-            uptr got;
-            struct { i64 s, n; } tsx;
-            /* wall-clock: 25с потолок */
-            clock_gettime(1, &tsx);
-            tns = tsx.s;
-            tnn = tsx.n;
-            if (tns > t0s + 25 ||
-                (tns == t0s + 25 && tnn >= t0n)) {
-                C2B_LOGS("[c2b] g100: time budget out @hits=");
-                C2B_LOGN(hits);
-                C2B_LOGS("\n");
-                goto done;
+        if (hi - lo > ((uptr)16 << 20)) continue;
+        c2b_g100_scan_range(lo, hi, &hits, &scanned);
+        (void)ls;
+    }
+    /* проход 2: остальные (<=1GB) с начала списка */
+    if (!c2b_g100_out) {
+        p = mp;
+        while (p < e && hits < 32 && !c2b_g100_out) {
+            uptr lo = 0, hi = 0;
+            i32 wr = 0;
+            i32 c;
+            while (p < e && *p == '\n') p++;
+            if (p >= e) break;
+            while (p < e && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
             }
-            if (want > sizeof(buf)) want = sizeof(buf);
-            if (want > ((uptr)256 << 10)) want = (uptr)256 << 10; /* 256KB: короткое окно гварда */
-            g_probe_active = 1;
-            if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                memcpy(buf, (const void *)a, want);
-                got = want;
-            } else {
-                got = 0;                    /* фолт = unmapped — скип региона */
+            if (p >= e || *p != '-') break;
+            p++;
+            while (p < e && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
             }
-            g_probe_active = 0;
-            if (got == 0) break;
-            {
-                u64 off;
-                for (off = 512; off + 64 <= got; off += 4) {
-                    const u32 *w = (const u32 *)(buf + off);
-                    u32 t = (w[7] << 8) | (w[7] >> 24);   /* RotWord */
-                    u32 s8 = c2b_g100_subw(t) ^ 0x01000000u;
-                    /* FIPS-197 AES-256: SubWord ТОЛЬКО на i%8==0;
-                     * w[9]/w[10] = прямые XOR (эмпирика-фикс) */
-                    if ((w[0] ^ s8) != w[8]) continue;
-                    if ((w[1] ^ w[8]) != w[9]) continue;
-                    if ((w[2] ^ w[9]) != w[10]) continue;
-                    /* HIT */
-                    {
-                        u8 kb[32];
-                        u32 k;
-                        u64 s2, en;
-                        C2B_LOGS("[c2b] g100: aes256ks @");
-                        C2B_LOGH((u32)((a + off) >> 32));
-                        C2B_LOGH((u32)(a + off));
-                        C2B_LOGS("keybe=");
-                        for (k = 0; k < 8; k++) {
-                            kb[k * 4 + 0] = (u8)(w[k] >> 24);
-                            kb[k * 4 + 1] = (u8)(w[k] >> 16);
-                            kb[k * 4 + 2] = (u8)(w[k] >> 8);
-                            kb[k * 4 + 3] = (u8)(w[k]);
-                        }
-                        c2b_g100_hexs(kb, 32);
-                        C2B_LOGS(" win=");
-                        s2 = off >= 512 ? off - 512 : 0;
-                        en = off + 512;
-                        if (en > got) en = got;
-                        c2b_g100_hexs(buf + s2, (u32)(en - s2));
-                        C2B_LOGS("\n");
-                        hits++;
-                        if (hits >= 32) break;
-                    }
-                }
-            }
-            if (got < want) break;
-            a += got - 1024;      /* перекрытие чанков (расписания на границе) */
+            if (p >= e || *p != ' ') break;
+            p++;
+            if (p < e && *p == 'r') { p++; }
+            if (p < e && *p == 'w') { wr = 1; p++; }
+            else if (p < e && *p == '-') { p++; }
+            while (p < e && *p != '\n') p++;
+            if (p < e) p++;
+            if (!wr || hi <= lo) continue;
+            if (hi - lo > ((uptr)1024 << 20)) continue;
+            c2b_g100_scan_range(lo, hi, &hits, &scanned);
         }
     }
-done:
     C2B_LOGS("[c2b] g100: scan done hits=");
     C2B_LOGN(hits);
+    C2B_LOGS(" mb=");
+    C2B_LOGN((u32)(scanned >> 20));
+    if (c2b_g100_out) C2B_LOGS(" TIMECUT");
     C2B_LOGS("\n");
 }
 

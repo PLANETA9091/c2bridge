@@ -698,6 +698,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       -ex 'handle SIGUSR2 nostop noprint' \
       -ex 'handle SIGALRM nostop noprint' \
       -ex 'handle SIGCONT nostop noprint' \
+      -ex 'handle SIGSEGV nostop noprint pass' \
       -ex run \
       -ex 'thread apply all bt' \
       --args ./csgo_linux64"

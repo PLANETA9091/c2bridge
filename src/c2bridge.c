@@ -6047,6 +6047,7 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 static u32 g_cl_s_total, g_cl_s_cl, g_cl_s_gc, g_cl_s_qc, g_cl_s_cn, g_cl_s_rc, g_cl_s_ot, g_cl_s_drop;
 static u32 g_cl_s_jn;
 static u32 g_cl_r_total, g_cl_r_cl, g_cl_r_ch, g_cl_r_rj, g_cl_r_si, g_cl_r_in, g_cl_r_ot, g_cl_r_drop;
+static u32 g_cl_rxraw_n, g_cl_rxraw_total; /* 58f-g77: сырой тап GNS-data (0x80+) в recvfrom */
 static u32 g_cl_log_n;         /* сколько connless уже прошло через trace (1-based) */
 static u32 g_cl_verbose;       /* C2B_CL_VERBOSE=1 (читается в c2b_main) */
 
@@ -6467,13 +6468,35 @@ static __thread u8  g_probe_jb[512] __attribute__((aligned(16)));
 static __thread u8  g_probe_active;
 static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен перманентно
                                * (процесс-глобальный: install-once, НЕ TLS) */
+static u8  g_segv_foreign_logged; /* 58f-g77: last-gasp латч — ОДНОКРАТНЫЙ
+                               * дамп RIP чужого (либового) фолта */
 
 static void c2b_probe_segv(i32 sig, void *si, void *uc)
 {
-    (void)sig; (void)si; (void)uc;
+    (void)sig;
     if (g_probe_active) {
         g_probe_active = 0;
         siglongjmp(g_probe_jb, 1);
+    }
+    /* 58f-g77: last-gasp — фолт в ЧУЖОМ потоке (либы) не имеет нашего
+     * jmp_buf; перед штатной SIG_DFL-смертью печатаем RIP/addr ОДИН РАЗ
+     * (латч) = точный адрес фолта внутри либы для RE (run230 a1/a4:
+     * тихая смерть в окне send->probe — подозреваемый = поток либы,
+     * обрабатывающий входящие дата-пакеты сервера). glibc x86-64:
+     * ucontext uc_mcontext.gregs @0x28, REG_RIP=16 -> rip @uc+0xA8;
+     * siginfo si_addr @0x10. write() = async-signal-safe, буфер TLS. */
+    if (!g_segv_foreign_logged) {
+        g_segv_foreign_logged = 1;
+        if (uc) {
+            uptr rip77 = *(const volatile uptr *)((const u8 *)uc + 0xA8);
+            uptr fa77 = si ? *(const volatile uptr *)((const u8 *)si + 0x10)
+                           : 0;
+            C2B_LOGS("[c2b] SEGV foreign rip=0x");
+            C2B_LOGH((u32)(rip77 >> 32)); C2B_LOGH((u32)rip77);
+            C2B_LOGS(" addr=0x");
+            C2B_LOGH((u32)(fa77 >> 32)); C2B_LOGH((u32)fa77);
+            C2B_LOGS("\n");
+        }
     }
     /* не наш контекст: возврат = refault-спин (run134/135 SIGKILL-клон).
      * Восстанавливаем SIG_DFL и возвращаемся — повторныи фолт убьёт процесс
@@ -11933,6 +11956,17 @@ static void c2b_g32_drive(void)
                             rc7 = -998;
                         }
                         g_probe_active = 0;
+                        /* 58f-g77: rc==-998 = фолт НАШЕГО потока, пойманный
+                         * гардой — печатаем и ПРОДОЛЖАЕМ (раньше: -998<0
+                         * молча триггерил 'session end'+break — фолт
+                         * маскировался под конец сессии, rxn оставался 0,
+                         * диагноз был невозможен). */
+                        if (rc7 == -998) {
+                            C2B_LOGS("[c2b] g71: rx FAULT @tick=");
+                            C2B_LOGN(tick7);
+                            C2B_LOGS(" — continuing\n");
+                            continue;
+                        }
                         if (rc7 < 0) {
                             C2B_LOGS("[c2b] g71: session end @tick="); C2B_LOGN(tick7);
                             C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
@@ -11940,7 +11974,9 @@ static void c2b_g32_drive(void)
                             break;
                         }
                         if (rc7 > 0 && ma[0]) c2b_g71_dumpmsg((void *)ma[0]);
-                        if ((tick7 % 200) == 199) {
+                        /* 58f-g77: тик каждые 4с (было 40с) = мелкая
+                         * сетка таймлайна смерть/ответ для сверения с pcap */
+                        if ((tick7 % 20) == 19) {
                             C2B_LOGS("[c2b] g71: tick="); C2B_LOGN(tick7);
                             C2B_LOGS(" rxn="); C2B_LOGN(g_gns_rx_n);
                             C2B_LOGS("\n");
@@ -13437,6 +13473,27 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
         const u8 *p = (const u8 *)buf;
+        /* 58f-g77: СЫРОЙ ТАП GNS-data (p[0]&0x80). run230: сервер слал
+         * 0x80/0x81/0x83 дата-пакеты (ответ 77B через 172мс после
+         * qconnect0x; собственный 0x81 33B через 10с после ConnectOK;
+         * бёрст 0x83 35B перед 0x24), но приёмная очередь через
+         * ReceiveMessages(12) оставалась ПУСТОЙ и ACK не уходило —
+         * разрыв recv<->enqueue = стена приёма. Тап доказывает: читает
+         * ли либа эти пакеты recvfrom'ом ВООБЩЕ. Рейтлимит 24 дампа;
+         * счётчик — всегда; fd= разделяет сокеты. */
+        if ((u32)r >= 5 && (p[0] & 0x80)) {
+            g_cl_rxraw_total++;
+            if (g_cl_rxraw_n < 24) {
+                u32 k77;
+                g_cl_rxraw_n++;
+                C2B_LOGS("[c2b] g77 rx-raw fd="); C2B_LOGN((u32)fd);
+                C2B_LOGS(" len="); C2B_LOGN((u32)r);
+                C2B_LOGS(" d=");
+                for (k77 = 0; k77 < 16 && k77 < (u32)r; k77++)
+                    C2B_LOGH(p[k77]);
+                C2B_LOGS("\n");
+            }
+        }
         /* 41f-g31: фиксация ВСЕХ 0x21 (кольцо для СВЕЖЕГО challenge) +
          * pending-триггер (reply на наш 0x20 с 'k'-капчера -> 0x22 немедленно)
          * + ВЕРДИКТ-лог 0x23..0x26 (0x23 ConnectOK = джекпот; 0x24 Closed =

@@ -16640,6 +16640,195 @@ static void *c2b_g106_thread(void *arg)
     return (void *)0;
 }
 
+/* ---------- 59m-g106w: udp28022 TRANSITION WATCHER ----------
+ * run294-урок: SDR-сокет (rem=28022) поднялся ПОСЛЕ pass2 (t+98), а
+ * pass3 не дожил до вердикта-килла => 4 пасса = мимо окна. Вотчер =
+ * 3s-каденс x 60 (~180s), лог ТОЛЬКО переходов ino, при появлении
+ * сокета = owner-scan (fd-сweep ВСЕХ pids + ns/net-сравнение). */
+
+static u32 c2b_g106_wprev;
+
+/* fd-сweep всех pids: кто владеет socket:[ino] + ns/net-проверка */
+static void c2b_g106_owner_scan(u32 ino)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 syscall(i64, ...);
+    extern i64 readlink(const char *, char *, u64);
+    extern i32 getpid(void);
+    char db[8192], pb[96], lb[256], nb[96], sb[64];
+    u32 mypid = (u32)getpid();
+    i32 fd;
+    i64 sn, off;
+    u32 selfns = 0, nlid = 0;
+    sn = readlink("/proc/self/ns/net", nb, sizeof(nb) - 1);
+    if (sn > 5) {
+        nb[sn] = 0;
+        {   /* "net:[4026531956]" -> u32 хэш строки */
+            u32 q2;
+            for (q2 = 0; q2 < (u32)sn; q2++) selfns = selfns * 31 + (u32)nb[q2];
+        }
+        C2B_LOGS("[c2b] g106w: self ");
+        c2b_log(nb);
+        C2B_LOGS("\n");
+    }
+    fd = open("/proc", 0x10000);
+    if (fd < 0) return;
+    for (;;) {
+        i64 n = syscall((i64)217, (i64)fd, db, (i64)sizeof(db));
+        if (n <= 0) break;
+        off = 0;
+        while (off + 19 <= n) {
+            u16 reclen = *(const u16 *)(const void *)(db + off + 16);
+            const char *nm = db + off + 19;
+            u32 fl = 0, pv = 0, k;
+            while (off + 19 + fl < (u32)n && nm[fl]) fl++;
+            if (fl && fl < 8 && nm[0] >= '0' && nm[0] <= '9') {
+                for (k = 0; k < fl; k++) {
+                    if (nm[k] < '0' || nm[k] > '9') { pv = 0; break; }
+                    pv = pv * 10 + (u32)(nm[k] - '0');
+                }
+                if (pv) {
+                    i32 fdd;
+                    c2b_g106_path(pb, "/proc/", pv, "/fd");
+                    fdd = open(pb, 0x10000);
+                    if (fdd >= 0) {
+                        for (;;) {
+                            i64 fn2 = syscall((i64)217, (i64)fdd, db,
+                                              (i64)sizeof(db));
+                            i64 o2 = 0;
+                            if (fn2 <= 0) break;
+                            while (o2 + 19 <= fn2) {
+                                u16 rl2 = *(const u16 *)(const void *)
+                                          (db + o2 + 16);
+                                const char *nm2 = db + o2 + 19;
+                                u32 fl2 = 0;
+                                while (o2 + 19 + fl2 < (u32)fn2 && nm2[fl2])
+                                    fl2++;
+                                if (fl2 && fl2 < 12 &&
+                                    nm2[0] >= '0' && nm2[0] <= '9') {
+                                    u32 pl = c2b_g106_path(pb, "/proc/", pv,
+                                                           "/fd/");
+                                    u32 k2;
+                                    for (k2 = 0; k2 < fl2 &&
+                                                pl + k2 < sizeof(pb) - 1; k2++)
+                                        pb[pl + k2] = nm2[k2];
+                                    pb[pl + k2] = 0;
+                                    {
+                                        i64 rl = readlink(pb, lb,
+                                                          sizeof(lb) - 1);
+                                        if (rl > 8 && lb[0] == 's' &&
+                                            lb[1] == 'o' && lb[2] == 'c') {
+                                            u64 xino = 0;
+                                            u32 q3;
+                                            for (q3 = 8; q3 < (u32)rl &&
+                                                        lb[q3] != ']'; q3++)
+                                                if (lb[q3] >= '0' &&
+                                                    lb[q3] <= '9')
+                                                    xino = xino * 10 +
+                                                        (u64)(lb[q3] - '0');
+                                            if ((u32)xino == ino) {
+                                                u32 cn, q4, ns = 0;
+                                                char cb[64], mb[96];
+                                                i64 sn2;
+                                                c2b_g106_path(mb, "/proc/",
+                                                              pv, "/comm");
+                                                cn = c2b_g106_read_file(
+                                                    mb, cb, sizeof(cb));
+                                                while (cn && (cb[cn - 1] ==
+                                                              '\n' ||
+                                                              cb[cn - 1] == 0))
+                                                    cn--;
+                                                sn2 = c2b_g106_path(
+                                                    mb, "/proc/", pv,
+                                                    "/ns/net");
+                                                sn2 = readlink(mb, sb,
+                                                               sizeof(sb) - 1);
+                                                if (sn2 > 5) {
+                                                    sb[sn2] = 0;
+                                                    for (q4 = 0;
+                                                         q4 < (u32)sn2; q4++)
+                                                        ns = ns * 31 +
+                                                            (u32)sb[q4];
+                                                }
+                                                C2B_LOGS("[c2b] g106w: OWNER pid=");
+                                                C2B_LOGD(pv);
+                                                C2B_LOGS("comm=");
+                                                if (cn) c2b_log(cb);
+                                                C2B_LOGS("self=");
+                                                if (pv == mypid)
+                                                    C2B_LOGS("YES");
+                                                else
+                                                    C2B_LOGS("no");
+                                                C2B_LOGS(" ns=");
+                                                if (sn2 > 5) {
+                                                    c2b_log(sb);
+                                                    if (ns == selfns && selfns)
+                                                        C2B_LOGS(" SAME-NS");
+                                                    else
+                                                        C2B_LOGS(" DIFF-NS");
+                                                } else {
+                                                    C2B_LOGS("unreadable");
+                                                }
+                                                C2B_LOGS("\n");
+                                                nlid++;
+                                                if (nlid >= 6) {
+                                                    close(fdd);
+                                                    close(fd);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (rl2 == 0 || o2 + (i64)rl2 > fn2) break;
+                                o2 += (i64)rl2;
+                            }
+                        }
+                        close(fdd);
+                    }
+                }
+            }
+            if (reclen == 0 || off + (i64)reclen > n) break;
+            off += (i64)reclen;
+        }
+    }
+    close(fd);
+    if (!nlid) C2B_LOGS("[c2b] g106w: NO owner found in /proc\n");
+}
+
+static void *c2b_g106w_thread(void *arg)
+{
+    u32 it;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G106W");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g106w: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (it = 0; it < 60; it++) {           /* ~180s @3s */
+        u32 lp, rp, ino;
+        usleep(3000000);
+        ino = c2b_g106_udp28022(&lp, &rp);
+        if (ino != c2b_g106_wprev) {
+            C2B_LOGS("[c2b] g106w: udp28022 t=");
+            C2B_LOGD(it * 3);
+            C2B_LOGS("ino=");
+            C2B_LOGH(ino);
+            C2B_LOGS("loc=");
+            C2B_LOGH(lp);
+            C2B_LOGS("rem=");
+            C2B_LOGH(rp);
+            C2B_LOGS("\n");
+            c2b_g106_wprev = ino;
+            if (ino) c2b_g106_owner_scan(ino);
+        }
+    }
+    return (void *)0;
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -18466,6 +18655,10 @@ i32 c2b_main(void)
     {   /* 59m-g106: the steam-client process campaign (the layout/access map) */
         void *t106 = 0;
         pthread_create(&t106, 0, c2b_g106_thread, 0);
+    }
+    {   /* 59m-g106w: the udp28022 transition watcher (the SDR-socket owner) */
+        void *t106w = 0;
+        pthread_create(&t106w, 0, c2b_g106w_thread, 0);
     }
 #endif
     r = c2b_try_install();

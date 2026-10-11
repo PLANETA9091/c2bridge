@@ -363,9 +363,12 @@ jobs:
           # "engine_client"; g24 vtable 0xd78bb8, 'B'-парсер 0x25a8b0 — RVA
           # "engine 34a96ae"). bins его до сих пор НЕ собирали — офлайн RE
           # маршрута (d) (скан cmp-констант 0x508/0x50c) был невозможен.
+          # run248 analysis: death-2 = libvstdlib_client.so+0x25606 (tier1-CRC,
+          # NULL crc-context, len=7744, callers 0xe36e/0xe6c2/0x10242) — the bin
+          # MUST be in the artifact for the offline RE of the caller chain.
           # head -6: steamclient даёт 4 копии, engine_client 1-2 копии.
           mkdir -p e2e-out/bins
-          for name in steamclient.so libsteamnetworkingsockets.so matchmaking_client.so engine_client.so; do
+          for name in steamclient.so libsteamnetworkingsockets.so matchmaking_client.so engine_client.so libvstdlib_client.so vstdlib_client.so; do
             find -L ~/.steam ~/.local/share/Steam "$GITHUB_WORKSPACE" /tmp -maxdepth 8 \
               -type f -name "$name" 2>/dev/null | head -6 | while IFS= read -r f; do
               tgt="e2e-out/bins/${name}__$(echo "$f" | md5sum | cut -c1-6).so"

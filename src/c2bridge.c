@@ -11730,64 +11730,113 @@ static void c2b_g32_drive(void)
                 }
             }   /* att */
         }
-        /* 58f-g74b: C2S_CONNECT-ПРОБА — ПЕРВЫЙ in-channel байт клиента.
- * Ран 227: сессия ЖИВА (g73 снял cert-CA стену), сервер молчит до
- * первого байта клиента (факт ран 222/223). Шлём капчуренную
- * ticket-зону 'k' (g70b g_kcap) через SendMessageToConnection —
- * реакция сервера (0x27-данные / 0x24-reason / тишина) = спецификация
- * in-channel протокола. СЛОТ: run222-эмпирика — слот 11 НА 006 = Send
- * (зонд вернул rc=1 и реально доставил 1-байтовое сообщение серверу),
- * слот 12 = Receive. Для 009 = слот 10 (публичный порядок).
- * Форма вызова 6-арг: (h, pData, cbData, flags=1=reliable, &out) —
- * покрывает и 3-арг-era (лишние игнорируются), и 5-арг (валидный out).
- * Сессия может быть ещё CONNECTING (0x23 не долетел) -> ретраи 20x500мс
- * до rc==1 (k_EResultOK). Киллисвитч C2B_G74_SEND=0. SEGV-гард. */
+        /* 58f-g76: C2S_CONNECT-ПРОБА v2 — СИНТЕТИЧЕСКИЙ первый in-channel
+         * байт клиента. g74b был мёртв: k-ticket blob (g_kcap) НИ РАЗУ не
+         * капчурился (runs 227/228/229 — legacy-'k' путь не стреляет).
+         * НОВОЕ СЫРЬЁ (run229, g16 send @784): ДВИЖОК САМ шлёт свой первый
+         * пакет при коннекте — OOB "qconnect0x%08X\0" (23B: ff ff ff ff +
+         * строка + NUL; на первой попытке qc=0x00000000; rva=0x4b7ec9;
+         * код-комментарий C2B_CLQ_QCONNECT подтверждает формат).
+         * ГИПОТЕЗА: S2 (CS:GO SDR) in-channel dance = ТОТ ЖЕ legacy CLV2
+         * OOB-набор команд (qconnect0x -> 'A' -> connect0x -> 'B'), но
+         * внутри GNS-сообщений, а не UDP-датаграмм. Шлём ТОЧНУЮ форму
+         * движка через SendMessageToConnection (слот 11 на 006 / 10 на
+         * 009, reliable), ретраи 20x500мс до rc==1 (k_EResultOK).
+         * Реакция сервера (0x27-данные = in-channel 'A'/статс,
+         * 0x24-reason, тишина) = следующий точный требователь.
+         * Значение qc: C2B_G76_QC (hex, default 0 = как у движка).
+         * Источник: C2B_G76_BLOB=1 -> k-blob, если капчурился (A/B
+         * retained). Киллисвитч C2B_G76_SEND=0. SEGV-гард. Форма вызова
+         * 6-арг: (h, pData, cbData, flags, &out) — покрывает 3-арг-era. */
         if (g_gns_conn_h && g_gns_conn_iface) {
-            const char *e74 = getenv("C2B_G74_SEND");
+            const char *e74 = getenv("C2B_G76_SEND");
+            u8 buf76[64];
+            u32 len76 = 0;
             if (e74 && e74[0] == '0') {
-                C2B_LOGS("[c2b] g74: send disabled (C2B_G74_SEND=0)\n");
-            } else if (!g_kcap_len) {
-                C2B_LOGS("[c2b] g74: no k-ticket blob yet (skip send)\n");
+                C2B_LOGS("[c2b] g76: send disabled (C2B_G76_SEND=0)\n");
             } else {
-                void **vt74 = *(void ***)g_gns_conn_iface;
-                u32 send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
-                i32 rc74 = -999, try74;
-                i64 out74 = -1;
-                C2B_LOGS("[c2b] g74: C2S_CONNECT probe: k-ticket blob len=");
-                C2B_LOGN(g_kcap_len);
+                const char *e76b = getenv("C2B_G76_BLOB");
+                if (e76b && e76b[0] == '1' && g_kcap_len) {
+                    if (g_kcap_len > sizeof(buf76))
+                        g_kcap_len = sizeof(buf76);
+                    memcpy(buf76, g_kcap, g_kcap_len);
+                    len76 = g_kcap_len;
+                    C2B_LOGS("[c2b] g76: source=k-blob len=");
+                } else {
+                    u32 qc76 = 0;
+                    const char *e76q = getenv("C2B_G76_QC");
+                    if (e76q && e76q[0]) {
+                        uptr v76 = 0;
+                        const char *q76 = e76q;
+                        while (*q76) {
+                            u32 d76 = (u32)(u8)*q76;
+                            if (d76 >= '0' && d76 <= '9')
+                                v76 = (v76 << 4) | (u32)(d76 - '0');
+                            else if (d76 >= 'a' && d76 <= 'f')
+                                v76 = (v76 << 4) | (u32)(d76 - 'a' + 10);
+                            else if (d76 >= 'A' && d76 <= 'F')
+                                v76 = (v76 << 4) | (u32)(d76 - 'A' + 10);
+                            else
+                                break;
+                            q76++;
+                        }
+                        qc76 = (u32)v76;
+                    }
+                    buf76[0] = 0xff; buf76[1] = 0xff;
+                    buf76[2] = 0xff; buf76[3] = 0xff;
+                    memcpy(buf76 + 4, "qconnect0x", 10);
+                    {   static const char hx76[] = "0123456789abcdef";
+                        u32 i76;
+                        for (i76 = 0; i76 < 8; i76++)
+                            buf76[14 + i76] =
+                                hx76[(qc76 >> (28 - i76 * 4)) & 0xf];
+                    }
+                    buf76[22] = 0;
+                    len76 = 23;
+                    C2B_LOGS("[c2b] g76: synthetic qconnect0x qc=");
+                    C2B_LOGN(qc76);
+                    C2B_LOGS(" len=");
+                }
+                C2B_LOGN(len76);
                 C2B_LOGS(" head=");
                 {   u32 k74;
-                    for (k74 = 0; k74 < 16 && k74 < g_kcap_len; k74++)
-                        C2B_LOGH(g_kcap[k74]);
+                    for (k74 = 0; k74 < 16 && k74 < len76; k74++)
+                        C2B_LOGH(buf76[k74]);
                 }
                 C2B_LOGS("\n");
-                for (try74 = 0; try74 < 20; try74++) {
-                    out74 = -1;
-                    g_probe_active = 1;
-                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                        rc74 = ((i32 (*)(void *, uptr, const void *, u32, i32,
-                                          i64 *))vt74[send_slot])(
-                            g_gns_conn_iface, g_gns_conn_h,
-                            g_kcap, g_kcap_len, 1, &out74);
-                    } else {
+                {
+                    void **vt74 = *(void ***)g_gns_conn_iface;
+                    u32 send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
+                    i32 rc74 = -999, try74;
+                    i64 out74 = -1;
+                    for (try74 = 0; try74 < 20; try74++) {
+                        out74 = -1;
+                        g_probe_active = 1;
+                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                            rc74 = ((i32 (*)(void *, uptr, const void *, u32,
+                                              i32, i64 *))vt74[send_slot])(
+                                g_gns_conn_iface, g_gns_conn_h,
+                                buf76, len76, 1, &out74);
+                        } else {
+                            g_probe_active = 0;
+                            C2B_LOGS("[c2b] g76: SendMessageToConnection SEGV\n");
+                            break;
+                        }
                         g_probe_active = 0;
-                        C2B_LOGS("[c2b] g74: SendMessageToConnection SEGV\n");
-                        break;
+                        if (rc74 == 1) {
+                            C2B_LOGS("[c2b] g76: C2S_CONNECT SENT try=");
+                            C2B_LOGN((u32)try74);
+                            C2B_LOGS(" out="); C2B_LOGN((u32)(i32)out74);
+                            C2B_LOGS("\n");
+                            break;
+                        }
+                        usleep(500000);
                     }
-                    g_probe_active = 0;
-                    if (rc74 == 1) {
-                        C2B_LOGS("[c2b] g74: blob SENT try=");
-                        C2B_LOGN((u32)try74);
-                        C2B_LOGS(" out="); C2B_LOGN((u32)(i32)out74);
+                    if (rc74 != 1) {
+                        C2B_LOGS("[c2b] g76: send NOT ok rc=");
+                        C2B_LOGN((u32)(i32)rc74);
                         C2B_LOGS("\n");
-                        break;
                     }
-                    usleep(500000);
-                }
-                if (rc74 != 1) {
-                    C2B_LOGS("[c2b] g74: send NOT ok rc=");
-                    C2B_LOGN((u32)(i32)rc74);
-                    C2B_LOGS("\n");
                 }
             }
         }

@@ -15488,6 +15488,184 @@ static void *c2b_g102_thread(void *arg)
     }
 }
 
+/* ---------- 59j-g103: CHACHA20-POLY1305 STATE SCAN ----------
+ * ФАКТ-ЦЕПОЧКА (run 38164256490): g102 = aesni_set_encrypt_key
+ * @0x278160 = installed + readback OK = ZERO calls; g101 = 0x64710 =
+ * zero; g100 = 26GB schedule-скан = zero; данные 0x8x = ciphertext
+ * (C>S 51B chunks = random). В либе НЕТ AES sbox (AES = AESNI-only)
+ * => AES в live = НЕ ИСПОЛЬЗУЕТСЯ. 'expand 32-byte k' @0x369340 +
+ * 'ChaCha20-Poly1305' EVP-имена в либе => LIVE CRYPTO = CHACHA20-POLY1305
+ * (Valve-сборка = chacha default). g103 = скан памяти на sigma
+ * (16B ASCII) = chacha-state в EVP-ctx: key @+16 (32B), counter+nonce
+ * @+48..64. Поздний bulk-pread (g100v5-каденция: 1.3GB/s в idle),
+ * 5 пассов x 9s. Anon-only (inode==0). Dedupe по key. Killswitch
+ * C2B_G103=0. */
+static u32 c2b_g103_nlog;
+static u8  c2b_g103_keys[8][32];
+static void *c2b_g103_thread(void *arg)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    static char mp[262144];
+    static u8 seg[1 << 22];           /* 4MB */
+    u32 pass;
+    (void)arg;
+    for (pass = 0; pass < 5 && c2b_g103_nlog < 8; pass++) {
+        i32 fdm, fdm2;
+        i64 n = 0;
+        char *p, *e;
+        u32 preads = 0, fails = 0;
+        u64 vis = 0;
+        struct { i64 s, n; } t0, tc;
+        {
+            const char *e103 = getenv("C2B_G103");
+            if (e103 && e103[0] == '0') {
+                C2B_LOGS("[c2b] g103: disabled by env\n");
+                return (void *)0;
+            }
+        }
+        usleep(pass == 0 ? 8000000 : 12000000);
+        fdm2 = open("/proc/self/maps", 0);
+        if (fdm2 < 0) continue;
+        for (;;) {
+            i64 r = read(fdm2, mp + n, (i64)sizeof(mp) - 1 - n);
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i64)sizeof(mp) - 1) break;
+        }
+        close(fdm2);
+        if (n <= 0) continue;
+        mp[n] = 0;
+        fdm = open("/proc/self/mem", 0);
+        if (fdm < 0) continue;
+        clock_gettime(1, &t0);
+        p = mp;
+        e = mp + n;
+        while (p < e) {
+            uptr lo = 0, hi = 0;
+            i32 c, rw = 0;
+            u64 inode = 0;
+            u32 st;
+            /* lo '-' hi ' ' perms ' ' offset ' ' dev ' ' inode [' ' path] */
+            while (p < e && *p == '\n') p++;
+            if (p >= e) break;
+            while (p < e && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e || *p != '-') continue;
+            p++;
+            while (p < e && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e || *p != ' ') continue;
+            p++;
+            /* perms */
+            while (p < e && *p != ' ') {
+                if (*p == 'r') rw = 1;
+                p++;
+            }
+            if (p >= e) break;
+            p++;
+            /* offset, dev */
+            for (st = 0; st < 2 && p < e; st++) {
+                while (p < e && *p != ' ') p++;
+                if (p < e) p++;
+            }
+            /* inode (десятичный) */
+            while (p < e && *p >= '0' && *p <= '9')
+                inode = inode * 10 + (u64)(*p++ - '0');
+            /* до конца строки */
+            while (p < e && *p != '\n') p++;
+            if (p < e) p++;
+            if (hi <= lo || !rw || inode != 0) continue;
+            clock_gettime(1, &tc);
+            if ((tc.s - t0.s) * 1000000000LL + (tc.n - t0.n) >
+                9000000000LL)
+                break;                     /* бюджет пасса 9s */
+            {
+                uptr a = lo;
+                while (a < hi) {
+                    u64 want = (u64)(hi - a) > (1ULL << 22)
+                        ? (1ULL << 22) : (u64)(hi - a);
+                    i64 got = pread(fdm, seg, want, (i64)a);
+                    clock_gettime(1, &tc);
+                    if ((tc.s - t0.s) * 1000000000LL + (tc.n - t0.n) >
+                        9000000000LL)
+                        break;
+                    if (got <= 0) { fails++; break; }
+                    preads++;
+                    vis += (u64)got;
+                    {
+                        const u8 *b = seg;
+                        i64 i2;
+                        for (i2 = 0; i2 + 64 <= got; i2++) {
+                            uptr addr;
+                            u32 di, du;
+                            if (b[i2] != 0x65 || b[i2 + 1] != 0x78)
+                                continue;  /* 'e','x' префильтр */
+                            if (*(const u64 *)(b + i2) !=
+                                0x3320646e61707865ULL)
+                                continue;
+                            if (*(const u64 *)(b + i2 + 8) !=
+                                0x6b20657479622d32ULL)
+                                continue;
+                            addr = a + (uptr)i2;
+                            du = c2b_g103_nlog;
+                            for (di = 0; di < c2b_g103_nlog; di++)
+                                if (memcmp(c2b_g103_keys[di], b + i2 + 16,
+                                           32) == 0) {
+                                    du = di;
+                                    break;
+                                }
+                            if (du == c2b_g103_nlog && du < 8) {
+                                u32 z;
+                                for (z = 0; z < 32; z++)
+                                    c2b_g103_keys[du][z] = b[i2 + 16 + z];
+                                c2b_g103_nlog = du + 1;
+                                C2B_LOGS("[c2b] g103: CHA");
+                                C2B_LOGN(du);
+                                C2B_LOGS(" @");
+                                C2B_LOGH((u32)(addr >> 32));
+                                C2B_LOGH((u32)addr);
+                                C2B_LOGS(" key=");
+                                c2b_g100_hexs(b + i2 + 16, 32);
+                                C2B_LOGS(" tail=");
+                                c2b_g100_hexs(b + i2 + 48, 16);
+                                C2B_LOGS("\n");
+                            }
+                        }
+                    }
+                    a += (uptr)got;
+                }
+            }
+        }
+        close(fdm);
+        C2B_LOGS("[c2b] g103: pass");
+        C2B_LOGN(pass);
+        C2B_LOGS(" preads=");
+        C2B_LOGN(preads);
+        C2B_LOGS(" vis=");
+        C2B_LOGN((u32)(vis >> 20));
+        C2B_LOGS("MB fails=");
+        C2B_LOGN(fails);
+        C2B_LOGS(" logged=");
+        C2B_LOGN(c2b_g103_nlog);
+        C2B_LOGS("\n");
+    }
+    return (void *)0;
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -17298,6 +17476,10 @@ i32 c2b_main(void)
          * до коннекта — keygen = при EVP-init, до арма g98) */
         void *t102 = 0;
         pthread_create(&t102, 0, c2b_g102_thread, 0);
+    }
+    {   /* 59j-g103: chacha20-poly1305 state scan (key @sigma+16) */
+        void *t103 = 0;
+        pthread_create(&t103, 0, c2b_g103_thread, 0);
     }
 #endif
     r = c2b_try_install();

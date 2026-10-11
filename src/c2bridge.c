@@ -13936,17 +13936,23 @@ static void c2b_g50_force_cstate(void) { }
 /* ---------- 58f-g97: вотчер ЗАКРЫТИЯ GNS-сессии (тред, 0.5с-поллинг) ----------
  * run256-факты: сервер закрывает сессию ~15с ПОСЛЕ первого in-channel 'k'
  * (релей rc=1 = доставлен) — ПРИЧИНА закрытия не наблюдаема (колбэк
- * статуса не захвачен; rc=3 со 2-го выстрела = мёртвый хэндл). Механика:
- * 0.5с-поллинг слота 13 (GetConnectionInfo, g82-карта: 13=GetInfo,
- * rc=1 жив) пока живы h/iface. Лог ТОЛЬКО на переходах стейта
- * (info[0..3] = state enum: 0 none / 1 connecting / 2 connected /
- * 3 closedbypeer / 4 problemlocal / 5 finwait / 6 linger / 7 dead),
- * при отклонении rc!=1 и 30с-heartbeat; на каждом логе = ШИРОКИЙ дамп
- * info[0..0xFF] hex + ASCII-выжимка (пробеги >=4 печатных) — серверный
- * end-reason/m_szEndDebug сидит в хвосте SteamNetConnectionInfo_t.
- * После перехода в dead-path (st 3..7) досидеть 20с (финальный стейт
- * до CloseConnection-аck движка) и выйти. TLS-гарда (g_probe_jb =
- * __thread) = безопасно на своём треде. Killswitch C2B_G97=0. */
+ * статуса не захвачен; rc=3 со 2-го выстрела = мёртвый хэндл).
+ * 58f-g97b (run257-урок): слот 13 = НЕ GetConnectionInfo (rc=1, буфер
+ * нулевой) = GetDetailedConnectionStatus(handle, struct, cb) БЕЗ cb-арга
+ * (int-возврат 1 = ошибка). Слот-карта (якоря: 1=Connect ✓ g32,
+ * 4=CloseConnection ✓ g75, 10/11=Send ✓ g90, 12=Receive ✓ g81) =>
+ * GetConnectionInfo = СЛОТ 3: bool(h, SteamNetConnectionInfo_t*).
+ * Механика: 0.5с-поллинг СЛОТА 3 пока живы h/iface. Лог ТОЛЬКО на
+ * переходах стейта (info[0..3] = state enum: 0 none / 1 connecting /
+ * 2 connected / 3 closedbypeer / 4 problemlocal / 5 finwait / 6 linger /
+ * 7 dead), при отклонении rc!=1 и 30с-heartbeat; на каждом логе = ШИРОКИЙ
+ * дамп info[0..0xFF] hex + ASCII-выжимка (пробеги >=4 печатных) —
+ * m_eEndReason/m_szEndDebug сидят в хвосте SteamNetConnectionInfo_t;
+ * ПЛЮС на event-строках слот 13 (Detailed) УЖЕ С cb=1024 (второй дамп =
+ * расширенный статус с тем же end-debug). После dead-path (st 3..7)
+ * досидеть 20с (финальный стейт до CloseConnection-аck движка) и выйти.
+ * TLS-гарда (g_probe_jb = __thread) = безопасно на своём треде.
+ * Killswitch C2B_G97=0. */
 static void c2b_g97_log_ascii(const u8 *p, u32 n)
 {
     u32 i = 0;
@@ -13989,20 +13995,21 @@ static void *c2b_g97_thread(void *arg)
     C2B_LOGS("\n");
     for (t = 0; t < 720 && !done; t++) {   /* 720 x 0.5с = 6 мин максимум */
         void **vt97;
-        i32 rc = -999;
-        u8 ma[1024];
+        i32 rc = -999, rcd = -999;
+        u8 ma[1024], md[1024];
         u32 j, st;
         usleep(500000);
         if (!g_gns_conn_h || !g_gns_conn_iface) { done = 1; break; }
         vt97 = *(void ***)g_gns_conn_iface;
         for (j = 0; j < sizeof ma; j++) ma[j] = 0;
+        for (j = 0; j < sizeof md; j++) md[j] = 0;
         g_probe_active = 1;
         if (__sigsetjmp(g_probe_jb, 1) == 0) {
-            rc = ((i32 (*)(void *, uptr, void *))vt97[13])(
+            rc = ((i32 (*)(void *, uptr, void *))vt97[3])(
                 g_gns_conn_iface, g_gns_conn_h, ma);
         } else {
             g_probe_active = 0;
-            C2B_LOGS("[c2b] g97: GetConnectionInfo SEGV — exit\n");
+            C2B_LOGS("[c2b] g97: GetConnectionInfo(slot3) SEGV — exit\n");
             break;
         }
         g_probe_active = 0;
@@ -14019,6 +14026,28 @@ static void *c2b_g97_thread(void *arg)
             C2B_LOGS("\n[c2b] g97: ascii:");
             c2b_g97_log_ascii(ma, 0x100);
             C2B_LOGS("\n");
+            /* 58f-g97b: слот 13 = GetDetailedConnectionStatus(h, st, cb) —
+             * теперь С размером (1024 >= sizeof struct); int rc (0 = ок) */
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rcd = ((i32 (*)(void *, uptr, void *, uptr))vt97[13])(
+                    g_gns_conn_iface, g_gns_conn_h, md, (uptr)sizeof md);
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g97: GetDetailedConnectionStatus SEGV\n");
+            }
+            g_probe_active = 0;
+            if (rcd == 0) {
+                C2B_LOGS("[c2b] g97: detail rc=0 info=");
+                for (j = 0; j < 0x100; j++) C2B_LOGH(md[j]);
+                C2B_LOGS("\n[c2b] g97: detail-ascii:");
+                c2b_g97_log_ascii(md, 0x100);
+                C2B_LOGS("\n");
+            } else {
+                C2B_LOGS("[c2b] g97: detail rc=");
+                C2B_LOGD(rcd);
+                C2B_LOGS("\n");
+            }
         }
         prev = st;
         if (st >= 3 && st <= 7) {
@@ -14262,13 +14291,12 @@ static void *c2b_g90_thread(void *arg)
             continue;
         }
         /* 58f-g96b: decode rc=3 (InvalidParam со 2-го выстрела, run255) —
-         * состояние сессии ПЕРЕД каждым релеем: слот 13 = GetConnectionInfo
-         * (SDK-009 карта, g82; rc>0 = ок), дамп info[0..0x27] hex. rc=3 при
-         * живой сессии = state-гейт (not connecting?) — карта состояний
-         * ответит. SEGV-гард, rate-limit 1/2 (чётные выстрелы).
-         * 58f-g97b (run256-урок): дамп расширен 0x27 -> 0xFF + ASCII-
-         * выжимка на КАЖДОМ выстреле (<=13 строк) — end-debug строка
-         * закрытия должна быть видна уже в пре-релей снапшоте. */
+         * состояние сессии ПЕРЕД каждым релеем. 58f-g97b (run257-урок):
+         * слот 13 = GetDetailedConnectionStatus БЕЗ cb = int-ошибка 1, буфер
+         * нулевой; GetConnectionInfo = СЛОТ 3 (карта: 1=Connect ✓, 4=Close ✓,
+         * 10/11=Send ✓, 12=Receive ✓). Дамп info[0..0xFF] hex + ASCII на
+         * КАЖДОМ выстреле (<=13 строк) — end-debug закрытия виден уже в
+         * пре-релей снапшоте. SEGV-гард. */
         {
             void **vt96 = *(void ***)g_gns_conn_iface;
             u8 ma96[1024];
@@ -14277,11 +14305,11 @@ static void *c2b_g90_thread(void *arg)
             for (j96 = 0; j96 < sizeof ma96; j96++) ma96[j96] = 0;
             g_probe_active = 1;
             if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                rc96 = ((i32 (*)(void *, uptr, void *))vt96[13])(
+                rc96 = ((i32 (*)(void *, uptr, void *))vt96[3])(
                     g_gns_conn_iface, g_gns_conn_h, ma96);
             } else {
                 g_probe_active = 0;
-                C2B_LOGS("[c2b] g96: GetConnectionInfo SEGV\n");
+                C2B_LOGS("[c2b] g96: GetConnectionInfo(slot3) SEGV\n");
             }
             g_probe_active = 0;
             C2B_LOGS("[c2b] g96: conninfo rc=");

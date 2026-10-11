@@ -726,10 +726,13 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   TCPD_LOG="$RUNDIR/pcap.a${ATTEMPT}.pcap"
   TCPD_PID=""
   if command -v tcpdump >/dev/null 2>&1; then
-    sudo -n timeout $((DURATION + 60)) tcpdump -i any -U -s 128 \
+    # g100-era (run265-урок): snaplen 128 = 797/1518 pkts усечены — хэндшейк
+    # (cert/crypt ~300B) и крупные S>C S2-пакеты срезаны, оффлайн-дешифр
+    # невозможен. -s 0 = полные пакеты (pcap вырастает ~3-5x, ок).
+    sudo -n timeout $((DURATION + 60)) tcpdump -i any -U -s 0 \
       -w "$TCPD_LOG" 'udp and not port 53' >/dev/null 2>&1 &
     TCPD_PID=$!
-    log "attempt $ATTEMPT: tcpdump started (pid $TCPD_PID, cap $((DURATION+60))s)"
+    log "attempt $ATTEMPT: tcpdump started (pid $TCPD_PID, cap $((DURATION+60))s, snaplen 0=full)"
   else
     log "attempt $ATTEMPT: tcpdump NOT available (GNS wire visibility skipped)"
   fi

@@ -14554,6 +14554,211 @@ static i32 c2b_g98_send_probe(u32 msg, u32 frm, u32 idx)
     return c2b_g98_send_msg(7, b2, 2, frm, idx);
 }
 
+/* ---------- 59f-g100: AES-256 KEY-SCHEDULE HEAP SCAN (run265-урок) ----------
+ * Цель: оффлайн-дешифр SNS 0x83-потока (обе стороны). Сессионные AES-256-GCM
+ * ключи живут ТОЛЬКО внутри EVP-контекстов libsteamnetworkingsockets
+ * (статический OpenSSL, .symtab stripped, динсимволов нет — readelf-факт).
+ * ГНС-мастер (steamnetworkingsockets_connections.cpp Recv_CryptInfo):
+ * контекст = m_pCryptContextSend/Recv -> EVP_AES_GCM_CTX { AES_KEY ks
+ * (60 u32 слов расписания) + gcm-состояние с iv[16] }. Сканируем rw-память
+ * процесса на РАСПИСАНИЕ ключей AES-256 (FIPS-197, u32-домен):
+ *   w[8]  == w[0] ^ SubWord(RotWord(w[7])) ^ 0x01000000
+ *   w[9]  == w[1] ^ w[8]        (SubWord ТОЛЬКО на i%8==0!)
+ *   w[10] == w[2] ^ w[9]
+ * 96-бит фильтр -> ложных срабатываний на куче нет. На хит: дамп keybe
+ * (32B, BE-сериализация w[0..7] = ключ как в OpenSSL GETU32) + окна ±512B
+ * (EVP-iv[16] = ПОСЛЕДНИЙ использованный IV -> оффлайн: base_iv = iv - seq
+ * последнего пакета; GCM-таг реального 0x83-пакета = оракул).
+ * Оффлайн-инструмент: scripts/pcap_sns_decrypt.py --keys-from-log.
+ * Одноразово в конце g98-watch (t+33s, сессия жива, ключи валидны).
+ * Киллисвитч C2B_G100=0. Самотест: расписание проверено на синтетике. */
+static u8 c2b_g100_sbox[256];
+static u32 c2b_g100_ready;
+static const char c2b_g100_hx[] = "0123456789abcdef";
+
+static void c2b_g100_init(void)
+{
+    u8 alog[256], lg[256];
+    u16 i;
+    u8 v = 1;
+    for (i = 0; i < 255; i++) {
+        u8 lo;
+        alog[i] = v;
+        lg[v] = (u8)i;
+        lo = (u8)(v << 1);            /* v *= 3 в GF(2^8), poly 0x11b */
+        if (v & 0x80) lo ^= 0x1b;
+        v = (u8)(lo ^ v);
+    }
+    for (i = 1; i < 256; i++) {
+        u8 s = alog[(u8)((u8)(255 - lg[i]) % 255)];  /* инверс */
+        u8 b = s ^ (u8)((s << 1) | (s >> 7)) ^ (u8)((s << 2) | (s >> 6))
+             ^ (u8)((s << 3) | (s >> 5)) ^ (u8)((s << 4) | (s >> 4))
+             ^ 0x63;
+        c2b_g100_sbox[i] = b;
+    }
+    c2b_g100_sbox[0] = 0x63;
+    c2b_g100_ready = 1;
+}
+
+static u32 c2b_g100_subw(u32 x)
+{
+    return ((u32)c2b_g100_sbox[(x >> 24) & 0xff] << 24)
+         | ((u32)c2b_g100_sbox[(x >> 16) & 0xff] << 16)
+         | ((u32)c2b_g100_sbox[(x >> 8) & 0xff] << 8)
+         | (u32)c2b_g100_sbox[x & 0xff];
+}
+
+static void c2b_g100_hexs(const u8 *p, u32 n)
+{
+    u32 i;
+    char b2[2];
+    for (i = 0; i < n; i++) {
+        b2[0] = c2b_g100_hx[p[i] >> 4];
+        b2[1] = c2b_g100_hx[p[i] & 15];
+        c2b_out(b2, 2);
+    }
+}
+
+static void c2b_g100_scan(void)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    /* pread = глобальный extern @line 80 (i64 pread(i32, void*, uptr, uptr)) */
+    static char mp[262144];
+    static u8 buf[1 << 20];
+    i32 fdm;
+    i64 n = 0;
+    u32 hits = 0;
+    long long budget = 0;
+    char *p, *e;
+    {
+        const char *e100 = getenv("C2B_G100");
+        if (e100 && e100[0] == '0') {
+            C2B_LOGS("[c2b] g100: disabled by env\n");
+            return;
+        }
+    }
+    if (!c2b_g100_ready) c2b_g100_init();
+    {
+        i32 fdm2 = open("/proc/self/maps", 0);
+        if (fdm2 >= 0) {
+            for (;;) {
+                i64 r = read(fdm2, mp + n, (i64)sizeof(mp) - 1 - n);
+                if (r <= 0) break;
+                n += r;
+                if (n >= (i64)sizeof(mp) - 1) break;
+            }
+            close(fdm2);
+        }
+    }
+    if (n <= 0) {
+        C2B_LOGS("[c2b] g100: no maps\n");
+        return;
+    }
+    mp[n] = 0;
+    fdm = open("/proc/self/mem", 0);
+    if (fdm < 0) {
+        C2B_LOGS("[c2b] g100: no mem\n");
+        return;
+    }
+    C2B_LOGS("[c2b] g100: scan start\n");
+    p = mp;
+    e = mp + n;
+    while (p < e && hits < 32) {
+        uptr lo = 0, hi = 0;
+        i32 wr = 0;
+        i32 c;
+        u64 got;
+        uptr a;
+        while (p < e && *p == '\n') p++;
+        if (p >= e) break;
+        while (p < e && *p != '-') {
+            c = *p;
+            if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                lo = (lo << 4) | (uptr)(c - 'a' + 10);
+            else break;
+            p++;
+        }
+        if (p >= e || *p != '-') break;
+        p++;
+        while (p < e && *p != ' ') {
+            c = *p;
+            if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                hi = (hi << 4) | (uptr)(c - 'a' + 10);
+            else break;
+            p++;
+        }
+        if (p >= e || *p != ' ') break;
+        p++;
+        /* perms: r?-w? */
+        if (p < e && *p == 'r') { p++; }
+        if (p < e && *p == 'w') { wr = 1; p++; }
+        else if (p < e && *p == '-') { p++; }
+        while (p < e && *p != '\n') p++;
+        if (p < e) p++;
+        if (!wr || hi <= lo) continue;
+        if (hi - lo > ((uptr)256 << 20)) continue;    /* гигантские скип */
+        budget += (long long)(hi - lo);
+        if (budget > (long long)1500 << 20) break;    /* бюджет 1.5GB */
+        a = lo;
+        while (a < hi && hits < 32) {
+            u64 want = (u64)(hi - a);
+            i64 got2;
+            if (want > sizeof(buf)) want = sizeof(buf);
+            got2 = pread(fdm, buf, want, (i64)a);
+            if (got2 <= 0) break;
+            got = (u64)got2;
+            {
+                u64 off;
+                for (off = 512; off + 64 <= got; off += 4) {
+                    const u32 *w = (const u32 *)(buf + off);
+                    u32 t = (w[7] << 8) | (w[7] >> 24);   /* RotWord */
+                    u32 s8 = c2b_g100_subw(t) ^ 0x01000000u;
+                    /* FIPS-197 AES-256: SubWord ТОЛЬКО на i%8==0;
+                     * w[9]/w[10] = прямые XOR (эмпирика-фикс) */
+                    if ((w[0] ^ s8) != w[8]) continue;
+                    if ((w[1] ^ w[8]) != w[9]) continue;
+                    if ((w[2] ^ w[9]) != w[10]) continue;
+                    /* HIT */
+                    {
+                        u8 kb[32];
+                        u32 k;
+                        u64 s2, en;
+                        C2B_LOGS("[c2b] g100: aes256ks @");
+                        C2B_LOGH((u32)((a + off) >> 32));
+                        C2B_LOGH((u32)(a + off));
+                        C2B_LOGS("keybe=");
+                        for (k = 0; k < 8; k++) {
+                            kb[k * 4 + 0] = (u8)(w[k] >> 24);
+                            kb[k * 4 + 1] = (u8)(w[k] >> 16);
+                            kb[k * 4 + 2] = (u8)(w[k] >> 8);
+                            kb[k * 4 + 3] = (u8)(w[k]);
+                        }
+                        c2b_g100_hexs(kb, 32);
+                        C2B_LOGS(" win=");
+                        s2 = off >= 512 ? off - 512 : 0;
+                        en = off + 512;
+                        if (en > got) en = got;
+                        c2b_g100_hexs(buf + s2, (u32)(en - s2));
+                        C2B_LOGS("\n");
+                        hits++;
+                        if (hits >= 32) break;
+                    }
+                }
+            }
+            if (got < want) break;
+            a += got - 1024;      /* перекрытие чанков (расписания на границе) */
+        }
+    }
+    close(fdm);
+    C2B_LOGS("[c2b] g100: scan done hits=");
+    C2B_LOGN(hits);
+    C2B_LOGS("\n");
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -14696,6 +14901,10 @@ static void *c2b_g98_thread(void *arg)
             }
         }
     }
+    /* 59f-g100: скан расписаний AES-256 в rw-памяти (ключи EVP-контекстов
+     * SNS-либы). run266+: pcap (snaplen 0) + keybe/окна -> оффлайн-дешифр
+     * 0x83 обеих сторон (scripts/pcap_sns_decrypt.py --keys-from-log). */
+    c2b_g100_scan();
     return (void *)0;
 }
 

@@ -13803,9 +13803,9 @@ static void c2b_g50_force_cstate(void) { }
  * 'k' капчурится g90-сайтом СИНХРОННО; (3) релей В GNS-КАНАЛ через
  * SendMessageToConnection (slot 11 на 006 / 10 на 009, reliable) —
  * сервер получает 'k' in-channel = фаза-B (b)/(d) materialized.
- * 58f-g90v2 (run244): выстрел 1 = по приходу in-channel 'A' (детектор в
- * dumpmsg), chal <- 'A'; выстрел 2 = только при перечеллендже (новый 'A')
- * = chal <- свежий 'A'. Killswitch C2B_G90=0. SEGV-гарда на обоих вызовах. */
+ * 58f-g90v3 (run245): chal = СТЕЙТОВЫЙ (ненулевой S2-'A'); перезапись из
+ * in-channel 'A' только при ненулевом значении (chal=0 блокирует 'k').
+ * Killswitch C2B_G90=0. SEGV-гарда на обоих вызовах. */
 static void *c2b_g90_thread(void *arg)
 {
     u32 it, shot;
@@ -13844,6 +13844,13 @@ static void *c2b_g90_thread(void *arg)
          * in-channel 'A' (seq>0, до 5 мин) и берём ЕГО chal (сервер дал чел-
          * лендж В ЭТОМ канале = контекст правильный); выстрел 2 = ТОЛЬКО при
          * новом 'A' после выстрела 1 (сервер перечелленджил после 'k'). */
+        /* 58f-g90v3 (run245-урок): chal=0 (из in-channel 'A') БЛОКИРУЕТ
+         * сборку/отправку 'k' (v2: "no 'k' captured after scp call"; v1 с
+         * ненулевым S2-chal = 0x5114becd собрал ПОЛНЫЙ 'k' 513B). Вывод:
+         * движковый SendConnectPacket требует НЕнулевой challenge. v3:
+         * TIMING оставляем v2 ('A'-гейт = правильный момент), но chal =
+         * СТЕЙТОВЫЙ (свежий S2-'A' парс, ненулевой — 0x5114becd/0xae9dbf10
+         * в run244). Перезапись ТОЛЬКО если новый 'A' дал НЕнулевой chal. */
         if (shot == 0) {
             u32 w90;
             for (w90 = 0; w90 < 600 && !g_g90_A_seq; w90++) usleep(500000);
@@ -13859,7 +13866,7 @@ static void *c2b_g90_thread(void *arg)
             }
         }
         st = (uptr)c2b_g49_state;
-        if (g_g90_A_seq != g_g90_last_seq) {
+        if (g_g90_A_seq != g_g90_last_seq && g_g90_A_chal) {
             *(volatile u32 *)(st + 0x4d8) = g_g90_A_chal;
             C2B_LOGS("[c2b] g90: chal <- in-channel 'A' ");
             C2B_LOGH(g_g90_A_chal);

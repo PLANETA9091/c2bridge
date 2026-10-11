@@ -6519,6 +6519,91 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
             C2B_LOGS(" rsp=0x");
             C2B_LOGH((u32)(rsp77 >> 32)); C2B_LOGH((u32)rsp77);
             C2B_LOGS("\n");
+            /* 58f-g88: РАЗРЕШЕНИЕ МОДУЛЯ ФОЛТА: /proc/self/maps -> строка,
+             * содержащая rip77 (open/read/close = async-signal-safe, парс
+             * ручной, без stdio). Печатаем lo + ripoff + путь = точный модуль
+             * + RVA для офлайн-RE (сигнатура-2: rip-лоу 25606/5606 в
+             * 234a1/236a3/239a1/241a1, rdx=0x1e40, rdi=0 — модуль/функция
+             * неизвестны). */ 
+            {
+                extern i32 open(const char *, i32, ...);
+                extern i64 read(i32, void *, u64);
+                extern i32 close(i32);
+                static char mp88[262144];
+                i32 fd88 = open("/proc/self/maps", 0);
+                i64 n88 = 0;
+                if (fd88 >= 0) {
+                    for (;;) {
+                        i64 r88 = read(fd88, mp88 + n88,
+                                       (i64)sizeof(mp88) - 1 - n88);
+                        if (r88 <= 0) break;
+                        n88 += r88;
+                        if (n88 >= (i64)sizeof(mp88) - 1) break;
+                    }
+                    close(fd88);
+                }
+                if (n88 > 0) {
+                    char *p88 = mp88, *e88 = mp88 + n88;
+                    mp88[n88] = 0;
+                    while (p88 < e88) {
+                        uptr lo88 = 0, hi88 = 0;
+                        char *q88;
+                        q88 = p88;
+                        while (p88 < e88 && *p88 != '-') {
+                            char c88 = *p88;
+                            if (c88 >= '0' && c88 <= '9')
+                                lo88 = (lo88 << 4) | (uptr)(c88 - '0');
+                            else if (c88 >= 'a' && c88 <= 'f')
+                                lo88 = (lo88 << 4) | (uptr)(c88 - 'a' + 10);
+                            else break;
+                            p88++;
+                        }
+                        if (p88 >= e88 || p88 == q88) break;
+                        p88++;                       /* '-' */
+                        while (p88 < e88 && *p88 != ' ') {
+                            char c88 = *p88;
+                            if (c88 >= '0' && c88 <= '9')
+                                hi88 = (hi88 << 4) | (uptr)(c88 - '0');
+                            else if (c88 >= 'a' && c88 <= 'f')
+                                hi88 = (hi88 << 4) | (uptr)(c88 - 'a' + 10);
+                            else break;
+                            p88++;
+                        }
+                        if (rip77 >= lo88 && rip77 < hi88) {
+                            /* путь = после 4-го пробела perms/offset/dev/inode */
+                            char *path88 = p88;
+                            u32 sp88 = 0;
+                            char *w88 = p88;
+                            while (w88 < e88 && *w88 != '\n') {
+                                if (*w88 == ' ') {
+                                    sp88++;
+                                    if (sp88 == 4) path88 = w88 + 1;
+                                }
+                                w88++;
+                            }
+                            C2B_LOGS("[c2b] g88 MOD lo=0x");
+                            C2B_LOGH((u32)(lo88 >> 32)); C2B_LOGH((u32)lo88);
+                            C2B_LOGS(" ripoff=0x");
+                            C2B_LOGH((u32)(rip77 - lo88));
+                            C2B_LOGS(" hi=0x");
+                            C2B_LOGH((u32)(hi88 >> 32)); C2B_LOGH((u32)hi88);
+                            C2B_LOGS(" path=");
+                            if (w88 > path88 && path88[0] == '/') {
+                                char sv88 = *w88;
+                                *w88 = 0;
+                                c2b_log(path88);
+                                *w88 = sv88;
+                            } else {
+                                c2b_log("(anon)");
+                            }
+                            c2b_log("\n");
+                            break;
+                        }
+                        while (p88 < e88 && *p88 != '\n') p88++;
+                        if (p88 < e88) p88++;
+                    }
+                }
+            }
         }
     }
     /* не наш контекст: возврат = refault-спин (run134/135 SIGKILL-клон).

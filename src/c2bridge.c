@@ -6612,6 +6612,39 @@ static u32 g_auth_vtidx = 13;
 static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
 #endif  /* C2B_SELFTEST */
 
+#ifndef C2B_SELFTEST
+/* 58f-g78: ласт-газп для фатальных НЕ-SEGV сигналов (SIGILL=4/SIGABRT=6/
+ * SIGBUS=7): печатаем RIP ОДИН РАЗ (латч на сигнал) и возвращаемся —
+ * SIG_DFL-чейн добьёт процесс штатно. run230/231: тихие смерти в окне
+ * g76-send БЕЗ единого SEGV — подозреваемый = ассерт либы (abort =
+ * SIGABRT); RIP = точная точка (адрес ассерта внутри либы) для RE.
+ * glibc x86-64 ucontext: uc_mcontext.gregs @0x28, REG_RIP=16 -> 0xA8. */
+static void c2b_lastgasp(i32 sig, void *si, void *uc)
+{
+    static volatile u8 g_lg_seen[32];
+    (void)si;
+    if (sig >= 0 && sig < 32 && !g_lg_seen[sig]) {
+        g_lg_seen[sig] = 1;
+        if (uc) {
+            uptr rip78 = *(const volatile uptr *)((const u8 *)uc + 0xA8);
+            C2B_LOGS("[c2b] fatal sig="); C2B_LOGN((u32)sig);
+            C2B_LOGS(" rip=0x");
+            C2B_LOGH((u32)(rip78 >> 32)); C2B_LOGH((u32)rip78);
+            C2B_LOGS("\n");
+        }
+    }
+    {
+        struct c2b_sigaction dfl;
+        u32 t;
+        for (t = 0; t < sizeof(dfl); t++) ((u8 *)&dfl)[t] = 0;
+        dfl.handler = 0;
+        dfl.flags = 0;
+        sigemptyset(dfl.mask);
+        sigaction(sig, &dfl, (void *)0);
+    }
+}
+#endif  /* C2B_SELFTEST */
+
 /* 50p-g69: перманентная установка SEGV-хэндлера (если auth-probe ещё не
  * ставил). Вызывается из c2b_main ДО тредов. Идемпотентен. */
 #ifndef C2B_SELFTEST
@@ -6625,6 +6658,11 @@ static void c2b_segv_guard_install(void)
     sa.flags = 4;                                  /* SA_SIGINFO */
     sigemptyset(sa.mask);
     sigaction(11, &sa, (void *)0);
+    /* 58f-g78: перманентные ласт-газпы SIGILL/SIGABRT/SIGBUS (см. выше) */
+    sa.handler = (uptr)c2b_lastgasp;
+    sigaction(4, &sa, (void *)0);
+    sigaction(6, &sa, (void *)0);
+    sigaction(7, &sa, (void *)0);
     g_segv_guard_on = 1;
 }
 #else
@@ -13407,7 +13445,63 @@ static void *c2b_g63_thread(void *arg)
 }
 #endif
 
+/* 58f-g77/78: ОБЩИЙ сырой тап GNS-data (recvfrom + recvmmsg). run231:
+ * тап в recvfrom поймал ТОЛЬКО 5B relay-кипэлайвы '82 00000000 0b' —
+ * сессионные дата-пакеты (33-77B, 0x81/0x83) мимо -> читаются батчем
+ * (recvmmsg) ЛИБО тонули в рейтлимите (24 уткнулись в кипэлайвы).
+ * g78: кипэлайвы len==5 в дамп НЕ пишем (счётчик — да), лимит 96. */
+static void c2b_g77_rxraw_tap(int fd, const u8 *p, u32 n)
+{
+    u32 k77;
+    if (n < 5 || !(p[0] & 0x80)) return;
+    g_cl_rxraw_total++;
+    if (n == 5 && p[0] == 0x82) return;    /* relay-кипэлайв: не дампим */
+    if (g_cl_rxraw_n >= 96) return;
+    g_cl_rxraw_n++;
+    C2B_LOGS("[c2b] g77 rx-raw fd="); C2B_LOGN((u32)fd);
+    C2B_LOGS(" len="); C2B_LOGN(n);
+    C2B_LOGS(" d=");
+    for (k77 = 0; k77 < 16 && k77 < n; k77++) C2B_LOGH(p[k77]);
+    C2B_LOGS("\n");
+}
+
+/* 58f-g78: recvmmsg-хук — БАТЧ-чтение. passthrough + тот же тап на каждое
+ * сообщение вектора (r = число заполненных mmsghdr). */
+struct c2b_mmsghdr { struct c2b_msghdr msg_hdr; unsigned msg_len; };
+typedef ssize_t (*c2b_recvmmsg_fn)(int, struct c2b_mmsghdr *, unsigned, int,
+                                   void *);
+static void *g_clp_recvmmsg;
 __attribute__((visibility("default")))
+ssize_t recvmmsg(int fd, struct c2b_mmsghdr *msgvec, unsigned vlen, int flags,
+                 void *timeout)
+{
+    if (!g_clp_recvmmsg) {
+        void *f = dlsym(C2B_CL_RTLD_NEXT, "recvmmsg");
+        if (!f) f = (void *)1;
+        g_clp_recvmmsg = f;
+    }
+    if ((uptr)g_clp_recvmmsg == 1) {
+        *__errno_location() = 2;            /* ENOENT */
+        return -1;
+    }
+    {
+        ssize_t r = ((c2b_recvmmsg_fn)g_clp_recvmmsg)(fd, msgvec, vlen, flags,
+                                                      timeout);
+        if (r > 0 && msgvec) {
+            u32 k;
+            for (k = 0; k < (u32)r && k < 64; k++) {
+                u32 nl = msgvec[k].msg_len;
+                if (nl && msgvec[k].msg_hdr.msg_iov &&
+                    msgvec[k].msg_hdr.msg_iov[0].iov_base)
+                    c2b_g77_rxraw_tap(fd, (const u8 *)
+                                      msgvec[k].msg_hdr.msg_iov[0].iov_base,
+                                      nl);
+            }
+        }
+        return r;
+    }
+}
+
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
 {
@@ -13473,27 +13567,9 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
         const u8 *p = (const u8 *)buf;
-        /* 58f-g77: СЫРОЙ ТАП GNS-data (p[0]&0x80). run230: сервер слал
-         * 0x80/0x81/0x83 дата-пакеты (ответ 77B через 172мс после
-         * qconnect0x; собственный 0x81 33B через 10с после ConnectOK;
-         * бёрст 0x83 35B перед 0x24), но приёмная очередь через
-         * ReceiveMessages(12) оставалась ПУСТОЙ и ACK не уходило —
-         * разрыв recv<->enqueue = стена приёма. Тап доказывает: читает
-         * ли либа эти пакеты recvfrom'ом ВООБЩЕ. Рейтлимит 24 дампа;
-         * счётчик — всегда; fd= разделяет сокеты. */
-        if ((u32)r >= 5 && (p[0] & 0x80)) {
-            g_cl_rxraw_total++;
-            if (g_cl_rxraw_n < 24) {
-                u32 k77;
-                g_cl_rxraw_n++;
-                C2B_LOGS("[c2b] g77 rx-raw fd="); C2B_LOGN((u32)fd);
-                C2B_LOGS(" len="); C2B_LOGN((u32)r);
-                C2B_LOGS(" d=");
-                for (k77 = 0; k77 < 16 && k77 < (u32)r; k77++)
-                    C2B_LOGH(p[k77]);
-                C2B_LOGS("\n");
-            }
-        }
+        /* 58f-g77/78: сырой тап — общий хелпер (кипэлайвы len==5 не дампим,
+         * лимит 96; см. c2b_g77_rxraw_tap) */
+        c2b_g77_rxraw_tap(fd, p, (u32)r);
         /* 41f-g31: фиксация ВСЕХ 0x21 (кольцо для СВЕЖЕГО challenge) +
          * pending-триггер (reply на наш 0x20 с 'k'-капчера -> 0x22 немедленно)
          * + ВЕРДИКТ-лог 0x23..0x26 (0x23 ConnectOK = джекпот; 0x24 Closed =

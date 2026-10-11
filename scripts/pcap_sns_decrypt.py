@@ -54,9 +54,8 @@ FLAG_TIME_SINCE_PREV = 0x02
 
 # ---------------------------------------------------------------- protobuf --
 def pb_fields(buf):
-    """Minimal protobuf field walker -> {tag: [values]}, length-delim = bytes,
-    varint = int, fixed64 = int, fixed32 = int. Keeps the raw bytes for
-    length-delim fields (the inner .info()/.cert() verbatim requirement)."""
+    """Minimal protobuf field walker -> {tag: [values]}. Defensive against
+    snaplen truncation: on any out-of-bounds, return what we have."""
     out = {}
     i = 0
     n = len(buf)
@@ -78,6 +77,8 @@ def pb_fields(buf):
             v = 0
             shift = 0
             while True:
+                if i >= n:
+                    return out
                 b = buf[i]
                 i += 1
                 v |= (b & 0x7F) << shift
@@ -86,21 +87,29 @@ def pb_fields(buf):
                     break
             out.setdefault(tag, []).append(v)
         elif wt == 1:  # fixed64
+            if i + 8 > n:
+                return out
             out.setdefault(tag, []).append(struct.unpack_from("<Q", buf, i)[0])
             i += 8
         elif wt == 2:  # length-delimited: keep raw bytes
             l = 0
             shift = 0
             while True:
+                if i >= n:
+                    return out
                 b = buf[i]
                 i += 1
                 l |= (b & 0x7F) << shift
                 shift += 7
                 if not (b & 0x80):
                     break
+            if i + l > n:
+                l = n - i  # truncated field
             out.setdefault(tag, []).append(bytes(buf[i:i + l]))
             i += l
         elif wt == 5:  # fixed32
+            if i + 4 > n:
+                return out
             out.setdefault(tag, []).append(struct.unpack_from("<I", buf, i)[0])
             i += 4
         else:
@@ -199,24 +208,35 @@ def game_flow(pkts):
 
 
 # ------------------------------------------------------------- handshake --
+NO_LEN_MSGS = (0x22, 0x23)  # the connect-family: [msgid][proto], custom-built
+
+
 def parse_control(pay):
-    """Observed steamclient SNS build: [msgid u8][protobuf from offset 1]
-    (GNS master adds a u16 len at offset 1 — try both)."""
+    """Observed steamclient SNS build:
+    0x22/0x23 (the connect-family) = [msgid u8][protobuf @1]
+    0x20/0x21/0x24/0x25 (SendMsg)   = [msgid u8][u16 LE len][protobuf @3]
+    (GNS master: SendMsg uses UDPPaddedMessageHdr; ConnectRequest/OK are
+    hand-serialized without the length.)"""
     if not pay:
         return None, None
     msgid = pay[0]
-    f = pb_fields(pay[1:])
-    if f:
-        return msgid, f
-    if len(pay) >= 3:  # GNS-master variant: [msgid][u16 len][proto]
+    if msgid in NO_LEN_MSGS:
+        f = pb_fields(pay[1:])
+        return msgid, (f if f else None)
+    if len(pay) >= 3:
         ln = struct.unpack_from("<H", pay, 1)[0]
         if 0 < ln <= len(pay) - 3:
             return msgid, pb_fields(pay[3:3 + ln])
     return msgid, None
 
 
+def _b(v):
+    """bytes-only filter (a truncated parse can yield ints for the tags)."""
+    return bytes(v) if isinstance(v, (bytes, bytearray)) else None
+
+
 def extract_handshake(pkts, flow):
-    """-> dict with the client/server crypt+cert+connid from 0x22/0x21"""
+    """-> dict with the client/server crypt+cert+connid from 0x22/0x23"""
     a, b = flow  # sorted (ip,port) pair; client = whoever sent 0x22
     hs = {"client": None, "server": None, "ts_first": None, "ts_last": None}
     for ts, pay, src, sp, dst, dp in pkts:
@@ -235,22 +255,22 @@ def extract_handshake(pkts, flow):
             connid = f.get(5, [None])[0]
         else:
             continue
-        crypt_signed = f.get(7, [None])[0]
-        cert_signed = f.get(4, [None])[0] or f.get(8, [None])[0]
+        crypt_signed = _b(f.get(7, [None])[0])
+        cert_signed = _b(f.get(4, [None])[0]) or _b(f.get(8, [None])[0])
         info = {}
         inner = None
         if crypt_signed:
             cf = pb_fields(crypt_signed)
-            inner = cf.get(1, [None])[0]
+            inner = _b(cf.get(1, [None])[0])
             if inner:
                 ci = pb_fields(inner)
                 info["key_type"] = ci.get(1, [None])[0]
-                info["key_data"] = ci.get(2, [None])[0]
+                info["key_data"] = _b(ci.get(2, [None])[0])
                 info["nonce"] = ci.get(3, [None])[0]
         cert_inner = None
         if cert_signed:
             sf = pb_fields(cert_signed)
-            cert_inner = sf.get(1, [None])[0]
+            cert_inner = _b(sf.get(1, [None])[0])
         hs[side] = {"connid": connid, "crypt_inner": inner,
                     "nonce": info.get("nonce"),
                     "key_data": info.get("key_data"),
@@ -566,8 +586,10 @@ def main():
         if not h:
             print(f"{side}: MISSING")
             continue
+        nonce = h["nonce"]
+        ns = f"{nonce:#x}" if isinstance(nonce, int) else str(nonce)
         print(f"{side}: connid={h['connid']:#x} nonce="
-              f"{h['nonce']:#x} key_type={h['key_type']} "
+              f"{ns} key_type={h['key_type']} "
               f"pub={h['key_data'].hex() if h['key_data'] else None}")
         print(f"        cert_inner={h['cert_inner'].hex() if h['cert_inner'] else None}")
         print(f"        crypt_inner={h['crypt_inner'].hex() if h['crypt_inner'] else None}")

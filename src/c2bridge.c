@@ -16837,10 +16837,13 @@ static void *c2b_g106w_thread(void *arg)
  * порт-фильтра: fd-иноды ИГРЫ + steam-pids -> lookup в /proc/net/udp ->
  * лог (pid, local, rem) RAW-строками; дедуп по (pid,ino). 6s-каденс x 30. */
 
-static u32 c2b_g106w2_seen[4096][2];
+static u32 c2b_g106w2_seen[8192][2];
 static u32 c2b_g106w2_nseen;
 static u32 c2b_g106w2_nspids[200];
 static u32 c2b_g106w2_nspid;
+static u32 c2b_g106w2_first_pids[256];
+static u32 c2b_g106w2_nfirst;
+static u32 c2b_g106w2_first_done;
 
 /* inode-in-table: fidx = the 0-based inode field (udp/tcp/netlink = 9,
  * unix = 6); возвращает 1 если строка с inode==ino найдена */
@@ -16930,8 +16933,10 @@ static void c2b_g106w2_sockmap(void)
     i32 fd;
     i64 off;
     u32 un, un6, utcp, utcp6, uux, unl;
-    /* run298-урок: мишени = ВСЕ pids (SDR-владелец = НЕ steam-named!),
-     * seen-cap 4096 (160 = заполнилось за 1-2 тика = SDR молча дропнут) */
+    /* run303-урок: ВСЕ udp-сокеты игры = UNCONNECTED (rem=0) = пинги;
+     * SDR-сокет = НЕ в fd-столе игры. Мишени = steam|hl2|csgo-named
+     * (клиент!) каждый тик + НОВИЧКИ (не было в первом тике) — полный
+     * all-pids скан = 4500+ сокетов = заполнял seen-кап за 1 тик. */
     targets[ntp++] = mypid;
     fd = open("/proc", 0x10000);
     if (fd >= 0) {
@@ -16939,7 +16944,7 @@ static void c2b_g106w2_sockmap(void)
             i64 n2 = syscall((i64)217, (i64)fd, db, (i64)sizeof(db));
             if (n2 <= 0) break;
             off = 0;
-            while (off + 19 <= n2 && ntp < 14) {
+            while (off + 19 <= n2) {
                 u16 reclen = *(const u16 *)(const void *)(db + off + 16);
                 const char *nm = db + off + 19;
                 u32 fl = 0, pv = 0, k;
@@ -16950,15 +16955,40 @@ static void c2b_g106w2_sockmap(void)
                         pv = pv * 10 + (u32)(nm[k] - '0');
                     }
                     if (pv && pv != mypid) {
-                        if (ntp < 220) targets[ntp++] = pv;
+                        u32 newcomer = 1, du3;
+                        for (du3 = 0; du3 < c2b_g106w2_nfirst; du3++)
+                            if (c2b_g106w2_first_pids[du3] == pv) {
+                                newcomer = 0;
+                                break;
+                            }
+                        if (!c2b_g106w2_first_done &&
+                            c2b_g106w2_nfirst < 256)
+                            c2b_g106w2_first_pids
+                                [c2b_g106w2_nfirst++] = pv;
+                        if (ntp >= 216) continue;
+                        if (newcomer) {
+                            targets[ntp++] = pv;
+                        } else {
+                            u32 cn;
+                            c2b_g106_path(pb, "/proc/", pv, "/comm");
+                            cn = c2b_g106_read_file(pb, cb2, sizeof(cb2));
+                            while (cn && (cb2[cn - 1] == '\n' ||
+                                          cb2[cn - 1] == 0))
+                                cn--;
+                            cb2[cn] = 0;
+                            if (cn && (c2b_g106_has(cb2, cn, "steam") ||
+                                       c2b_g106_has(cb2, cn, "hl2") ||
+                                       c2b_g106_has(cb2, cn, "csgo")))
+                                targets[ntp++] = pv;
+                        }
                     }
                 }
                 if (reclen == 0 || off + (i64)reclen > n2) break;
                 off += (i64)reclen;
             }
-            if (ntp >= 14) break;
         }
         close(fd);
+        c2b_g106w2_first_done = 1;
     }
     un = c2b_g106_read_file("/proc/net/udp", ub, sizeof(ub));
     if (!c2b_g106w2_nseen) {

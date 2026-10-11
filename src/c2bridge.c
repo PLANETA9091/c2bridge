@@ -13933,6 +13933,110 @@ static void c2b_g50_force_cstate(void) { }
 #endif
 
 #ifndef C2B_SELFTEST
+/* ---------- 58f-g97: вотчер ЗАКРЫТИЯ GNS-сессии (тред, 0.5с-поллинг) ----------
+ * run256-факты: сервер закрывает сессию ~15с ПОСЛЕ первого in-channel 'k'
+ * (релей rc=1 = доставлен) — ПРИЧИНА закрытия не наблюдаема (колбэк
+ * статуса не захвачен; rc=3 со 2-го выстрела = мёртвый хэндл). Механика:
+ * 0.5с-поллинг слота 13 (GetConnectionInfo, g82-карта: 13=GetInfo,
+ * rc=1 жив) пока живы h/iface. Лог ТОЛЬКО на переходах стейта
+ * (info[0..3] = state enum: 0 none / 1 connecting / 2 connected /
+ * 3 closedbypeer / 4 problemlocal / 5 finwait / 6 linger / 7 dead),
+ * при отклонении rc!=1 и 30с-heartbeat; на каждом логе = ШИРОКИЙ дамп
+ * info[0..0xFF] hex + ASCII-выжимка (пробеги >=4 печатных) — серверный
+ * end-reason/m_szEndDebug сидит в хвосте SteamNetConnectionInfo_t.
+ * После перехода в dead-path (st 3..7) досидеть 20с (финальный стейт
+ * до CloseConnection-аck движка) и выйти. TLS-гарда (g_probe_jb =
+ * __thread) = безопасно на своём треде. Killswitch C2B_G97=0. */
+static void c2b_g97_log_ascii(const u8 *p, u32 n)
+{
+    u32 i = 0;
+    while (i < n) {
+        u32 j;
+        if (p[i] < 0x20 || p[i] > 0x7e) { i++; continue; }
+        for (j = i; j < n && p[j] >= 0x20 && p[j] <= 0x7e; j++) { }
+        if (j - i >= 4) {
+            char b2[2];
+            u32 q;
+            C2B_LOGS(" @"); C2B_LOGD(i); C2B_LOGS("'");
+            for (q = i; q < j; q++) { b2[0] = (char)p[q]; b2[1] = 0; C2B_LOGS(b2); }
+            C2B_LOGS("'");
+        }
+        i = j;
+    }
+}
+
+static void *c2b_g97_thread(void *arg)
+{
+    u32 t, prev = 0xFFFFFFFFu, dead_run = 0, done = 0;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G97");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g97: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (t = 0; t < 1200; t++) {
+        if (g_gns_conn_h && g_gns_conn_iface) break;
+        usleep(500000);
+    }
+    if (!g_gns_conn_h || !g_gns_conn_iface) {
+        C2B_LOGS("[c2b] g97: no session in 10min — exit\n");
+        return (void *)0;
+    }
+    C2B_LOGS("[c2b] g97: armed h=");
+    C2B_LOGH((u32)g_gns_conn_h);
+    C2B_LOGS("\n");
+    for (t = 0; t < 720 && !done; t++) {   /* 720 x 0.5с = 6 мин максимум */
+        void **vt97;
+        i32 rc = -999;
+        u8 ma[1024];
+        u32 j, st;
+        usleep(500000);
+        if (!g_gns_conn_h || !g_gns_conn_iface) { done = 1; break; }
+        vt97 = *(void ***)g_gns_conn_iface;
+        for (j = 0; j < sizeof ma; j++) ma[j] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc = ((i32 (*)(void *, uptr, void *))vt97[13])(
+                g_gns_conn_iface, g_gns_conn_h, ma);
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g97: GetConnectionInfo SEGV — exit\n");
+            break;
+        }
+        g_probe_active = 0;
+        st = (u32)ma[0] | ((u32)ma[1] << 8) | ((u32)ma[2] << 16) |
+             ((u32)ma[3] << 24);
+        if (prev == 0xFFFFFFFFu || st != prev || rc != 1 || (t % 60) == 0) {
+            C2B_LOGS("[c2b] g97: t=");
+            C2B_LOGD(t / 2);            /* секунды с арма */
+            C2B_LOGS("st="); C2B_LOGD(st);
+            C2B_LOGS("rc="); C2B_LOGD(rc);
+            C2B_LOGS("rel="); C2B_LOGD(g_kfull_rel);
+            C2B_LOGS("info=");
+            for (j = 0; j < 0x100; j++) C2B_LOGH(ma[j]);
+            C2B_LOGS("\n[c2b] g97: ascii:");
+            c2b_g97_log_ascii(ma, 0x100);
+            C2B_LOGS("\n");
+        }
+        prev = st;
+        if (st >= 3 && st <= 7) {
+            dead_run++;
+            if (dead_run >= 40) done = 1;   /* 20с мёртвого стейта = хватит */
+        } else {
+            dead_run = 0;
+        }
+    }
+    C2B_LOGS("[c2b] g97: exit t=");
+    C2B_LOGD(t / 2);
+    C2B_LOGS("st="); C2B_LOGD(prev);
+    C2B_LOGS("\n");
+    return (void *)0;
+}
+#endif
+
+#ifndef C2B_SELFTEST
 /* ---------- 58f-g90: триггер+релей 'k' in-channel (тред) ----------
  * run243 ФАКТЫ: g49-детур захватил стейт (st=0x369bc478) c ЖИВЫМИ полями
  * (chal=0x82f6b2ef от S2-'A', proto=3, val=0x00ee0a07, strstr("connect0x…")
@@ -14161,8 +14265,11 @@ static void *c2b_g90_thread(void *arg)
          * состояние сессии ПЕРЕД каждым релеем: слот 13 = GetConnectionInfo
          * (SDK-009 карта, g82; rc>0 = ок), дамп info[0..0x27] hex. rc=3 при
          * живой сессии = state-гейт (not connecting?) — карта состояний
-         * ответит. SEGV-гард, rate-limit 1/2 (чётные выстрелы). */
-        if ((shot & 1) == 0) {
+         * ответит. SEGV-гард, rate-limit 1/2 (чётные выстрелы).
+         * 58f-g97b (run256-урок): дамп расширен 0x27 -> 0xFF + ASCII-
+         * выжимка на КАЖДОМ выстреле (<=13 строк) — end-debug строка
+         * закрытия должна быть видна уже в пре-релей снапшоте. */
+        {
             void **vt96 = *(void ***)g_gns_conn_iface;
             u8 ma96[1024];
             i32 rc96 = -999;
@@ -14180,7 +14287,10 @@ static void *c2b_g90_thread(void *arg)
             C2B_LOGS("[c2b] g96: conninfo rc=");
             C2B_LOGN((u32)(i32)rc96);
             C2B_LOGS(" info=");
-            for (j96 = 0; j96 < 0x28; j96++) C2B_LOGH(ma96[j96]);
+            for (j96 = 0; j96 < 0x100; j96++) C2B_LOGH(ma96[j96]);
+            C2B_LOGS("\n");
+            C2B_LOGS("[c2b] g96: ascii:");
+            c2b_g97_log_ascii(ma96, 0x100);
             C2B_LOGS("\n");
         }
         vt9 = *(void ***)g_gns_conn_iface;
@@ -15849,6 +15959,10 @@ i32 c2b_main(void)
     {   /* 58f-g90: триггер+релей 'k' in-channel (SendConnectPacket-materialization) */
         void *t90 = 0;
         pthread_create(&t90, 0, c2b_g90_thread, 0);
+    }
+    {   /* 58f-g97: вотчер закрытия GNS-сессии (end-reason/end-debug) */
+        void *t97 = 0;
+        pthread_create(&t97, 0, c2b_g97_thread, 0);
     }
 #endif
     r = c2b_try_install();

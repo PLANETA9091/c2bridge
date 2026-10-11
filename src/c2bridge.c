@@ -14649,7 +14649,7 @@ static u32 c2b_g100_harvest(const u8 *p, u32 n, uptr *out, u32 max)
     for (i = 0; i + 8 <= n; i += 8) {
         uptr v;
         memcpy(&v, p + i, 8);
-        if (v < ((uptr)0x1000000) || v >= ((uptr)0x8000000000ull))
+        if (v < ((uptr)0x1000000) || v >= ((uptr)0x800000000000ull))
             continue;
         if (v & 7) continue;
         for (k = 0; k < cnt; k++)

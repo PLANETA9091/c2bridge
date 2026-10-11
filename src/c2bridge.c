@@ -7341,7 +7341,7 @@ static void c2b_g32_drive(void);
 static void *c2b_g32_thread(void *arg);
 /* 58f-g71: fwd decl (дамп принятого GNS-сообщения; определение ниже драйвера) */
 static u32 g_gns_rx_n;
-static void c2b_g71_dumpmsg(void *mp);
+static i32 c2b_g71_dumpmsg(void *mp);
 
 void c2b_g11_xport_log(uptr wrap, uptr orsp)
 {
@@ -11624,8 +11624,15 @@ static void c2b_g32_drive(void)
             void **vt7;
             void *ciface = g_gns_conn_iface;
             uptr ch7 = g_gns_conn_h;
-            cs[0] = (g_gns_conn_ver == 1) ? 12u : 11u;    /* 1 -> ...009 */
-            cs[1] = (g_gns_conn_ver == 1) ? 11u : 12u;
+            /* g71b: ОДИН консервативный кандидат — слот 12 для обеих версий
+             * (run222 a3: слот 12 = rc 0, ma не трогает, сессия жива;
+             * слот 11 = rc 1, ИНОГДА пишет мусор в ma[0] (a1-крэш) и
+             * возможно СТАВИТ 1-байтовое сообщение серверу — НЕ ЗОНДИРУЕМ).
+             * rc>0+валидный дамп = приёмник; rc==0 = пустая очередь —
+             * поллим на нём (сервер молчит до первого байта клиента —
+             * C2S_CONNECT, следующий раунд). rc<0/фолт = слот не тот. */
+            cs[0] = 12u;
+            cs[1] = 11u;
             if (ch7 && ciface) {
                 i32 rx_slot = -1;
                 u32 ci2;
@@ -11646,11 +11653,21 @@ static void c2b_g32_drive(void)
                     C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
                     C2B_LOGS("\n");
                     if (rc7 > 0 && ma[0]) {
+                        if (c2b_g71_dumpmsg((void *)ma[0]) == 0) {
+                            rx_slot = (i32)cs[ci2];
+                            C2B_LOGS("[c2b] g71: RX SLOT FOUND=");
+                            C2B_LOGN((u32)rx_slot);
+                            C2B_LOGS("\n");
+                        }
+                    } else if (rc7 == 0) {
+                        /* пустая очередь = здоровый приёмник (или безобидный
+                         * геттер) — фиксируем, НЕ пробуя рискованные слоты */
                         rx_slot = (i32)cs[ci2];
-                        C2B_LOGS("[c2b] g71: RX SLOT FOUND="); C2B_LOGN((u32)rx_slot);
+                        C2B_LOGS("[c2b] g71: empty-queue slot fixed=");
+                        C2B_LOGN((u32)rx_slot);
                         C2B_LOGS("\n");
-                        c2b_g71_dumpmsg((void *)ma[0]);
                     }
+                    /* rc7 < 0 / фолт -> следующий кандидат */
                 }
                 if (rx_slot >= 0) {
                     u32 tick7;
@@ -11692,23 +11709,35 @@ static void c2b_g32_drive(void)
     }
 }
 
-/* 58f-g71: дамп принятого SteamNetworkingMessage_t* (m_pData@0, m_cbSize@8):
- * len + первые 64B hex — открытие протокола in-channel (run221: сессия
- * CONNECTED, очередь сообщений никто не дренирует). READ-ONLY. */
+/* 58f-g71b: дамп принятого SteamNetworkingMessage_t* (m_pData@0, m_cbSize@8):
+ * len + первые 64B hex. ПОЛНОСТЬЮ под SEGV-гардой (run222 a1-урок: слот 11
+ * вернул rc=1 с МУСОРНЫМ ma[0] -> незащищённый дамп = смерть процесса).
+ * Возврат: 0 = ок, -1 = фолт (слот подозрителен). */
 static u32 g_gns_rx_n;
-static void c2b_g71_dumpmsg(void *mp)
+static i32 c2b_g71_dumpmsg(void *mp)
 {
-    u32 msz, k;
-    const u8 *pd;
-    if (!mp) return;
-    msz = *(const volatile u32 *)((const u8 *)mp + 8);
-    pd = *(const volatile void *const *)mp;
-    g_gns_rx_n++;
-    C2B_LOGS("[c2b] g71: msg#"); C2B_LOGN(g_gns_rx_n);
-    C2B_LOGS(" len="); C2B_LOGN(msz);
-    C2B_LOGS(" d=");
-    if (pd) for (k = 0; k < 64 && k < msz; k++) C2B_LOGH(pd[k]);
-    C2B_LOGS("\n");
+    u32 msz = 0, k;
+    const u8 *pd = 0;
+    i32 rc = 0;
+    if (!mp) return -1;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        msz = *(const volatile u32 *)((const u8 *)mp + 8);
+        pd = *(const volatile void *const *)mp;
+        g_gns_rx_n++;
+        C2B_LOGS("[c2b] g71: msg#"); C2B_LOGN(g_gns_rx_n);
+        C2B_LOGS(" len="); C2B_LOGN(msz);
+        C2B_LOGS(" d=");
+        if (pd) for (k = 0; k < 64 && k < msz; k++) C2B_LOGH(pd[k]);
+        C2B_LOGS("\n");
+    } else {
+        g_gns_rx_n++;
+        C2B_LOGS("[c2b] g71: msg#"); C2B_LOGN(g_gns_rx_n);
+        C2B_LOGS(" DUMP FAULT (мусорный ptr) — скип\n");
+        rc = -1;
+    }
+    g_probe_active = 0;
+    return rc;
 }
 
 #endif  /* C2B_SELFTEST (g32a-драйвер: real-build only) */

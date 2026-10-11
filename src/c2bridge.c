@@ -16837,9 +16837,9 @@ static void *c2b_g106w_thread(void *arg)
  * порт-фильтра: fd-иноды ИГРЫ + steam-pids -> lookup в /proc/net/udp ->
  * лог (pid, local, rem) RAW-строками; дедуп по (pid,ino). 6s-каденс x 30. */
 
-static u32 c2b_g106w2_seen[160][2];
+static u32 c2b_g106w2_seen[4096][2];
 static u32 c2b_g106w2_nseen;
-static u32 c2b_g106w2_nspids[40];
+static u32 c2b_g106w2_nspids[200];
 static u32 c2b_g106w2_nspid;
 
 /* inode-in-table: fidx = the 0-based inode field (udp/tcp/netlink = 9,
@@ -16893,6 +16893,7 @@ static void c2b_g106w2_nslog(u32 pid)
     c2b_g106_path(pb, "/proc/", pid, "/comm");
     cn = c2b_g106_read_file(pb, cb, sizeof(cb));
     while (cn && (cb[cn - 1] == '\n' || cb[cn - 1] == 0)) cn--;
+    cb[cn] = 0;   /* NUL-терминатор ПОСЛЕ стрипа — run298: строка резалась */
     C2B_LOGS("[c2b] g106w2: ns p");
     C2B_LOGD(pid);
     C2B_LOGS("comm=");
@@ -16923,13 +16924,14 @@ static void c2b_g106w2_sockmap(void)
     static char tb6[65536];
     static char xb[65536];
     static char nb2[65536];
-    char db[8192], pb[96], lb[256], mb[96], cb2[64];
-    u32 targets[16];
+    char db[8192], pb[96], lb[256], cb2[64];
+    static u32 targets[220];
     u32 ntp = 0, mypid = (u32)getpid(), ti;
     i32 fd;
     i64 off;
     u32 un, un6, utcp, utcp6, uux, unl;
-    /* мишени = мы + steam-pids (быстрый comm-скан) */
+    /* run298-урок: мишени = ВСЕ pids (SDR-владелец = НЕ steam-named!),
+     * seen-cap 4096 (160 = заполнилось за 1-2 тика = SDR молча дропнут) */
     targets[ntp++] = mypid;
     fd = open("/proc", 0x10000);
     if (fd >= 0) {
@@ -16948,14 +16950,7 @@ static void c2b_g106w2_sockmap(void)
                         pv = pv * 10 + (u32)(nm[k] - '0');
                     }
                     if (pv && pv != mypid) {
-                        u32 cn;
-                        c2b_g106_path(mb, "/proc/", pv, "/comm");
-                        cn = c2b_g106_read_file(mb, cb2, sizeof(cb2));
-                        while (cn && (cb2[cn - 1] == '\n' ||
-                                      cb2[cn - 1] == 0))
-                            cn--;
-                        if (cn && c2b_g106_has(cb2, cn, "steam"))
-                            targets[ntp++] = pv;
+                        if (ntp < 220) targets[ntp++] = pv;
                     }
                 }
                 if (reclen == 0 || off + (i64)reclen > n2) break;
@@ -16991,7 +16986,7 @@ static void c2b_g106w2_sockmap(void)
             u32 du2;
             for (du2 = 0; du2 < c2b_g106w2_nspid; du2++)
                 if (c2b_g106w2_nspids[du2] == targets[ti]) break;
-            if (du2 == c2b_g106w2_nspid && c2b_g106w2_nspid < 40) {
+            if (du2 == c2b_g106w2_nspid && c2b_g106w2_nspid < 200) {
                 c2b_g106w2_nspids[c2b_g106w2_nspid++] = targets[ti];
                 c2b_g106w2_nslog(targets[ti]);
             }
@@ -17106,13 +17101,7 @@ static void c2b_g106w2_sockmap(void)
                                         C2B_LOGS("udp6-hit\n");
                                     } else if (c2b_g106w2_in_table(
                                             xb, uux, xino, 6)) {
-                                        C2B_LOGS("[c2b] g106w2: p");
-                                        C2B_LOGD(targets[ti]);
-                                        C2B_LOGS("fd=");
-                                        C2B_LOGD(fdn);
-                                        C2B_LOGS("ino=");
-                                        C2B_LOGH((u32)xino);
-                                        C2B_LOGS("unix-hit\n");
+                                        /* unix = тот же ns, тихо (объём) */
                                     } else if (c2b_g106w2_in_table(
                                             tb, utcp, xino, 9) ||
                                         c2b_g106w2_in_table(

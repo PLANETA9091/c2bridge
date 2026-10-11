@@ -14659,13 +14659,29 @@ static void c2b_g100_scan_range(i32 fdm, uptr lo, uptr hi, u32 *hits,
         if (got <= 0) return;
         for (off = 512; off + 64 <= (u64)got; off += 4) {
             const u32 *w = (const u32 *)(c2b_g100_buf + off);
-            u32 t = (w[7] << 8) | (w[7] >> 24);   /* RotWord */
-            u32 s8 = c2b_g100_subw(t) ^ 0x01000000u;
-            /* FIPS-197 AES-256: SubWord ТОЛЬКО на i%8==0;
-             * w[9]/w[10] = прямые XOR (эмпирика-фикс) */
-            if ((w[0] ^ s8) != w[8]) continue;
-            if ((w[1] ^ w[8]) != w[9]) continue;
-            if ((w[2] ^ w[9]) != w[10]) continue;
+            u32 t, s8, r;
+            i32 isle = 0;
+            /* run269-урок: хитов 0 в 26.4GB — реальный OpenSSL x86-64
+             * (AES-NI asm) хранит расписание в БАЙТ-СВАПНУТЫХ (LE) словах
+             * (эмпирика asexpand.c: w[0]=b обмен; w9/w10 = XOR в обоих
+             * доменах; LE-фильтр: R'(x)=(x>>8)|(x<<24), rcon=0x00000001).
+             * Фильтр = ДВУХДОМЕННЫЙ (BE C-конвенция + LE asm). */
+            t = (w[7] << 8) | (w[7] >> 24);              /* BE RotWord */
+            s8 = c2b_g100_subw(t) ^ 0x01000000u;
+            if ((w[0] ^ s8) == w[8] &&
+                (w[1] ^ w[8]) == w[9] &&
+                (w[2] ^ w[9]) == w[10]) {
+                isle = 0;
+            } else {
+                t = (w[7] >> 8) | (w[7] << 24);          /* LE-домен */
+                s8 = c2b_g100_subw(t) ^ 0x00000001u;
+                if ((w[0] ^ s8) == w[8] &&
+                    (w[1] ^ w[8]) == w[9] &&
+                    (w[2] ^ w[9]) == w[10])
+                    isle = 1;
+                else
+                    continue;
+            }
             /* HIT */
             {
                 u8 kb[32];
@@ -14674,14 +14690,19 @@ static void c2b_g100_scan_range(i32 fdm, uptr lo, uptr hi, u32 *hits,
                 C2B_LOGS("[c2b] g100: aes256ks @");
                 C2B_LOGH((u32)((a + off) >> 32));
                 C2B_LOGH((u32)(a + off));
-                C2B_LOGS("keybe=");
-                for (k = 0; k < 8; k++) {
-                    kb[k * 4 + 0] = (u8)(w[k] >> 24);
-                    kb[k * 4 + 1] = (u8)(w[k] >> 16);
-                    kb[k * 4 + 2] = (u8)(w[k] >> 8);
-                    kb[k * 4 + 3] = (u8)(w[k]);
+                C2B_LOGS(isle ? "le keybe=" : "be keybe=");
+                if (isle) {
+                    /* LE-хранение: ключ = СЫРЫЕ байты памяти w[0..7] */
+                    c2b_g100_hexs((const u8 *)w, 32);
+                } else {
+                    for (k = 0; k < 8; k++) {
+                        kb[k * 4 + 0] = (u8)(w[k] >> 24);
+                        kb[k * 4 + 1] = (u8)(w[k] >> 16);
+                        kb[k * 4 + 2] = (u8)(w[k] >> 8);
+                        kb[k * 4 + 3] = (u8)(w[k]);
+                    }
+                    c2b_g100_hexs(kb, 32);
                 }
-                c2b_g100_hexs(kb, 32);
                 C2B_LOGS(" win=");
                 s2 = off >= 512 ? off - 512 : 0;
                 en = off + 512;

@@ -5522,9 +5522,20 @@ static void c2b_up_obs_note(i32 t, void *msg, u32 rel, u32 voi)
  * selftest'а напрямую. Возвращает rv, который движок увидит из SendNetMsg. */
 #ifndef C2B_SELFTEST
 /* 50p-g69 fwd: SEGV-гарда примитивы (определения в non-selftest части ниже,
- * у auth-probe; хэндлер ставится перманентно c2b_segv_guard_install) */
-static u8  g_probe_jb[512] __attribute__((aligned(16)));
-static u8  g_probe_active;
+ * у auth-probe; хэндлер ставится перманентно c2b_segv_guard_install).
+ * 50p-g72: ПАРА СДЕЛАНА THREAD-LOCAL (TLS initial-exec). Run224 (4d4c8d9)
+ * вскрыл системный гоночный дефект: ~60 гард-сайтов (аплинк bsz/ser,
+ * auth-probe, все детур-тунки) делили ОДИН g_probe_jb + ОДИН g_probe_active
+ * между тредами. Пост-акцепт аплинк (главный тред, bsz LoadingProgress =
+ * ГАРАНТИРОВАННЫЙ фолт: чужой класс @1ef9f0, obj+0x18=NULL) + одновременная
+ * активность GNS-треда (g18 free-site spew интерливится с SNM-принтом в
+ * логе) = второй тред сигсетjmp'ит ПОВЕРХ jmp-buf'а первого / сбрасывает
+ * g_probe_active в 0 -> хэндлер видит active=0 -> SIG_DFL + рефолт =
+ * тихая смерть (run224: ~41s, up2{gf}=0, gdb 'Program terminated with
+ * signal SIGSEGV' БЕЗ хэндлерного лога). TLS делает семантику точной:
+ * хэндлер бежит на фолтящем треде и видит ЕГО флаг. */
+static __thread u8  g_probe_jb[512] __attribute__((aligned(16)));
+static __thread u8  g_probe_active;
 #endif
 u64 c2b_up_dispatch(const void *blk)
 {
@@ -6426,9 +6437,10 @@ struct c2b_sigaction {          /* glibc x86-64 layout */
     u32  flags;                 /* sa_flags; SA_SIGINFO = 4 */
     uptr restorer;              /* sa_restorer */
 };
-static u8  g_probe_jb[512] __attribute__((aligned(16)));
-static u8  g_probe_active;
-static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен перманентно */
+static __thread u8  g_probe_jb[512] __attribute__((aligned(16)));
+static __thread u8  g_probe_active;
+static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен перманентно
+                               * (процесс-глобальный: install-once, НЕ TLS) */
 
 static void c2b_probe_segv(i32 sig, void *si, void *uc)
 {

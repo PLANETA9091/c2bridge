@@ -6604,6 +6604,35 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                     }
                 }
             }
+            /* 58f-g89: ДАМП КОДА ВОКРУГ ФОЛТА: 32B ДО + 32B ПОСЛЕ rip из
+             * региона (anon-регион = НЕ файловый модуль — дизасм офлайн
+             * единственная идентификация) + 5 стоп-слов с rsp (адреса
+             * возврата = цепочка вызовов). Смерть = триггер 5B 0xc2-пакет
+             * на fd 0x10 (run239a1/242a1: rx-raw fd=0x10 len=5 d=c2 40 00
+             * 00 0b СТРОГО перед SEGV; rdi=0, rdx=0x1e40=7744 — memcpy
+             * (NULL, ..., 7744)). */
+            {
+                const volatile u8 *cp89 = (const volatile u8 *)rip77;
+                i32 k89;
+                C2B_LOGS("[c2b] g89 CODE-32@rip-0x20=");
+                for (k89 = -32; k89 < 0; k89++)
+                    C2B_LOGH(cp89[k89]);
+                c2b_log("\n");
+                C2B_LOGS("[c2b] g89 CODE-32@rip=");
+                for (k89 = 0; k89 < 32; k89++)
+                    C2B_LOGH(cp89[k89]);
+                c2b_log("\n");
+                {
+                    const volatile uptr *sp89 = (const volatile uptr *)rsp77;
+                    i32 w89;
+                    C2B_LOGS("[c2b] g89 STACK@rsp=");
+                    for (w89 = 0; w89 < 6; w89++) {
+                        uptr v89 = sp89[w89];
+                        C2B_LOGH((u32)(v89 >> 32)); C2B_LOGH((u32)v89);
+                    }
+                    c2b_log("\n");
+                }
+            }
         }
     }
     /* не наш контекст: возврат = refault-спин (run134/135 SIGKILL-клон).

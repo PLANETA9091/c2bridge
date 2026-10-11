@@ -14859,7 +14859,7 @@ static void c2b_g100_scan(void)
     C2B_LOGN(nfl[0]);
     C2B_LOGS("\n");
     /* 2. BFS глубиной 3 с dedup */
-    for (depth = 0; depth < 3 && hits < 32 && !c2b_g100_out; depth++) {
+    for (depth = 0; depth < 4 && hits < 32 && !c2b_g100_out; depth++) {
         u32 cur = depth & 1, nxt = cur ^ 1;
         u32 i;
         nfl[nxt] = 0;
@@ -14868,7 +14868,7 @@ static void c2b_g100_scan(void)
             i64 got;
             u32 np;
             if (c2b_g100_seen(a)) continue;
-            if (preads >= 2000) { c2b_g100_out = 1; break; }
+            if (preads >= 3000) { c2b_g100_out = 1; break; }
             if (c2b_g100_deadline()) { c2b_g100_out = 1; break; }
             preads++;
             got = pread(fdm, c2b_g100_obj, sizeof(c2b_g100_obj) - 256,
@@ -14876,17 +14876,24 @@ static void c2b_g100_scan(void)
             if (got <= 0) { fails++; continue; }
             if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, a, &hits))
                 break;
-            if (depth < 2) {
-                /* харвест + dedup на пуше (иначе дубли заполняют фронтир) */
+            if (depth < 3) {
+                /* v8d (run275-урок): seen() на ПУШЕ схлопывал обход — граф
+                 * плотный (узлы ссылаются друг на друга), пуш-маркировка
+                 * непосканированных = все уровни после первого пусты
+                 * (run275: preads=156, l1=0, l2=0). Dedup ТОЛЬКО внутри
+                 * фронтира; seen() = ТОЛЬКО на скане (поп). */
                 u32 base_i = nfl[nxt];
-                u32 k2;
+                u32 k2, m2;
                 np = c2b_g100_harvest(c2b_g100_obj, (u32)got,
                                       fr[nxt] + nfl[nxt],
                                       (u32)(1024 - nfl[nxt]));
                 nfl[nxt] += np;
-                /* компакция: убрать уже-виденные */
+                /* дедуп внутри фронтира (без seen): наивный квадрат = ок
+                 * для <=1024 */
                 for (k2 = base_i; k2 < nfl[nxt]; k2++) {
-                    if (c2b_g100_seen(fr[nxt][k2])) {
+                    for (m2 = 0; m2 < k2; m2++)
+                        if (fr[nxt][m2] == fr[nxt][k2]) break;
+                    if (m2 < k2) {
                         fr[nxt][k2] = fr[nxt][nfl[nxt] - 1];
                         nfl[nxt]--;
                         k2--;

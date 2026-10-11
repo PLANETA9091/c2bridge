@@ -8263,6 +8263,15 @@ static volatile uptr c2b_g49_state;   /* g50: ПОЛНЫЙ 64-бит ptr инс�
                                       * захваченный g49-детуром (обработчик 'A'
                                       * работает на нитке движка ДО cstate-гейта) */
 static u32 c2b_g49_nl;
+/* 58f-g95: refresh челленджа в установенном соединении (run254-dwell):
+ * сервер перечелленджит 'A' с СВЕЖИМ chal (0x53f4ddfc/0x2ee0de00) по GNS-
+ * каналу (from=127.0.0.1:32105), но connectionless-парсер движка их НЕ видит
+ * (0 строк g49) -> ретрай-'k' движка ходят со СТАРЫМ chal (0xcbecddaa x11
+ * капчур=#1..#11) -> транспорт connected, игровой signon НЕ отвечает.
+ * g95: g16b-хук сканирует КАЖДЫЙ recv на форму ff×4+'A'+le32@5≠0 -> пишет
+ * свежий chal в state+0x4d8 + bump seq; g90-тред досылает scp-шот с ним. */
+static volatile u32 g_g95_seq;        /* счётчик refresh'ей (g16b-контекст) */
+static volatile u32 g_g95_consumed;   /* последний seq, взятый g90-тредом */
 
 void c2b_g49_log(uptr state, uptr buf)
 {
@@ -9480,6 +9489,33 @@ void c2b_g16b_log(uptr rlen, uptr frame)
     const u8 *data, *from;
     if (!frame) return;
     cnt = ++n;
+    /* 58f-g95: 'A'-refresh ДО noise-гейта — сканируем КАЖДЫЙ recv. Форма
+     * классического S2C-челленджа: ff ff ff ff 41 + le32(chal)≠0
+     * (run254-dwell: 0x53f4ddfc/0x2ee0de00, from=релей 127.0.0.1:32105).
+     * Запись в state+0x4d8 = обычный u32-стор на нитке движка (атомарность
+     * естественная); chal=0 (case-9 in-channel форма) НЕ пишем — нулевой
+     * chal блокирует сборку 'k' (урок run245). */
+    {
+        sp = *(volatile uptr *)(frame - 0x140);
+        data = sp ? (const u8 *)(sp + 4) : (const u8 *)0;
+        if (data && (i32)rlen >= 9 &&
+            *(volatile const u32 *)data == 0xffffffffu &&
+            *(volatile const u8 *)(data + 4) == 0x41) {
+            u32 ch95 = *(volatile const u32 *)(data + 5);
+            uptr st95 = c2b_g49_state;
+            if (ch95 != 0 && st95) {
+                *(volatile u32 *)(st95 + 0x4d8) = ch95;
+                g_g95_seq++;
+                if ((g_g95_seq & 0x07) == 1) {
+                    C2B_LOGS("[c2b] g95: 'A' challenge refreshed chal=0x");
+                    C2B_LOGH(ch95);
+                    C2B_LOGS(" seq=");
+                    C2B_LOGN(g_g95_seq);
+                    C2B_LOGS("\n");
+                }
+            }
+        }
+    }
     /* первые 24 — всё подряд (калибровка шума); дальше ТОЛЬКО
      * connectionless-помеченные (ffffffff + печатный тип) — редкие 'A'/'B'
      * bait'ы не теряются в broadcast-шуме */
@@ -13926,7 +13962,10 @@ static void *c2b_g90_thread(void *arg)
     C2B_LOGS(" h=");
     C2B_LOGH((u32)g_gns_conn_h);
     C2B_LOGS("\n");
-    for (shot = 0; shot < 2; shot++) {
+    /* 58f-g95: 12 выстрелов вместо 2 — ретрай-цикл движка в установленном
+     * соединении капчурит 11 'k' за 90с (run254-dwell); каждый СВЕЖИЙ
+     * 'A'-челлендж (g95-seq bump) = право на новый scp-шот с ним. */
+    for (shot = 0; shot < 12; shot++) {
         uptr st, vt, fn;
         u32 chal, proto, k9;
         u32 n0 = g_kfull_n;
@@ -13955,19 +13994,35 @@ static void *c2b_g90_thread(void *arg)
                 break;
             }
         } else {
-            usleep(15000000);              /* окно ответа сервера на 'k' */
-            if (g_g90_A_seq == g_g90_last_seq) {
-                C2B_LOGS("[c2b] g90: no re-challenge — shot 2 skipped\n");
-                break;
+            /* 58f-g95: ждём ЛИБО новый g95-refresh (свежий chal на legacy-
+             * пути), ЛИБО новый in-channel 'A', до 20с (0.5с-шаги). Ничего —
+             * скип (раньше: жёсткие 15с + скип без re-challenge). */
+            u32 w95;
+            u32 s0 = g_g95_seq, a0 = g_g90_A_seq;
+            for (w95 = 0; w95 < 40; w95++) {
+                usleep(500000);
+                if (g_g95_seq != s0 || g_g90_A_seq != a0) break;
+            }
+            if (g_g95_seq == s0 && g_g90_A_seq == a0) {
+                C2B_LOGS("[c2b] g90: no fresh challenge — shot skipped\n");
+                continue;
             }
         }
         st = (uptr)c2b_g49_state;
-        if (g_g90_A_seq != g_g90_last_seq && g_g90_A_chal) {
+        if (g_g95_seq != g_g95_consumed) {
+            /* 58f-g95: свежий chal УЖЕ записан g16b-хуком в st+0x4d8 —
+             * приоритет над in-channel 'A' (legacy-путь = источник ретрай-
+             * цикла сервера); логаем что берём refreshed-значение. */
+            C2B_LOGS("[c2b] g95: shot uses refreshed chal=0x");
+            C2B_LOGH(*(volatile u32 *)(st + 0x4d8));
+            C2B_LOGS("\n");
+        } else if (g_g90_A_seq != g_g90_last_seq && g_g90_A_chal) {
             *(volatile u32 *)(st + 0x4d8) = g_g90_A_chal;
             C2B_LOGS("[c2b] g90: chal <- in-channel 'A' ");
             C2B_LOGH(g_g90_A_chal);
             C2B_LOGS("\n");
         }
+        g_g95_consumed = g_g95_seq;
         g_g90_last_seq = g_g90_A_seq;
         /* 58f-g90v4 (run246-урок): chal ненулевой (0x15fac443), но 'k' НЕ
          * собрался. КОРЕНЬ: после 'A'-парса snap = NEW-style netadr ЦЕЛИ,

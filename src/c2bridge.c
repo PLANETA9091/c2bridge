@@ -6475,6 +6475,9 @@ static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен п
                                * (процесс-глобальный: install-once, НЕ TLS) */
 static u8  g_segv_foreign_logged; /* 58f-g77: last-gasp латч — ОДНОКРАТНЫЙ
                                * дамп RIP чужого (либового) фолта */
+static volatile u8 g92_rescued;   /* 58f-g92: one-shot лог спасения sig-1 */
+static volatile uptr g_true_empty_rep; /* 58f-g92: истинный &_S_empty_rep
+                               * libstdc++ (dlsym в инсталляторе хэндлера) */
 static volatile uptr g_lg_lo, g_lg_hi; /* 58f-g90a: регион фолта из maps */
 static volatile u32  g_lg_anon;        /* 1 = не файловый (anon/blob) */
 
@@ -6484,6 +6487,36 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
     if (g_probe_active) {
         g_probe_active = 0;
         siglongjmp(g_probe_jb, 1);
+    }
+    /* 58f-g92: sig-1 RESCUE (run248/249/250: rip-low ec2a8f = blob+0x64a8f =
+     * engine+0x2c2a8f-эквив — dispose COW std::string с _M_p = 0x7fXX_0000000X
+     * (мусорный указатель, писанный slot-41 виртуалом; rep = _M_p-0x18 лежит
+     * под 4GB-границей -> lock xadd -1 фолтит). РЕМОНТ В ХЭНДЛЕРЕ:
+     * RAX := true_empty_rep+0x18 (стринг), R14 := true_empty_rep (пустой реп,
+     * читанный из слота) -> после перезапуска lea/cmp @...a5e СОВПАДАЮТ ->
+     * je -> dispose = no-op -> процесс ЖИВ. Перезапуск = RIP - 0x31 (xadd
+     * @...a8f -> lea/cmp @...a5e, та же страница). БЛОБ = плоский срез
+     * engine+0x25e000 (blob+0x64a8f = engine+0x2c2a8f) — проверяем оба
+     * варианта rip-low. После патча падение дальше невозможно (все адреса
+     * валидны), лайвлока нет. Патч ДО last-gasp дампа: дамп остаётся для
+     * форензики, потом sigreturn с починенными регистрами. */
+    if (uc && g_true_empty_rep) {
+        volatile uptr *gr92 = (volatile uptr *)((u8 *)uc + 0x28);
+        uptr rip92 = gr92[16];
+        uptr lo92 = rip92 & 0xffffffUL;
+        if (lo92 == 0xec2a8fUL || lo92 == 0x2c2a8fUL) {
+            gr92[13] = g_true_empty_rep + 0x18;   /* RAX = _M_p стринга */
+            gr92[6]  = g_true_empty_rep;          /* R14 = пустой реп */
+            gr92[16] = rip92 - 0x31;              /* RIP = lea/cmp */
+            if (!g92_rescued) {
+                g92_rescued = 1;
+                C2B_LOGS("[c2b] g92: sig-1 RESCUED (COW empty-rep repair) "
+                         "rip=0x");
+                C2B_LOGH((u32)(rip92 >> 32));
+                C2B_LOGH((u32)rip92);
+                C2B_LOGS("\n");
+            }
+        }
     }
     /* 58f-g77: last-gasp — фолт в ЧУЖОМ потоке (либы) не имеет нашего
      * jmp_buf; перед штатной SIG_DFL-смертью печатаем RIP/addr ОДИН РАЗ
@@ -6766,6 +6799,17 @@ static void c2b_auth_ticket_probe(void)
     /* 50p-g69: хэндлер остаётся НАВСЕГДА (не восстанавливаем oldsa):
      * гард-тунки детуров (g_probe_jb) + аплинк-гарды g69 в dispatch живут
      * весь процесс — контейнмент фолтов важнее честного краша движка. */
+    /* 58f-g92: кэш истинного пустого репа libstdc++ (COW) для sig-1-ремонта;
+     * dlsym = в обычном контексте потока (не в хэндлере, AS-safe). RTLD_
+     * DEFAULT = 0. Символ = weak-unique в libstdc++.so.6 (GLIBCXX_3.4). */
+    {
+        void *er92 = dlsym((void *)0, "_ZNSs4_Rep20_S_empty_rep_storageE");
+        g_true_empty_rep = (uptr)er92;
+        C2B_LOGS("[c2b] g92: true empty rep = 0x");
+        C2B_LOGH((u32)(g_true_empty_rep >> 32));
+        C2B_LOGH((u32)g_true_empty_rep);
+        C2B_LOGS("\n");
+    }
     sigaction(11, &sa, (void *)0);
     g_segv_guard_on = 1;
 }

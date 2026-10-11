@@ -11317,6 +11317,7 @@ static u32 g_kfull_len;
 static volatile u32 g_kfull_n;
 static volatile u32 g_kfull_rel;
 static volatile u32 g_g90_A_seq;
+static volatile u32 c2b_g90_puregns_logged;   /* g90v6: one-shot pure-GNS marker */
 static volatile u32 g_g90_A_chal;
 static u32 g_g90_last_seq;
 
@@ -13823,10 +13824,26 @@ static void *c2b_g90_thread(void *arg)
     }
     for (it = 0; it < 1200; it++) {
         if (c2b_g49_state && g_gns_conn_h && g_gns_conn_iface) break;
+        /* 58f-g90v6 (run249-урок, a4): 'A'-детектор сработал (seq=1), walk
+         * жив, НО g49 state НЕ захвачен (pure-GNS поток: движок не парсит
+         * legacy S2-'A' -> стейт-капчер молчит -> тред не армится -> выстре-
+         * ла нет, окно закрывается тиками). Наблюдаемость: один раз логаем. */
+        if (!c2b_g90_puregns_logged && g_g90_A_seq && g_gns_conn_h &&
+            !c2b_g49_state) {
+            c2b_g90_puregns_logged = 1;
+            C2B_LOGS("[c2b] g90: in-channel 'A' seen but NO g49 state "
+                     "(pure-GNS flow, no scp possible) — still waiting\n");
+        }
         usleep(500000);
     }
     if (!c2b_g49_state || !g_gns_conn_h || !g_gns_conn_iface) {
-        C2B_LOGS("[c2b] g90: no state/session in 10min — exit\n");
+        C2B_LOGS("[c2b] g90: no state/session in 10min — exit (state=");
+        C2B_LOGH((u32)(uptr)c2b_g49_state);
+        C2B_LOGS(" h=");
+        C2B_LOGH((u32)g_gns_conn_h);
+        C2B_LOGS(" Aseq=");
+        C2B_LOGN(g_g90_A_seq);
+        C2B_LOGS(")\n");
         return (void *)0;
     }
     C2B_LOGS("[c2b] g90: armed st=");

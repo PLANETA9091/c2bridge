@@ -125,10 +125,17 @@ launch_client() {
   # g34v2-урок (run179): fd-бюджет движка (nofile 1024) -> 'epoll_ctl failed,
   # error 0x9' в GNS ConnectByIPAddress. ulimit ВНУТРИ sh -c (sudo-сессии
   # лимиты не делят) + exec, чтобы steam.sh получил лимит как свой.
+  # run249-урок (sig-1, engine+0x2c2a8f-эквивалент в relocated-блобе): COW
+  # std::string dispose падает на _M_p = 0x7fXX_00000000-0x18 — слот GOT
+  # _ZNSs4_Rep20_S_empty_rep_storage собран релокатором блоба без borrow;
+  # стреляет ТОЛЬКО при 4GB-выровненной базе libstdc++ (ASLR-лотерея:
+  # 15 PASS / 5 смертей). setarch -R: детерминированная раскладка -> либо
+  # всегда живы, либо всегда мертвы (и тогда слот дампится один раз).
+  # personality наследуется через fork/exec — движок тоже без ASLR.
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
     LIBGL_ALWAYS_SOFTWARE=1 \
     STEAM_FORCE_DESKTOPUI_SOFTWARE_RENDERING=1 \
-    sh -c "ulimit -n 65535 2>/dev/null; exec '$STEAM_SH' -login '$STEAM_USER' '$STEAM_PASS' -silent -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox" \
+    sh -c "ulimit -n 65535 2>/dev/null; exec setarch --addr-no-randomize '$STEAM_SH' -login '$STEAM_USER' '$STEAM_PASS' -silent -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox" \
     >"$LOG" 2>&1 &
 }
 launch_client

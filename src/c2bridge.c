@@ -14999,6 +14999,186 @@ static void c2b_g100_scan(void)
     C2B_LOGS("\n");
 }
 
+/* ---------- 59h-g101: GenerateHMAC256 PREMASTER CAPTURE ----------
+ * РЕ-ФАКТ (оффлайн objdump SNS-либы): "Steam datagram" @0x421a7b →
+ * lea @0xe5765 (KDF-сайт) → call @0xe57e3 → 0x64710 =
+ * CCrypto::GenerateHMAC256 (4 call sites). Extract-шаг KDF:
+ * GenerateHMAC256(salt[16], 16, premaster[32], 32, prk) → SysV:
+ * rdi=salt, rsi=16, rdx=PREMASTER, rcx=32, r8=out. Фильтр
+ * len==16 && keylen==32 = ТОЛЬКО extract (expand: len~300B; certs:
+ * len=cert-size). Капчур salt+premaster hex → оффлайн KDF
+ * (pcap_sns_decrypt.py --premaster) → КЛЮЧИ → дешифр 0x83. Установка
+ * РАННИМ тредом (до коннекта: KDF = при обработке ConnectOK, до арма
+ * g98). Тримплин: 17B пролог (7 push/mov, позиционно-независим) + jmp
+ * rel32 назад; патч = 14B (jmp *%rip + abs addr). Killswitch C2B_G101=0. */
+static u8 c2b_g101_tramp[64] __attribute__((aligned(16)));
+static u32 c2b_g101_got;
+static u32 c2b_g101_installed;
+
+static void c2b_g101_detour(const void *data, u32 len, const void *key,
+                            u32 keylen, void *out)
+{
+    if (len == 16 && keylen == 32 && !c2b_g101_got) {
+        c2b_g101_got = 1;
+        C2B_LOGS("[c2b] g101: salt=");
+        c2b_g100_hexs((const u8 *)data, 16);
+        C2B_LOGS(" premaster=");
+        c2b_g100_hexs((const u8 *)key, 32);
+        C2B_LOGS("\n");
+    }
+    ((void (*)(const void *, u32, const void *, u32, void *))
+        c2b_g101_tramp)(data, len, key, keylen, out);
+}
+
+static void *c2b_g101_thread(void *arg)
+{
+    /* mprotect = глобальный extern; open/read/close = локальные как в g100 */
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    (void)arg;
+    for (;;) {
+        const char *e101 = getenv("C2B_G101");
+        if (e101 && e101[0] == '0') {
+            C2B_LOGS("[c2b] g101: disabled by env\n");
+            return (void *)0;
+        }
+        {
+            i32 fdm = open("/proc/self/maps", 0);
+            i64 n = 0;
+            static char mp[262144];
+            char *p, *e2;
+            uptr base = 0;
+            u32 found = 0;
+            if (fdm < 0) return (void *)0;
+            for (;;) {
+                i64 r = read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
+                if (r <= 0) break;
+                n += r;
+                if (n >= (i64)sizeof(mp) - 1) break;
+            }
+            close(fdm);
+            if (n <= 0) return (void *)0;
+            mp[n] = 0;
+            /* первая r-xp/r--p строка либы = база */
+            p = mp;
+            e2 = mp + n;
+            while (p < e2 && !found) {
+                uptr lo = 0, hi = 0;
+                i32 c;
+                char pb[512];
+                u32 pl = 0, ps;
+                while (p < e2 && *p == '\n') p++;
+                if (p >= e2) break;
+                while (p < e2 && *p != '-') {
+                    c = *p;
+                    if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                    else if (c >= 'a' && c <= 'f')
+                        lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                    else break;
+                    p++;
+                }
+                if (p >= e2 || *p != '-') break;
+                p++;
+                while (p < e2 && *p != ' ') {
+                    c = *p;
+                    if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                    else if (c >= 'a' && c <= 'f')
+                        hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                    else break;
+                    p++;
+                }
+                if (p >= e2 || *p != ' ') break;
+                p++;
+                /* perms + остальное до \n */
+                while (p < e2 && *p != '\n') {
+                    if (pl < sizeof(pb) - 1) pb[pl++] = *p;
+                    p++;
+                }
+                pb[pl] = 0;
+                if (p < e2) p++;
+                if (hi <= lo || pl < 26) continue;
+                for (ps = 0; ps + 25 < pl; ps++) {
+                    if (pb[ps] == 'l' && pb[ps + 1] == 'i' &&
+                        pb[ps + 2] == 'b' && pb[ps + 3] == 's' &&
+                        pb[ps + 4] == 't' && pb[ps + 5] == 'e' &&
+                        pb[ps + 6] == 'a' && pb[ps + 7] == 'm') {
+                        /* первый маппинг либы = низкий адрес = база */
+                        if (!base || lo < base) base = lo;
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                usleep(2000000);
+                continue;
+            }
+            {
+                u8 *tgt = (u8 *)(base + 0x64710);
+                u8 *tp;
+                u32 k;
+                /* верификация пролога (run280-эмпирика) */
+                static const u8 pro[17] = {
+                    0x41, 0x57, 0x41, 0x89, 0xcf, 0x41, 0x56, 0x41,
+                    0x89, 0xf6, 0x41, 0x55, 0x4c, 0x89, 0xef, 0x41,
+                    0x54
+                };
+                {
+                    for (k = 0; k < 17; k++)
+                        if (tgt[k] != pro[k]) {
+                            C2B_LOGS("[c2b] g101: prolog mismatch @");
+                            C2B_LOGH((u32)((uptr)tgt >> 32));
+                            C2B_LOGH((u32)(uptr)tgt);
+                            C2B_LOGS("\n");
+                            return (void *)0;
+                        }
+                }
+                /* тримплин: 17B копия + jmp rel32 → tgt+17 */
+                for (k = 0; k < 17; k++) c2b_g101_tramp[k] = tgt[k];
+                tp = c2b_g101_tramp + 17;
+                tp[0] = 0xe9;
+                {
+                    i32 rel = (i32)((uptr)(tgt + 17) -
+                                    ((uptr)c2b_g101_tramp + 21));
+                    tp[1] = (u8)rel;
+                    tp[2] = (u8)(rel >> 8);
+                    tp[3] = (u8)(rel >> 16);
+                    tp[4] = (u8)(rel >> 24);
+                }
+                /* патч: jmp *%rip(0) + abs64 → detour */
+                if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)), 0x2000,
+                             3 /*RW*/) != 0) {
+                    C2B_LOGS("[c2b] g101: mprotect fail\n");
+                    return (void *)0;
+                }
+                {
+                    u8 pat[14];
+                    uptr da = (uptr)c2b_g101_detour;
+                    pat[0] = 0xff; pat[1] = 0x25; pat[2] = 0;
+                    pat[3] = 0; pat[4] = 0; pat[5] = 0;
+                    pat[6] = (u8)da; pat[7] = (u8)(da >> 8);
+                    pat[8] = (u8)(da >> 16); pat[9] = (u8)(da >> 24);
+                    pat[10] = (u8)(da >> 32); pat[11] = (u8)(da >> 40);
+                    pat[12] = (u8)(da >> 48); pat[13] = (u8)(da >> 56);
+                    for (k = 0; k < 17; k++) tgt[k] = 0x90;
+                    for (k = 0; k < 14; k++) tgt[k] = pat[k];
+                }
+                if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)), 0x2000,
+                             5 /*RX*/) != 0) {
+                    C2B_LOGS("[c2b] g101: mprotect RX fail\n");
+                }
+                c2b_g101_installed = 1;
+                C2B_LOGS("[c2b] g101: hook installed @");
+                C2B_LOGH((u32)((uptr)tgt >> 32));
+                C2B_LOGH((u32)(uptr)tgt);
+                C2B_LOGS("\n");
+                return (void *)0;
+            }
+        }
+    }
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -16799,6 +16979,11 @@ i32 c2b_main(void)
     {   /* 58f-g98: S2 in-channel frame bisect (one shot per session) */
         void *t98 = 0;
         pthread_create(&t98, 0, c2b_g98_thread, 0);
+    }
+    {   /* 59h-g101: GenerateHMAC256 premaster capture (ранняя установка,
+         * до коннекта — KDF = при ConnectOK, до арма g98) */
+        void *t101 = 0;
+        pthread_create(&t101, 0, c2b_g101_thread, 0);
     }
 #endif
     r = c2b_try_install();

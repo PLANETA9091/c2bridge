@@ -855,6 +855,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
         done < <(lsns -t net -o NS,NPROCS,PID,COMMAND --no-headers 2>/dev/null)
       ' > "$RUNDIR/sdr_sockets_ns.txt" 2>/dev/null || true
       log "attempt $ATTEMPT: per-netns sdr sockets: $(grep -ac . "$RUNDIR/sdr_sockets_ns.txt" 2>/dev/null) lines"
+      # g108c: run306 verdict — the flow = 96 pkts/100s spanning the marker,
+      # with the SRC-PORT ROTATION (43800->46846) AND the IFACE CHANGE
+      # (ifidx 2->3): the SDR socket = RECREATED mid-session and the one-shot
+      # marker ss = caught the between-sockets instant. The ss = PERIODIC
+      # (5s, the whole attempt = the socket lifecycle log) + the ifname map.
+      ip -o link 2>/dev/null | head -10 > "$RUNDIR/ifnames.txt" || true
+      ( while (( SECONDS < END )); do
+          echo "=== t=$SECONDS ==="
+          sudo -n ss -upan 2>/dev/null | grep -aE ":$TPORT |:27005 |:27015 "
+          sleep 5
+        done ) > "$RUNDIR/ss_timeline.txt" 2>/dev/null & SSLOOP_PID=$!
       # g94: post-marker dwell — the longevity + signon-progress window
       if (( POST_DWELL > 0 )); then
         DEND=$((SECONDS + POST_DWELL))

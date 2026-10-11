@@ -564,12 +564,72 @@ def brute_keys(pkts, flow, cands):
 
 
 # ------------------------------------------------------------------ main --
+def parse_g103_log(path):
+    """-> [(key32, tail16)] from the c2b g103 chacha-state scan lines"""
+    out = []
+    import re
+    for line in open(path, "r", errors="replace"):
+        if "g103: CHA" not in line:
+            continue
+        mk = re.search(r"key=([0-9a-f]{64})", line)
+        mt = re.search(r"tail=([0-9a-f]{32})", line)
+        if not mk:
+            continue
+        tail = bytes.fromhex(mt.group(1)) if mt else b"\x00" * 16
+        out.append((bytes.fromhex(mk.group(1)), tail))
+    return out
+
+
+def chacha_decrypt(key, nonce12, chunk):
+    if len(chunk) <= 16:
+        return None
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import (
+            ChaCha20Poly1305)
+        return ChaCha20Poly1305(key).decrypt(nonce12, chunk, None)
+    except Exception:
+        return None
+
+
+def chacha_brute(pkts, flow, cands):
+    """The captured state = [sigma|key|ctr|last-nonce]. The nonce = the
+    per-packet base + pkt (the first 8B LE add). Brute: for each key,
+    direction, pkt and wrap k: nonce = captured - pkt_num; the Poly1305
+    tag = the oracle. Returns (key, base_iv12, dir, pkt_num) or None."""
+    a, b = flow
+    trials = []
+    for ts, pay, src, sp, dst, dp in pkts:
+        if {(src, sp), (dst, dp)} != set(flow):
+            continue
+        if not pay or not (pay[0] & FLAG_DATA):
+            continue
+        flags, to_conn, seq, chunk = parse_data_pkt(pay)
+        if chunk is None or len(chunk) <= 16:
+            continue
+        d = "sc" if (src, sp) == b else "cs"
+        trials.append((d, seq, chunk))
+    trials.sort(key=lambda x: -len(x[2]))  # the longest = the best oracle
+    for key, tail in cands:
+        for d, seq, chunk in trials[:6]:
+            for k in range(4):
+                pkt = seq + 0x10000 * k
+                nonce = bytearray(tail[4:16])
+                n0 = (int.from_bytes(nonce[0:8], "little") - pkt) \
+                    & 0xFFFFFFFFFFFFFFFF
+                nonce[0:8] = n0.to_bytes(8, "little")
+                pt = chacha_decrypt(key, bytes(nonce), chunk)
+                if pt is not None:
+                    return key, bytes(nonce), d, pkt, pt
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("pcap", nargs="?")
     ap.add_argument("--premaster", default=None)
     ap.add_argument("--keys-from-log", default=None)
+    ap.add_argument("--chacha-log", default=None)
     args = ap.parse_args()
 
     if args.selftest:
@@ -610,6 +670,44 @@ def main():
         print(f"KeySend={ks.hex()}\nKeyRecv={kr.hex()}\nIVSend={ivs.hex()}"
               f"\nIVRecv={ivr.hex()}")
         decrypt_stream(pkts, flow, ks, kr, ivs, ivr)
+    elif args.chacha_log:
+        cands = parse_g103_log(args.chacha_log)
+        print(f"g103 chacha candidates: {len(cands)}")
+        hit = chacha_brute(pkts, flow, cands)
+        if not hit:
+            print("NO CHACHA CANDIDATE VERIFIED")
+            sys.exit(2)
+        key, base_iv, d, pkt, pt0 = hit
+        print(f"VERIFIED chacha key={key.hex()} dir={d} "
+              f"base_iv={base_iv.hex()} (pkt={pkt})")
+        print(f"first PT[{len(pt0)}]={pt0.hex()}")
+        # full stream both directions with the winning key/base
+        a, b = flow
+        n_ok = n_tot = 0
+        for ts, pay, src, sp, dst, dp in pkts:
+            if {(src, sp), (dst, dp)} != set(flow):
+                continue
+            if not pay or not (pay[0] & FLAG_DATA):
+                continue
+            flags, to_conn, seq, chunk = parse_data_pkt(pay)
+            if chunk is None or len(chunk) <= 16:
+                continue
+            from_server = (src, sp) == b
+            n_tot += 1
+            for k in range(4):
+                pkt2 = seq + 0x10000 * k
+                nonce = bytearray(base_iv)
+                n0 = (int.from_bytes(nonce[0:8], "little") + pkt2) \
+                    & 0xFFFFFFFFFFFFFFFF
+                nonce[0:8] = n0.to_bytes(8, "little")
+                pt = chacha_decrypt(key, bytes(nonce), chunk)
+                if pt is not None:
+                    n_ok += 1
+                    dd = "S>C" if from_server else "C>S"
+                    print(f"  {dd} t={ts:.3f} seq={seq} pkt={pkt2} "
+                          f"PT[{len(pt)}]={pt.hex()}")
+                    break
+        print(f"decrypted {n_ok}/{n_tot} data packets (single-key view)")
     elif args.keys_from_log:
         cands = parse_g100_log(args.keys_from_log)
         print(f"g100 candidates: {len(cands)}")
@@ -628,7 +726,7 @@ def main():
         n_ok = sum(1 for r in res if r["pt"] is not None)
         print(f"decrypted {n_ok}/{len(res)} data packets")
     else:
-        print("(give --premaster or --keys-from-log to decrypt)")
+        print("(give --premaster/--keys-from-log/--chacha-log to decrypt)")
 
 
 if __name__ == "__main__":

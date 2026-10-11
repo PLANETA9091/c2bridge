@@ -6488,13 +6488,31 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
     if (!g_segv_foreign_logged) {
         g_segv_foreign_logged = 1;
         if (uc) {
-            uptr rip77 = *(const volatile uptr *)((const u8 *)uc + 0xA8);
+            /* 58f-g80: полный сет регистров (как в c2b_lastgasp) — все три
+             * поимки смертей (run232-a3/233-a1/233-a3) = СЕГВ-иностранцы с
+             * ОДИНАКОВЫМ сигнатуром (rip-лоу ec2a8f, addr=маппинг-6, смерть
+             * сразу после CCLCMsg_LoadingProgress) — регистры = офлайн-
+             * мэппинг точного сайта (rdi = вероятный указатель-агрессор). */
+            const volatile uptr *gr =
+                (const volatile uptr *)((const u8 *)uc + 0x28);
+            uptr rip77 = gr[16], rdi77 = gr[8], rsi77 = gr[9];
+            uptr rdx77 = gr[12], rax77 = gr[13], rsp77 = gr[15];
             uptr fa77 = si ? *(const volatile uptr *)((const u8 *)si + 0x10)
                            : 0;
             C2B_LOGS("[c2b] SEGV foreign rip=0x");
             C2B_LOGH((u32)(rip77 >> 32)); C2B_LOGH((u32)rip77);
             C2B_LOGS(" addr=0x");
             C2B_LOGH((u32)(fa77 >> 32)); C2B_LOGH((u32)fa77);
+            C2B_LOGS(" rdi=0x");
+            C2B_LOGH((u32)(rdi77 >> 32)); C2B_LOGH((u32)rdi77);
+            C2B_LOGS(" rsi=0x");
+            C2B_LOGH((u32)(rsi77 >> 32)); C2B_LOGH((u32)rsi77);
+            C2B_LOGS(" rdx=0x");
+            C2B_LOGH((u32)(rdx77 >> 32)); C2B_LOGH((u32)rdx77);
+            C2B_LOGS(" rax=0x");
+            C2B_LOGH((u32)(rax77 >> 32)); C2B_LOGH((u32)rax77);
+            C2B_LOGS(" rsp=0x");
+            C2B_LOGH((u32)(rsp77 >> 32)); C2B_LOGH((u32)rsp77);
             C2B_LOGS("\n");
         }
     }
@@ -13475,7 +13493,10 @@ static void c2b_g77_rxraw_tap(int fd, const u8 *p, u32 n)
     if (n < 5 || !(p[0] & 0x80)) return;
     g_cl_rxraw_total++;
     if (n == 5 && p[0] == 0x82) return;    /* relay-кипэлайв: не дампим */
-    if (g_cl_rxraw_n >= 96) return;
+    if (p[0] == 0xff) return; /* 58f-g80: движковый OOB (ff..) НЕ дампим —
+                               * именно он выел лимит 96 в run233-a4
+                               * (42x0x3b+41x0x21) до сессионных пакетов */
+    if (g_cl_rxraw_n >= 128) return;
     g_cl_rxraw_n++;
     C2B_LOGS("[c2b] g77 rx-raw fd="); C2B_LOGN((u32)fd);
     C2B_LOGS(" len="); C2B_LOGN(n);

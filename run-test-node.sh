@@ -837,6 +837,24 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
         | grep -aE "udp.*28022|udp.*$TPORT" | head -10 \
         > "$RUNDIR/sdr_conntrack.txt" 2>/dev/null || true
       sudo -n sh -c 'for p in $(pgrep -f "a2s_relay|relay.py" 2>/dev/null | head -3); do echo "== pid $p =="; cat /proc/$p/cmdline 2>/dev/null | tr "\0" " "; echo; done' > "$RUNDIR/relay_probe.txt" 2>/dev/null || true
+      # g108b: the per-netns sweep — run305 verdict: the host-ns ss -upan =
+      # EMPTY at the live flow (the pcap = 72 pkts 53243->28022) => the SDR
+      # socket = in a CHILD netns (routed out via the host iface = tcpdump
+      # sees it, the host ss//proc-net = not). lsns + nsenter = the full
+      # per-netns udp inventory = THE owner pid + the ns.
+      sudo -n lsns -t net > "$RUNDIR/netns_list.txt" 2>/dev/null || true
+      sudo -n bash -c '
+        TPORT='"$TPORT"'
+        while read -r NS NPROCS PID CMD; do
+          HIT=$(nsenter -t "$PID" -n ss -upan 2>/dev/null \
+                | grep -aE ":28022 |:$TPORT " | head -4)
+          if [ -n "$HIT" ]; then
+            echo "== ns $NS procs=$NPROCS rep=$PID ($CMD) =="
+            echo "$HIT"
+          fi
+        done < <(lsns -t net -o NS,NPROCS,PID,COMMAND --no-headers 2>/dev/null)
+      ' > "$RUNDIR/sdr_sockets_ns.txt" 2>/dev/null || true
+      log "attempt $ATTEMPT: per-netns sdr sockets: $(grep -ac . "$RUNDIR/sdr_sockets_ns.txt" 2>/dev/null) lines"
       # g94: post-marker dwell — the longevity + signon-progress window
       if (( POST_DWELL > 0 )); then
         DEND=$((SECONDS + POST_DWELL))

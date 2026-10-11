@@ -11014,6 +11014,243 @@ static i32 c2b_g47_ret0(uptr self) { (void)self; return 0; }
 static uptr c2b_g47_vt[18];
 static uptr c2b_g47_obj[1];
 
+/* ================= 58f-g73: IP_AllowWithoutAuth — обход cert-CA стены ======
+ * Ран 225-конц2: сервер 152.233.19.133:28022 шлёт 0x23 ConnectOK, но
+ * сандбокс-steamclient ОТВЕРГАЕТ серверный SDR-серт (CA key
+ * 13151444190962006299 не в доверенном наборе) и САМ закрывает сессию
+ * (0x24, reason 4003 'Bad cert: CA key ... is not known to us').
+ * Фикс: GNS-конфиг IP_AllowWithoutAuth=1 ГЛОБАЛЬНО, ДО ConnectByIPAddress.
+ * Конфиг-API живёт на ISteamNetworkingUtils ("SteamNetworkingUtils003",
+ * публичный порядок слотов: 0 AllocateMessage, 1 SetConfigValue,
+ * 2 GetConfigValue, 3 GetConfigValueInfo, 4 GetFirstConfigValue).
+ * Слот НЕ УГАДЫВАЕМ (закрытый бинарь может отличаться):
+ *  (1) свип слотов 0..12: вызов (ev=36, &name, &dt, &scope, &next, +2
+ *      запасных) — настоящий GetConfigValueInfo вернёт печатную строку
+ *      имени конфига (верификация ВНУТРИ гвард-окна); чужие слоты дают
+ *      NULL/мусор/SEGV-гард. 7-арг форма: GetConfigValue получает
+ *      валидные pResult/cbResult (запись в скрэтч, не в регистры).
+ *  (2) перечисление ev=0..127 найденным слотом -> точный ev по имени
+ *      'IP_AllowWithoutAuth' (оффлайн-оценка из .rodata-кластера = 36;
+ *      либа 'lib Jul 13 2023'). Полная карта = в форензику.
+ *  (3) SetConfigValue = S_info-2 (публичный порядок Set/Get/Info),
+ *      кандидаты по убыванию доверия; верификация чтением
+ *      GetConfigValue(S_info-1) ДО/ПОСЛЕ (было !=1, стало 1).
+ * Всё под SEGV-гардом (TLS-пара g72, тот же поток g32). Фейл-оупен:
+ * любой отказ = только лог, коннект идёт как раньше. Киллисвитч C2B_G73=0.
+ * Скоуп-энумы: Global=1, SocketsInterface=2; dataType Int32=1. */
+static i32 c2b_g73_streq(const char *a, const char *b)
+{
+    i32 i;
+    if (!a || !b) return 0;
+    for (i = 0; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+    return a[i] == b[i];
+}
+
+/* печатная-строка проверка ВНУТРИ гвард-окна (lib-указатель может быть
+ * мусором от чужого слота — сам дереф должен быть под гардой). */
+static i32 c2b_g73_pname_ok(const char *pn)
+{
+    i32 n = 0;
+    if (!pn) return 0;
+    while (n < 48 && pn[n]) {
+        if (pn[n] < 32 || pn[n] > 126) return 0;
+        n++;
+    }
+    return (n >= 3) ? 1 : 0;
+}
+
+static void c2b_g73_allow_no_auth(void *clp, i32 user)
+{
+    static const char n03[] = "SteamNetworkingUtils003";
+    static const char n02[] = "SteamNetworkingUtils002";
+    void *uif = 0;
+    void **vt;
+    u8 scr[256];                      /* единый скрэтч: чужие записи остаются
+                                       * внутри буфера (не в регистрах/стеке) */
+    const char **ppn;
+    i32 *pdt, *psc, *pnx;
+    uptr *pnx2;
+    i32 s, s_info = -1, s_get = -1, s_set = -1;
+    i32 ev, ev_final = -1;
+    i32 one = 1;
+    i32 gdt = 0, gval = -1;
+    uptr gsz;
+    u8 gbuf[64];
+    const char *e = getenv("C2B_G73");
+    if (e && e[0] == '0') {
+        C2B_LOGS("[c2b] g73: disabled (C2B_G73=0)\n");
+        return;
+    }
+    ppn = (const char **)(scr + 0);
+    pdt = (i32 *)(scr + 16);
+    psc = (i32 *)(scr + 32);
+    pnx = (i32 *)(scr + 48);
+    pnx2 = (uptr *)(scr + 64);
+    /* FOUIF("SteamNetworkingUtils003"), фолбэк 002 — под гардой */
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        uif = ((void *(*)(i32, const char *))clp)(user, n03);
+        if (!uif)
+            uif = ((void *(*)(i32, const char *))clp)(user, n02);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+    }
+    if (!uif) {
+        C2B_LOGS("[c2b] g73: no SteamNetworkingUtils iface (skip)\n");
+        return;
+    }
+    C2B_LOGS("[c2b] g73: utils iface ok\n");
+    vt = *(void ***)uif;
+    /* (1) СВИП СЛОТОВ 0..12: ищем GetConfigValueInfo по печатному имени */
+    for (s = 0; s < 13; s++) {
+        i32 rc = 0, mark = 0;
+        for (ev = 0; ev < 256; ev++) scr[ev] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc = ((i32 (*)(void *, i32, const char **, i32 *, i32 *, i32 *,
+                   uptr *))vt[s])(uif, 36, ppn, pdt, psc, pnx, pnx2);
+            if (rc != 0 && c2b_g73_pname_ok(*ppn)) mark = 2;   /* имя! */
+            else if (rc != 0) mark = 1;                        /* rc без имени */
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g73: slot "); C2B_LOGN((u32)s);
+            C2B_LOGS(" SEGV\n");
+            continue;
+        }
+        C2B_LOGS("[c2b] g73: slot "); C2B_LOGN((u32)s);
+        C2B_LOGS(" rc="); C2B_LOGN((u32)rc);
+        if (mark == 2) {
+            C2B_LOGS(" name="); C2B_LOGS(*ppn);
+            C2B_LOGS(" dt="); C2B_LOGN((u32)*pdt);
+            C2B_LOGS(" scope="); C2B_LOGN((u32)*psc);
+        }
+        C2B_LOGS("\n");
+        if (mark == 2 && s_info < 0) s_info = s;
+    }
+    if (s_info < 0) {
+        C2B_LOGS("[c2b] g73: no GetConfigValueInfo slot (skip)\n");
+        return;
+    }
+    C2B_LOGS("[c2b] g73: info slot="); C2B_LOGN((u32)s_info); C2B_LOGS("\n");
+    /* (2) ПЕРЕЧИСЛЕНИЕ ev=0..127 -> точный ev по имени (карта в лог) */
+    for (ev = 0; ev <= 127; ev++) {
+        i32 rc;
+        for (s = 0; s < 256; s++) scr[s] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc = ((i32 (*)(void *, i32, const char **, i32 *, i32 *, i32 *,
+                   uptr *))vt[s_info])(uif, ev, ppn, pdt, psc, pnx, pnx2);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g73: info ev="); C2B_LOGN((u32)ev);
+            C2B_LOGS(" SEGV (walk stop)\n");
+            break;
+        }
+        if (rc != 0 && c2b_g73_pname_ok(*ppn)) {
+            C2B_LOGS("[c2b] g73: ev="); C2B_LOGN((u32)ev);
+            C2B_LOGS(" name="); C2B_LOGS(*ppn);
+            if (*pnx > 0) { C2B_LOGS(" next="); C2B_LOGN((u32)*pnx); }
+            C2B_LOGS("\n");
+            if (c2b_g73_streq(*ppn, "IP_AllowWithoutAuth")) { ev_final = ev; }
+        }
+    }
+    if (ev_final < 0) {
+        C2B_LOGS("[c2b] g73: IP_AllowWithoutAuth NOT in table (skip)\n");
+        return;
+    }
+    C2B_LOGS("[c2b] g73: ev_final="); C2B_LOGN((u32)ev_final); C2B_LOGS("\n");
+    /* верифицируем Get-слот (S_info-1): корректный ответ + sane cb */
+    if (s_info >= 1) {
+        gsz = sizeof(gbuf);
+        gdt = 0; gval = -1;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            s = ((i32 (*)(void *, i32, i32, uptr, i32 *, void *, uptr *))
+                 vt[s_info - 1])(uif, ev_final, 1, (uptr)0, &gdt, gbuf, &gsz);
+            g_probe_active = 0;
+            if (s == 1 && gsz <= sizeof(gbuf)) {
+                gval = *(i32 *)gbuf;
+                s_get = s_info - 1;
+            }
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g73: get-probe SEGV (no readback)\n");
+        }
+        if (s_get >= 0) {
+            C2B_LOGS("[c2b] g73: get slot="); C2B_LOGN((u32)s_get);
+            C2B_LOGS(" val="); C2B_LOGN((u32)gval);
+            C2B_LOGS(" dt="); C2B_LOGN((u32)gdt); C2B_LOGS("\n");
+        }
+    }
+    /* (3) SET-кандидаты: S_info-2 (публичный порядок), потом -3, -1, +1 */
+    {
+        i32 cand[4], nc = 0, ci;
+        if (s_info >= 2) cand[nc++] = s_info - 2;
+        if (s_info >= 3) cand[nc++] = s_info - 3;
+        if (s_info >= 1) cand[nc++] = s_info - 1;
+        cand[nc++] = s_info + 1;
+        for (ci = 0; ci < nc && s_set < 0; ci++) {
+            i32 sc_ = cand[ci], rc = 0, before = -999, after = -999;
+            if (sc_ < 0) continue;
+            if (s_get >= 0) {
+                gsz = sizeof(gbuf); gdt = 0;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    s = ((i32 (*)(void *, i32, i32, uptr, i32 *, void *,
+                          uptr *))vt[s_get])(uif, ev_final, 1, (uptr)0,
+                          &gdt, gbuf, &gsz);
+                    g_probe_active = 0;
+                    if (s == 1 && gsz <= sizeof(gbuf)) before = *(i32 *)gbuf;
+                } else g_probe_active = 0;
+            }
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rc = ((i32 (*)(void *, i32, i32, uptr, i32, void *, uptr *))
+                      vt[sc_])(uif, ev_final, 1, (uptr)0, 1, &one, pnx2);
+                g_probe_active = 0;
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g73: set cand "); C2B_LOGN((u32)sc_);
+                C2B_LOGS(" SEGV\n");
+                continue;
+            }
+            C2B_LOGS("[c2b] g73: set cand "); C2B_LOGN((u32)sc_);
+            C2B_LOGS(" rc="); C2B_LOGN((u32)rc); C2B_LOGS("\n");
+            if (rc == 0) continue;
+            if (s_get >= 0) {
+                gsz = sizeof(gbuf); gdt = 0;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    s = ((i32 (*)(void *, i32, i32, uptr, i32 *, void *,
+                          uptr *))vt[s_get])(uif, ev_final, 1, (uptr)0,
+                          &gdt, gbuf, &gsz);
+                    g_probe_active = 0;
+                    if (s == 1 && gsz <= sizeof(gbuf)) after = *(i32 *)gbuf;
+                } else g_probe_active = 0;
+                C2B_LOGS("[c2b] g73: readback before=");
+                C2B_LOGN((u32)(i32)before); C2B_LOGS(" after=");
+                C2B_LOGN((u32)(i32)after); C2B_LOGS("\n");
+                if (after == 1) { s_set = sc_; break; }   /* верифицирован */
+            } else {
+                /* нет ридбека — доверяем rc==1 (слабее, но name-якорь есть) */
+                s_set = sc_;
+                C2B_LOGS("[c2b] g73: set accepted by rc (no readback)\n");
+                break;
+            }
+        }
+    }
+    if (s_set < 0) {
+        C2B_LOGS("[c2b] g73: no SetConfigValue candidate verified (skip)\n");
+        return;
+    }
+    C2B_LOGS("[c2b] g73: IP_AllowWithoutAuth=1 SET ev=");
+    C2B_LOGN((u32)ev_final); C2B_LOGS(" slot="); C2B_LOGN((u32)s_set);
+    C2B_LOGS(" (Global) — cert-CA wall bypass armed\n");
+}
+
 /* ================= 41f-g32a: GNS ConnectByIPAddress-драйвер =================
  * Цель — заставить steamclient-овский GNS СОЗДАТЬ реальное соединение к
  * CS2-цели: его 0x20/0x21 обмен + ПОСТРОЕННЫЙ 0x22 (его cert+crypt, подпись
@@ -11564,6 +11801,10 @@ static void c2b_g32_drive(void)
         sa.flags = 4;
         sigemptyset(sa.mask);
         if (sigaction(11, &sa, &oldsa) != 0) return;
+        /* 58f-g73: обход cert-CA стены — IP_AllowWithoutAuth=1 глобально
+         * (SteamNetworkingUtils, name-verified sweep; см. блок выше).
+         * Фейл-оупен: только лог, коннект ниже идёт как раньше. */
+        c2b_g73_allow_no_auth(g_clp_fouif, g_steamuser_user);
         clp = g_clp_fouif;
         for (vi = 0; vi < 2; vi++) {
             void *iface = 0;

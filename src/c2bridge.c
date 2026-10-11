@@ -5491,11 +5491,16 @@ static const uptr g_fg_vt[14] = {
     (uptr)c2b_fg_getsize    /* 13 GetSize */
 };
 
+/* g85: движок провёл SNM t=7 (CNETMsg_SignonState) на своём канале —
+ * определение ниже (рядом с g84-статиками), здесь fwd для obs_note */
+static u32 g_c2b_signon_seen;
+
 /* гистограмма v0 (бывший c2b_up_obs64, вызывается из dispatch) */
 static void c2b_up_obs_note(i32 t, void *msg, u32 rel, u32 voi)
 {
     if (t < 0 || t >= 64 || !msg) return;
     g_up_st.bytype[t]++;
+    if (t == 7) g_c2b_signon_seen = 1;   /* g85: CNETMsg_SignonState на канале движка */
     if (g_up_st.first[t] < 3) {
         g_up_st.first[t]++;
         uptr vt = *(uptr *)msg;
@@ -7504,6 +7509,7 @@ static void *g_gns_conn_iface;          /* g71: iface сработавшего �
 static uptr  g_gns_conn_h;              /* g71: хэндл GNS-соединения */
 static u32   g_gns_walk_slot;           /* g84: слот-приёмник, найденный походом 14..27 (0=нет) */
 static u8    g_gns_stbuf[4352];         /* g84: буфер detailed-status текста (4KB + запас) */
+static u32   g_c2b_signon_seen;         /* g85: движок провёл SNM t=7 (SignonState) = канал жив */
 static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
 static socklen_t g_gns_dstlen;          /* 0 = не собран */
 
@@ -12137,47 +12143,47 @@ static void c2b_g32_drive(void)
                     }
                     /* rc7 < 0 / фолт -> следующий кандидат */
                 }
-                if (rx_slot >= 0) {
-                    /* g84: слот-приёмник уже найден походом на пред. заходе =
-                     * полный полл 240с; иначе 50с (ответ+signon укладываются
-                     * в ~5с после C2S_CONNECT — окно освобождаем для похода) */
-                    c2b_g84_pollslot(vt7, ciface, ch7, (u32)rx_slot,
-                                     g_gns_walk_slot ? 240u * 5u : 50u * 5u);
-                } else {
-                    C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");
-                }
-                /* 58f-g84: ПОХОД ПО СЛОТАМ 14..27 — после 50-с полла (урок
-                 * run237: pre-poll поход на a4 ДЕРЖАЛ GNS-lock 173мс (slot 20
-                 * = ReceiveMessagesOnListenSocket — имя из GNSLIB-lock-
-                 * warning!) + assert-спам — 77B-ответ сервера, пришедший В
-                 * ОКНО ПОХОДА, не обработан движком (SNM не было, PASS
-                 * сорван). Теперь: ответ/signon (~5с) завершаются в 50-с
-                 * полле, поход = ПОСЛЕ. Слот 20 ИСКЛЮЧЁН (лок-хог, сигнатура
-                 * уже известна). ГЕЙТ ДАМПА: только ma0 >= 2^40 (правдоп.
-                 * heap-ptr; run237: ma0=0x8_00000010/0xaf_00000003 =
-                 * struct-геттеры, мусорные дампы = шум). Находка =
-                 * g_gns_walk_slot (след. заход = полный полл на нём) +
-                 * ДОЛИВ-ПОЛЛ 100с СЕЙЧАС. НОВОЕ: rc в [64..4095] =
-                 * size-query (18: rc=1978) -> повторный вызов с 4KB буфером
-                 * + ТЕКСТОВЫЙ дамп = detailed status (очереди байт, пакеты,
-                 * ошибки дешифра) = ПРЯМАЯ СУДЬБА 77B. Киллисвитч C2B_G83=0. */
+                /* 58f-g85: ПОХОД ПО СЛОТАМ 14..27 — ПЕРЕД поллом, но ПОД ГЕЙТОМ
+                 * ЗНАКА (урок run237-a4: pre-poll поход сорвал обработку 77B —
+                 * slot-20 GNS-lock 173мс + assert-спам; урок run238-a1: post-
+                 * poll поход НЕ ЗАПУСКАЕТСЯ — лог режется бюджетом попытки
+                 * сразу после старта полла). Гейт: ждём g_c2b_signon_seen
+                 * (SNM t=7 на канале движка = signon ЗАВЕРШЁН, ходить
+                 * безопасно) до 30с; по таймауту идём всё равно (signon мёртв
+                 * — разрушать нечего, а карта срочно нужна). Слот 20
+                 * ИСКЛЮЧЁН (лок-хог ReceiveMessagesOnListenSocket, сигнатура
+                 * из run237). ГЕЙТ ДАМПА: ma0 >= 2^40 (heap-ptr; run237:
+                 * 0x8_00000010/0xaf_00000003 = struct-геттеры = шум). Находка
+                 * = g_gns_walk_slot (персист: след. попытка поллит на нём) +
+                 * ДОЛИВ-ПОЛЛ 100с СЕЙЧАС. rc в [64..4095] = size-query (18:
+                 * rc=1978 = detailed status) -> повторный вызов с 4KB буфером
+                 * + ТЕКСТОВЫЙ дамп = очереди байт/пакеты/ошибки дешифра =
+                 * ПРЯМАЯ СУДЬБА 77B. Киллисвитч C2B_G83=0. */
                 {
                     const char *e83 = getenv("C2B_G83");
                     if (g_gns_walk_slot) {
-                        C2B_LOGS("[c2b] g84: receiver known, walk skipped\n");
+                        C2B_LOGS("[c2b] g85: receiver known, walk skipped\n");
                     } else if (e83 && e83[0] == '0') {
-                        C2B_LOGS("[c2b] g84: walk disabled (C2B_G83=0)\n");
+                        C2B_LOGS("[c2b] g85: walk disabled (C2B_G83=0)\n");
                     } else {
-                        u32 s83;
+                        u32 s83, wait8;
+                        for (wait8 = 0; wait8 < 30u; wait8++) {
+                            if (g_c2b_signon_seen) break;
+                            usleep(1000000);
+                        }
+                        C2B_LOGS("[c2b] g85: walk gate signon_seen=");
+                        C2B_LOGN(g_c2b_signon_seen);
+                        C2B_LOGS(" waited="); C2B_LOGN(wait8);
+                        C2B_LOGS("s\n");
                         for (s83 = 14u; s83 <= 27u; s83++) {
                             u64 ma83[128];
                             i32 rc83 = -999;
                             if (s83 == 20u) {
-                                C2B_LOGS("[c2b] g84 walk slot=20 SKIP (ListenSocket-recv, lock-hog)\n");
+                                C2B_LOGS("[c2b] g85 walk slot=20 SKIP (ListenSocket-recv, lock-hog)\n");
                                 continue;
                             }
                             if ((uptr)vt7[s83] < 0x1000u) {
-                                C2B_LOGS("[c2b] g84 walk slot="); C2B_LOGN(s83);
+                                C2B_LOGS("[c2b] g85 walk slot="); C2B_LOGN(s83);
                                 C2B_LOGS(" SKIP (ptr<0x1000)\n");
                                 continue;
                             }
@@ -12191,7 +12197,7 @@ static void c2b_g32_drive(void)
                                 rc83 = -998;         /* фолт слота */
                             }
                             g_probe_active = 0;
-                            C2B_LOGS("[c2b] g84 walk slot="); C2B_LOGN(s83);
+                            C2B_LOGS("[c2b] g85 walk slot="); C2B_LOGN(s83);
                             C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc83);
                             C2B_LOGS(" ma0=");
                             C2B_LOGH((u32)(ma83[0] >> 32));
@@ -12201,7 +12207,7 @@ static void c2b_g32_drive(void)
                                 /* правдоподобный heap-ptr = кандидат-приёмник */
                                 if (c2b_g71_dumpmsg((void *)ma83[0]) == 0) {
                                     g_gns_walk_slot = s83;
-                                    C2B_LOGS("[c2b] g84: RX SLOT FOUND=");
+                                    C2B_LOGS("[c2b] g85: RX SLOT FOUND=");
                                     C2B_LOGN(s83);
                                     C2B_LOGS(" — drain-poll 100s now\n");
                                     c2b_g84_pollslot(vt7, ciface, ch7, s83, 100u * 5u);
@@ -12220,7 +12226,7 @@ static void c2b_g32_drive(void)
                                 g_probe_active = 0;
                                 if (rc84 > 0 && rc84 <= 4351) {
                                     u32 off, e84 = (u32)rc84;
-                                    C2B_LOGS("[c2b] g84 STATUS slot="); C2B_LOGN(s83);
+                                    C2B_LOGS("[c2b] g85 STATUS slot="); C2B_LOGN(s83);
                                     C2B_LOGS(" len="); C2B_LOGN(e84);
                                     C2B_LOGS("\n");
                                     g_gns_stbuf[e84] = 0;
@@ -12234,7 +12240,7 @@ static void c2b_g32_drive(void)
                                         g_gns_stbuf[off + cl] = sv;
                                     }
                                 } else {
-                                    C2B_LOGS("[c2b] g84 STATUS slot="); C2B_LOGN(s83);
+                                    C2B_LOGS("[c2b] g85 STATUS slot="); C2B_LOGN(s83);
                                     C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc84);
                                     C2B_LOGS(" (no text)\n");
                                 }
@@ -12243,6 +12249,13 @@ static void c2b_g32_drive(void)
                              * граница карты/фолт — сигнатуры для карты */
                         }
                     }
+                }
+                if (rx_slot >= 0) {
+                    /* g85: полл ВСЕГДА полный 240с (поход = до полла, под
+                     * гейтом знака; находка похода уже отработана доливом) */
+                    c2b_g84_pollslot(vt7, ciface, ch7, (u32)rx_slot, 240u * 5u);
+                } else {
+                    C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");
                 }
             }
         }

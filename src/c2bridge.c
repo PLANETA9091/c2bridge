@@ -14200,8 +14200,17 @@ static void *c2b_g90_thread(void *arg)
     (void)arg;
     {
         const char *e = getenv("C2B_G90");
-        if (e && e[0] == '0') {
-            C2B_LOGS("[c2b] g90: disabled by env\n");
+        /* 58f-g99v4 (run264-урок): DEFAULT FLIP. Raw-S1 'k' in-channel = THE
+         * death trigger: run258 = 0x24 parse-error 0.19s после доставки 'k';
+         * run262/264 = 'k' rc=1 -> сессия мертва (тапы/пробы ни при чём —
+         * в 264 тапов НЕТ вообще, смерть всё равно); run260 = БЕЗ 'k' = сессия
+         * жива 20+s + PASS. Milestone #10 ('k'-материализация) = отработан;
+         * релей = антагонист живой сессии. Default = OFF; C2B_G90=1 = явный
+         * откат (легаси-'k'-путь для RE). */
+        if (!e || e[0] == '0') {
+            C2B_LOGS("[c2b] g90: 'k' in-channel relay DISABLED (default; "
+                     "C2B_G90=1 to restore) — raw S1 'k' = the S2 parse-error "
+                     "death (runs 258/262/264)\n");
             return (void *)0;
         }
     }

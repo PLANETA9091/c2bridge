@@ -823,6 +823,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     if grep -aqiE 'Connected\(|Signing up to server|Connected to' "$OUT" 2>/dev/null \
        || sudo -n grep -aqiE 'Connected\(|Signing up to server|Connected to' "$CONLOG" 2>/dev/null; then
       CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"
+      # g108: THE SDR-socket owner at the LIVE moment — the runs 297-304
+      # chain: the pcap source socket = invisible in the game's /proc/net/udp
+      # view and the in-game w2 scan = never ran during the live session
+      # (the verdict kill = seconds after the marker, the 6s cadence = 0-1
+      # ticks). ss -upan = root = ALL udp sockets + the owner pids.
+      TPORT="${TARGET##*:}"
+      sudo -n ss -upan 2>/dev/null | grep -aE ":28022 |:$TPORT " \
+        > "$RUNDIR/sdr_sockets.txt" 2>/dev/null || true
+      sudo -n ss -upan 2>/dev/null > "$RUNDIR/ss_udp_all.txt" 2>/dev/null || true
+      log "attempt $ATTEMPT: sdr sockets: $(grep -ac . "$RUNDIR/sdr_sockets.txt" 2>/dev/null) lines; first: $(head -1 "$RUNDIR/sdr_sockets.txt" 2>/dev/null | cut -c1-120)"
+      sudo -n cat /proc/net/nf_conntrack 2>/dev/null \
+        | grep -aE "udp.*28022|udp.*$TPORT" | head -10 \
+        > "$RUNDIR/sdr_conntrack.txt" 2>/dev/null || true
+      sudo -n sh -c 'for p in $(pgrep -f "a2s_relay|relay.py" 2>/dev/null | head -3); do echo "== pid $p =="; cat /proc/$p/cmdline 2>/dev/null | tr "\0" " "; echo; done' > "$RUNDIR/relay_probe.txt" 2>/dev/null || true
       # g94: post-marker dwell — the longevity + signon-progress window
       if (( POST_DWELL > 0 )); then
         DEND=$((SECONDS + POST_DWELL))

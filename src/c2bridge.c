@@ -14637,14 +14637,16 @@ static i32 c2b_g100_deadline(void)
     return 0;
 }
 
-/* скан одного региона (прямыми 256KB-чанками под SEGV-гвардом) */
-static void c2b_g100_scan_range(uptr lo, uptr hi, u32 *hits,
+/* скан одного диапазона (pread 256KB-чанками; run266/268-урок: прямые
+ * чтения = фолты = mmap_sem-голодание на пике загрузки движка; pread =
+ * паттерн g24 (2.4GB OK), работает на IDLE-фазе) */
+static void c2b_g100_scan_range(i32 fdm, uptr lo, uptr hi, u32 *hits,
                                 long long *scanned)
 {
     uptr a = lo;
     while (a < hi && *hits < 32) {
         uptr want = hi - a;
-        uptr got;
+        i64 got;
         u64 off;
         if (c2b_g100_deadline()) {
             c2b_g100_out = 1;
@@ -14653,16 +14655,9 @@ static void c2b_g100_scan_range(uptr lo, uptr hi, u32 *hits,
         if (want > sizeof(c2b_g100_buf)) want = sizeof(c2b_g100_buf);
         if (want > ((uptr)256 << 10)) want = (uptr)256 << 10;
         *scanned += (long long)want;
-        g_probe_active = 1;
-        if (__sigsetjmp(g_probe_jb, 1) == 0) {
-            memcpy(c2b_g100_buf, (const void *)a, want);
-            got = want;
-        } else {
-            got = 0;                    /* фолт = unmapped — скип региона */
-        }
-        g_probe_active = 0;
-        if (got == 0) return;
-        for (off = 512; off + 64 <= got; off += 4) {
+        got = pread(fdm, c2b_g100_buf, want, (i64)a);
+        if (got <= 0) return;
+        for (off = 512; off + 64 <= (u64)got; off += 4) {
             const u32 *w = (const u32 *)(c2b_g100_buf + off);
             u32 t = (w[7] << 8) | (w[7] >> 24);   /* RotWord */
             u32 s8 = c2b_g100_subw(t) ^ 0x01000000u;
@@ -14690,14 +14685,14 @@ static void c2b_g100_scan_range(uptr lo, uptr hi, u32 *hits,
                 C2B_LOGS(" win=");
                 s2 = off >= 512 ? off - 512 : 0;
                 en = off + 512;
-                if (en > got) en = got;
+                if (en > (u64)got) en = (u64)got;
                 c2b_g100_hexs(c2b_g100_buf + s2, (u32)(en - s2));
                 C2B_LOGS("\n");
                 (*hits)++;
                 if (*hits >= 32) break;
             }
         }
-        if (got < want) return;
+        if ((u64)got < (u64)want) return;
         a += got - 1024;      /* перекрытие чанков (расписания на границе) */
     }
 }
@@ -14707,15 +14702,16 @@ static void c2b_g100_scan(void)
     extern i32 open(const char *, i32, ...);
     extern i32 close(i32);
     extern i64 read(i32, void *, u64);
-    /* run267-урок: 25с не хватило (time budget out @hits=0) и кап региона
-     * 256MB скипнул tcmalloc-арены (там EVP-контексты). v3: ДВЕ ПРОХОДКИ —
-     * сперва малые регионы <=16MB (вероятные арены аллокатора), потом все
-     * остальные <=1GB; потолок 45с wall-clock; в конце лог скачанного MB. */
+    /* v4 (run268-урок): и direct-read v3 застрял — фолты = тот же mmap_sem
+     * на пике загрузки. pread + LATE-плейсмент: после g98-watch + 12с сна
+     * (t+45, dwell-фаза, движок idle), потолок 20с -> done к t+65 < t+75
+     * (гибель клиента). Две проходки: малые <=16MB, потом <=1GB. */
     static char mp[262144];
     i64 n = 0;
     u32 hits = 0;
     long long scanned = 0;
     char *p, *e;
+    i32 fdm;
     struct { i64 s, n; } ts0;
     {
         const char *e100 = getenv("C2B_G100");
@@ -14742,6 +14738,11 @@ static void c2b_g100_scan(void)
         return;
     }
     mp[n] = 0;
+    fdm = open("/proc/self/mem", 0);
+    if (fdm < 0) {
+        C2B_LOGS("[c2b] g100: no mem\n");
+        return;
+    }
     clock_gettime(1, &ts0);
     c2b_g100_t0s = ts0.s;
     c2b_g100_t0n = ts0.n;
@@ -14785,7 +14786,7 @@ static void c2b_g100_scan(void)
         if (p < e) p++;
         if (!wr || hi <= lo) continue;
         if (hi - lo > ((uptr)16 << 20)) continue;
-        c2b_g100_scan_range(lo, hi, &hits, &scanned);
+        c2b_g100_scan_range(fdm, lo, hi, &hits, &scanned);
         (void)ls;
     }
     /* проход 2: остальные (<=1GB) с начала списка */
@@ -14824,9 +14825,10 @@ static void c2b_g100_scan(void)
             if (p < e) p++;
             if (!wr || hi <= lo) continue;
             if (hi - lo > ((uptr)1024 << 20)) continue;
-            c2b_g100_scan_range(lo, hi, &hits, &scanned);
+            c2b_g100_scan_range(fdm, lo, hi, &hits, &scanned);
         }
     }
+    close(fdm);
     C2B_LOGS("[c2b] g100: scan done hits=");
     C2B_LOGN(hits);
     C2B_LOGS(" mb=");
@@ -14871,10 +14873,6 @@ static void *c2b_g98_thread(void *arg)
     C2B_LOGS(" msg=");
     C2B_LOGN(msg);
     C2B_LOGS("\n");
-    /* 59f-g100v2: скан расписаний AES-256 СРАЗУ после арма (ключи SNS-
-     * сессии валидны; run266-урок: скан в КОНЦЕ = pread/mmap_sem starvation
-     * застрял и съел хвост лога). Прямое чтение под гвардом + 25с потолок. */
-    c2b_g100_scan();
     usleep(3000000);      /* 3s: the engine finishes the 0x20-0x23 handshake */
     {
         u32 g99_on = 1;
@@ -14981,6 +14979,11 @@ static void *c2b_g98_thread(void *arg)
             }
         }
     }
+    /* 59f-g100v4: скан расписаний AES-256 в LATE-фазе (t+45, dwell-idle):
+     * pread-паттерн g24 + потолок 20с (run266/268: скан на пике загрузки =
+     * mmap_sem-голодание = застрял и съел хвост лога). */
+    usleep(12000000);
+    c2b_g100_scan();
     return (void *)0;
 }
 

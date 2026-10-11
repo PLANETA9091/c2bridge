@@ -13858,29 +13858,34 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 }
                 return (ssize_t)len;               /* дроп без отправки */
             }
-            /* 58f-g96a: КАНАЛЬНЫЕ датаграммы движка к :28022 (post-accept
-             * signon-попытки). run255-факты: сервер (РЕАЛЬНЫЙ, pcap-подтвер-
-             * ждено) шлёт legacy 'A'/'B' на raw-UDP 28022, движок доходит до
-             * cstate=2, НО после win-пути шлёт канал-датаграммы (S1-фрейминг)
-             * НАПРЯМУЮ в raw — сервер молча роняет -> таймаут -> retry-'k'.
-             * Дамп контента = сырьё для оффлайн-RE фрейминга (translate-
-             * трек). Rate-limit 1/8, только не-connectionless, только порт
-             * 28022 (BE 6d 76 @ sockaddr+2). */
-            if (p && (i32)len >= 8 &&
+            /* 58f-g98a (run259-урок): КАНАЛЬНЫЕ датаграммы движка — ЛЮБОЙ dst
+             * (run255-эра: raw :28022; текущая: loopback 127.0.0.1:27005 —
+             * g96a-фильтр порта = СЛЕПЫЙ к основному потоку). ПОЛНЫЙ hex до
+             * 400B (лимит лог-строки 4096) = сырьё S1-фрейм-RE: аплинк-
+             * сигнон-стрим движка (SNM t=15 LoadingProgress / t=6 SetConVar /
+             * t=7 SignonState — run259: ВСЁ ушло в канал) + ретрай-'k'-эра.
+             * Rate 1/8, кап 480 счётчик (60 дампах). */
+            if (p && (i32)len >= 4 &&
                 !(p[0] == 0xff && p[1] == 0xff && p[2] == 0xff && p[3] == 0xff) &&
-                addr && addrlen >= 4 &&
-                ((const u8 *)addr)[2] == 0x6d && ((const u8 *)addr)[3] == 0x76) {
-                static volatile u32 n96;
-                u32 c96 = ++n96;
-                if ((c96 & 0x07) == 1) {
-                        u32 k96;
-                        C2B_LOGS("[c2b] g96: chn-send #");
-                        C2B_LOGN(c96);
+                addr && addrlen >= 4) {
+                static volatile u32 n98;
+                u32 c98 = ++n98;
+                if ((c98 & 0x07) == 1 && c98 <= 480) {
+                        u32 k98, h98 = (u32)len;
+                        const u8 *ad98 = (const u8 *)addr;
+                        C2B_LOGS("[c2b] g98: chn-send #");
+                        C2B_LOGN(c98);
                         C2B_LOGS(" len=");
                         C2B_LOGN((u32)len);
-                        C2B_LOGS(" head=");
-                        for (k96 = 0; k96 < 24 && (u32)k96 < (u32)len; k96++)
-                                C2B_LOGH(p[k96]);
+                        C2B_LOGS(" dst=");
+                        C2B_LOGH(((u32)ad98[4] << 24) | ((u32)ad98[5] << 16) |
+                                 ((u32)ad98[6] << 8) | (u32)ad98[7]);
+                        C2B_LOGS(":");
+                        C2B_LOGN(((u32)ad98[2] << 8) | (u32)ad98[3]);
+                        C2B_LOGS(" hex=");
+                        if (h98 > 400) h98 = 400;
+                        for (k98 = 0; k98 < h98; k98++)
+                                C2B_LOGH(p[k98]);
                         C2B_LOGS("\n");
                 }
             }
@@ -14340,6 +14345,184 @@ static void *c2b_g90_thread(void *arg)
         C2B_LOGN((u32)(i32)rc9);
         C2B_LOGS("\n");
         if (rc9 == 1) g_kfull_rel++;
+    }
+    return (void *)0;
+}
+
+/* ---------- 58f-g98: S2 in-channel frame bisect (thread, one shot per session) ----------
+ * run258-pcap DECODE: the server's game layer = the S2 protobuf NetMessage parser;
+ * the raw S1-'k' in-channel = NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR (0xFFF) 0.05s
+ * after the delivery; the ENGINE's own 51B seq-2 hello (t=0.559) = TOLERATED (the
+ * GNS-lib C2S_CONNECT = the SDR layer, not the game layer). The S2 game frame =
+ * the last unknown. CANDIDATES (the bisect): FRM=0 [1B type][4B LE size][body]
+ * (the S1/demo family), FRM=1 [1B type][varint size][body] (== [varint type]
+ * [varint size] for the small values; the FRM=2 alias), FRM=3 [1B type][body]
+ * (flat — the s2s1 um-tables "CS2-плоский wire [N][payload]" form).
+ * MSG=0 type=7 net_SignonState body 08 02 (state=2 CONNECTED; the S1/S2 field-map
+ * g_renum_7 = identity 1..4 -> the body asis-valid). MSG=1 type=8 net_ClientInfo
+ * candidate, EMPTY body (the empty proto = always parseable -> the pure
+ * frame+type acceptance test). MECHANICS: 3s post-arm, probe #1; the session
+ * state (slot 3 conninfo) 1s-поллинг; state==2 @8s -> probe #2 (the alternate
+ * MSG, the same FRM) = the (frame,msg) pair per session; the exit-from-state-2
+ * = the server's reaction moment (the verdict = the g97 end-debug + the pcap:
+ * the parse-error vs the silence vs the response). The g90 'k' relay = UNTOUCHED
+ * (the PASS baseline 8/8). Killswitch C2B_G98=0; FRM = C2B_G98_FRM (0/1/3),
+ * MSG = C2B_G98_MSG (0/1). */
+static i32 c2b_g98_send_probe(u32 msg, u32 frm, u32 idx)
+{
+    u8 hdr[8], body[8], pkt[16];
+    u32 hlen = 0, blen = 0, mtype = 0, plen = 0, i;
+    void **vt;
+    i32 rc = -999;
+    i64 out = -1;
+    u32 send_slot;
+    if (!g_gns_conn_h || !g_gns_conn_iface) return -999;
+    vt = *(void ***)g_gns_conn_iface;
+    if (!vt) return -999;
+    if (msg == 1) {
+        mtype = 8;                              /* net_ClientInfo, empty body */
+        blen = 0;
+    } else {
+        mtype = 7;                              /* net_SignonState {state=2} */
+        body[0] = 0x08; body[1] = 0x02;
+        blen = 2;
+    }
+    if (frm == 0) {
+        hdr[0] = (u8)mtype;
+        hdr[1] = (u8)(blen & 0xff);
+        hdr[2] = (u8)((blen >> 8) & 0xff);
+        hdr[3] = (u8)((blen >> 16) & 0xff);
+        hdr[4] = (u8)((blen >> 24) & 0xff);
+        hlen = 5;
+    } else if (frm == 1) {
+        hdr[0] = (u8)mtype;
+        hdr[1] = (u8)blen;                      /* varint (blen <= 127) */
+        hlen = 2;
+    } else {
+        hdr[0] = (u8)mtype;                     /* flat [N][payload] */
+        hlen = 1;
+    }
+    for (i = 0; i < hlen; i++) pkt[plen++] = hdr[i];
+    for (i = 0; i < blen; i++) pkt[plen++] = body[i];
+    send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
+    C2B_LOGS("[c2b] g98: probe #");
+    C2B_LOGN(idx);
+    C2B_LOGS(" frm=");
+    C2B_LOGN(frm);
+    C2B_LOGS(" msg=");
+    C2B_LOGN(msg);
+    C2B_LOGS(" type=");
+    C2B_LOGN(mtype);
+    C2B_LOGS(" hex=");
+    for (i = 0; i < plen; i++) C2B_LOGH(pkt[i]);
+    C2B_LOGS("\n");
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt[send_slot])(
+            g_gns_conn_iface, g_gns_conn_h, pkt, plen, 1, &out);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] g98: SendMessageToConnection SEGV\n");
+        return -998;
+    }
+    C2B_LOGS("[c2b] g98: probe rc=");
+    C2B_LOGN((u32)(i32)rc);
+    C2B_LOGS(" slot=");
+    C2B_LOGN(send_slot);
+    C2B_LOGS("\n");
+    return rc;
+}
+
+static void *c2b_g98_thread(void *arg)
+{
+    u32 it, frm = 0, msg = 0;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G98");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g98: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    {
+        const char *e = getenv("C2B_G98_FRM");
+        if (e && e[0] >= '0' && e[0] <= '9') frm = (u32)(e[0] - '0');
+        if (frm == 2) frm = 1;                  /* the alias */
+        if (frm > 3) frm = 0;
+    }
+    {
+        const char *e = getenv("C2B_G98_MSG");
+        if (e && (e[0] == '0' || e[0] == '1')) msg = (u32)(e[0] - '0');
+    }
+    for (it = 0; it < 600; it++) {
+        if (g_gns_conn_h && g_gns_conn_iface) break;
+        usleep(500000);
+    }
+    if (!g_gns_conn_h || !g_gns_conn_iface) {
+        C2B_LOGS("[c2b] g98: no session in 5min — exit\n");
+        return (void *)0;
+    }
+    C2B_LOGS("[c2b] g98: armed h=");
+    C2B_LOGH((u32)g_gns_conn_h);
+    C2B_LOGS(" frm=");
+    C2B_LOGN(frm);
+    C2B_LOGS(" msg=");
+    C2B_LOGN(msg);
+    C2B_LOGS("\n");
+    usleep(3000000);      /* 3s: the engine finishes the 0x20-0x23 handshake */
+    {
+        i32 rc1 = c2b_g98_send_probe(msg, frm, 1);
+        u32 w8, alt = msg ^ 1u, fired2 = 0;
+        (void)rc1;
+        for (w8 = 0; w8 < 31; w8++) {
+            u8 ma96[256];
+            i32 rc96 = -999;
+            u32 j96, st96 = 0xFFFFFFFFu;
+            usleep(1000000);
+            if (!g_gns_conn_h || !g_gns_conn_iface) break;
+            for (j96 = 0; j96 < sizeof ma96; j96++) ma96[j96] = 0;
+            {
+                void **vt96 = *(void ***)g_gns_conn_iface;
+                if (!vt96) break;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    rc96 = ((i32 (*)(void *, uptr, void *))vt96[3])(
+                        g_gns_conn_iface, g_gns_conn_h, ma96);
+                } else {
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] g98: conninfo SEGV\n");
+                    break;
+                }
+                g_probe_active = 0;
+            }
+            if (rc96 == 1) {
+                st96 = (u32)ma96[0] | ((u32)ma96[1] << 8) |
+                       ((u32)ma96[2] << 16) | ((u32)ma96[3] << 24);
+            }
+            if (w8 == 0 || w8 == 4 || w8 == 7 || w8 == 11 || w8 == 19 ||
+                w8 == 29 || rc96 != 1 || st96 != 2u) {
+                C2B_LOGS("[c2b] g98: t+");
+                C2B_LOGN(w8 + 1);
+                C2B_LOGS("s conninfo rc=");
+                C2B_LOGN((u32)(i32)rc96);
+                C2B_LOGS(" state=");
+                C2B_LOGN(st96);
+                C2B_LOGS("\n");
+            }
+            if (rc96 != 1 || (st96 != 2u && st96 != 0xFFFFFFFFu)) {
+                C2B_LOGS("[c2b] g98: session reaction at t+");
+                C2B_LOGN(w8 + 1);
+                C2B_LOGS("s (state=");
+                C2B_LOGN(st96);
+                C2B_LOGS(") — verdict via g97 end-debug + pcap\n");
+                break;
+            }
+            if (w8 == 7 && !fired2) {
+                fired2 = 1;
+                (void)c2b_g98_send_probe(alt, frm, 2);
+            }
+        }
     }
     return (void *)0;
 }
@@ -15991,6 +16174,10 @@ i32 c2b_main(void)
     {   /* 58f-g97: вотчер закрытия GNS-сессии (end-reason/end-debug) */
         void *t97 = 0;
         pthread_create(&t97, 0, c2b_g97_thread, 0);
+    }
+    {   /* 58f-g98: S2 in-channel frame bisect (one shot per session) */
+        void *t98 = 0;
+        pthread_create(&t98, 0, c2b_g98_thread, 0);
     }
 #endif
     r = c2b_try_install();

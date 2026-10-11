@@ -14859,7 +14859,7 @@ static void c2b_g100_scan(void)
     C2B_LOGN(nfl[0]);
     C2B_LOGS("\n");
     /* 2. BFS глубиной 3 с dedup */
-    for (depth = 0; depth < 4 && hits < 32 && !c2b_g100_out; depth++) {
+    for (depth = 0; depth < 6 && hits < 32 && !c2b_g100_out; depth++) {
         u32 cur = depth & 1, nxt = cur ^ 1;
         u32 i;
         nfl[nxt] = 0;
@@ -14876,6 +14876,29 @@ static void c2b_g100_scan(void)
             if (got <= 0) { fails++; continue; }
             if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, a, &hits))
                 break;
+            /* v9: handle-фильтр — GNS кладёт хэндл внутрь узлов карты и
+             * connection-объекта (m_hSelf); фронтир = ТОЛЬКО содержащие
+             * хэндл -> путь к контекстам = короткий и точный. */
+            {
+                u8 hb[4];
+                u32 hx, hfound = 0;
+                u32 hv = (u32)g_gns_conn_h;
+                hb[0] = (u8)hv; hb[1] = (u8)(hv >> 8);
+                hb[2] = (u8)(hv >> 16); hb[3] = (u8)(hv >> 24);
+                if (hv && (u32)got >= 4) {
+                    for (hx = 0; hx + 4 <= (u32)got; hx += 4) {
+                        if (c2b_g100_obj[hx] == hb[0] &&
+                            c2b_g100_obj[hx + 1] == hb[1] &&
+                            c2b_g100_obj[hx + 2] == hb[2] &&
+                            c2b_g100_obj[hx + 3] == hb[3]) {
+                            hfound = 1;
+                            break;
+                        }
+                    }
+                }
+                if (depth > 0 && !hfound) continue;   /* не наш путь */
+                if (!hfound && depth >= 1) continue;
+            }
             if (depth < 3) {
                 /* v8d (run275-урок): seen() на ПУШЕ схлопывал обход — граф
                  * плотный (узлы ссылаются друг на друга), пуш-маркировка

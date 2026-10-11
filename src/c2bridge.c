@@ -6476,6 +6476,9 @@ static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен п
 static u8  g_segv_foreign_logged; /* 58f-g77: last-gasp латч — ОДНОКРАТНЫЙ
                                * дамп RIP чужого (либового) фолта */
 static volatile u8 g92_rescued;   /* 58f-g92: one-shot лог спасения sig-1 */
+static volatile u8 g93_rescued;   /* 58f-g93: one-shot лог спасения death-2 */
+static const volatile u8 g93_nul; /* 58f-g93: статический NUL-байт — курсор
+                               * CRC-цикла после ремонта death-2 (rbx := сюда) */
 static volatile uptr g_true_empty_rep; /* 58f-g92: истинный &_S_empty_rep
                                * libstdc++ (dlsym в инсталляторе хэндлера) */
 static volatile uptr g_lg_lo, g_lg_hi; /* 58f-g90a: регион фолта из maps */
@@ -6515,6 +6518,34 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                 C2B_LOGH((u32)(rip92 >> 32));
                 C2B_LOGH((u32)rip92);
                 C2B_LOGS("\n");
+            }
+        }
+    }
+    /* 58f-g93: death-2 RESCUE (runs 243/245/246/247/252: rip = vstdlib-стринг-CRC
+     * @+0x25606, insn = movzx edi,byte[rbx] = 0f b6 3b, rbx=NULL (rdi=0 — геттер
+     * слота 7 вернул NULL, CRC-keyed sorted insert без null-чека), addr=0,
+     * rdx=0x1e40. РЕМОНТ: RBX := &g93_nul (статический нулевой байт) ->
+     * sigreturn реэзекьютит ТОТ ЖЕ RIP с починенным RBX -> байт = 0 ->
+     * test eax,eax -> выход из цикла -> CRC("") = бенигн-хэш, процесс ЖИВ.
+     * Сигнатур = БАЙТ-ПАТТЕРН insn @rip (маппинг-независимо: и файловый
+     * libvstdlib_client.so (run247), и anon-блоб среза (run252)).
+     * Патч ДО last-gasp дампа: дамп покажет POST-PATCH регистры = proof. */
+    if (uc) {
+        volatile uptr *gr93 = (volatile uptr *)((u8 *)uc + 0x28);
+        uptr rip93 = gr93[16], rbx93 = gr93[11], rdi93 = gr93[8];
+        if (rbx93 == 0 && rdi93 == 0 && si &&
+            *(const volatile uptr *)((const u8 *)si + 0x10) == 0) {
+            const volatile u8 *ip93 = (const volatile u8 *)rip93;
+            if (ip93[0] == 0x0f && ip93[1] == 0xb6 && ip93[2] == 0x3b) {
+                gr93[11] = (uptr)(unsigned long)&g93_nul;
+                if (!g93_rescued) {
+                    g93_rescued = 1;
+                    C2B_LOGS("[c2b] g93: death-2 RESCUED (CRC NULL-string) "
+                             "rip=0x");
+                    C2B_LOGH((u32)(rip93 >> 32));
+                    C2B_LOGH((u32)rip93);
+                    C2B_LOGS("\n");
+                }
             }
         }
     }

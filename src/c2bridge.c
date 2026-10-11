@@ -11161,22 +11161,29 @@ static u32 g_kcap_len;
 static u32 g_kcap_n;
 
 #ifndef C2B_SELFTEST
-/* 58f-g81: ReceiveMessages DETOUR (vtable slot 13). Эмпирика run222-234:
- * слот 11 = Send (g76 работает), слот 12 = rc=0 ВСЕГДА (полл rxn=0 вечность)
- * = Flush, НЕ Receive — карта ЭТОГО билда СДВИНУТА +1 vs SDK-008
- * (10=?, 11=Send, 12=Flush, 13=ReceiveMessagesOnConnection). run234: либа
- * ЧИТАЕТ сессионные данные (fd 0x58, g77-тап), но полл по 12 пуст. Детур =
- * passthrough + дамп ВСЕХ возвращённых сообщений = каптур расшифрованного
- * in-channel протокола НЕЗАВИСИМО от дрейнера (наш полл или собственный
- * насос движка — инстанс либы один = vtable общая). Установка =
- * mprotect+патч vtable ифейса (один раз, идемпотентно), киллисвитч C2B_G81=0. */
+/* 58f-g82: ReceiveMessages DETOUR (vtable slot 12 — ИСПРАВЛЕННАЯ карта).
+ * run235 (g81) эмпирика: слот 13 = rc=1 + ma[0]=0 = GetConnectionInfo
+ * (детур не стрелял — pMsgs[0]=0 скип), слот 12 = rc=0 всегда.
+ * ИТОГ: карта = SDK-009 (10=Send, 11=Flush, 12=Receive, 13=GetInfo),
+ * приёмный слот = 12, очередь ПУСТАЯ несмотря на чтение проводных данных
+ * (run234: 77B-ответ в тапе на fd 0x58). Детур на 12 = passthrough +
+ * g15-note ВЫЗЫВАЮЩЕГО (ra = мост/движок/либа — КТО дрейнит) + лог ВСЕХ
+ * rc!=0 + дамп сообщений. Киллисвитч C2B_G81=0 (общий с g81). */
 static void *g_clp_orig_recv13;
 static u32 g_gns_rxdet_n;
 static i32 c2b_g71_dumpmsg(void *mp); /* fwd (тело ниже, g71b) */
+static void c2b_g15_note(uptr ra, const char *tag); /* fwd (тело в interposes) */
 static i32 c2b_g81_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
 {
-    i32 rc = ((i32 (*)(void *, uptr, void **, i32))g_clp_orig_recv13)(
+    i32 rc;
+    c2b_g15_note((uptr)__builtin_return_address(0), "R12 ");
+    rc = ((i32 (*)(void *, uptr, void **, i32))g_clp_orig_recv13)(
         self, connH, pMsgs, nMax);
+    if (rc != 0) {
+        C2B_LOGS("[c2b] g82 recv12 rc="); C2B_LOGN((u32)rc);
+        C2B_LOGS(" conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
+        C2B_LOGS("\n");
+    }
     if (rc > 0 && pMsgs) {
         i32 k81;
         for (k81 = 0; k81 < rc && k81 < 8; k81++) {
@@ -11810,21 +11817,21 @@ static void c2b_g32_drive(void)
             g_gns_conn_iface = iface;
             g_gns_conn_h = h;
             g_gns_conn_ver = vi;
-            /* 58f-g81: ДЕТУР ReceiveMessages (слот 13) — каптур расшифрованных
-             * сообщений независимо от дрейнера; карта слотов = сдвинута
-             * (11=Send, 12=Flush, 13=Receive — см. коммент у детура) */
+            /* 58f-g82: ДЕТУР ReceiveMessages (слот 12 — ИСПРАВЛЕННАЯ карта:
+             * 13=GetInfo rc=1+ma[0]=0 в run235, 12=Receive). ra-нот вызова =
+             * кто дрейнит очередь; rc!=0 = всегда в лог */
             {
                 const char *e81 = getenv("C2B_G81");
                 if (e81 && e81[0] == '0') {
                     C2B_LOGS("[c2b] g81: disabled (C2B_G81=0)\n");
                 } else {
                     void **vt81 = *(void ***)iface;
-                    if (vt81[13] == (void *)&c2b_g81_recv_detour) {
+                    if (vt81[12] == (void *)&c2b_g81_recv_detour) {
                         C2B_LOGS("[c2b] g81: already armed\n");
-                    } else if (c2b_page_protect((uptr)&vt81[13], 8, 0x07) == 0) {
-                        g_clp_orig_recv13 = vt81[13];
-                        vt81[13] = (void *)&c2b_g81_recv_detour;
-                        C2B_LOGS("[c2b] g81: slot 13 DETOURED orig=0x");
+                    } else if (c2b_page_protect((uptr)&vt81[12], 8, 0x07) == 0) {
+                        g_clp_orig_recv13 = vt81[12];
+                        vt81[12] = (void *)&c2b_g81_recv_detour;
+                        C2B_LOGS("[c2b] g82: slot 12 (Receive) DETOURED orig=0x");
                         C2B_LOGH((u32)((uptr)g_clp_orig_recv13 >> 32));
                         C2B_LOGH((u32)(uptr)g_clp_orig_recv13);
                         C2B_LOGS("\n");
@@ -12016,13 +12023,12 @@ static void c2b_g32_drive(void)
              * rc>0+валидный дамп = приёмник; rc==0 = пустая очередь —
              * поллим на нём (сервер молчит до первого байта клиента —
              * C2S_CONNECT, следующий раунд). rc<0/фолт = слот не тот. */
-            /* g81: КАРТА СЛОТОВ СДВИНУТА (run222-234 эмпирика): 11=Send
-             * (g76 доставляет), 12=Flush (rc=0 всегда = ложный 'empty-queue'),
-             * 13=ReceiveMessagesOnConnection. Кандидаты теперь {13, 12}:
-             * rc>0+дамп = приёмник; rc==0 = пустая очередь/флаш.
-             * Слот 11 УБРАН из кандидатов (g71b-урок: это Send — крэш). */
-            cs[0] = 13u;
-            cs[1] = 12u;
+            /* g82: карта = SDK-009 (run235 эмпирика): 10=Send (g76),
+             * 11=Flush, 12=ReceiveMessagesOnConnection, 13=GetConnectionInfo
+             * (rc=1 + ma[0]=0). Кандидаты {12, 13}: rc>0+дамп = приёмник;
+             * rc==0 = пустая очередь. Слот 11 УБРАН (g71b: Send — крэш). */
+            cs[0] = 12u;
+            cs[1] = 13u;
             /* g71c→g74a: зонд/полл теперь ВКЛЮЧЁН ПО УМОЛЧАНИЮ (run227:
              * сессия жива после g73 — полл = наблюдатель in-channel
              * протокола; runs 223/224 A/B доказали безопасность полла,

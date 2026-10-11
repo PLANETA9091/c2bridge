@@ -12077,6 +12077,61 @@ static void c2b_g32_drive(void)
                     }
                     /* rc7 < 0 / фолт -> следующий кандидат */
                 }
+                /* 58f-g83: ПОХОД ПО СЛОТАМ 14..20 (ма-безопасные 4-арг пробы).
+                 * run236 вывод: Receive(12) дрейнят ТОЛЬКО два НАШИХ call-site
+                 * (g15-note: rva=0x25ca4/0x26bb4), rc=0 всегда — очередь
+                 * никогда не наполняется (стена ВНУТРИ либы). Модель (a):
+                 * приёмник = слот >= 14 в приватной карте (в открытом SDK-009
+                 * 14..17 = GetQuickConnectionStatus/GetDetailedConnectionStatus/
+                 * GetListenSocketInfo/CreateSocketPair — геттеры, ма-безопасные
+                 * при 1КБ ma). Сигнатура каждой пробы = rc + ma[0] (+ дамп под
+                 * гардой при rc>0+ma[0]); rc>0+валидный дамп = КАНДИДАТ-
+                 * ПРИЁМНИК -> слот полла ПЕРЕЗАПИСЫВАЕТСЯ (сообщения пойдут!).
+                 * rc<0 = код конца (сигнатура границы карты). 150мс пауза.
+                 * Киллисвитч C2B_G83=0. */
+                {
+                    const char *e83 = getenv("C2B_G83");
+                    if (e83 && e83[0] == '0') {
+                        C2B_LOGS("[c2b] g83: walk disabled (C2B_G83=0)\n");
+                    } else {
+                        u32 s83;
+                        for (s83 = 14u; s83 <= 20u; s83++) {
+                            u64 ma83[128];
+                            i32 rc83 = -999;
+                            if ((uptr)vt7[s83] < 0x1000u) {
+                                C2B_LOGS("[c2b] g83 walk slot="); C2B_LOGN(s83);
+                                C2B_LOGS(" SKIP (ptr<0x1000)\n");
+                                continue;
+                            }
+                            ma83[0] = 0;
+                            usleep(150000);
+                            g_probe_active = 1;
+                            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                                rc83 = ((i32 (*)(void *, uptr, void **, i32))vt7[s83])(
+                                    ciface, ch7, (void **)ma83, 1);
+                            } else {
+                                rc83 = -998;         /* фолт слота */
+                            }
+                            g_probe_active = 0;
+                            C2B_LOGS("[c2b] g83 walk slot="); C2B_LOGN(s83);
+                            C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc83);
+                            C2B_LOGS(" ma0=");
+                            C2B_LOGH((u32)(ma83[0] >> 32));
+                            C2B_LOGH((u32)(ma83[0] & 0xffffffffu));
+                            C2B_LOGS("\n");
+                            if (rc83 > 0 && ma83[0]) {
+                                if (c2b_g71_dumpmsg((void *)ma83[0]) == 0) {
+                                    rx_slot = (i32)s83;
+                                    C2B_LOGS("[c2b] g83: RX SLOT FOUND=");
+                                    C2B_LOGN((u32)rx_slot);
+                                    C2B_LOGS(" (poll switched)\n");
+                                }
+                            }
+                            /* rc83 == 0 = геттер/пусто — просто сигнатура;
+                             * rc83 < 0/-998 = граница карты/фолт — сигнатура */
+                        }
+                    }
+                }
                 if (rx_slot >= 0) {
                     u32 tick7;
                     C2B_LOGS("[c2b] g71: poll 240s on slot=");

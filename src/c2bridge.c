@@ -16518,7 +16518,8 @@ static void c2b_g106_enum(u32 pass)
                     cn = c2b_g106_read_file(pb, cb, sizeof(cb));
                     while (cn && (cb[cn - 1] == '\n' || cb[cn - 1] == 0)) cn--;
                     if (cn && (c2b_g106_has(cb, cn, "steam") ||
-                               c2b_g106_has(cb, cn, "hl2"))) {
+                               c2b_g106_has(cb, cn, "hl2") ||
+                               c2b_g106_has(cb, cn, "csgo"))) {
                         pids[np++] = pv;
                         C2B_LOGS("[c2b] g106: pid=");
                         C2B_LOGD(pv);
@@ -16545,6 +16546,11 @@ static void c2b_g106_enum(u32 pass)
         c2b_g106_pid_maps(pids[i], pass);
         c2b_g106_pid_fds(pids[i], uino);
     }
+    /* 59m-g106b: СВОЙ fd-стол = транспорт IPC (socketpair/pipe к клиенту) —
+     * у steam-pidов не видно НАШУ сторону; want_ino = udp-владелец не мы,
+     * но sock/pipe-профиль + udp28022-нет = ключевой вывод для IPC-tap. */
+    C2B_LOGS("[c2b] g106: SELF fds scan\n");
+    c2b_g106_pid_fds(mypid, uino);
     {
         char yb[16];
         u32 yn = c2b_g106_read_file("/proc/sys/kernel/yama/ptrace_scope",

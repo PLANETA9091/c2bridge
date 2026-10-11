@@ -5454,6 +5454,22 @@ static u8 g_up_sbuf[C2B_UP_SIN_CAP];         /* protobuf-байты исходн
 static u8 g_up_sframe[C2B_UP_SIN_CAP + 16];  /* [varint t][varint n][payload] */
 static u8 g_up_sout[C2B_UP_SOUT_CAP];        /* CS2-поток от транслятора */
 
+/* 58f-g99: аплинк-тап — движковые РЕАЛЬНЫЕ сигнон-сообщения (t, body)
+ * капчатся в ring для релея В GNS-СЕССИЮ (drain = g98-тред, FRM=0).
+ * Источник = c2b_up_dispatch после успешного ser(): g_up_sbuf = proto-body,
+ * t = S1-тип (NET 6=SetConVar / 7=SignonState identity; CLC 8=ClientInfo /
+ * 15=LoadingProgress — S1-плоский namespace, wire = [1B t][4B LE n][body]).
+ * run260-факт: FRM=0 + type 7 = ПРИНЯТ сервером (no parse-error) —
+ * сигнон-стрим движка = тот же фрейминг = релея-as-is.
+ * run261-факт: SNM 15/6/7 стреляют ПОСЛЕ fc (локальный 'B'-accept) —
+ * дрейн = 1/s в g98-треде ловит их в живую сессию. */
+#define C2B_G99_RCAP 16
+static volatile u32 g_g99_wi, g_g99_ri;
+static u32 g_g99_t[C2B_G99_RCAP];
+static u32 g_g99_len[C2B_G99_RCAP];
+static u8  g_g99_body[C2B_G99_RCAP][1024];
+static u32 g_g99_last_t, g_g99_last_len;   /* дедуп лога тапа */
+
 struct c2b_forge_t { uptr vt; i32 t; u32 rel; u32 len; const u8 *data; };
 
 static void c2b_fg_dtor(uptr a, u32 b) { (void)a; (void)b; }
@@ -5644,6 +5660,34 @@ u64 c2b_up_dispatch(const void *blk)
 #endif
         }
         if (n > 0 && n <= C2B_UP_SIN_CAP && sok) {
+            /* 58f-g99: тап сигнон-сообщений (до транслята: g_up_sbuf = S1-proto
+             * body as-is). NET 6/7 = S2-identity; CLC 8/15 = кандидат-зона.
+             * Ring 16, push = не-блокирующий (движковый хэндлер!). */
+            if ((t == 6 || t == 7 || t == 8 || t == 15) && n <= 1024) {
+                u32 w99 = __atomic_load_n(&g_g99_wi, __ATOMIC_ACQUIRE);
+                if (w99 - g_g99_ri < C2B_G99_RCAP) {
+                    u32 s99 = w99 & (C2B_G99_RCAP - 1);
+                    g_g99_t[s99] = (u32)t;
+                    g_g99_len[s99] = n;
+                    memcpy(g_g99_body[s99], g_up_sbuf, n);
+                    __atomic_store_n(&g_g99_wi, w99 + 1, __ATOMIC_RELEASE);
+                    if ((u32)t != g_g99_last_t || n != g_g99_last_len) {
+                        g_g99_last_t = (u32)t;
+                        g_g99_last_len = n;
+                        C2B_LOGS("[c2b] g99: tapped t=");
+                        C2B_LOGN((u32)t);
+                        C2B_LOGS(" len=");
+                        C2B_LOGN(n);
+                        C2B_LOGS(" head=");
+                        {
+                            u32 q99;
+                            for (q99 = 0; q99 < 16 && q99 < n; q99++)
+                                C2B_LOGH(g_up_sbuf[q99]);
+                        }
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
             u32 sl = 0;
             sl += c2b_write_varint(g_up_sframe + sl, (u32)t);
             sl += c2b_write_varint(g_up_sframe + sl, n);
@@ -13930,7 +13974,15 @@ static void c2b_g98_sendmsg_dump(const struct c2b_msghdr *msg, ssize_t r)
     if (!p98 || tot < 4) return;
     if (p98[0] == 0xff && p98[1] == 0xff && p98[2] == 0xff && p98[3] == 0xff)
         return;
-    if (msg->msg_name && msg->msg_namelen >= 4) {
+    /* 58f-g98a2b (run261-урок): БЕЗ AF_INET-фильтра = мусор DBus
+     * (org/freedesktop через AF_UNIX) — дамп = только INET-датаграммы. */
+    if (!msg->msg_name || msg->msg_namelen < 8 ||
+        ((const u8 *)msg->msg_name)[0] != 2 ||
+        ((const u8 *)msg->msg_name)[1] != 0)
+        return;
+    if (msg->msg_name && msg->msg_namelen >= 8 &&
+        ((const u8 *)msg->msg_name)[0] == 2 &&
+        ((const u8 *)msg->msg_name)[1] == 0) {
         ad98 = (const u8 *)msg->msg_name;
         al98 = (u32)msg->msg_namelen;
     }
@@ -14424,25 +14476,18 @@ static void *c2b_g90_thread(void *arg)
  * the parse-error vs the silence vs the response). The g90 'k' relay = UNTOUCHED
  * (the PASS baseline 8/8). Killswitch C2B_G98=0; FRM = C2B_G98_FRM (0/1/3),
  * MSG = C2B_G98_MSG (0/1). */
-static i32 c2b_g98_send_probe(u32 msg, u32 frm, u32 idx)
+static i32 c2b_g98_send_msg(u32 mtype, const u8 *body, u32 blen, u32 frm, u32 idx)
 {
-    u8 hdr[8], body[8], pkt[16];
-    u32 hlen = 0, blen = 0, mtype = 0, plen = 0, i;
+    u8 hdr[8], pkt[1100];
+    u32 hlen = 0, plen = 0, i;
     void **vt;
     i32 rc = -999;
     i64 out = -1;
     u32 send_slot;
     if (!g_gns_conn_h || !g_gns_conn_iface) return -999;
+    if (blen > 1024) return -997;
     vt = *(void ***)g_gns_conn_iface;
     if (!vt) return -999;
-    if (msg == 1) {
-        mtype = 8;                              /* net_ClientInfo, empty body */
-        blen = 0;
-    } else {
-        mtype = 7;                              /* net_SignonState {state=2} */
-        body[0] = 0x08; body[1] = 0x02;
-        blen = 2;
-    }
     if (frm == 0) {
         hdr[0] = (u8)mtype;
         hdr[1] = (u8)(blen & 0xff);
@@ -14459,18 +14504,19 @@ static i32 c2b_g98_send_probe(u32 msg, u32 frm, u32 idx)
         hlen = 1;
     }
     for (i = 0; i < hlen; i++) pkt[plen++] = hdr[i];
-    for (i = 0; i < blen; i++) pkt[plen++] = body[i];
+    if (blen) memcpy(pkt + plen, body, blen);
+    plen += blen;
     send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
-    C2B_LOGS("[c2b] g98: probe #");
+    C2B_LOGS("[c2b] g98: msg #");
     C2B_LOGN(idx);
+    C2B_LOGS(" t=");
+    C2B_LOGN(mtype);
     C2B_LOGS(" frm=");
     C2B_LOGN(frm);
-    C2B_LOGS(" msg=");
-    C2B_LOGN(msg);
-    C2B_LOGS(" type=");
-    C2B_LOGN(mtype);
+    C2B_LOGS(" len=");
+    C2B_LOGN(blen);
     C2B_LOGS(" hex=");
-    for (i = 0; i < plen; i++) C2B_LOGH(pkt[i]);
+    for (i = 0; i < plen && i < 24; i++) C2B_LOGH(pkt[i]);
     C2B_LOGS("\n");
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
@@ -14482,12 +14528,21 @@ static i32 c2b_g98_send_probe(u32 msg, u32 frm, u32 idx)
         C2B_LOGS("[c2b] g98: SendMessageToConnection SEGV\n");
         return -998;
     }
-    C2B_LOGS("[c2b] g98: probe rc=");
+    C2B_LOGS("[c2b] g98: msg rc=");
     C2B_LOGN((u32)(i32)rc);
     C2B_LOGS(" slot=");
     C2B_LOGN(send_slot);
     C2B_LOGS("\n");
     return rc;
+}
+
+static i32 c2b_g98_send_probe(u32 msg, u32 frm, u32 idx)
+{
+    u8 b2[2];
+    if (msg == 1)
+        return c2b_g98_send_msg(8, (const u8 *)0, 0, frm, idx);
+    b2[0] = 0x08; b2[1] = 0x02;
+    return c2b_g98_send_msg(7, b2, 2, frm, idx);
 }
 
 static void *c2b_g98_thread(void *arg)
@@ -14528,61 +14583,43 @@ static void *c2b_g98_thread(void *arg)
     C2B_LOGS("\n");
     usleep(3000000);      /* 3s: the engine finishes the 0x20-0x23 handshake */
     {
-        i32 rc1 = c2b_g98_send_probe(msg, frm, 1);
-        u32 w8, alt = msg ^ 1u, fired2 = 0;
-        (void)rc1;
-        for (w8 = 0; w8 < 31; w8++) {
-            u8 ma96[256];
-            i32 rc96 = -999;
-            u32 j96, st96 = 0xFFFFFFFFu;
-            usleep(1000000);
-            if (!g_gns_conn_h || !g_gns_conn_iface) break;
-            for (j96 = 0; j96 < sizeof ma96; j96++) ma96[j96] = 0;
-            {
-                void **vt96 = *(void ***)g_gns_conn_iface;
-                if (!vt96) break;
-                g_probe_active = 1;
-                if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                    rc96 = ((i32 (*)(void *, uptr, void *))vt96[3])(
-                        g_gns_conn_iface, g_gns_conn_h, ma96);
-                } else {
-                    g_probe_active = 0;
-                    C2B_LOGS("[c2b] g98: conninfo SEGV\n");
-                    break;
+        u32 g99_on = 1;
+        const char *e9 = getenv("C2B_G99");
+        if (e9 && e9[0] == '0') g99_on = 0;
+        {
+            i32 rc1 = c2b_g98_send_probe(msg, frm, 1);
+            u32 w8, alt = msg ^ 1u, fired2 = 0;
+            (void)rc1;
+            /* 58f-g98c (run261-урок): conninfo (слот 3) = ненадёжен на wrapper
+             * (rc=0 нулевой ИЛИ SEGV) — watch = ТОЛЬКО таймер. Смерть/реакция
+             * сервера = pcap + g97. 58f-g99: дрейн ring = 1/с, FRM=0,
+             * движковые РЕАЛЬНЫЕ сигнон-сообщения (tapped в dispatch). */
+            for (w8 = 0; w8 < 30; w8++) {
+                usleep(1000000);
+                if (!g_gns_conn_h || !g_gns_conn_iface) break;
+                if (w8 == 7 && !fired2) {
+                    fired2 = 1;
+                    (void)c2b_g98_send_probe(alt, frm, 2);
                 }
-                g_probe_active = 0;
-            }
-            if (rc96 == 1) {
-                st96 = (u32)ma96[0] | ((u32)ma96[1] << 8) |
-                       ((u32)ma96[2] << 16) | ((u32)ma96[3] << 24);
-            }
-            if (w8 == 0 || w8 == 4 || w8 == 7 || w8 == 11 || w8 == 19 ||
-                w8 == 29 || st96 != 2u || (rc96 != 0 && rc96 != 1)) {
-                C2B_LOGS("[c2b] g98: t+");
-                C2B_LOGN(w8 + 1);
-                C2B_LOGS("s conninfo rc=");
-                C2B_LOGN((u32)(i32)rc96);
-                C2B_LOGS(" state=");
-                C2B_LOGN(st96);
-                C2B_LOGS("\n");
-            }
-            /* 58f-g98b (run260-урок): rc=0 = слот-3 пустой на wrapper-iface
-             * (не смерть!). Смерть = rc=3 (dead handle) или rc=1+state!=2.
-             * rc=0 = молча продолжаем — probe#2 НЕ гейтится на conninfo
-             * (стреляет по таймеру t+8s всегда). */
-            if (rc96 == 3 || (rc96 == 1 && st96 != 2u)) {
-                C2B_LOGS("[c2b] g98: session reaction at t+");
-                C2B_LOGN(w8 + 1);
-                C2B_LOGS("s (rc=");
-                C2B_LOGN((u32)(i32)rc96);
-                C2B_LOGS(" state=");
-                C2B_LOGN(st96);
-                C2B_LOGS(") — verdict via g97 end-debug + pcap\n");
-                break;
-            }
-            if (w8 == 7 && !fired2) {
-                fired2 = 1;
-                (void)c2b_g98_send_probe(alt, frm, 2);
+                if (!g99_on) continue;
+                {
+                    u32 ri99 = __atomic_load_n(&g_g99_ri, __ATOMIC_ACQUIRE);
+                    u32 wi99 = __atomic_load_n(&g_g99_wi, __ATOMIC_ACQUIRE);
+                    if (ri99 == wi99) continue;
+                    {
+                        u32 s99 = ri99 & (C2B_G99_RCAP - 1);
+                        u32 mt = g_g99_t[s99], ml = g_g99_len[s99];
+                        i32 r99 = c2b_g98_send_msg(mt, g_g99_body[s99], ml,
+                                                   0, ri99 + 1);
+                        __atomic_store_n(&g_g99_ri, ri99 + 1,
+                                         __ATOMIC_RELEASE);
+                        if (r99 != 1) {
+                            C2B_LOGS("[c2b] g99: relay rc!=1 — stop drain\n");
+                            break;
+                        }
+                        usleep(400000);
+                    }
+                }
             }
         }
     }

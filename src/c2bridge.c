@@ -14718,7 +14718,7 @@ static u32 c2b_g100_scan_buf(const u8 *buf, u32 n, uptr base, u32 *hits)
     return 0;
 }
 
-static u8 c2b_g100_obj[4096];
+static u8 c2b_g100_obj[8192];   /* v10: 8KB — connection obj > 4KB */
 static uptr c2b_g100_vis[4096];
 static u32 c2b_g100_nvis;
 

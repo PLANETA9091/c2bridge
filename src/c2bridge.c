@@ -14719,6 +14719,7 @@ static u32 c2b_g100_scan_buf(const u8 *buf, u32 n, uptr base, u32 *hits)
 }
 
 static u8 c2b_g100_obj[8192];   /* v10: 8KB — connection obj > 4KB */
+static u32 g100_dumped;
 static uptr c2b_g100_vis[4096];
 static u32 c2b_g100_nvis;
 
@@ -14784,6 +14785,7 @@ static void c2b_g100_scan(void)
     c2b_g100_t0n = ts0.n;
     c2b_g100_out = 0;
     c2b_g100_nvis = 0;
+    g100_dumped = 0;
     C2B_LOGS("[c2b] g100: scan start\n");
     /* 1. rw-сегменты SNS-либы + их указатели = стартовый фронтир */
     p = mp;
@@ -14876,6 +14878,36 @@ static void c2b_g100_scan(void)
             if (got <= 0) { fails++; continue; }
             if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, a, &hits))
                 break;
+            /* v11-DEBUG: дамп ПЕРВЫХ двух handle-содержащих объектов
+             * (офлайн: найти офсеты m_pCryptContext* вручную) */
+            {
+                u8 hb2[4];
+                u32 hv2 = (u32)g_gns_conn_h;
+                hb2[0] = (u8)hv2; hb2[1] = (u8)(hv2 >> 8);
+                hb2[2] = (u8)(hv2 >> 16); hb2[3] = (u8)(hv2 >> 24);
+                if (hv2) {
+                    u32 hx2;
+                    for (hx2 = 0; hx2 + 4 <= (u32)got; hx2 += 4) {
+                        if (c2b_g100_obj[hx2] == hb2[0] &&
+                            c2b_g100_obj[hx2 + 1] == hb2[1] &&
+                            c2b_g100_obj[hx2 + 2] == hb2[2] &&
+                            c2b_g100_obj[hx2 + 3] == hb2[3]) {
+                            if (g100_dumped < 2) {
+                                C2B_LOGS("[c2b] g100: hbobj @");
+                                C2B_LOGH((u32)(a >> 32));
+                                C2B_LOGH((u32)a);
+                                C2B_LOGS(" len=");
+                                C2B_LOGN((u32)got);
+                                C2B_LOGS(" hex=");
+                                c2b_g100_hexs(c2b_g100_obj, (u32)got);
+                                C2B_LOGS("\n");
+                                g100_dumped++;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             /* v9: handle-фильтр — GNS кладёт хэндл внутрь узлов карты и
              * connection-объекта (m_hSelf); фронтир = ТОЛЬКО содержащие
              * хэндл -> путь к контекстам = короткий и точный. */

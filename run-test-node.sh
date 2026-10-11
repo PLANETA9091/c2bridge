@@ -866,6 +866,36 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
           sudo -n ss -upan 2>/dev/null | grep -aE ":$TPORT |:27005 |:27015 "
           sleep 5
         done ) > "$RUNDIR/ss_timeline.txt" 2>/dev/null & SSLOOP_PID=$!
+      # g109: run307-вердикт — таймлайн с фильтром rem=:$TPORT слеп к
+      # UNCONNECTED-сокетам (rem=0:0, sendto-путь), а run297 показал
+      # /proc/net/udp = 4 строки НА ВСЮ машину => СДР-датаграммы уходят
+      # БЕЗ udp-сокета = raw/packet-сокет или недосмотр фильтра.
+      # (1) ПОЛНЫЙ безфильтровый ss-таймлайн (все udp + состояния);
+      # (2) raw/packet-инвентарь (ss -wpan = raw, ss -0pan = packet) в
+      # маркере + таймлайном 15с; (3) /proc/net/{raw,packet,icmp};
+      # (4) conntrack ВСЕХ udp (NAT-пара = оригинальный порт отправителя).
+      ( while (( SECONDS < END )); do
+          echo "=== t=$SECONDS ==="
+          sudo -n ss -upan 2>/dev/null
+          sleep 5
+        done ) > "$RUNDIR/ss_timeline_full.txt" 2>/dev/null & SSFULL_PID=$!
+      ( while (( SECONDS < END )); do
+          echo "=== t=$SECONDS ==="
+          sudo -n ss -wpan -a 2>/dev/null
+          echo '--- packet ---'
+          sudo -n ss -0pan -a 2>/dev/null
+          sleep 15
+        done ) > "$RUNDIR/rawsock_timeline.txt" 2>/dev/null & SSRAW_PID=$!
+      ( sudo -n ss -wpan -a 2>/dev/null; echo '--- packet ---'; sudo -n ss -0pan -a 2>/dev/null;
+        echo '--- /proc/net/raw ---'; sudo -n cat /proc/net/raw 2>/dev/null;
+        echo '--- /proc/net/packet ---'; sudo -n cat /proc/net/packet 2>/dev/null;
+        echo '--- /proc/net/icmp ---'; sudo -n cat /proc/net/icmp 2>/dev/null ) \
+        > "$RUNDIR/raw_packet_sockets.txt" 2>/dev/null || true
+      log "attempt $ATTEMPT: raw/packet sockets: $(grep -ac . "$RUNDIR/raw_packet_sockets.txt" 2>/dev/null) lines"
+      ( sudo -n sysctl net.netfilter.nf_conntrack_count 2>/dev/null; \
+        sudo -n cat /proc/net/nf_conntrack 2>/dev/null | grep -a 'udp' | head -60 ) \
+        > "$RUNDIR/conntrack_full.txt" 2>/dev/null || true
+      log "attempt $ATTEMPT: conntrack udp lines: $(grep -ac . "$RUNDIR/conntrack_full.txt" 2>/dev/null)"
       # g94: post-marker dwell — the longevity + signon-progress window
       if (( POST_DWELL > 0 )); then
         DEND=$((SECONDS + POST_DWELL))

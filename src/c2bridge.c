@@ -13598,6 +13598,111 @@ static void c2b_g15_note(uptr ra, const char *tag)
  * отвергло; ret==len = ушло (тогда вопрос к pcap); хук не увидел =
  * raw-syscall путь. */
 static u32 g_g40_n;
+
+/* 352-g109: РАЗВЯЗКА ПАРАДОКСА SDR-ОТПРАВИТЕЛЯ (runs 297-307: /proc/net/udp
+ * всей машины = 4 строки, СДР-поток на проводе = БЕЗ udp-сокета вообще,
+ * ss-таймлайн (фильтр rem=:28022) = слеп к UNCONNECTED sendto-сокетам).
+ * (a) Игра шлёт SDR через sendto/sendmsg на :28022 -> ЛОВИМ ЗДЕСЬ: g40
+ *     ослеплён гейтом g_gns_connect_go + фильтром len<400 (только >=400B
+ *     или dst==цель 'k'); g98 = каждое 8-е, cap 480. Перепись = UNGATED,
+ *     ВСЕ AF_INET-отправки в 24-слотовую таблицу {ip,port,n,bytes,fd}.
+ * (b) Отправитель = сырой/packet-сокет (клиент, туннель, ядро) -> в игре
+ *     НОЛЬ SDR-HITов при живом потоке = РЕШИТЕЛЬНЫЙ ОТРИЦАТЕЛЬНЫЙ =
+ *     харнесс-часть g109 (ss -wpan/-0pan + /proc/net/{raw,packet}).
+ * На порт 28022 = немедленный полный лог (fd + dst + len + hex[24]).
+ * Флаш таблицы = каждый 256-й вызов + при SDR-HIT. Killswitch C2B_G109=0. */
+struct c2b_g109_slot { u32 ip; u32 port; u32 n; u32 bytes; u32 fd; };
+static struct c2b_g109_slot g_g109_tab[24];
+static volatile u32 g_g109_tot, g_g109_ov, g_g109_sdr;
+
+static void c2b_g109_flush(void)
+{
+    u32 i;
+    C2B_LOGS("[c2b] g109 census tot="); C2B_LOGN(g_g109_tot);
+    C2B_LOGS("ov="); C2B_LOGN(g_g109_ov);
+    C2B_LOGS("sdr="); C2B_LOGN(g_g109_sdr);
+    C2B_LOGS("\n");
+    for (i = 0; i < 24; i++) {
+        if (!g_g109_tab[i].n) continue;
+        C2B_LOGS("[c2b] g109 dst["); C2B_LOGN(i);
+        C2B_LOGS("] ");
+        C2B_LOGN((g_g109_tab[i].ip >> 24) & 255); C2B_LOGS(".");
+        C2B_LOGN((g_g109_tab[i].ip >> 16) & 255); C2B_LOGS(".");
+        C2B_LOGN((g_g109_tab[i].ip >> 8) & 255); C2B_LOGS(".");
+        C2B_LOGN(g_g109_tab[i].ip & 255); C2B_LOGS(":");
+        C2B_LOGN(g_g109_tab[i].port);
+        C2B_LOGS("n="); C2B_LOGN(g_g109_tab[i].n);
+        C2B_LOGS("b="); C2B_LOGN(g_g109_tab[i].bytes);
+        C2B_LOGS("fd="); C2B_LOGN(g_g109_tab[i].fd);
+        C2B_LOGS("\n");
+    }
+}
+
+static void c2b_g109_census(i32 fd, u32 len, const void *addr, const u8 *pl)
+{
+#ifndef C2B_SELFTEST
+    const u8 *p = (const u8 *)addr;
+    u32 ip, port, i, k, h;
+    static i32 on = -1;
+    if (on < 0) {
+        const char *e = getenv("C2B_G109");
+        on = !(e && e[0] == '0');
+    }
+    if (!on) return;
+    if (!p || !len || len > 65536) return;
+    if (p[0] != 2 || p[1] != 0) return;         /* только AF_INET */
+    ip = ((u32)p[4] << 24) | ((u32)p[5] << 16) | ((u32)p[6] << 8) | (u32)p[7];
+    port = ((u32)p[2] << 8) | (u32)p[3];
+    if (!ip || !port) return;
+    g_g109_tot++;
+    for (i = 0; i < 24; i++) {
+        if (g_g109_tab[i].n && g_g109_tab[i].ip == ip &&
+            g_g109_tab[i].port == port) {
+            g_g109_tab[i].n++;
+            g_g109_tab[i].bytes += len;
+            break;
+        }
+    }
+    if (i == 24) {
+        for (i = 0; i < 24; i++) {
+            if (!g_g109_tab[i].n) {
+                g_g109_tab[i].ip = ip;
+                g_g109_tab[i].port = port;
+                g_g109_tab[i].n = 1;
+                g_g109_tab[i].bytes = len;
+                g_g109_tab[i].fd = (u32)fd;
+                break;
+            }
+        }
+        if (i == 24) g_g109_ov++;
+    }
+    if (port == 28022) {
+        u32 c = ++g_g109_sdr;
+        if (c <= 12 || (c & 0x07) == 1) {
+            C2B_LOGS("[c2b] g109 SDR-HIT #"); C2B_LOGN(c);
+            C2B_LOGS("fd="); C2B_LOGN((u32)fd);
+            C2B_LOGS("len="); C2B_LOGN(len);
+            C2B_LOGS("dst=");
+            C2B_LOGN((ip >> 24) & 255); C2B_LOGS(".");
+            C2B_LOGN((ip >> 16) & 255); C2B_LOGS(".");
+            C2B_LOGN((ip >> 8) & 255); C2B_LOGS(".");
+            C2B_LOGN(ip & 255); C2B_LOGS(":");
+            C2B_LOGN(port);
+            C2B_LOGS("hex=");
+            h = pl ? 24 : 0;
+            if (h > len) h = len;
+            for (k = 0; k < h; k++) C2B_LOGH(pl[k]);
+            C2B_LOGS("\n");
+        }
+        c2b_g109_flush();
+        return;
+    }
+    if ((g_g109_tot & 0xFF) == 0) c2b_g109_flush();
+#else
+    (void)fd; (void)len; (void)addr; (void)pl;
+#endif
+}
+
 static void c2b_g40_sdt_note(i32 fd, u32 len, const void *addr, ssize_t r)
 {
 #ifndef C2B_SELFTEST
@@ -13654,6 +13759,7 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     }
     if (addr && (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_s_total++;
+        c2b_g109_census(fd, (u32)len, addr, (const u8 *)buf);
         const u8 *p = (const u8 *)buf;
         if (c2b_cl_is_connless(p, (u32)len)) {
             g_cl_s_cl++;
@@ -14034,6 +14140,15 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
         }
         c2b_g40_sdt_note(fd, tot ? tot : 1u, msg ? msg->msg_name : 0, r);
         c2b_g98_sendmsg_dump(msg, r);
+        {
+            /* 352-g109: ungated dst-перепись (SDR-отправитель: игра vs
+             * сырой/packet-сокет). fd + msg_name + первый iov-базис. */
+            const u8 *f109 = 0;
+            if (msg && msg->msg_iov && msg->msg_iovlen &&
+                msg->msg_iovlen < 64 && msg->msg_iov[0].iov_base)
+                f109 = (const u8 *)msg->msg_iov[0].iov_base;
+            c2b_g109_census(fd, tot ? tot : 1u, msg ? msg->msg_name : 0, f109);
+        }
         return r;
     }
 }

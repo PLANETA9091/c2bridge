@@ -16133,6 +16133,503 @@ static void *c2b_g105_thread(void *arg)
     }
 }
 
+/* ---------- 59m-g106: STEAM-CLIENT PROCESS CAMPAIGN (the layout/access map) ----------
+ * АРХИТЕКТУРНЫЙ ФАКТ (runs 287-291): ВСЕ in-game crypto-хуки g100-g105 =
+ * установлены и верифицированы в памяти (readback ff25) = НОЛЬ вызовов, при
+ * этом wire = AEAD-шифртекст (51=35+16/35=19+16/23=7+16) и сессия живёт =>
+ * SDR-крипто = НЕ в игровом процессе. Steam-клиент (steam.sh, ОТДЕЛЬНЫЙ
+ * процесс; клиентский лог "Adding process ... gameID 730" = игра = его
+ * ребёнок) = носитель: SNS-либа игры = SDK/IPC-прокси, 28022-сокет + крипто =
+ * сторона клиента. БАРЬЕР = ГРАНИЦА ПРОЦЕССОВ.
+ * g106 = дешёвая READ-ONLY карта границы (ни одной записи, никакого ptrace):
+ *   1. /proc/self/maps: есть ли у ИГРЫ steamclient.so (sdk64 IPC-копия)?
+ *      = хукаемый in-game бинарник для IPC-tap маршрута.
+ *   2. Перечисление /proc (getdents64=217): pids steam-ядра (ubuntu12_32/steam),
+ *      steamwebhelper + hl2-движка; comm-лог; self-ppid (дерево).
+ *   3. Per steam-pid: строки maps steam-.so (путь + база + размер) = RE-цели
+ *      следующего раунда (клиентский steamclient.so = ДРУГОЙ бинарник vs
+ *      игровая SNS-либа = свежие офсеты нужны).
+ *   4. /proc/net/udp: порт 0x6d76 (28022 = SDR-цель) local/rem -> inode ->
+ *      владелец через /proc/<pid>/fd readlink = ОПРЕДЕЛИТЕЛЬНЫЙ владелец
+ *      SDR-сокета.
+ *   5. /proc/<pid>/mem pread-тест (8Б @ первая exec-база): OK/EPERM = точка
+ *      РЕШЕНИЯ для remote-scan маршрута (рецепт g103 в ЧУЖОМ процессе) vs
+ *      ptrace/harness-маршрут. yama ptrace_scope в лог.
+ * 3 пасса (t+8 / t+53 / t+143), killswitch C2B_G106=0. Бюджет ~50 строк/пасс. */
+
+static u32 c2b_g106_path(char *out, const char *pre, u32 pid, const char *post)
+{
+    u32 i = 0, j, v = pid, nd = 0, k;
+    char d[12];
+    while (pre[i]) { out[i] = pre[i]; i++; }
+    do { d[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+    for (k = 0; k < nd; k++) out[i + k] = d[nd - 1 - k];
+    i += nd;
+    for (j = 0; post[j]; j++) out[i + j] = post[j];
+    out[i + j] = 0;
+    return i + j;
+}
+
+static u32 c2b_g106_has(const char *hay, u32 hn, const char *ned)
+{
+    u32 i, j;
+    if (!ned[0]) return 0;
+    for (i = 0; i < hn; i++) {
+        for (j = 0; ned[j]; j++)
+            if (i + j >= hn || hay[i + j] != ned[j]) break;
+        if (!ned[j]) return 1;
+    }
+    return 0;
+}
+
+static u32 c2b_g106_read_file(const char *path, char *buf, u32 cap)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    i32 fd = open(path, 0);
+    i64 n = 0;
+    if (fd < 0) return 0;
+    for (;;) {
+        i64 r = read(fd, buf + n, (i64)cap - 1 - n);
+        if (r <= 0) break;
+        n += r;
+        if (n >= (i64)cap - 1) break;
+    }
+    close(fd);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    return (u32)n;
+}
+
+/* self ppid из /proc/self/stat (поле 4 после ") S ") — дерево: игра vs клиент */
+static u32 c2b_g106_self_ppid(void)
+{
+    static char sb[512];
+    u32 n = c2b_g106_read_file("/proc/self/stat", sb, sizeof(sb));
+    u32 i, rp = 0, j, sp = 0;
+    if (!n) return 0;
+    for (i = n; i > 0; i--)
+        if (sb[i - 1] == ')') { rp = i; break; }
+    if (!rp) return 0;
+    j = rp;
+    while (j < n && sb[j] == ' ') j++;
+    while (j < n && sb[j] != ' ') j++;          /* state */
+    while (j < n && sb[j] == ' ') j++;
+    while (j < n && sb[j] >= '0' && sb[j] <= '9') {
+        sp = sp * 10 + (u32)(sb[j] - '0');
+        j++;
+    }
+    return sp;
+}
+
+/* /proc/net/udp: первая запись с local/rem портом 0x6d76 (28022) -> inode */
+static u32 c2b_g106_udp28022(u32 *lport, u32 *rport)
+{
+    static char ub[131072];
+    u32 n = c2b_g106_read_file("/proc/net/udp", ub, sizeof(ub));
+    char *p = ub, *e2 = ub + n;
+    u32 found = 0;
+    *lport = 0;
+    *rport = 0;
+    if (!n) return 0;
+    while (p < e2 && *p != '\n') p++;           /* header */
+    if (p < e2) p++;
+    while (p < e2) {
+        char *le = p, *q;
+        u32 f = 0, lp = 0, rp2 = 0;
+        u64 ino = 0;
+        while (le < e2 && *le != '\n') le++;
+        q = p;
+        while (q < le) {
+            char *ts;
+            while (q < le && *q == ' ') q++;
+            if (q >= le) break;
+            ts = q;
+            while (q < le && *q != ' ') q++;
+            if (f == 1 || f == 2) {
+                u32 k, pv = 0;
+                u32 colon = 0;
+                for (k = 0; ts + k < q; k++)
+                    if (ts[k] == ':') { colon = 1; break; }
+                if (colon) {
+                    for (k = k + 1; ts + k < q; k++) {
+                        u32 ch = (u32)ts[k];
+                        u32 dv = (ch >= '0' && ch <= '9') ? ch - '0' :
+                                 (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10 : 0;
+                        pv = (pv << 4) | dv;
+                    }
+                    if (f == 1) lp = pv; else rp2 = pv;
+                }
+            } else if (f == 9) {
+                for (; ts < q; ts++)
+                    if (*ts >= '0' && *ts <= '9')
+                        ino = ino * 10 + (u64)(*ts - '0');
+            }
+            f++;
+        }
+        if ((lp == 0x6d76 || rp2 == 0x6d76) && !found) {
+            found = (u32)ino;
+            *lport = lp;
+            *rport = rp2;
+        }
+        p = (le < e2) ? le + 1 : le;
+    }
+    return found;
+}
+
+/* one pid's maps: steam-.so строки (cap 14) + первая exec-база + mem-тест */
+static void c2b_g106_pid_maps(u32 pid, u32 pass)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i32 *__errno_location(void);
+    static char mp[262144];
+    char pb[96];
+    char *p, *e;
+    u32 n, nlog = 0;
+    uptr firstexec = 0;
+    i32 fdm;
+    (void)pass;
+    c2b_g106_path(pb, "/proc/", pid, "/maps");
+    n = c2b_g106_read_file(pb, mp, sizeof(mp));
+    if (!n) {
+        C2B_LOGS("[c2b] g106: p");
+        C2B_LOGD(pid);
+        C2B_LOGS("maps EMPTY\n");
+        return;
+    }
+    p = mp;
+    e = mp + n;
+    while (p < e) {
+        char *le = p;
+        char path[256];
+        u32 pl = 0;
+        uptr lo = 0, hi = 0;
+        i32 xflag = 0, rflag = 0, bad = 0;
+        while (le < e && *le != '\n') le++;
+        {
+            char *q = p;
+            /* lo-hi perms offset dev inode [path] */
+            while (q < le && *q != '-') {
+                char c = *q;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else { bad = 1; break; }
+                q++;
+            }
+            if (!bad && q < le && *q == '-') {
+                q++;
+                while (q < le && *q != ' ') {
+                    char c = *q;
+                    if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                    else if (c >= 'a' && c <= 'f')
+                        hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                    else { bad = 1; break; }
+                    q++;
+                }
+            } else bad = 1;
+            if (!bad && q < le && *q == ' ') {
+                q++;
+                while (q < le && *q != ' ') {
+                    if (*q == 'r') rflag = 1;
+                    if (*q == 'x') xflag = 1;
+                    q++;
+                }
+                { u32 st;                              /* offset + dev */
+                  for (st = 0; st < 2 && q < le; st++) {
+                      while (q < le && *q != ' ') q++;
+                      if (q < le) q++;
+                  } }
+                while (q < le && *q >= '0' && *q <= '9') q++;   /* inode */
+                if (q < le && *q == ' ') {
+                    q++;
+                    while (q < le && pl < sizeof(path) - 1) path[pl++] = *q++;
+                }
+            } else bad = 1;
+        }
+        path[pl] = 0;
+        if (!bad && hi > lo && pl && path[0] == '/') {
+            if (xflag && rflag && !firstexec) firstexec = lo;
+            if (nlog < 14 &&
+                (c2b_g106_has(path, pl, "steamclient") ||
+                 c2b_g106_has(path, pl, "libsteam") ||
+                 (pl > 6 && c2b_g106_has(path, pl, "/steam") &&
+                  path[pl - 1] == 'm' && path[pl - 2] == 'a' &&
+                  path[pl - 3] == 'e' && path[pl - 4] == 't' &&
+                  path[pl - 5] == 's'))) {
+                nlog++;
+                C2B_LOGS("[c2b] g106: p");
+                C2B_LOGD(pid);
+                C2B_LOGS("so base=");
+                C2B_LOGH((u32)(lo >> 32));
+                C2B_LOGH((u32)lo);
+                C2B_LOGS("size=");
+                C2B_LOGH((u32)(hi - lo));
+                C2B_LOGS("x");
+                C2B_LOGN((u32)xflag);
+                C2B_LOGS(" ");
+                c2b_log(path);
+                C2B_LOGS("\n");
+            }
+        }
+        p = (le < e) ? le + 1 : le;
+    }
+    if (!firstexec) return;
+    /* mem-тест: /proc/<pid>/mem @ первая exec-база (8Б = ELF-заголовок) */
+    c2b_g106_path(pb, "/proc/", pid, "/mem");
+    fdm = open(pb, 0);
+    if (fdm < 0) {
+        C2B_LOGS("[c2b] g106: p");
+        C2B_LOGD(pid);
+        C2B_LOGS("mem open err=");
+        C2B_LOGH((u32)*__errno_location());
+        C2B_LOGS("\n");
+        return;
+    }
+    {
+        u8 t8[8];
+        i64 r = pread(fdm, t8, 8, (uptr)firstexec);
+        if (r == 8) {
+            u32 z, elf = (t8[0] == 0x7f && t8[1] == 0x45 &&
+                          t8[2] == 0x4c && t8[3] == 0x46) ? 1 : 0;
+            C2B_LOGS("[c2b] g106: p");
+            C2B_LOGD(pid);
+            C2B_LOGS("mem OK @");
+            C2B_LOGH((u32)(firstexec >> 32));
+            C2B_LOGH((u32)firstexec);
+            C2B_LOGS("elf=");
+            C2B_LOGN(elf);
+            C2B_LOGS("hdr=");
+            for (z = 0; z < 8; z++) C2B_LOGH(t8[z]);
+            C2B_LOGS("\n");
+        } else {
+            C2B_LOGS("[c2b] g106: p");
+            C2B_LOGD(pid);
+            C2B_LOGS("mem pread rc=");
+            C2B_LOGH((u32)(i64)r);
+            C2B_LOGS("err=");
+            C2B_LOGH((u32)*__errno_location());
+            C2B_LOGS("\n");
+        }
+    }
+    close(fdm);
+}
+
+/* one pid's fds: socket:/pipe: счётчики + socket:[ino]==want_ino -> ВЛАДЕЛЕЦ */
+static void c2b_g106_pid_fds(u32 pid, u32 want_ino)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 syscall(i64, ...);
+    extern i64 readlink(const char *, char *, u64);
+    char pb[128], db[4096], lb[256];
+    i32 fdd;
+    i64 n, off;
+    u32 nsock = 0, npipe = 0, nother = 0, owner = 0;
+    c2b_g106_path(pb, "/proc/", pid, "/fd");
+    fdd = open(pb, 0x10000);                     /* O_DIRECTORY */
+    if (fdd < 0) return;
+    for (;;) {
+        n = syscall((i64)217, (i64)fdd, db, (i64)sizeof(db));
+        if (n <= 0) break;
+        off = 0;
+        while (off + 21 <= n) {
+            u16 reclen = *(const u16 *)(const void *)(db + off + 16);
+            const char *nm = db + off + 21;
+            u32 fl = 0;
+            while (off + 21 + fl < (u32)n && nm[fl]) fl++;
+            if (fl && nm[0] >= '0' && nm[0] <= '9') {
+                u32 pl = c2b_g106_path(pb, "/proc/", pid, "/fd/");
+                u32 k;
+                for (k = 0; k < fl && pl + k < sizeof(pb) - 1; k++)
+                    pb[pl + k] = nm[k];
+                pb[pl + k] = 0;
+                {
+                    i64 rl = readlink(pb, lb, sizeof(lb) - 1);
+                    if (rl > 5) {
+                        lb[rl] = 0;
+                        if (lb[0] == 's' && lb[1] == 'o' && lb[2] == 'c' &&
+                            lb[3] == 'k' && lb[4] == 'e' && lb[5] == 't') {
+                            u64 ino = 0;
+                            u32 q2;
+                            nsock++;
+                            for (q2 = 8; q2 < (u32)rl && lb[q2] != ']'; q2++)
+                                if (lb[q2] >= '0' && lb[q2] <= '9')
+                                    ino = ino * 10 + (u64)(lb[q2] - '0');
+                            if (want_ino && (u32)ino == want_ino) owner = 1;
+                        } else if (lb[0] == 'p' && lb[1] == 'i' && lb[2] == 'p') {
+                            npipe++;
+                        } else {
+                            nother++;
+                        }
+                    }
+                }
+            }
+            if (reclen == 0 || off + (i64)reclen > n) break;
+            off += (i64)reclen;
+        }
+    }
+    close(fdd);
+    C2B_LOGS("[c2b] g106: p");
+    C2B_LOGD(pid);
+    C2B_LOGS("fds sock=");
+    C2B_LOGD(nsock);
+    C2B_LOGS("pipe=");
+    C2B_LOGD(npipe);
+    C2B_LOGS("other=");
+    C2B_LOGD(nother);
+    if (owner) C2B_LOGS(" **SDR-SOCKET-OWNER**");
+    C2B_LOGS("\n");
+}
+
+/* перечисление /proc: comm-match (steam/hl2) -> per-pid maps+fds */
+static void c2b_g106_enum(u32 pass)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 syscall(i64, ...);
+    extern i32 getpid(void);
+    char db[8192], cb[64], pb[96];
+    u32 pids[16];
+    u32 np = 0, mypid = (u32)getpid(), i;
+    u32 uloc = 0, urem = 0, uino;
+    i32 fd = open("/proc", 0x10000);
+    if (fd < 0) return;
+    for (;;) {
+        i64 n = syscall((i64)217, (i64)fd, db, (i64)sizeof(db));
+        i64 off = 0;
+        if (n <= 0) break;
+        while (off + 21 <= n) {
+            u16 reclen = *(const u16 *)(const void *)(db + off + 16);
+            const char *nm = db + off + 21;
+            u32 fl = 0, pv = 0;
+            while (off + 21 + fl < (u32)n && nm[fl]) fl++;
+            if (fl && fl < 8 && nm[0] >= '0' && nm[0] <= '9') {
+                u32 k;
+                for (k = 0; k < fl; k++) {
+                    if (nm[k] < '0' || nm[k] > '9') { pv = 0; break; }
+                    pv = pv * 10 + (u32)(nm[k] - '0');
+                }
+                if (pv && pv != mypid && np < 16) {
+                    u32 cn;
+                    c2b_g106_path(pb, "/proc/", pv, "/comm");
+                    cn = c2b_g106_read_file(pb, cb, sizeof(cb));
+                    while (cn && (cb[cn - 1] == '\n' || cb[cn - 1] == 0)) cn--;
+                    if (cn && (c2b_g106_has(cb, cn, "steam") ||
+                               c2b_g106_has(cb, cn, "hl2"))) {
+                        pids[np++] = pv;
+                        C2B_LOGS("[c2b] g106: pid=");
+                        C2B_LOGD(pv);
+                        C2B_LOGS("comm=");
+                        c2b_log(cb);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
+            if (reclen == 0 || off + (i64)reclen > n) break;
+            off += (i64)reclen;
+        }
+    }
+    close(fd);
+    uino = c2b_g106_udp28022(&uloc, &urem);
+    C2B_LOGS("[c2b] g106: udp28022 ino=");
+    C2B_LOGH(uino);
+    C2B_LOGS("loc=");
+    C2B_LOGH(uloc);
+    C2B_LOGS("rem=");
+    C2B_LOGH(urem);
+    C2B_LOGS("\n");
+    for (i = 0; i < np; i++) {
+        c2b_g106_pid_maps(pids[i], pass);
+        c2b_g106_pid_fds(pids[i], uino);
+    }
+    {
+        char yb[16];
+        u32 yn = c2b_g106_read_file("/proc/sys/kernel/yama/ptrace_scope",
+                                    yb, sizeof(yb));
+        C2B_LOGS("[c2b] g106: yama=");
+        if (yn) C2B_LOGH((u32)yb[0]);
+        else C2B_LOGS("absent ");
+        C2B_LOGS("\n");
+    }
+}
+
+/* сам-чек игры: steamclient.so (sdk64 IPC-копия) в НАШИХ maps? */
+static void c2b_g106_self_sdk(void)
+{
+    static char mp[262144];
+    u32 n = c2b_g106_read_file("/proc/self/maps", mp, sizeof(mp));
+    u32 hits = 0;
+    if (!n) return;
+    {
+        char *p = mp, *e = mp + n;
+        while (p < e) {
+            char *le = p;
+            while (le < e && *le != '\n') le++;
+            {
+                u32 ll = (u32)(le - p);
+                if (ll > 40 && c2b_g106_has(p, ll, "steamclient")) {
+                    char *q = p, *sp2 = p;
+                    uptr lo = 0;
+                    /* base = первые hex до '-' */
+                    while (q < le && *q != '-') {
+                        char c = *q;
+                        if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                        else if (c >= 'a' && c <= 'f')
+                            lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                        else break;
+                        q++;
+                    }
+                    while (sp2 < le && *sp2 != '/') sp2++;
+                    if (hits < 6 && sp2 < le) {
+                        hits++;
+                        C2B_LOGS("[c2b] g106: SELF base=");
+                        C2B_LOGH((u32)(lo >> 32));
+                        C2B_LOGH((u32)lo);
+                        C2B_LOGS(" ");
+                        c2b_log(sp2);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
+            p = (le < e) ? le + 1 : le;
+        }
+    }
+    if (!hits) C2B_LOGS("[c2b] g106: SELF no-steamclient\n");
+}
+
+static void *c2b_g106_thread(void *arg)
+{
+    u32 pass;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G106");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g106: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (pass = 0; pass < 3; pass++) {
+        u32 selp;
+        if (pass == 0) usleep(8000000);
+        if (pass == 1) usleep(45000000);
+        if (pass == 2) usleep(90000000);
+        C2B_LOGS("[c2b] g106: pass");
+        C2B_LOGD(pass);
+        C2B_LOGS("\n");
+        selp = c2b_g106_self_ppid();
+        C2B_LOGS("[c2b] g106: self ppid=");
+        C2B_LOGD(selp);
+        C2B_LOGS("\n");
+        c2b_g106_self_sdk();
+        c2b_g106_enum(pass);
+    }
+    C2B_LOGS("[c2b] g106: done\n");
+    return (void *)0;
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -17955,6 +18452,10 @@ i32 c2b_main(void)
     {   /* 59l-g105: chacha20_ssse3 hook (key+per-packet-ictx capture) */
         void *t105 = 0;
         pthread_create(&t105, 0, c2b_g105_thread, 0);
+    }
+    {   /* 59m-g106: the steam-client process campaign (the layout/access map) */
+        void *t106 = 0;
+        pthread_create(&t106, 0, c2b_g106_thread, 0);
     }
 #endif
     r = c2b_try_install();

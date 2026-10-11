@@ -16155,7 +16155,8 @@ static void *c2b_g105_thread(void *arg)
  *   5. /proc/<pid>/mem pread-тест (8Б @ первая exec-база): OK/EPERM = точка
  *      РЕШЕНИЯ для remote-scan маршрута (рецепт g103 в ЧУЖОМ процессе) vs
  *      ptrace/harness-маршрут. yama ptrace_scope в лог.
- * 3 пасса (t+8 / t+53 / t+143), killswitch C2B_G106=0. Бюджет ~50 строк/пасс. */
+ * 4 пасса (t+8 / 53 / 98 / 143 — run292-урок: PASS убивает движок раньше t+143),
+ * killswitch C2B_G106=0. Бюджет ~50 строк/пасс. */
 
 static u32 c2b_g106_path(char *out, const char *pre, u32 pid, const char *post)
 {
@@ -16435,11 +16436,11 @@ static void c2b_g106_pid_fds(u32 pid, u32 want_ino)
         n = syscall((i64)217, (i64)fdd, db, (i64)sizeof(db));
         if (n <= 0) break;
         off = 0;
-        while (off + 21 <= n) {
+        while (off + 19 <= n) {
             u16 reclen = *(const u16 *)(const void *)(db + off + 16);
-            const char *nm = db + off + 21;
+            const char *nm = db + off + 19;   /* d_name @19 (d_ino 8 + d_off 8 + reclen 2 + type 1) */
             u32 fl = 0;
-            while (off + 21 + fl < (u32)n && nm[fl]) fl++;
+            while (off + 19 + fl < (u32)n && nm[fl]) fl++;
             if (fl && nm[0] >= '0' && nm[0] <= '9') {
                 u32 pl = c2b_g106_path(pb, "/proc/", pid, "/fd/");
                 u32 k;
@@ -16501,11 +16502,11 @@ static void c2b_g106_enum(u32 pass)
         i64 n = syscall((i64)217, (i64)fd, db, (i64)sizeof(db));
         i64 off = 0;
         if (n <= 0) break;
-        while (off + 21 <= n) {
+        while (off + 19 <= n) {
             u16 reclen = *(const u16 *)(const void *)(db + off + 16);
-            const char *nm = db + off + 21;
+            const char *nm = db + off + 19;   /* d_name @19 (d_ino 8 + d_off 8 + reclen 2 + type 1) */
             u32 fl = 0, pv = 0;
-            while (off + 21 + fl < (u32)n && nm[fl]) fl++;
+            while (off + 19 + fl < (u32)n && nm[fl]) fl++;
             if (fl && fl < 8 && nm[0] >= '0' && nm[0] <= '9') {
                 u32 k;
                 for (k = 0; k < fl; k++) {
@@ -16617,11 +16618,14 @@ static void *c2b_g106_thread(void *arg)
             return (void *)0;
         }
     }
-    for (pass = 0; pass < 3; pass++) {
+    for (pass = 0; pass < 4; pass++) {
         u32 selp;
+        /* run292-урок: PASS-вердикт убивает движок до t+143 — пассы должны
+         * покрыть ВСЁ окно: t+8 (boot), t+53, t+98 (connect-окно), t+143. */
         if (pass == 0) usleep(8000000);
         if (pass == 1) usleep(45000000);
-        if (pass == 2) usleep(90000000);
+        if (pass == 2) usleep(45000000);
+        if (pass == 3) usleep(45000000);
         C2B_LOGS("[c2b] g106: pass");
         C2B_LOGD(pass);
         C2B_LOGS("\n");

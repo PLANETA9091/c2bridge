@@ -6374,6 +6374,14 @@ static u8   g_ticket_buf[2048];  /* последний тикет (полный,
 static void *g_steamnetutils_obj;   /* ISteamNetworkingUtils*, FUv */
 static u32  g_steamnetutils_seen;
 static volatile u32 g_gns_spew_n;   /* 41f-g7e: живость спью (все копии) */
+/* 58f-g75: флаги коннект-гейта (cert-CA гонка ран 228-a1: ConnectOK,
+ * обработанный ДО 'Got SDR network config' = 'Bad cert: CA key ... is not
+ * known to us' — доверенный CA-набор приезжает ВМЕСТЕ с SDR-конфигом;
+ * g73-bypass на SDR-путь НЕ действует). Сеты идемпотентны из любого
+ * либейного потока. */
+static volatile u32 g_sdr_cfg_ok;   /* 'Got SDR network config' виден */
+static volatile u32 g_sdr_conn_ok;  /* '] connected' виден (СЕССИЯ жива) */
+static volatile u32 g_sdr_conn_dead;/* 'problem detected locally'/'closed by peer' */
 
 static void c2b_gns_spew(i32 lvl, const char *msg)
 {
@@ -6403,6 +6411,24 @@ static void c2b_gns_libspew_hook(u32 a, u32 b, void *c, void *d,
     if (n < 0) return;
     if (n > 1000) n = 1000;
     if (buf[n - 1] != '\n') { buf[n] = '\n'; buf[n + 1] = 0; }
+    /* 58f-g75: гейт-флаги (скан подстрок — идемпотентно, любой поток) */
+    {
+        static const char cfgm[] = "Got SDR network config";
+        static const char connm[] = "] connected";
+        static const char deadm[] = "problem detected locally";
+        static const char deadm2[] = "closed by peer";
+        u32 m, q;
+        for (m = 0; buf[m]; m++) {
+            for (q = 0; cfgm[q] && buf[m + q] == cfgm[q]; q++) {}
+            if (!cfgm[q]) g_sdr_cfg_ok = 1;
+            for (q = 0; connm[q] && buf[m + q] == connm[q]; q++) {}
+            if (!connm[q]) g_sdr_conn_ok = 1;
+            for (q = 0; deadm[q] && buf[m + q] == deadm[q]; q++) {}
+            if (!deadm[q]) g_sdr_conn_dead = 1;
+            for (q = 0; deadm2[q] && buf[m + q] == deadm2[q]; q++) {}
+            if (!deadm2[q]) g_sdr_conn_dead = 1;
+        }
+    }
     C2B_LOGS("[c2b] GNSLIB["); C2B_LOGN(a); C2B_LOGS("] ");
     C2B_LOGS(buf);
 }
@@ -11605,7 +11631,19 @@ static void c2b_g32_drive(void)
         sigemptyset(sa.mask);
         if (sigaction(11, &sa, &oldsa) != 0) return;
         clp = g_clp_fouif;
-        for (vi = 0; vi < 2; vi++) {
+        /* 58f-g75: ДВУХФАЗНЫЙ КОННЕКТ (cert-CA гонка ран 228-a1). Факт:
+         * ConnectOK, обработанный ДО 'Got SDR network config' = 'Bad cert:
+         * CA key ... is not known to us' (доверенный CA-набор приезжает
+         * вместе с SDR-конфигом; g73-bypass на SDR-путь не действует).
+         * Конфиг-фетч стартует от ПЕРВОЙ GNS-активности — ожидание ДО
+         * коннекта = дедлок. Лечение: попытка → ждём ≤12с ('connected' |
+         * dead | cfg_ok) → 'connected' не дождались → CloseConnection +
+         * ретрай (до 3 аттемптов; ретрай всегда уже с cfg_ok=1). */
+        {
+            u32 att;
+            for (att = 0; att < 3; att++) {
+                i32 done75 = 0;
+                for (vi = 0; vi < 2 && !done75; vi++) {
             void *iface = 0;
             uptr h = 0;
             void **vt;
@@ -11656,7 +11694,41 @@ static void c2b_g32_drive(void)
                 C2B_LOGS(" s_hEpoll="); C2B_LOGN((u32)*pep);
                 C2B_LOGS("\n");
             }
-            break;   /* первая сработавшая версия */
+            /* 58f-g75: фазовая проверка ≤12s */
+            {
+                u32 w;
+                i32 ok75 = 0;
+                for (w = 0; w < 24; w++) {
+                    usleep(500000);
+                    if (g_sdr_conn_ok) { ok75 = 1; break; }
+                    if (g_sdr_conn_dead) break;
+                    if (g_sdr_cfg_ok && w >= 3) break;
+                }
+                if (ok75) {
+                    C2B_LOGS("[c2b] g75: session connected att=");
+                    C2B_LOGN(att); C2B_LOGS("\n");
+                    done75 = 1;
+                } else {
+                    C2B_LOGS("[c2b] g75: no 'connected' in 12s (cfg_ok=");
+                    C2B_LOGN(g_sdr_cfg_ok);
+                    C2B_LOGS(" dead="); C2B_LOGN(g_sdr_conn_dead);
+                    C2B_LOGS(") — close+retry\n");
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        ((i32 (*)(void *, uptr, i32, const char *, i32))vt[4])(
+                            iface, h, 0, (const char *)0, 0);
+                    }
+                    g_probe_active = 0;
+                    g_sdr_conn_dead = 0;
+                }
+            }
+                }   /* vi */
+                if (done75) break;
+                if (att < 2) {
+                    C2B_LOGS("[c2b] g75: retry attempt\n");
+                    usleep(1000000);
+                }
+            }   /* att */
         }
         /* 58f-g74b: C2S_CONNECT-ПРОБА — ПЕРВЫЙ in-channel байт клиента.
  * Ран 227: сессия ЖИВА (g73 снял cert-CA стену), сервер молчит до

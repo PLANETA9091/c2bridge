@@ -17152,6 +17152,356 @@ static void *c2b_g106w2_thread(void *arg)
     return (void *)0;
 }
 
+/* ---------- 59n-g107: THE SDK64 STEAMCLIENT.SO HOOK (the SDR capture) ----------
+ * РЕШЕНИЕ ЗАГРУЗКИ ПРОЦЕССА (runs 297-299): сокет-карта g106w2c/d =
+ * НЕПРЕЛОЖИМЫЙ ФАКТ — эфемерные UDP-сокеты SDR (fd=45+, порты = источники
+ * pcap-потоков к 152.233.19.133:28022) = В fd-столе САМОЙ ИГРЫ
+ * (csgo_linux64), netns = ОДИН (4026531833) у всех, NS-FOREIGN = ноль.
+ * АРХИТЕКТУРНЫЙ ВЫВОД run287-291 (the crypto = the client side) = ОТМЕНЕН:
+ * SDR-крипто = В ИГРЕ, но в ДРУГОЙ библиотеке — sdk64 steamclient.so
+ * (linux64/steamclient.so, d975c5, маппится 6 сегментами = run292 SELF),
+ * которую g100-g105 НЕ хукали (фильтр путей = 'libsteam*', а
+ * 'steamclient.so' НЕ содержит 'libsteam')! Оффлайн-RE d975c5 (run264 bins):
+ *   EVP chacha20-poly1305 init @0x21115b0 — пролог 14B = 53 48 83 ec 20
+ *     64 48 8b 04 25 28 00 00 00 (push rbx; sub $0x20; mov %fs:0x28) =
+ *     позиционно-независимый, 14B-кат ЧИСТЫЙ; (rdi=ctx, rsi=KEY32,
+ *     rdx=IV12, ecx=enc) — тот же конвентент, что g104.
+ *   ChaCha20_ssse3 @0x206bc74 (ctr32 @0x206bc40 + 0x34 = хвост-цепочка) —
+ *     пролог 16B = ТОЧНО g105-паттерн (41 54 41 55 41 56 41 57 48 83 ec 58
+ *     f3 0f 6f 09) + mk-check f3 0f 6f 51 10 @+16; (rdi=out, rsi=in,
+ *     rdx=len, rcx=KEY, r8=ICTX) — тот же конвентент, что g105.
+ * g107 = РЕЦЕПТЫ g104+g105 на steamclient.so-базах (фильтр пути =
+ * 'steamclient.so'), реестр {base,tramp} x4, 2s-рескан, killswitch
+ * C2B_G107 / C2B_G107_EVP / C2B_G107_SSSE. */
+
+extern void c2b_g107_stub_evp(void);
+__asm__(
+    ".text\n"
+    ".globl c2b_g107_stub_evp\n"
+    ".type c2b_g107_stub_evp, @function\n"
+    "c2b_g107_stub_evp:\n"
+    "  movq (%rsp), %r8\n"
+    "  jmp  c2b_g107_detour_evp\n"
+);
+extern void c2b_g107_stub_ssse(void);
+__asm__(
+    ".text\n"
+    ".globl c2b_g107_stub_ssse\n"
+    ".type c2b_g107_stub_ssse, @function\n"
+    "c2b_g107_stub_ssse:\n"
+    "  movq (%rsp), %r9\n"
+    "  jmp  c2b_g107_detour_ssse\n"
+);
+static void c2b_g107_detour_evp(void *ctx, const void *key, const void *iv,
+                                int enc, void *ra)
+    __attribute__((used));
+static void c2b_g107_detour_ssse(const void *out, const void *in, u64 len,
+                                 const void *key, const void *ictx, void *ra)
+    __attribute__((used));
+static u8   c2b_g107_tramp_evp[4][64] __attribute__((aligned(16)));
+static u8   c2b_g107_tramp_ssse[4][64] __attribute__((aligned(16)));
+static uptr c2b_g107_base[4];
+static u32  c2b_g107_nbase;
+static u32  c2b_g107_evp_got;
+static u32  c2b_g107_evp_ivonly;
+static u32  c2b_g107_ssse_keys;
+static u32  c2b_g107_ssse_ictx;
+static u32  c2b_g107_evp_calls;
+static u32  c2b_g107_ssse_calls;
+static u8   c2b_g107_key0[32];
+
+static void c2b_g107_detour_evp(void *ctx, const void *key, const void *iv,
+                                int enc, void *ra)
+{
+    int (*tramp)(void *, const void *, const void *, int) = 0;
+    u32 i, n, z;
+    (void)ctx;
+    for (i = 0; i < c2b_g107_nbase; i++) {
+        uptr d = (uptr)ra - c2b_g107_base[i];
+        if (d < 0x600000u) {
+            tramp = (int (*)(void *, const void *, const void *, int))
+                c2b_g107_tramp_evp[i];
+            break;
+        }
+    }
+    n = __atomic_add_fetch(&c2b_g107_evp_calls, 1, __ATOMIC_RELAXED);
+    if (n <= 12) {
+        C2B_LOGS("[c2b] g107: EVP call#");
+        C2B_LOGN(n);
+        C2B_LOGS(" enc=");
+        C2B_LOGN((u32)enc);
+        if (ra && c2b_g107_nbase) {
+            uptr d = (uptr)ra - c2b_g107_base[0];
+            C2B_LOGS(" ra=");
+            C2B_LOGH((u32)d);
+        }
+        C2B_LOGS("\n");
+    }
+    if (key && c2b_g107_evp_got < 4) {
+        u32 gi = __atomic_add_fetch(&c2b_g107_evp_got, 1, __ATOMIC_RELAXED);
+        C2B_LOGS("[c2b] g107: EKEY");
+        C2B_LOGN(gi);
+        C2B_LOGS("=");
+        c2b_g100_hexs((const u8 *)key, 32);
+        if (iv) {
+            C2B_LOGS(" iv=");
+            c2b_g100_hexs((const u8 *)iv, 12);
+        }
+        C2B_LOGS("\n");
+    } else if (!key && iv && c2b_g107_evp_ivonly < 4) {
+        u32 gi = __atomic_add_fetch(&c2b_g107_evp_ivonly, 1,
+                                    __ATOMIC_RELAXED);
+        C2B_LOGS("[c2b] g107: IVONLY");
+        C2B_LOGN(gi);
+        C2B_LOGS("=");
+        for (z = 0; z < 12; z++) C2B_LOGH(((const u8 *)iv)[z]);
+        C2B_LOGS("\n");
+    }
+    if (tramp) tramp(ctx, key, iv, enc);
+}
+
+static void c2b_g107_detour_ssse(const void *out, const void *in, u64 len,
+                                 const void *key, const void *ictx, void *ra)
+{
+    void (*tramp)(const void *, const void *, u64, const void *,
+                  const void *) = 0;
+    u32 i, n, z, same = 0;
+    for (i = 0; i < c2b_g107_nbase; i++) {
+        uptr d = (uptr)ra - c2b_g107_base[i];
+        if (d < 0x600000u) {
+            tramp = (void (*)(const void *, const void *, u64, const void *,
+                              const void *))c2b_g107_tramp_ssse[i];
+            break;
+        }
+    }
+    n = __atomic_add_fetch(&c2b_g107_ssse_calls, 1, __ATOMIC_RELAXED);
+    if (n <= 12) {
+        C2B_LOGS("[c2b] g107: SSSE call#");
+        C2B_LOGN(n);
+        C2B_LOGS(" len=");
+        C2B_LOGN((u32)len);
+        C2B_LOGS("\n");
+    }
+    if (key && c2b_g107_ssse_keys < 2) {
+        if (c2b_g107_ssse_keys == 1) {
+            for (z = 0; z < 32; z++)
+                same |= (u32)(c2b_g107_key0[z] ^ ((const u8 *)key)[z]);
+        }
+        if (!same || c2b_g107_ssse_keys == 0) {
+            c2b_g107_ssse_keys++;
+            C2B_LOGS("[c2b] g107: SKEY");
+            C2B_LOGN(c2b_g107_ssse_keys);
+            C2B_LOGS("=");
+            c2b_g100_hexs((const u8 *)key, 32);
+            C2B_LOGS("\n");
+            for (z = 0; z < 32; z++) c2b_g107_key0[z] = ((const u8 *)key)[z];
+        }
+    }
+    if (ictx && c2b_g107_ssse_ictx < 6) {
+        u32 gi = __atomic_add_fetch(&c2b_g107_ssse_ictx, 1,
+                                    __ATOMIC_RELAXED);
+        C2B_LOGS("[c2b] g107: ICTX");
+        C2B_LOGN(gi);
+        C2B_LOGS(" len=");
+        C2B_LOGN((u32)len);
+        C2B_LOGS("=");
+        c2b_g100_hexs((const u8 *)ictx, 16);
+        C2B_LOGS("\n");
+    }
+    if (tramp) tramp(out, in, len, key, ictx);
+}
+
+static void *c2b_g107_thread(void *arg)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    extern i64 read(i32, void *, u64);
+    static const u8 pe[14] = {
+        0x53, 0x48, 0x83, 0xec, 0x20, 0x64, 0x48, 0x8b, 0x04,
+        0x25, 0x28, 0x00, 0x00, 0x00
+    };
+    static const u8 ps[16] = {
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x83, 0xec, 0x58, 0xf3, 0x0f, 0x6f, 0x09
+    };
+    static const u8 mk[5] = { 0xf3, 0x0f, 0x6f, 0x51, 0x10 };
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G107");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g107: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (;;) {
+        i32 fdm = open("/proc/self/maps", 0);
+        i64 n = 0;
+        static char mp[262144];
+        char *p, *e2;
+        uptr cand[8];
+        u32 ncand = 0, ci;
+        u32 evp_on = 1, ssse_on = 1;
+        {
+            const char *x = getenv("C2B_G107_EVP");
+            if (x && x[0] == '0') evp_on = 0;
+            x = getenv("C2B_G107_SSSE");
+            if (x && x[0] == '0') ssse_on = 0;
+        }
+        if (fdm < 0) return (void *)0;
+        for (;;) {
+            i64 r = read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i64)sizeof(mp) - 1) break;
+        }
+        close(fdm);
+        if (n <= 0) return (void *)0;
+        mp[n] = 0;
+        p = mp;
+        e2 = mp + n;
+        while (p < e2 && ncand < 8) {
+            uptr lo = 0, hi = 0;
+            i32 c;
+            char pb[512];
+            u32 pl = 0, ps2;
+            while (p < e2 && *p == '\n') p++;
+            if (p >= e2) break;
+            while (p < e2 && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != '-') break;
+            p++;
+            while (p < e2 && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != ' ') break;
+            p++;
+            while (p < e2 && *p != '\n') {
+                if (pl < sizeof(pb) - 1) pb[pl++] = *p;
+                p++;
+            }
+            pb[pl] = 0;
+            if (p < e2) p++;
+            if (hi <= lo || pl < 20) continue;
+            for (ps2 = 0; ps2 + 15 < pl; ps2++) {
+                if (pb[ps2] == 's' && pb[ps2 + 1] == 't' &&
+                    pb[ps2 + 2] == 'e' && pb[ps2 + 3] == 'a' &&
+                    pb[ps2 + 4] == 'm' && pb[ps2 + 5] == 'c' &&
+                    pb[ps2 + 6] == 'l' && pb[ps2 + 7] == 'i' &&
+                    pb[ps2 + 8] == 'e' && pb[ps2 + 9] == 'n' &&
+                    pb[ps2 + 10] == 't' && pb[ps2 + 11] == '.' &&
+                    pb[ps2 + 12] == 's' && pb[ps2 + 13] == 'o') {
+                    u32 du;
+                    for (du = 0; du < ncand; du++)
+                        if (cand[du] == lo) break;
+                    if (du == ncand) cand[ncand++] = lo;
+                    break;
+                }
+            }
+        }
+        for (ci = 0; ci < ncand; ci++) {
+            u32 du;
+            for (du = 0; du < c2b_g107_nbase; du++)
+                if (c2b_g107_base[du] == cand[ci]) break;
+            if (du < c2b_g107_nbase) continue;
+            if (c2b_g107_nbase >= 4) break;
+            {   /* EVP init @+0x21115b0: 14B вериф + патч */
+                u8 *tgt = (u8 *)(cand[ci] + 0x21115b0);
+                u32 k, ok = 1;
+                for (k = 0; k < 14; k++)
+                    if (tgt[k] != pe[k]) { ok = 0; break; }
+                if (ok && tgt[0] == 0xff && tgt[1] == 0x25) ok = 0;
+                if (ok && evp_on) {
+                    u8 *tp = c2b_g107_tramp_evp[c2b_g107_nbase];
+                    i32 rel;
+                    for (k = 0; k < 14; k++) tp[k] = tgt[k];
+                    tp[14] = 0xe9;
+                    rel = (i32)((uptr)(tgt + 14) - ((uptr)tp + 19));
+                    tp[15] = (u8)rel;
+                    tp[16] = (u8)(rel >> 8);
+                    tp[17] = (u8)(rel >> 16);
+                    tp[18] = (u8)(rel >> 24);
+                    if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)),
+                                 0x2000, 3) != 0) {
+                        C2B_LOGS("[c2b] g107: EVP mprotect fail\n");
+                    } else {
+                        u8 pat[14];
+                        uptr da = (uptr)&c2b_g107_stub_evp;
+                        pat[0] = 0xff; pat[1] = 0x25;
+                        pat[2] = 0; pat[3] = 0; pat[4] = 0; pat[5] = 0;
+                        for (k = 0; k < 8; k++)
+                            pat[6 + k] = (u8)(da >> (8 * k));
+                        for (k = 0; k < 14; k++) tgt[k] = pat[k];
+                        if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)),
+                                     0x2000, 5) != 0)
+                            C2B_LOGS("[c2b] g107: EVP mprotect RX fail\n");
+                        C2B_LOGS("[c2b] g107: EVP hook base=");
+                        C2B_LOGH((u32)(cand[ci] >> 32));
+                        C2B_LOGH((u32)cand[ci]);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
+            {   /* ChaCha20_ssse3 @+0x206bc74: 16B вериф + патч */
+                u8 *tgt = (u8 *)(cand[ci] + 0x206bc74);
+                u8 *mkp = (u8 *)(cand[ci] + 0x206bc84);
+                u32 k, ok = 1;
+                for (k = 0; k < 16; k++)
+                    if (tgt[k] != ps[k]) { ok = 0; break; }
+                if (ok)
+                    for (k = 0; k < 5; k++)
+                        if (mkp[k] != mk[k]) { ok = 0; break; }
+                if (ok && tgt[0] == 0xff && tgt[1] == 0x25) ok = 0;
+                if (ok && ssse_on) {
+                    u8 *tp = c2b_g107_tramp_ssse[c2b_g107_nbase];
+                    i32 rel;
+                    for (k = 0; k < 16; k++) tp[k] = tgt[k];
+                    tp[16] = 0xe9;
+                    rel = (i32)((uptr)(tgt + 16) - ((uptr)tp + 21));
+                    tp[17] = (u8)rel;
+                    tp[18] = (u8)(rel >> 8);
+                    tp[19] = (u8)(rel >> 16);
+                    tp[20] = (u8)(rel >> 24);
+                    if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)),
+                                 0x2000, 3) != 0) {
+                        C2B_LOGS("[c2b] g107: SSSE mprotect fail\n");
+                    } else {
+                        u8 pat[16];
+                        uptr da = (uptr)&c2b_g107_stub_ssse;
+                        pat[0] = 0xff; pat[1] = 0x25;
+                        pat[2] = 0; pat[3] = 0; pat[4] = 0; pat[5] = 0;
+                        for (k = 0; k < 8; k++)
+                            pat[6 + k] = (u8)(da >> (8 * k));
+                        pat[14] = 0x90;
+                        pat[15] = 0x90;
+                        for (k = 0; k < 16; k++) tgt[k] = pat[k];
+                        if (mprotect((void *)((uptr)tgt & ~((uptr)0xFFF)),
+                                     0x2000, 5) != 0)
+                            C2B_LOGS("[c2b] g107: SSSE mprotect RX fail\n");
+                        C2B_LOGS("[c2b] g107: SSSE hook base=");
+                        C2B_LOGH((u32)(cand[ci] >> 32));
+                        C2B_LOGH((u32)cand[ci]);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
+            c2b_g107_base[c2b_g107_nbase] = cand[ci];
+            c2b_g107_nbase++;
+        }
+        usleep(2000000);
+    }
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -18986,6 +19336,10 @@ i32 c2b_main(void)
     {   /* 59m-g106w2: the fd-inode socket map (the port-filter-free tap) */
         void *t106w2 = 0;
         pthread_create(&t106w2, 0, c2b_g106w2_thread, 0);
+    }
+    {   /* 59n-g107: the sdk64 steamclient.so hook (the SDR key/iv capture) */
+        void *t107 = 0;
+        pthread_create(&t107, 0, c2b_g107_thread, 0);
     }
 #endif
     r = c2b_try_install();

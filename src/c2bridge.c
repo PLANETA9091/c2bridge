@@ -15119,9 +15119,13 @@ static void *c2b_g101_thread(void *arg)
                 u8 *tp;
                 u32 k;
                 /* верификация пролога (run280-эмпирика) */
+                /* ЭМПИРИКА: файл-байты @0x64710 (run265 lib __cb0ca8):
+                 * 41574189cf 41564189f6 415549 89fd 4154 4d89c4
+                 * = push r15; mov ecx,r15d; push r14; mov esi,r14d;
+                 *   push r13; mov rdi,r13; push r12 */
                 static const u8 pro[17] = {
                     0x41, 0x57, 0x41, 0x89, 0xcf, 0x41, 0x56, 0x41,
-                    0x89, 0xf6, 0x41, 0x55, 0x4c, 0x89, 0xef, 0x41,
+                    0x89, 0xf6, 0x41, 0x55, 0x49, 0x89, 0xfd, 0x41,
                     0x54
                 };
                 {

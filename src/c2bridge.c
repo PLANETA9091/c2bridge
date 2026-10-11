@@ -17337,7 +17337,8 @@ static void *c2b_g107_thread(void *arg)
     for (;;) {
         i32 fdm = open("/proc/self/maps", 0);
         i64 n = 0;
-        static char mp[262144];
+        static char mp[1048576];   /* run302-урок: 256KB = хвост резался,
+                                    * поздний dlopen sdk64 = не влезал */
         char *p, *e2;
         uptr cand[8];
         u32 ncand = 0, ci;
@@ -17419,9 +17420,11 @@ static void *c2b_g107_thread(void *arg)
                 }
             }
         }
-        if (c2b_g107_nscan < 3) {
+        if (c2b_g107_nscan < 3 || ncand > 0) {
             C2B_LOGS("[c2b] g107: cands=");
             C2B_LOGN(ncand);
+            C2B_LOGS("maps_n=");
+            C2B_LOGN((u32)n);
             C2B_LOGS("\n");
         }
         for (ci = 0; ci < ncand; ci++) {

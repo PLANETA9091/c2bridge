@@ -13858,6 +13858,32 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 }
                 return (ssize_t)len;               /* дроп без отправки */
             }
+            /* 58f-g96a: КАНАЛЬНЫЕ датаграммы движка к :28022 (post-accept
+             * signon-попытки). run255-факты: сервер (РЕАЛЬНЫЙ, pcap-подтвер-
+             * ждено) шлёт legacy 'A'/'B' на raw-UDP 28022, движок доходит до
+             * cstate=2, НО после win-пути шлёт канал-датаграммы (S1-фрейминг)
+             * НАПРЯМУЮ в raw — сервер молча роняет -> таймаут -> retry-'k'.
+             * Дамп контента = сырьё для оффлайн-RE фрейминга (translate-
+             * трек). Rate-limit 1/8, только не-connectionless, только порт
+             * 28022 (BE 6d 76 @ sockaddr+2). */
+            if (p && (i32)len >= 8 &&
+                !(p[0] == 0xff && p[1] == 0xff && p[2] == 0xff && p[3] == 0xff) &&
+                addr && addrlen >= 4 &&
+                ((const u8 *)addr)[2] == 0x6d && ((const u8 *)addr)[3] == 0x76) {
+                static volatile u32 n96;
+                u32 c96 = ++n96;
+                if ((c96 & 0x07) == 1) {
+                        u32 k96;
+                        C2B_LOGS("[c2b] g96: chn-send #");
+                        C2B_LOGN(c96);
+                        C2B_LOGS(" len=");
+                        C2B_LOGN((u32)len);
+                        C2B_LOGS(" head=");
+                        for (k96 = 0; k96 < 24 && (u32)k96 < (u32)len; k96++)
+                                C2B_LOGH(p[k96]);
+                        C2B_LOGS("\n");
+                }
+            }
             i32 act = c2b_cl_filter_uplink(p, (u32)len);
             c2b_cl_trace(1, p, (u32)len, act);
             if (act == C2B_CL_DROP) return (ssize_t)len;   /* v2: дроп без отправки */
@@ -14130,6 +14156,32 @@ static void *c2b_g90_thread(void *arg)
         if (g_kfull_n == n0 || !g_kfull_len) {
             C2B_LOGS("[c2b] g90: no 'k' captured after scp call\n");
             continue;
+        }
+        /* 58f-g96b: decode rc=3 (InvalidParam со 2-го выстрела, run255) —
+         * состояние сессии ПЕРЕД каждым релеем: слот 13 = GetConnectionInfo
+         * (SDK-009 карта, g82; rc>0 = ок), дамп info[0..0x27] hex. rc=3 при
+         * живой сессии = state-гейт (not connecting?) — карта состояний
+         * ответит. SEGV-гард, rate-limit 1/2 (чётные выстрелы). */
+        if ((shot & 1) == 0) {
+            void **vt96 = *(void ***)g_gns_conn_iface;
+            u8 ma96[1024];
+            i32 rc96 = -999;
+            u32 j96;
+            for (j96 = 0; j96 < sizeof ma96; j96++) ma96[j96] = 0;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rc96 = ((i32 (*)(void *, uptr, void *))vt96[13])(
+                    g_gns_conn_iface, g_gns_conn_h, ma96);
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g96: GetConnectionInfo SEGV\n");
+            }
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g96: conninfo rc=");
+            C2B_LOGN((u32)(i32)rc96);
+            C2B_LOGS(" info=");
+            for (j96 = 0; j96 < 0x28; j96++) C2B_LOGH(ma96[j96]);
+            C2B_LOGS("\n");
         }
         vt9 = *(void ***)g_gns_conn_iface;
         send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;

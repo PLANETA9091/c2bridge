@@ -14744,6 +14744,7 @@ static void c2b_g100_scan(void)
     u32 hits = 0;
     u32 segn = 0;
     u32 preads = 0;
+    u32 fails = 0;
     u32 depth;
     char *p, *e;
     i32 fdm;
@@ -14872,7 +14873,7 @@ static void c2b_g100_scan(void)
             preads++;
             got = pread(fdm, c2b_g100_obj, sizeof(c2b_g100_obj) - 256,
                         (i64)a);
-            if (got <= 0) continue;
+            if (got <= 0) { fails++; continue; }
             if (c2b_g100_scan_buf(c2b_g100_obj, (u32)got, a, &hits))
                 break;
             if (depth < 2) {
@@ -14900,6 +14901,12 @@ static void c2b_g100_scan(void)
     C2B_LOGN(hits);
     C2B_LOGS(" preads=");
     C2B_LOGN(preads);
+    C2B_LOGS(" fl=");
+    C2B_LOGN(fails);
+    C2B_LOGS(" l1=");
+    C2B_LOGN(nfl[0]);
+    C2B_LOGS(" l2=");
+    C2B_LOGN(nfl[1]);
     if (c2b_g100_out) C2B_LOGS(" TIMECUT");
     C2B_LOGS("\n");
 }

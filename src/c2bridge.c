@@ -11633,7 +11633,17 @@ static void c2b_g32_drive(void)
              * C2S_CONNECT, следующий раунд). rc<0/фолт = слот не тот. */
             cs[0] = 12u;
             cs[1] = 11u;
-            if (ch7 && ciface) {
+            /* g71c: зонд/полл — ТОЛЬКО по env (run223: a1/a2 "client died"
+             * ~31-41с = окно полла; run221 (без g71) = 0 смертей. env-гейт
+             * = чистый A/B на run224: без C2B_G71_RX полла нет вовсе). */
+            {
+                const char *e71 = getenv("C2B_G71_RX");
+                if (!e71 || e71[0] == '0') {
+                    C2B_LOGS("[c2b] g71: probe disabled (C2B_G71_RX unset)\n");
+                    cs[0] = 0; cs[1] = 0;
+                }
+            }
+            if (ch7 && ciface && cs[0]) {
                 i32 rx_slot = -1;
                 u32 ci2;
                 vt7 = *(void ***)ciface;

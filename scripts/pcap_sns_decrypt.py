@@ -270,7 +270,10 @@ def extract_handshake(pkts, flow):
         cert_inner = None
         if cert_signed:
             sf = pb_fields(cert_signed)
-            cert_inner = _b(sf.get(1, [None])[0])
+            # Valve-internal CertSigned: the inner cert = field 4 (observed
+            # 226108011220... = the CMsgSteamDatagramCertificate); the GNS
+            # master uses field 1 — try both.
+            cert_inner = _b(sf.get(4, [None])[0]) or _b(sf.get(1, [None])[0])
         hs[side] = {"connid": connid, "crypt_inner": inner,
                     "nonce": info.get("nonce"),
                     "key_data": info.get("key_data"),

@@ -14624,14 +14624,20 @@ static void c2b_g100_scan(void)
     extern i32 open(const char *, i32, ...);
     extern i32 close(i32);
     extern i64 read(i32, void *, u64);
-    /* pread = глобальный extern @line 80 (i64 pread(i32, void*, uptr, uptr)) */
+    /* run266-урок: pread(/proc/self/mem) = READ mmap_sem, движок постоянно
+     * mmap/munmap (WRITE sem) -> скан = slow-motion (1.5GB не прошёл за 40с,
+     * лог застрял). v2 = ПРЯМОЕ чтение под SEGV-гвардом (паттерн g71/g84:
+     * __sigsetjmp + g_probe_active) — mmap_sem НЕ нужен, unmapping = фолт =
+     * скип чанка. Бюджеты: 25с wall-clock (clock_gettime на чанке), 3GB,
+     * <=32 хитов. Скан = в НАЧАЛЕ g98 (ключи валидны сразу после fc). */
+    extern i32 clock_gettime(i32 clk, void *ts);
     static char mp[262144];
     static u8 buf[1 << 20];
-    i32 fdm;
     i64 n = 0;
     u32 hits = 0;
     long long budget = 0;
     char *p, *e;
+    i64 t0s, t0n, tns, tnn;
     {
         const char *e100 = getenv("C2B_G100");
         if (e100 && e100[0] == '0') {
@@ -14657,10 +14663,11 @@ static void c2b_g100_scan(void)
         return;
     }
     mp[n] = 0;
-    fdm = open("/proc/self/mem", 0);
-    if (fdm < 0) {
-        C2B_LOGS("[c2b] g100: no mem\n");
-        return;
+    {
+        struct { i64 s, n; } ts0;
+        clock_gettime(1, &ts0);
+        t0s = ts0.s;
+        t0n = ts0.n;
     }
     C2B_LOGS("[c2b] g100: scan start\n");
     p = mp;
@@ -14669,7 +14676,6 @@ static void c2b_g100_scan(void)
         uptr lo = 0, hi = 0;
         i32 wr = 0;
         i32 c;
-        u64 got;
         uptr a;
         while (p < e && *p == '\n') p++;
         if (p >= e) break;
@@ -14702,15 +14708,34 @@ static void c2b_g100_scan(void)
         if (!wr || hi <= lo) continue;
         if (hi - lo > ((uptr)256 << 20)) continue;    /* гигантские скип */
         budget += (long long)(hi - lo);
-        if (budget > (long long)1500 << 20) break;    /* бюджет 1.5GB */
+        if (budget > (long long)3000 << 20) break;    /* бюджет 3GB */
         a = lo;
         while (a < hi && hits < 32) {
-            u64 want = (u64)(hi - a);
-            i64 got2;
+            uptr want = (uptr)(hi - a);
+            uptr got;
+            struct { i64 s, n; } tsx;
+            /* wall-clock: 25с потолок */
+            clock_gettime(1, &tsx);
+            tns = tsx.s;
+            tnn = tsx.n;
+            if (tns > t0s + 25 ||
+                (tns == t0s + 25 && tnn >= t0n)) {
+                C2B_LOGS("[c2b] g100: time budget out @hits=");
+                C2B_LOGN(hits);
+                C2B_LOGS("\n");
+                goto done;
+            }
             if (want > sizeof(buf)) want = sizeof(buf);
-            got2 = pread(fdm, buf, want, (i64)a);
-            if (got2 <= 0) break;
-            got = (u64)got2;
+            if (want > ((uptr)256 << 10)) want = (uptr)256 << 10; /* 256KB: короткое окно гварда */
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                memcpy(buf, (const void *)a, want);
+                got = want;
+            } else {
+                got = 0;                    /* фолт = unmapped — скип региона */
+            }
+            g_probe_active = 0;
+            if (got == 0) break;
             {
                 u64 off;
                 for (off = 512; off + 64 <= got; off += 4) {
@@ -14753,7 +14778,7 @@ static void c2b_g100_scan(void)
             a += got - 1024;      /* перекрытие чанков (расписания на границе) */
         }
     }
-    close(fdm);
+done:
     C2B_LOGS("[c2b] g100: scan done hits=");
     C2B_LOGN(hits);
     C2B_LOGS("\n");
@@ -14795,6 +14820,10 @@ static void *c2b_g98_thread(void *arg)
     C2B_LOGS(" msg=");
     C2B_LOGN(msg);
     C2B_LOGS("\n");
+    /* 59f-g100v2: скан расписаний AES-256 СРАЗУ после арма (ключи SNS-
+     * сессии валидны; run266-урок: скан в КОНЦЕ = pread/mmap_sem starvation
+     * застрял и съел хвост лога). Прямое чтение под гвардом + 25с потолок. */
+    c2b_g100_scan();
     usleep(3000000);      /* 3s: the engine finishes the 0x20-0x23 handshake */
     {
         u32 g99_on = 1;
@@ -14901,10 +14930,6 @@ static void *c2b_g98_thread(void *arg)
             }
         }
     }
-    /* 59f-g100: скан расписаний AES-256 в rw-памяти (ключи EVP-контекстов
-     * SNS-либы). run266+: pcap (snaplen 0) + keybe/окна -> оффлайн-дешифр
-     * 0x83 обеих сторон (scripts/pcap_sns_decrypt.py --keys-from-log). */
-    c2b_g100_scan();
     return (void *)0;
 }
 

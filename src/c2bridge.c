@@ -6626,10 +6626,29 @@ static void c2b_lastgasp(i32 sig, void *si, void *uc)
     if (sig >= 0 && sig < 32 && !g_lg_seen[sig]) {
         g_lg_seen[sig] = 1;
         if (uc) {
-            uptr rip78 = *(const volatile uptr *)((const u8 *)uc + 0xA8);
+            /* 58f-g79: полный сет регистров = офлайн-мэппинг RIP в либу без
+             * /proc/self/maps (run232 a3: rip=0x7f3223ec2a8f addr=0x7f31fffffffa
+             * — либа между steamclient.so@0x7f3214000000 и
+             * libSNS@0x7f3250a00000 не опознана — баз не хватает).
+             * gregs base = uc+0x28; x86-64: RDI=8 RSI=9 RDX=12 RAX=13
+             * RSP=15 RIP=16. */
+            const volatile uptr *gr =
+                (const volatile uptr *)((const u8 *)uc + 0x28);
+            uptr rip78 = gr[16], rdi78 = gr[8], rsi78 = gr[9];
+            uptr rdx78 = gr[12], rax78 = gr[13], rsp78 = gr[15];
             C2B_LOGS("[c2b] fatal sig="); C2B_LOGN((u32)sig);
             C2B_LOGS(" rip=0x");
             C2B_LOGH((u32)(rip78 >> 32)); C2B_LOGH((u32)rip78);
+            C2B_LOGS(" rdi=0x");
+            C2B_LOGH((u32)(rdi78 >> 32)); C2B_LOGH((u32)rdi78);
+            C2B_LOGS(" rsi=0x");
+            C2B_LOGH((u32)(rsi78 >> 32)); C2B_LOGH((u32)rsi78);
+            C2B_LOGS(" rdx=0x");
+            C2B_LOGH((u32)(rdx78 >> 32)); C2B_LOGH((u32)rdx78);
+            C2B_LOGS(" rax=0x");
+            C2B_LOGH((u32)(rax78 >> 32)); C2B_LOGH((u32)rax78);
+            C2B_LOGS(" rsp=0x");
+            C2B_LOGH((u32)(rsp78 >> 32)); C2B_LOGH((u32)rsp78);
             C2B_LOGS("\n");
         }
     }
@@ -13502,6 +13521,30 @@ ssize_t recvmmsg(int fd, struct c2b_mmsghdr *msgvec, unsigned vlen, int flags,
     }
 }
 
+/* 58f-g79: recvmsg-хук — одиночное msghdr-чтение (третий вариант после
+ * recvfrom/recvmmsg; закрывает ВСЕ UDP-чтения). passthrough + тап на iov[0]. */
+static void *g_clp_recvmsg;
+__attribute__((visibility("default")))
+ssize_t recvmsg(int fd, struct c2b_msghdr *msg, int flags)
+{
+    if (!g_clp_recvmsg) {
+        void *f = dlsym(C2B_CL_RTLD_NEXT, "recvmsg");
+        if (!f) f = (void *)1;
+        g_clp_recvmsg = f;
+    }
+    if ((uptr)g_clp_recvmsg == 1) {
+        *__errno_location() = 2;            /* ENOENT */
+        return -1;
+    }
+    {
+        ssize_t r = ((c2b_sendmsg_fn)g_clp_recvmsg)(fd, msg, flags);
+        if (r > 0 && msg && msg->msg_iov && msg->msg_iov[0].iov_base)
+            c2b_g77_rxraw_tap(fd, (const u8 *)msg->msg_iov[0].iov_base,
+                              (u32)r);
+        return r;
+    }
+}
+
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
 {
@@ -13563,13 +13606,16 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             return (ssize_t)blen;
         }
     }
+    /* 58f-g79: тап ДО family-гейта. run232: сессионные дата-пакеты (33-77B
+     * 0x81/0x83, ДОКАЗАНЫ в pcap оба направления) не видны ни в recvfrom-тапе
+     * (за family-гейтом), ни в recvmmsg — главный подозреваемый: ЧТЕНИЕ
+     * CONNECTED-сокета с addr=NULL (гейт addr&&family отфильтровывает).
+     * Тап ловит ЛЮБОЙ успешный UDP-чтённый буфер (рейтлимит внутри). */
+    if (r > 0 && buf) c2b_g77_rxraw_tap(fd, (const u8 *)buf, (u32)r);
     if (r > 0 && addr &&
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
         const u8 *p = (const u8 *)buf;
-        /* 58f-g77/78: сырой тап — общий хелпер (кипэлайвы len==5 не дампим,
-         * лимит 96; см. c2b_g77_rxraw_tap) */
-        c2b_g77_rxraw_tap(fd, p, (u32)r);
         /* 41f-g31: фиксация ВСЕХ 0x21 (кольцо для СВЕЖЕГО challenge) +
          * pending-триггер (reply на наш 0x20 с 'k'-капчера -> 0x22 немедленно)
          * + ВЕРДИКТ-лог 0x23..0x26 (0x23 ConnectOK = джекпот; 0x24 Closed =

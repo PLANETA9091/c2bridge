@@ -318,7 +318,8 @@ jobs:
           else
             # 5 attempts in full mode: the CLV2 'A'-reply format matrix
             # (C2B_CLV2_FMT = (attempt-1) % 5) needs all five slots.
-            C2B_ATTEMPTS=5 bash run-test-node.sh
+            # g94: 90s post-marker dwell = the signon progress + longevity data.
+            C2B_ATTEMPTS=5 C2B_POST_DWELL=90 bash run-test-node.sh
           fi
 
       # ---------- artifacts ----------

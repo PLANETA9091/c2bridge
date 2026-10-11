@@ -39,6 +39,11 @@ GAME_HOME="$(getent passwd "$GAME_USER" | cut -d: -f6)"
 BRIDGE_DIR="${C2B_BRIDGE_DIR:-$NODE_HOME/bridge}"
 DURATION="${C2B_DURATION:-240}"
 MAX_ATTEMPTS="${C2B_ATTEMPTS:-3}"
+# g94: post-marker dwell (C2B_POST_DWELL sec) — keep the client ALIVE after the
+# connection marker to capture the signon progress / the wire traffic / the
+# longevity (runs 251/252 killed AT the marker = the post-connect window
+# unobserved; the g16/g17 + walk lines during the dwell = the next-barrier data).
+POST_DWELL="${C2B_POST_DWELL:-0}"
 TRANSLATE="${C2B_TRANSLATE:-1}"
 SMOKE="${C2B_SMOKE:-0}"
 FARM="${C2B_FARM:-0}"
@@ -814,7 +819,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     engine_alive || { log "attempt $ATTEMPT: client died during connect"; save_conlog; break; }
     if grep -aqiE 'Connected\(|Signing up to server|Connected to' "$OUT" 2>/dev/null \
        || sudo -n grep -aqiE 'Connected\(|Signing up to server|Connected to' "$CONLOG" 2>/dev/null; then
-      CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"; break
+      CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"
+      # g94: post-marker dwell — the longevity + signon-progress window
+      if (( POST_DWELL > 0 )); then
+        DEND=$((SECONDS + POST_DWELL))
+        while (( SECONDS < DEND )); do
+          engine_alive || { log "attempt $ATTEMPT: client died in post-marker dwell (t+$((POST_DWELL - (DEND - SECONDS)))s)"; break; }
+          sleep 5
+        done
+        log "attempt $ATTEMPT: post-marker dwell done (${POST_DWELL}s)"
+      fi
+      break
     fi
     # bridge-side evidence: engine QCONNECTS the target (class name in the CL
     # trace line; run 54 lesson: "other" class = LanSearch broadcast noise)

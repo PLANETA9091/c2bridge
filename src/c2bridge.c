@@ -14601,6 +14601,20 @@ static void *c2b_g98_thread(void *arg)
                     fired2 = 1;
                     (void)c2b_g98_send_probe(alt, frm, 2);
                 }
+                /* 58f-g99v2 (run262-урок): тап в dispatch = мёртв (bsz @1EF9F0
+                 * = wrong-class -> fault -> n=0 -> ser не доходит). Пока ser не
+                 * починен (RE lite-vtable = след. раунд) — СИНТЕТИЧЕСКИЙ
+                 * SetConVar (t=6, S1/S2 identity, валидный минимальный proto):
+                 * CNETMsg_SetConVar{ convars{ name="cl_interp",
+                 * value="0.031" } } @t+9s. */
+                if (w8 == 9) {
+                    static const u8 sc99[] = {
+                        0x0a, 0x12,                         /* field1, len 18 */
+                        0x0a, 0x09, 'c', 'l', '_', 'i', 'n', 't', 'e', 'r', 'p',
+                        0x12, 0x05, '0', '.', '0', '3', '1'
+                    };
+                    (void)c2b_g98_send_msg(6, sc99, (u32)sizeof(sc99), 0, 99);
+                }
                 if (!g99_on) continue;
                 {
                     u32 ri99 = __atomic_load_n(&g_g99_ri, __ATOMIC_ACQUIRE);

@@ -17311,6 +17311,7 @@ static void c2b_g107_detour_ssse(const void *out, const void *in, u64 len,
     if (tramp) tramp(out, in, len, key, ictx);
 }
 
+static u32 c2b_g107_nscan;
 static void *c2b_g107_thread(void *arg)
 {
     extern i32 open(const char *, i32, ...);
@@ -17411,16 +17412,28 @@ static void *c2b_g107_thread(void *arg)
         }
         for (ci = 0; ci < ncand; ci++) {
             u32 du;
+            u32 evp_v = 0, ssse_v = 0;
             for (du = 0; du < c2b_g107_nbase; du++)
                 if (c2b_g107_base[du] == cand[ci]) break;
             if (du < c2b_g107_nbase) continue;
             if (c2b_g107_nbase >= 4) break;
+            if (c2b_g107_nscan < 3) {
+                C2B_LOGS("[c2b] g107: scan");
+                C2B_LOGN(c2b_g107_nscan);
+                C2B_LOGS(" base=");
+                C2B_LOGH((u32)(cand[ci] >> 32));
+                C2B_LOGH((u32)cand[ci]);
+                C2B_LOGS("ncand=");
+                C2B_LOGN(ncand);
+                C2B_LOGS("\n");
+            }
             {   /* EVP init @+0x21115b0: 14B вериф + патч */
                 u8 *tgt = (u8 *)(cand[ci] + 0x21115b0);
                 u32 k, ok = 1;
                 for (k = 0; k < 14; k++)
                     if (tgt[k] != pe[k]) { ok = 0; break; }
                 if (ok && tgt[0] == 0xff && tgt[1] == 0x25) ok = 0;
+                evp_v = ok;
                 if (ok && evp_on) {
                     u8 *tp = c2b_g107_tramp_evp[c2b_g107_nbase];
                     i32 rel;
@@ -17462,6 +17475,7 @@ static void *c2b_g107_thread(void *arg)
                     for (k = 0; k < 5; k++)
                         if (mkp[k] != mk[k]) { ok = 0; break; }
                 if (ok && tgt[0] == 0xff && tgt[1] == 0x25) ok = 0;
+                ssse_v = ok;
                 if (ok && ssse_on) {
                     u8 *tp = c2b_g107_tramp_ssse[c2b_g107_nbase];
                     i32 rel;
@@ -17497,7 +17511,17 @@ static void *c2b_g107_thread(void *arg)
             }
             c2b_g107_base[c2b_g107_nbase] = cand[ci];
             c2b_g107_nbase++;
+            if (c2b_g107_nscan < 3) {
+                C2B_LOGS("[c2b] g107: verify base#");
+                C2B_LOGN(c2b_g107_nbase);
+                C2B_LOGS("evp=");
+                C2B_LOGN(evp_v);
+                C2B_LOGS("ssse=");
+                C2B_LOGN(ssse_v);
+                C2B_LOGS("\n");
+            }
         }
+        c2b_g107_nscan++;
         usleep(2000000);
     }
 }

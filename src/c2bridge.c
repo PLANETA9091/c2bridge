@@ -7330,12 +7330,18 @@ static u32 g_gns_relay;                 /* C2B_GNS_RELAY=1 */
 static u32 g_gns_relay_sent;            /* сколько 0x22 ушло через relay */
 static u8  g_gns_connect_target[24];    /* C2B_GNS_CONNECT=ip:port (ascii) */
 static u32 g_gns_connect_go;            /* драйвер вооружён */
+static u32 g_gns_conn_ver;              /* g71: версия сработавшего интерфейса (0=006 1=009) */
+static void *g_gns_conn_iface;          /* g71: iface сработавшего коннекта */
+static uptr  g_gns_conn_h;              /* g71: хэндл GNS-соединения */
 static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
 static socklen_t g_gns_dstlen;          /* 0 = не собран */
 
 /* 41f-g32a: fwd decl — драйвер определяется ниже, зовётся из auth-потока */
 static void c2b_g32_drive(void);
 static void *c2b_g32_thread(void *arg);
+/* 58f-g71: fwd decl (дамп принятого GNS-сообщения; определение ниже драйвера) */
+static u32 g_gns_rx_n;
+static void c2b_g71_dumpmsg(void *mp);
 
 void c2b_g11_xport_log(uptr wrap, uptr orsp)
 {
@@ -11582,6 +11588,10 @@ static void c2b_g32_drive(void)
             }
             C2B_LOGS("[c2b] g32: ConnectByIPAddress h="); C2B_LOGN((u32)h);
             C2B_LOGS("\n");
+            /* g71: запоминаем iface/h/версию для зонда приёмника */
+            g_gns_conn_iface = iface;
+            g_gns_conn_h = h;
+            g_gns_conn_ver = vi;
             /* 43f-g38b: состояние НИЗКОУРОВНЕВОГО слоя ПОСЛЕ коннекта:
              * если AddRef отработал с полным инитом, s_hEpoll != -1 и
              * refcnt вырос; s_hEpoll=-1 при живом refcnt = init был
@@ -11596,9 +11606,111 @@ static void c2b_g32_drive(void)
             }
             break;   /* первая сработавшая версия */
         }
+        /* 58f-g71: ПРИЁМНЫЙ ЗОНД GNS-СЕССИИ. SDK-порядок ISteamNetworkingSockets
+         * (vt[1]=ConnectByIPAddress подтверждён): 0 CreateListenSocketIP,
+         * 1 ConnectByIPAddress, 2 ConnectP2P, 3 AcceptConnection,
+         * 4 CloseConnection, 5 CloseListenSocket, 6 SetConnectionUserData,
+         * 7 GetConnectionUserData, 8 SetConnectionName, 9 GetConnectionName,
+         * 10 SendMessageToConnection, 11 FlushMessagesToConnection (008+),
+         * 12 ReceiveMessagesOnConnection, 13 GetConnectionInfo. Для 006
+         * (без Flush): 11=Receive, 12=GetConnectionInfo. Кандидаты:
+         * 009 -> {12, 11}; 006 -> {11, 12}. ma = 1КБ стека (чужой слот с
+         * сигнатурой GetConnectionInfo пишет ~344Б СТРУКТУРУ в out-буфер).
+         * rc>0 + ma[0] = СЛОТ НАЙДЕН -> фиксация + poll 240s (дренируем
+         * очередь, дампим сообщения). rc<0 = закрыт/фолт -> следующий.
+         * Зонд и poll — под SEGV-гардой (г handler перманентный с g69). */
+        {
+            u32 cs[2];
+            void **vt7;
+            void *ciface = g_gns_conn_iface;
+            uptr ch7 = g_gns_conn_h;
+            cs[0] = (g_gns_conn_ver == 1) ? 12u : 11u;    /* 1 -> ...009 */
+            cs[1] = (g_gns_conn_ver == 1) ? 11u : 12u;
+            if (ch7 && ciface) {
+                i32 rx_slot = -1;
+                u32 ci2;
+                vt7 = *(void ***)ciface;
+                for (ci2 = 0; ci2 < 2 && rx_slot < 0; ci2++) {
+                    u64 ma[128];
+                    i32 rc7 = -999;
+                    ma[0] = 0;
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        rc7 = ((i32 (*)(void *, uptr, void **, i32))vt7[cs[ci2]])(
+                            ciface, ch7, (void **)ma, 1);
+                    } else {
+                        rc7 = -998;              /* фолт слота */
+                    }
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] g71: probe slot="); C2B_LOGN(cs[ci2]);
+                    C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
+                    C2B_LOGS("\n");
+                    if (rc7 > 0 && ma[0]) {
+                        rx_slot = (i32)cs[ci2];
+                        C2B_LOGS("[c2b] g71: RX SLOT FOUND="); C2B_LOGN((u32)rx_slot);
+                        C2B_LOGS("\n");
+                        c2b_g71_dumpmsg((void *)ma[0]);
+                    }
+                }
+                if (rx_slot >= 0) {
+                    u32 tick7;
+                    C2B_LOGS("[c2b] g71: poll 240s on slot=");
+                    C2B_LOGN((u32)rx_slot);
+                    C2B_LOGS("\n");
+                    for (tick7 = 0; tick7 < 240u * 5u; tick7++) {
+                        u64 ma[128];
+                        i32 rc7 = -999;
+                        usleep(200000);
+                        ma[0] = 0;
+                        g_probe_active = 1;
+                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                            rc7 = ((i32 (*)(void *, uptr, void **, i32))vt7[rx_slot])(
+                                ciface, ch7, (void **)ma, 1);
+                        } else {
+                            rc7 = -998;
+                        }
+                        g_probe_active = 0;
+                        if (rc7 < 0) {
+                            C2B_LOGS("[c2b] g71: session end @tick="); C2B_LOGN(tick7);
+                            C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
+                            C2B_LOGS("\n");
+                            break;
+                        }
+                        if (rc7 > 0 && ma[0]) c2b_g71_dumpmsg((void *)ma[0]);
+                        if ((tick7 % 200) == 199) {
+                            C2B_LOGS("[c2b] g71: tick="); C2B_LOGN(tick7);
+                            C2B_LOGS(" rxn="); C2B_LOGN(g_gns_rx_n);
+                            C2B_LOGS("\n");
+                        }
+                    }
+                } else {
+                    C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");
+                }
+            }
+        }
         sigaction(11, &oldsa, (void *)0);
     }
 }
+
+/* 58f-g71: дамп принятого SteamNetworkingMessage_t* (m_pData@0, m_cbSize@8):
+ * len + первые 64B hex — открытие протокола in-channel (run221: сессия
+ * CONNECTED, очередь сообщений никто не дренирует). READ-ONLY. */
+static u32 g_gns_rx_n;
+static void c2b_g71_dumpmsg(void *mp)
+{
+    u32 msz, k;
+    const u8 *pd;
+    if (!mp) return;
+    msz = *(const volatile u32 *)((const u8 *)mp + 8);
+    pd = *(const volatile void *const *)mp;
+    g_gns_rx_n++;
+    C2B_LOGS("[c2b] g71: msg#"); C2B_LOGN(g_gns_rx_n);
+    C2B_LOGS(" len="); C2B_LOGN(msz);
+    C2B_LOGS(" d=");
+    if (pd) for (k = 0; k < 64 && k < msz; k++) C2B_LOGH(pd[k]);
+    C2B_LOGS("\n");
+}
+
 #endif  /* C2B_SELFTEST (g32a-драйвер: real-build only) */
 
 /* xorshift32; сид = адрес стека (ASLR) — conn_id требует уникальности, не крипто */

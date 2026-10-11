@@ -12080,14 +12080,13 @@ static void c2b_g32_drive(void)
              * 11=Flush, 12=ReceiveMessagesOnConnection, 13=GetConnectionInfo
              * (rc=1 + ma[0]=0). Кандидаты {12, 13}: rc>0+дамп = приёмник;
              * rc==0 = пустая очередь. Слот 11 УБРАН (g71b: Send — крэш). */
-            cs[0] = 12u;
-            cs[1] = 13u;
-            /* g84: поход g83/g84 (post-poll) нашёл приёмник на ПРЕДЫДУЩЕМ
-             * заходе — фиксируем его ПЕРВЫМ кандидатом (полл уйдёт на него;
-             * run237 эмпирика: слот 20 = ReceiveMessagesOnListenSocket —
-             * ИМЯ подтверждено GNSLIB-lock-warning; 18 = detailed-status
-             * size-query rc=1978; 16/17 = struct-геттеры; 20-фолт = 4-арг
-             * на listen-сокетном приёмнике). */
+            /* g87: слот 14 = ПРИЁМНИК (run239-a1: rc=1 + реальный heap-ptr
+             * + дамп in-channel 'A' ChallengeRequest; 12 = красная селёдка —
+             * rc=0 ВСЕГДА, никогда не доставляет). Кандидаты {14, 12}:
+             * rc==0 на 14 = ПУСТАЯ ОЧЕРЕДЬ РЕАЛЬНОГО приёмника (run240-a3)
+             * — полл уйдёт на 14 и дождётся сообщений. */
+            cs[0] = 14u;
+            cs[1] = 12u;
             if (g_gns_walk_slot >= 14u && g_gns_walk_slot <= 27u) {
                 cs[0] = g_gns_walk_slot;
                 cs[1] = 12u;

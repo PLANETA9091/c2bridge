@@ -13873,6 +13873,48 @@ static void *c2b_g90_thread(void *arg)
             C2B_LOGS("\n");
         }
         g_g90_last_seq = g_g90_A_seq;
+        /* 58f-g90v4 (run246-урок): chal ненулевой (0x15fac443), но 'k' НЕ
+         * собрался. КОРЕНЬ: после 'A'-парса snap = NEW-style netadr ЦЕЛИ,
+         * а живой канал движка (el) = локальный релей (127.0.0.1) -> ALT-
+         * путь чека (b) (65e930 OLD-сравнение) НЕ совпадает -> SendConnect-
+         * Packet молчит. В run168 el = цель (S1-era challenge binding) ->
+         * совпадал. ФИКС = рецепт g26v2/g29: зеркалим OLD-поля el в snap
+         * (ip BE @st+0x4f4 = el+0x4c, port BE @st+0x4f8 = el+0x50); snap[0x1c]
+         * НЕ трогаем (натуральный 0 = не ad-hoc -> plain-UDP путь). */
+        {
+            uptr arr = *(volatile const uptr *)(st + 0x148);
+            u32 cnt = *(volatile const u32 *)(st + 0x158);
+            u32 ei;
+            if (arr && cnt) {
+                for (ei = 0; ei < cnt && ei < 8; ei++) {
+                    uptr el = arr + (uptr)ei * 0x68;
+                    u32 e64 = *(volatile const u32 *)(el + 0x64);
+                    if (e64 >= 1u && e64 <= 3u) {
+                        u32 eip = *(volatile const u32 *)(el + 0x4c);
+                        u16 ept = *(volatile const u16 *)(el + 0x50);
+                        u32 sip = *(volatile const u32 *)(st + 0x4f4);
+                        u16 spt = *(volatile const u16 *)(st + 0x4f8);
+                        if (sip != eip)
+                            *(volatile u32 *)(st + 0x4f4) = eip;
+                        if (spt != ept)
+                            *(volatile u16 *)(st + 0x4f8) = ept;
+                        C2B_LOGS("[c2b] g90v4: snap<-el mirrors el=");
+                        C2B_LOGH((u32)el);
+                        C2B_LOGS(" e64=");
+                        C2B_LOGN(e64);
+                        C2B_LOGS(" ip=");
+                        C2B_LOGH(eip);
+                        C2B_LOGS(" pt=");
+                        C2B_LOGH(ept);
+                        C2B_LOGS(" (was ");
+                        C2B_LOGH(sip);
+                        C2B_LOGH(spt);
+                        C2B_LOGS(")\n");
+                        break;
+                    }
+                }
+            }
+        }
         g_probe_active = 1;
         if (__sigsetjmp(g_probe_jb, 1) == 0) {
             if (*(volatile u32 *)(st + 0x8dc4) == 0)

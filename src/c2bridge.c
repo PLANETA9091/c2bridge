@@ -14637,85 +14637,87 @@ static i32 c2b_g100_deadline(void)
     return 0;
 }
 
-/* скан одного диапазона (pread 256KB-чанками; run266/268-урок: прямые
- * чтения = фолты = mmap_sem-голодание на пике загрузки движка; pread =
- * паттерн g24 (2.4GB OK), работает на IDLE-фазе) */
-static void c2b_g100_scan_range(i32 fdm, uptr lo, uptr hi, u32 *hits,
-                                long long *scanned)
+/* v7 (run271-урок): BULK-скан = mmap_sem-голодание на ЛЮБОЙ активной фазе
+ * движка (v1 t+33, v6 t+6 = застряли; v4/v5 t+45 idle = 1.3GB/s, но смерть
+ * клиента = переменная t+25..75 = окно не гарантировано). РЕШЕНИЕ:
+ * НАПРАВЛЕННЫЙ ОБХОД: (1) rw-сегменты самой SNS-либы (~0.5MB, пара pread);
+ * (2) харвест указателей из них (heap-указатели) -> pread 2KB -> скан
+ * расписания + харвест второго уровня (connection obj -> m_pCryptContext* ->
+ * EVP ctx с AES_KEY). Всего ~2-5с мелких pread = storm-tolerant. Фильтр
+ * двухдоменный (v5). Лог: sns seg= hits1= ptrs1= + финальный done. */
+static u32 c2b_g100_harvest(const u8 *p, u32 n, uptr *out, u32 max)
 {
-    uptr a = lo;
-    while (a < hi && *hits < 32) {
-        uptr want = hi - a;
-        i64 got;
-        u64 off;
-        if (c2b_g100_deadline()) {
-            c2b_g100_out = 1;
-            return;
-        }
-        if (want > sizeof(c2b_g100_buf)) want = sizeof(c2b_g100_buf);
-        if (want > ((uptr)256 << 10)) want = (uptr)256 << 10;
-        *scanned += (long long)want;
-        got = pread(fdm, c2b_g100_buf, want, (i64)a);
-        if (got <= 0) return;
-        for (off = 512; off + 64 <= (u64)got; off += 4) {
-            const u32 *w = (const u32 *)(c2b_g100_buf + off);
-            u32 t, s8, r;
-            i32 isle = 0;
-            /* run269-урок: хитов 0 в 26.4GB — реальный OpenSSL x86-64
-             * (AES-NI asm) хранит расписание в БАЙТ-СВАПНУТЫХ (LE) словах
-             * (эмпирика asexpand.c: w[0]=b обмен; w9/w10 = XOR в обоих
-             * доменах; LE-фильтр: R'(x)=(x>>8)|(x<<24), rcon=0x00000001).
-             * Фильтр = ДВУХДОМЕННЫЙ (BE C-конвенция + LE asm). */
-            t = (w[7] << 8) | (w[7] >> 24);              /* BE RotWord */
-            s8 = c2b_g100_subw(t) ^ 0x01000000u;
+    u32 i, cnt = 0, k;
+    for (i = 0; i + 8 <= n; i += 8) {
+        uptr v;
+        memcpy(&v, p + i, 8);
+        if (v < ((uptr)0x1000000) || v >= ((uptr)0x8000000000ull))
+            continue;
+        if (v & 7) continue;
+        for (k = 0; k < cnt; k++)
+            if (out[k] == v) break;
+        if (k < cnt) continue;
+        out[cnt++] = v;
+        if (cnt >= max) break;
+    }
+    return cnt;
+}
+
+static u32 c2b_g100_scan_buf(const u8 *buf, u32 n, uptr base, u32 *hits)
+{
+    u64 off;
+    for (off = 512; off + 64 <= n; off += 4) {
+        const u32 *w = (const u32 *)(buf + off);
+        u32 t, s8;
+        i32 isle = 0;
+        t = (w[7] << 8) | (w[7] >> 24);              /* BE RotWord */
+        s8 = c2b_g100_subw(t) ^ 0x01000000u;
+        if ((w[0] ^ s8) == w[8] &&
+            (w[1] ^ w[8]) == w[9] &&
+            (w[2] ^ w[9]) == w[10]) {
+            isle = 0;
+        } else {
+            t = (w[7] >> 8) | (w[7] << 24);          /* LE-домен */
+            s8 = c2b_g100_subw(t) ^ 0x00000001u;
             if ((w[0] ^ s8) == w[8] &&
                 (w[1] ^ w[8]) == w[9] &&
-                (w[2] ^ w[9]) == w[10]) {
-                isle = 0;
-            } else {
-                t = (w[7] >> 8) | (w[7] << 24);          /* LE-домен */
-                s8 = c2b_g100_subw(t) ^ 0x00000001u;
-                if ((w[0] ^ s8) == w[8] &&
-                    (w[1] ^ w[8]) == w[9] &&
-                    (w[2] ^ w[9]) == w[10])
-                    isle = 1;
-                else
-                    continue;
-            }
-            /* HIT */
-            {
-                u8 kb[32];
-                u32 k;
-                u64 s2, en;
-                C2B_LOGS("[c2b] g100: aes256ks @");
-                C2B_LOGH((u32)((a + off) >> 32));
-                C2B_LOGH((u32)(a + off));
-                C2B_LOGS(isle ? "le keybe=" : "be keybe=");
-                if (isle) {
-                    /* LE-хранение: ключ = СЫРЫЕ байты памяти w[0..7] */
-                    c2b_g100_hexs((const u8 *)w, 32);
-                } else {
-                    for (k = 0; k < 8; k++) {
-                        kb[k * 4 + 0] = (u8)(w[k] >> 24);
-                        kb[k * 4 + 1] = (u8)(w[k] >> 16);
-                        kb[k * 4 + 2] = (u8)(w[k] >> 8);
-                        kb[k * 4 + 3] = (u8)(w[k]);
-                    }
-                    c2b_g100_hexs(kb, 32);
-                }
-                C2B_LOGS(" win=");
-                s2 = off >= 512 ? off - 512 : 0;
-                en = off + 512;
-                if (en > (u64)got) en = (u64)got;
-                c2b_g100_hexs(c2b_g100_buf + s2, (u32)(en - s2));
-                C2B_LOGS("\n");
-                (*hits)++;
-                if (*hits >= 32) break;
-            }
+                (w[2] ^ w[9]) == w[10])
+                isle = 1;
+            else
+                continue;
         }
-        if ((u64)got < (u64)want) return;
-        a += got - 1024;      /* перекрытие чанков (расписания на границе) */
+        /* HIT */
+        {
+            u8 kb[32];
+            u32 k;
+            u64 s2, en;
+            C2B_LOGS("[c2b] g100: aes256ks @");
+            C2B_LOGH((u32)((base + off) >> 32));
+            C2B_LOGH((u32)(base + off));
+            C2B_LOGS(isle ? "le keybe=" : "be keybe=");
+            if (isle) {
+                /* LE-хранение: ключ = СЫРЫЕ байты памяти w[0..7] */
+                c2b_g100_hexs((const u8 *)w, 32);
+            } else {
+                for (k = 0; k < 8; k++) {
+                    kb[k * 4 + 0] = (u8)(w[k] >> 24);
+                    kb[k * 4 + 1] = (u8)(w[k] >> 16);
+                    kb[k * 4 + 2] = (u8)(w[k] >> 8);
+                    kb[k * 4 + 3] = (u8)(w[k]);
+                }
+                c2b_g100_hexs(kb, 32);
+            }
+            C2B_LOGS(" win=");
+            s2 = off >= 512 ? off - 512 : 0;
+            en = off + 512;
+            if (en > n) en = n;
+            c2b_g100_hexs(buf + s2, (u32)(en - s2));
+            C2B_LOGS("\n");
+            (*hits)++;
+            if (*hits >= 32) return 1;
+        }
     }
+    return 0;
 }
 
 static void c2b_g100_scan(void)
@@ -14723,19 +14725,16 @@ static void c2b_g100_scan(void)
     extern i32 open(const char *, i32, ...);
     extern i32 close(i32);
     extern i64 read(i32, void *, u64);
-    /* v6 (run270-урок): гибель клиента = ПЕРЕМЕННАЯ (t+25..t+75) — LATE
-     * (t+45) скан не доживает. v6: СБОР регионов в массив + СКАН В ОБРАТНОМ
-     * ПОРЯДКЕ (mmap-арены аллокатора = высокие адреса = первыми), плейсмент
-     * СРАЗУ после арма+3с (t+6), pread, потолок 15с -> done к t+21 < t+25
-     * (минимальный наблюдённый death). Пропуски: не-rw, >1GB. */
     static char mp[262144];
-    static struct { uptr lo, hi; } rg[768];
+    static u8 seg[1 << 20];           /* SNS lib rw-сегменты */
+    static u8 obj[4096];
+    static uptr ptrs1[512];
+    static uptr ptrs2[512];
     i64 n = 0;
     u32 hits = 0;
-    long long scanned = 0;
+    u32 segn = 0;
     char *p, *e;
     i32 fdm;
-    u32 nrg = 0, k;
     struct { i64 s, n; } ts0;
     {
         const char *e100 = getenv("C2B_G100");
@@ -14772,13 +14771,16 @@ static void c2b_g100_scan(void)
     c2b_g100_t0n = ts0.n;
     c2b_g100_out = 0;
     C2B_LOGS("[c2b] g100: scan start\n");
-    /* сбор rw-регионов (<=1GB) */
+    /* 1. собрать и прочитать rw-сегменты SNS-либы */
     p = mp;
     e = mp + n;
-    while (p < e && nrg < 768) {
+    while (p < e && !c2b_g100_out) {
         uptr lo = 0, hi = 0;
         i32 wr = 0;
         i32 c;
+        i32 issns = 0;
+        char pathbuf[512];
+        u32 pl = 0, ps;
         while (p < e && *p == '\n') p++;
         if (p >= e) break;
         while (p < e && *p != '-') {
@@ -14804,27 +14806,77 @@ static void c2b_g100_scan(void)
         if (p < e && *p == 'r') { p++; }
         if (p < e && *p == 'w') { wr = 1; p++; }
         else if (p < e && *p == '-') { p++; }
-        while (p < e && *p != '\n') p++;
+        while (p < e && *p != '\n') {
+            if (pl < sizeof(pathbuf) - 1) pathbuf[pl++] = *p;
+            p++;
+        }
+        pathbuf[pl] = 0;
         if (p < e) p++;
         if (!wr || hi <= lo) continue;
-        if (hi - lo > ((uptr)1024 << 20)) continue;
-        rg[nrg].lo = lo;
-        rg[nrg].hi = hi;
-        nrg++;
+        /* путь = хвост строки после inode; ищем имя либы */
+        for (ps = 0; ps + 25 < pl; ps++) {
+            if (pathbuf[ps] == 'l' &&
+                pathbuf[ps + 1] == 'i' && pathbuf[ps + 2] == 'b' &&
+                pathbuf[ps + 3] == 's' && pathbuf[ps + 4] == 't' &&
+                pathbuf[ps + 5] == 'e' && pathbuf[ps + 6] == 'a' &&
+                pathbuf[ps + 7] == 'm') {
+                issns = 1;
+                break;
+            }
+        }
+        if (!issns) continue;
+        {
+            uptr want = hi - lo;
+            i64 got;
+            if (want > (uptr)sizeof(seg) - segn)
+                want = (uptr)(sizeof(seg) - segn);
+            if ((i64)want <= 0) continue;
+            got = pread(fdm, seg + segn, want, (i64)lo);
+            if (got <= 0) continue;
+            c2b_g100_scan_buf(seg + segn, (u32)got, lo, &hits);
+            segn += (u32)got;
+        }
     }
-    /* скан В ОБРАТНОМ порядке (арены = высокие адреса = первыми);
-     * маленькие (<=16MB) внутри группы тоже от старших к младшим */
-    for (k = nrg; k > 0 && hits < 32 && !c2b_g100_out; k--) {
-        c2b_g100_scan_range(fdm, rg[k - 1].lo, rg[k - 1].hi,
-                            &hits, &scanned);
+    C2B_LOGS("[c2b] g100: sns seg=");
+    C2B_LOGN(segn);
+    C2B_LOGS(" hits1=");
+    C2B_LOGN(hits);
+    C2B_LOGS("\n");
+    /* 2. харвест указателей из сегментов SNS -> depth-1 */
+    if (hits < 32 && segn > 64 && !c2b_g100_out) {
+        u32 np1 = c2b_g100_harvest(seg, segn, ptrs1, 512);
+        u32 i1;
+        C2B_LOGS("[c2b] g100: ptrs1=");
+        C2B_LOGN(np1);
+        C2B_LOGS("\n");
+        for (i1 = 0; i1 < np1 && hits < 32 && !c2b_g100_out; i1++) {
+            i64 got;
+            u32 np2, i2;
+            if (c2b_g100_deadline()) { c2b_g100_out = 1; break; }
+            got = pread(fdm, obj, sizeof(obj) - 256, (i64)ptrs1[i1]);
+            if (got <= 0) continue;
+            if (c2b_g100_scan_buf(obj, (u32)got, ptrs1[i1], &hits))
+                break;
+            /* depth-2: указатели из объекта */
+            np2 = c2b_g100_harvest(obj, (u32)got, ptrs2, 512);
+            for (i2 = 0; i2 < np2 && hits < 32 && !c2b_g100_out; i2++) {
+                static u8 obj2[2048];
+                i64 got2;
+                if (c2b_g100_deadline()) {
+                    c2b_g100_out = 1;
+                    break;
+                }
+                got2 = pread(fdm, obj2, sizeof(obj2), (i64)ptrs2[i2]);
+                if (got2 <= 0) continue;
+                if (c2b_g100_scan_buf(obj2, (u32)got2, ptrs2[i2], &hits))
+                    break;
+            }
+            if (hits >= 32 || c2b_g100_out) break;
+        }
     }
     close(fdm);
     C2B_LOGS("[c2b] g100: scan done hits=");
     C2B_LOGN(hits);
-    C2B_LOGS(" mb=");
-    C2B_LOGN((u32)(scanned >> 20));
-    C2B_LOGS(" reg=");
-    C2B_LOGN(nrg);
     if (c2b_g100_out) C2B_LOGS(" TIMECUT");
     C2B_LOGS("\n");
 }

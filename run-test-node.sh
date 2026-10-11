@@ -863,9 +863,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       ip -o link 2>/dev/null | head -10 > "$RUNDIR/ifnames.txt" || true
       ( while (( SECONDS < END )); do
           echo "=== t=$SECONDS ==="
-          sudo -n ss -upan 2>/dev/null | grep -aE ":$TPORT |:27005 |:27015 "
+          sudo -n ss -upan 2>/dev/null | grep -aE ":$TPORT |:27005 |:27015 |:dfff "
           sleep 5
         done ) > "$RUNDIR/ss_timeline.txt" 2>/dev/null & SSLOOP_PID=$!
+      # g109b: run308-census verdict — the game's SDR datagrams = ALL to the
+      # loopback relay 127.0.0.1:57343 (0xdfff, n=3136/session, fd=0x11) =
+      # ZERO direct :28022 sends => the real SDR endpoint = the :57343
+      # receiver = THE STEAM CLIENT (the SNS-crypto holder). The :dfff
+      # listener's pid = THE client-side campaign anchor.
+      sudo -n ss -upan 2>/dev/null | grep -a ":dfff " \
+        > "$RUNDIR/relay57343_owner.txt" 2>/dev/null || true
+      log "attempt $ATTEMPT: :57343 relay owner: $(grep -ac . "$RUNDIR/relay57343_owner.txt" 2>/dev/null) lines: $(head -1 "$RUNDIR/relay57343_owner.txt" 2>/dev/null | cut -c1-140)"
       # g109: run307-вердикт — таймлайн с фильтром rem=:$TPORT слеп к
       # UNCONNECTED-сокетам (rem=0:0, sendto-путь), а run297 показал
       # /proc/net/udp = 4 строки НА ВСЮ машину => СДР-датаграммы уходят

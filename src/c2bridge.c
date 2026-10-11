@@ -11029,6 +11029,13 @@ static void *c2b_auth_thread(void *arg)
     return 0;
 }
 
+/* 58f-g74b: капчуренная ticket-зона 'k' (byte 17+) — сырьё для C2S_CONNECT
+ * пробы. Заполняется в 'k'-пути (g70b), читается из g32-драйвера.
+ * ВНЕ условных блоков: пишут обе сборки (selftest включает 'k'-путь). */
+static u8  g_kcap[2048];
+static u32 g_kcap_len;
+static u32 g_kcap_n;
+
 #ifndef C2B_SELFTEST
 /* g32a-обёртка для pthread: spew_rearm держит auth-поток в 60x5s цикле
  * (run173: драйвер ПОСЛЕ rearm недостижим — попытка кончается раньше) */
@@ -11651,6 +11658,67 @@ static void c2b_g32_drive(void)
             }
             break;   /* первая сработавшая версия */
         }
+        /* 58f-g74b: C2S_CONNECT-ПРОБА — ПЕРВЫЙ in-channel байт клиента.
+ * Ран 227: сессия ЖИВА (g73 снял cert-CA стену), сервер молчит до
+ * первого байта клиента (факт ран 222/223). Шлём капчуренную
+ * ticket-зону 'k' (g70b g_kcap) через SendMessageToConnection —
+ * реакция сервера (0x27-данные / 0x24-reason / тишина) = спецификация
+ * in-channel протокола. СЛОТ: run222-эмпирика — слот 11 НА 006 = Send
+ * (зонд вернул rc=1 и реально доставил 1-байтовое сообщение серверу),
+ * слот 12 = Receive. Для 009 = слот 10 (публичный порядок).
+ * Форма вызова 6-арг: (h, pData, cbData, flags=1=reliable, &out) —
+ * покрывает и 3-арг-era (лишние игнорируются), и 5-арг (валидный out).
+ * Сессия может быть ещё CONNECTING (0x23 не долетел) -> ретраи 20x500мс
+ * до rc==1 (k_EResultOK). Киллисвитч C2B_G74_SEND=0. SEGV-гард. */
+        if (g_gns_conn_h && g_gns_conn_iface) {
+            const char *e74 = getenv("C2B_G74_SEND");
+            if (e74 && e74[0] == '0') {
+                C2B_LOGS("[c2b] g74: send disabled (C2B_G74_SEND=0)\n");
+            } else if (!g_kcap_len) {
+                C2B_LOGS("[c2b] g74: no k-ticket blob yet (skip send)\n");
+            } else {
+                void **vt74 = *(void ***)g_gns_conn_iface;
+                u32 send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
+                i32 rc74 = -999, try74;
+                i64 out74 = -1;
+                C2B_LOGS("[c2b] g74: C2S_CONNECT probe: k-ticket blob len=");
+                C2B_LOGN(g_kcap_len);
+                C2B_LOGS(" head=");
+                {   u32 k74;
+                    for (k74 = 0; k74 < 16 && k74 < g_kcap_len; k74++)
+                        C2B_LOGH(g_kcap[k74]);
+                }
+                C2B_LOGS("\n");
+                for (try74 = 0; try74 < 20; try74++) {
+                    out74 = -1;
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        rc74 = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                                          i64 *))vt74[send_slot])(
+                            g_gns_conn_iface, g_gns_conn_h,
+                            g_kcap, g_kcap_len, 1, &out74);
+                    } else {
+                        g_probe_active = 0;
+                        C2B_LOGS("[c2b] g74: SendMessageToConnection SEGV\n");
+                        break;
+                    }
+                    g_probe_active = 0;
+                    if (rc74 == 1) {
+                        C2B_LOGS("[c2b] g74: blob SENT try=");
+                        C2B_LOGN((u32)try74);
+                        C2B_LOGS(" out="); C2B_LOGN((u32)(i32)out74);
+                        C2B_LOGS("\n");
+                        break;
+                    }
+                    usleep(500000);
+                }
+                if (rc74 != 1) {
+                    C2B_LOGS("[c2b] g74: send NOT ok rc=");
+                    C2B_LOGN((u32)(i32)rc74);
+                    C2B_LOGS("\n");
+                }
+            }
+        }
         /* 58f-g71: ПРИЁМНЫЙ ЗОНД GNS-СЕССИИ. SDK-порядок ISteamNetworkingSockets
          * (vt[1]=ConnectByIPAddress подтверждён): 0 CreateListenSocketIP,
          * 1 ConnectByIPAddress, 2 ConnectP2P, 3 AcceptConnection,
@@ -11678,13 +11746,15 @@ static void c2b_g32_drive(void)
              * C2S_CONNECT, следующий раунд). rc<0/фолт = слот не тот. */
             cs[0] = 12u;
             cs[1] = 11u;
-            /* g71c: зонд/полл — ТОЛЬКО по env (run223: a1/a2 "client died"
-             * ~31-41с = окно полла; run221 (без g71) = 0 смертей. env-гейт
-             * = чистый A/B на run224: без C2B_G71_RX полла нет вовсе). */
+            /* g71c→g74a: зонд/полл теперь ВКЛЮЧЁН ПО УМОЛЧАНИЮ (run227:
+             * сессия жива после g73 — полл = наблюдатель in-channel
+             * протокола; runs 223/224 A/B доказали безопасность полла,
+             * смерти были гонкой гварда — починено g72). Киллисвитч:
+             * C2B_G71_RX=0. */
             {
                 const char *e71 = getenv("C2B_G71_RX");
-                if (!e71 || e71[0] == '0') {
-                    C2B_LOGS("[c2b] g71: probe disabled (C2B_G71_RX unset)\n");
+                if (e71 && e71[0] == '0') {
+                    C2B_LOGS("[c2b] g71: probe disabled (C2B_G71_RX=0)\n");
                     cs[0] = 0; cs[1] = 0;
                 }
             }
@@ -13012,8 +13082,8 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                      * auth (В 0x22 ticket-поля НЕТ — дескриптор g70). Лог:
                      * длина + первые 32 байта hex. */
                     if (len > 17) {
-                        static u8 g_kcap[2048];
-                        static u32 g_kcap_len, g_kcap_n;
+                        /* g74: буферы подняты в файловый скоуп (g74b шлёт их
+                         * из g32-драйвера как C2S_CONNECT-пробу) */
                         u32 cl = len - 17, k7;
                         if (cl > sizeof(g_kcap)) cl = sizeof(g_kcap);
                         memcpy(g_kcap, p + 17, cl);

@@ -16839,6 +16839,76 @@ static void *c2b_g106w_thread(void *arg)
 
 static u32 c2b_g106w2_seen[160][2];
 static u32 c2b_g106w2_nseen;
+static u32 c2b_g106w2_nspids[40];
+static u32 c2b_g106w2_nspid;
+
+/* inode-in-table: fidx = the 0-based inode field (udp/tcp/netlink = 9,
+ * unix = 6); возвращает 1 если строка с inode==ino найдена */
+static u32 c2b_g106w2_in_table(const char *b, u32 n, u64 ino, u32 fidx)
+{
+    const char *p = b, *e = b + n;
+    if (!n) return 0;
+    while (p < e) {
+        const char *le = p;
+        u32 f = 0;
+        u64 il = 0;
+        while (le < e && *le != '\n') le++;
+        {
+            const char *q = p;
+            while (q < le) {
+                const char *ts;
+                while (q < le && *q == ' ') q++;
+                if (q >= le) break;
+                ts = q;
+                while (q < le && *q != ' ') q++;
+                if (f == fidx) {
+                    for (; ts < q; ts++)
+                        if (*ts >= '0' && *ts <= '9')
+                            il = il * 10 + (u64)(*ts - '0');
+                    break;
+                }
+                f++;
+            }
+        }
+        if (il == ino && il) return 1;
+        p = (le < e) ? le + 1 : le;
+    }
+    return 0;
+}
+
+/* ns/net readlink -> "net:[N]" лог (дедуп по pid через seen-массив) */
+static void c2b_g106w2_nslog(u32 pid)
+{
+    extern i64 readlink(const char *, char *, u64);
+    char pb[96], sb[96], cb[64];
+    i64 rl;
+    u32 cn, k;
+    rl = readlink("/proc/self/ns/net", sb, sizeof(sb) - 1);
+    if (rl <= 5) return;
+    sb[rl] = 0;
+    c2b_g106_path(pb, "/proc/", pid, "/ns/net");
+    rl = readlink(pb, pb + 48, sizeof(pb) - 49);
+    if (rl <= 5) return;
+    pb[48 + rl] = 0;
+    c2b_g106_path(pb, "/proc/", pid, "/comm");
+    cn = c2b_g106_read_file(pb, cb, sizeof(cb));
+    while (cn && (cb[cn - 1] == '\n' || cb[cn - 1] == 0)) cn--;
+    C2B_LOGS("[c2b] g106w2: ns p");
+    C2B_LOGD(pid);
+    C2B_LOGS("comm=");
+    if (cn) c2b_log(cb);
+    C2B_LOGS("net=");
+    c2b_log(pb + 48);
+    C2B_LOGS("self=");
+    c2b_log(sb);
+    {   /* сравнение хвостов [N] */
+        const char *a = pb + 48, *b2 = sb;
+        while (*a && *b2 && *a == *b2) { a++; b2++; }
+        if (!*a && !*b2) C2B_LOGS("SAME");
+        else C2B_LOGS("DIFF");
+    }
+    C2B_LOGS("\n");
+}
 
 static void c2b_g106w2_sockmap(void)
 {
@@ -16848,12 +16918,17 @@ static void c2b_g106w2_sockmap(void)
     extern i64 readlink(const char *, char *, u64);
     extern i32 getpid(void);
     static char ub[131072];
+    static char ub6[65536];
+    static char tb[131072];
+    static char tb6[65536];
+    static char xb[65536];
+    static char nb2[65536];
     char db[8192], pb[96], lb[256], mb[96], cb2[64];
     u32 targets[16];
     u32 ntp = 0, mypid = (u32)getpid(), ti;
     i32 fd;
     i64 off;
-    u32 un;
+    u32 un, un6, utcp, utcp6, uux, unl;
     /* мишени = мы + steam-pids (быстрый comm-скан) */
     targets[ntp++] = mypid;
     fd = open("/proc", 0x10000);
@@ -16899,11 +16974,28 @@ static void c2b_g106w2_sockmap(void)
         C2B_LOGS("\n");
     }
     if (!un) return;
+    /* 5 дополнительных таблиц для классификации миссов: udp6/tcp/tcp6/
+     * unix(Инода=f6)/netlink — мисс ВО ВСЕХ = сокет ЧУЖОГО netns = THE SDR */
+    un6 = c2b_g106_read_file("/proc/net/udp6", ub6, sizeof(ub6));
+    utcp = c2b_g106_read_file("/proc/net/tcp", tb, sizeof(tb));
+    utcp6 = c2b_g106_read_file("/proc/net/tcp6", tb6, sizeof(tb6));
+    uux = c2b_g106_read_file("/proc/net/unix", xb, sizeof(xb));
+    unl = c2b_g106_read_file("/proc/net/netlink", nb2, sizeof(nb2));
     for (ti = 0; ti < ntp; ti++) {
         i32 fdd;
         c2b_g106_path(pb, "/proc/", targets[ti], "/fd");
         fdd = open(pb, 0x10000);
         if (fdd < 0) continue;
+        /* ns/net карты — раз на pid (дедуп через nsseen) */
+        {
+            u32 du2;
+            for (du2 = 0; du2 < c2b_g106w2_nspid; du2++)
+                if (c2b_g106w2_nspids[du2] == targets[ti]) break;
+            if (du2 == c2b_g106w2_nspid && c2b_g106w2_nspid < 40) {
+                c2b_g106w2_nspids[c2b_g106w2_nspid++] = targets[ti];
+                c2b_g106w2_nslog(targets[ti]);
+            }
+        }
         for (;;) {
             i64 fn2 = syscall((i64)217, (i64)fdd, db, (i64)sizeof(db));
             i64 o2 = 0;
@@ -16937,10 +17029,9 @@ static void c2b_g106w2_sockmap(void)
                                     break;
                                 if (du == c2b_g106w2_nseen &&
                                     c2b_g106w2_nseen < 160) {
-                                    /* дедуп: пишем (pid,ino) СРАЗУ (и миссы
-                                     * тоже — tcp-иноды не ресканим); лог =
-                                     * только если inode найден в /proc/net/udp */
-                                    char *lp2 = ub, *e2 = ub + un;
+                                    /* классификация: udp / udp6 / unix /
+                                     * tcp,tcp6,netlink (тихо) / МИСС ВО ВСЕХ =
+                                     * сокет ЧУЖОГО netns = THE SDR OWNER */
                                     u32 fdn = 0, fdv = 0, k3;
                                     for (k3 = 0; k3 < fl2; k3++)
                                         fdv = fdv * 10 + (u32)(nm2[k3] - '0');
@@ -16950,65 +17041,96 @@ static void c2b_g106w2_sockmap(void)
                                     c2b_g106w2_seen
                                         [c2b_g106w2_nseen][1] = (u32)xino;
                                     c2b_g106w2_nseen++;
-                                    while (lp2 < e2) {
-                                        char *le = lp2;
-                                        while (le < e2 && *le != '\n') le++;
-                                        {
-                                            /* inode = поле 9: быстрый скан
-                                             * по токенам через ' ' */
-                                            char *q4 = lp2;
-                                            u32 f4 = 0, m4 = 0;
-                                            u64 inol = 0;
-                                            while (q4 < le) {
-                                                char *ts;
-                                                while (q4 < le && *q4 == ' ')
-                                                    q4++;
-                                                if (q4 >= le) break;
-                                                ts = q4;
-                                                while (q4 < le && *q4 != ' ')
-                                                    q4++;
-                                                if (f4 == 9) {
-                                                    for (; ts < q4; ts++)
-                                                        if (*ts >= '0' &&
-                                                            *ts <= '9')
-                                                            inol = inol * 10 +
-                                                                (u64)(*ts -
-                                                                      '0');
+                                    if (c2b_g106w2_in_table(ub, un, xino, 9)) {
+                                        char *lp2 = ub, *e2 = ub + un;
+                                        while (lp2 < e2) {
+                                            char *le = lp2;
+                                            while (le < e2 && *le != '\n') le++;
+                                            {
+                                                const char *q4 = lp2;
+                                                u32 f4 = 0;
+                                                u64 inol = 0;
+                                                while (q4 < le) {
+                                                    const char *ts;
+                                                    while (q4 < le && *q4 == ' ')
+                                                        q4++;
+                                                    if (q4 >= le) break;
+                                                    ts = q4;
+                                                    while (q4 < le &&
+                                                           *q4 != ' ')
+                                                        q4++;
+                                                    if (f4 == 9) {
+                                                        for (; ts < q4; ts++)
+                                                            if (*ts >= '0' &&
+                                                                *ts <= '9')
+                                                                inol =
+                                                                    inol * 10 +
+                                                                    (u64)(*ts -
+                                                                          '0');
+                                                        break;
+                                                    }
+                                                    f4++;
+                                                }
+                                                if (inol == xino) {
+                                                    u32 lnl = (u32)(le - lp2);
+                                                    if (lnl > 96) lnl = 96;
+                                                    C2B_LOGS("[c2b] g106w2: p");
+                                                    C2B_LOGD(targets[ti]);
+                                                    C2B_LOGS("fd=");
+                                                    C2B_LOGD(fdn);
+                                                    C2B_LOGS("ino=");
+                                                    C2B_LOGH((u32)xino);
+                                                    C2B_LOGS("udp=");
+                                                    {
+                                                        u32 lnl2 = lnl;
+                                                        if (lnl2 > 2 &&
+                                                            lp2[lnl2 - 1] ==
+                                                            '\r')
+                                                            lnl2--;
+                                                        c2b_out(lp2, lnl2);
+                                                    }
+                                                    C2B_LOGS("\n");
                                                     break;
                                                 }
-                                                f4++;
                                             }
-                                            if (inol == xino) m4 = 1;
-                                            if (m4) {
-                                                u32 lnl = (u32)(le - lp2);
-                                                if (lnl > 96) lnl = 96;
-                                                c2b_g106w2_seen
-                                                    [c2b_g106w2_nseen][0] =
-                                                    targets[ti];
-                                                c2b_g106w2_seen
-                                                    [c2b_g106w2_nseen][1] =
-                                                    (u32)xino;
-                                                c2b_g106w2_nseen++;
-                                                C2B_LOGS("[c2b] g106w2: p");
-                                                C2B_LOGD(targets[ti]);
-                                                C2B_LOGS("fd=");
-                                                C2B_LOGD(fdn);
-                                                C2B_LOGS("ino=");
-                                                C2B_LOGH((u32)xino);
-                                                C2B_LOGS("udp=");
-                                                {
-                                                    u32 lnl2 = lnl;
-                                                    if (lnl2 > 2 &&
-                                                        lp2[lnl2 - 1] ==
-                                                        '\r')
-                                                        lnl2--;
-                                                    c2b_out(lp2, lnl2);
-                                                }
-                                                C2B_LOGS("\n");
-                                                break;   /* строка найдена */
-                                            }
+                                            lp2 = (le < e2) ? le + 1 : le;
                                         }
-                                        lp2 = (le < e2) ? le + 1 : le;
+                                    } else if (c2b_g106w2_in_table(
+                                            ub6, un6, xino, 9)) {
+                                        C2B_LOGS("[c2b] g106w2: p");
+                                        C2B_LOGD(targets[ti]);
+                                        C2B_LOGS("fd=");
+                                        C2B_LOGD(fdn);
+                                        C2B_LOGS("ino=");
+                                        C2B_LOGH((u32)xino);
+                                        C2B_LOGS("udp6-hit\n");
+                                    } else if (c2b_g106w2_in_table(
+                                            xb, uux, xino, 6)) {
+                                        C2B_LOGS("[c2b] g106w2: p");
+                                        C2B_LOGD(targets[ti]);
+                                        C2B_LOGS("fd=");
+                                        C2B_LOGD(fdn);
+                                        C2B_LOGS("ino=");
+                                        C2B_LOGH((u32)xino);
+                                        C2B_LOGS("unix-hit\n");
+                                    } else if (c2b_g106w2_in_table(
+                                            tb, utcp, xino, 9) ||
+                                        c2b_g106w2_in_table(
+                                            tb6, utcp6, xino, 9) ||
+                                        c2b_g106w2_in_table(
+                                            nb2, unl, xino, 9)) {
+                                        /* tcp/tcp6/netlink = тот же ns, тихо */
+                                    } else {
+                                        C2B_LOGS("[c2b] g106w2: p");
+                                        C2B_LOGD(targets[ti]);
+                                        C2B_LOGS("fd=");
+                                        C2B_LOGD(fdn);
+                                        C2B_LOGS("ino=");
+                                        C2B_LOGH((u32)xino);
+                                        C2B_LOGS(" **NS-FOREIGN-SOCKET**");
+                                        if (targets[ti] == mypid)
+                                            C2B_LOGS(" **IS-GAME**");
+                                        C2B_LOGS("\n");
                                     }
                                 }
                             }

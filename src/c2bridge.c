@@ -7072,7 +7072,7 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
  * killswitch C2B_KREL=0. */
 #ifndef C2B_SELFTEST
 static u32 g_krel_on = 1, g_krel_keep, g_krel_init;
-static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal;
+static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal, g_krel_chalv;
 #define C2B_KREL_CAP 12
 /* v21: цель krel = ЖИВАЯ сессия ДВИЖКА (run357-урок: krel#1 rc=1 улетел в
  * сессию моста, а ЖИВАЯ SDR-сессия = у движка: ConnectOK 0x23 (08 01 12 20
@@ -7082,7 +7082,16 @@ static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal;
  * чистыми slot-13 чтениями (h=1..64); ищем st=2 connected h != мостового.
  * Killswitch C2B_K21ENG=0 = старое поведение (хэндл моста). */
 static u32 g_k21_eng = 1;
-static u32 g_k21_scan_done, g_k21_eng_h;
+static u32 g_k21_eng_h;
+/* v22: СКАН РЕ-АРМИРУЕМЫЙ — run358-урок: one-shot сработал ДО установления
+ * сессии движка (eng-h=0 на krel#1, ConnectOK пришёл позже) = окно потеряно.
+ * Теперь скан повторяется на каждом НОВОМ chal (дедап по chal = спам-гейт),
+ * жёсткий кап 32 скана/сессию; после death-stop ре-арм (кап 4) пробуждает
+ * релей и сбрасывает кэш хэндла. K21WAIT=1 (default): eng-h=0 => НЕ стрелять
+ * в мостовую сессию (run357: она мертва к krel#2; run256-класс: 513B raw в
+ * надёжном SNP-канале = яд для сервера) — ждать живой канал движка; сервер
+ * ретраит 'A' => scp => новый krel-шанс. C2B_K21WAIT=0 = старый фолбэк. */
+static u32 g_k21_wait = 1, g_k21_scan_cnt, g_k21_rearm;
 static volatile u32 g_krel_dead;
 #endif
 
@@ -15189,17 +15198,18 @@ static void *c2b_g82wp_thread(void *arg)
  * Находим ЖИВУЮ сессию движка: rc==1 + непустой info + st==2 + h != моста.
  * Логируем КАЖДЫЙ живой/ненулевой h с info[0..0x30] — адресная проверка
  * (m_addrRemote = 152.233.19.133:28022) вручную по логу, если st-семантика
- * вдруг иная. Один проход за сессию (g_k21_scan_done). */
+ * вдруг иная. v22: ре-армируемый (кэш ТОЛЬКО при успехе; кап 32 скана). */
 static u32 c2b_k21_engscan(void)
 {
     void **vt21;
     u8 mi[256];
     u32 h21, j, hfound = 0;
-    if (g_k21_scan_done) return g_k21_eng_h;
-    g_k21_scan_done = 1;
+    if (g_k21_eng_h) return g_k21_eng_h;   /* v22: кэш только при успехе */
+    if (g_k21_scan_cnt >= 32) return 0;    /* v22: спам-кап сканов */
+    g_k21_scan_cnt++;
     if (!g_gns_conn_iface || !g_gns_conn_h) return 0;
     vt21 = *(void ***)g_gns_conn_iface;
-    for (h21 = 1; h21 <= 64; h21++) {
+    for (h21 = 1; h21 <= 128; h21++) {
         i32 rc21 = -999;
         for (j = 0; j < sizeof mi; j++) mi[j] = 0;
         g_probe_active = 1;
@@ -15231,7 +15241,8 @@ static u32 c2b_k21_engscan(void)
         }
     }
     g_k21_eng_h = hfound;
-    C2B_LOGS("[c2b] k21: eng-scan done eng-h="); C2B_LOGN(g_k21_eng_h);
+    C2B_LOGS("[c2b] k21: eng-scan #"); C2B_LOGN(g_k21_scan_cnt);
+    C2B_LOGS(" done eng-h="); C2B_LOGN(g_k21_eng_h);
     C2B_LOGS(" br-h="); C2B_LOGN((u32)g_gns_conn_h);
     C2B_LOGS("\n");
     return g_k21_eng_h;
@@ -15254,21 +15265,51 @@ static void c2b_k19_relay(void)
         if (e && e[0] == '1') g_krel_keep = 1;
         e = getenv("C2B_K21ENG");
         if (e && e[0] == '0') g_k21_eng = 0;
+        e = getenv("C2B_K21WAIT");
+        if (e && e[0] == '0') g_k21_wait = 0;
         g_krel_init = 1;
     }
-    if (g_krel_dead) return;            /* v21: не спамить мёртвый хэндл */
+    if (g_krel_dead) {
+        /* v22: ре-арм — мёртвый хэндл мог смениться живым (сессия движка
+         * устанавливается ПОЗЖЕ первого krel-окна, run358-факт); кап 4 */
+        if (g_k21_rearm >= 4) return;
+        g_k21_rearm++;
+        g_krel_dead = 0;
+        g_k21_eng_h = 0;               /* форс-рескан */
+        C2B_LOGS("[c2b] k21: re-arm #"); C2B_LOGN(g_k21_rearm);
+        C2B_LOGS("\n");
+    }
     if (!g_krel_on || !g_gns_conn_h || !g_gns_conn_iface) return;
     if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
     if (g_krel_sent >= C2B_KREL_CAP) return;
     kch = ((u32)g_kfull[13]) | ((u32)g_kfull[14] << 8) |
           ((u32)g_kfull[15] << 16) | ((u32)g_kfull[16] << 24);
-    if (g_krel_sent && kch == g_krel_chal) return;   /* дедуп по chal */
+    if (g_krel_chalv && kch == g_krel_chal) return;  /* v22: дедуп и на wait-шотах */
+    g_krel_chal = kch;
+    g_krel_chalv = 1;
     vt19 = *(void ***)g_gns_conn_iface;
     slot19 = (g_gns_conn_ver == 0) ? 11u : 10u;
+    /* v22: скан ДО копирования/лог-хедера — (a) wait-шот не тратит счётчик
+     * релеев, (b) скан-строки не перехлёстываются с krel-строкой (run358:
+     * интерлив потерял tgt/rc #1) */
+    hsend = g_gns_conn_h;
+    if (g_k21_eng) {
+        he21 = c2b_k21_engscan();
+        if (he21) {
+            hsend = (uptr)he21;
+        } else if (g_k21_wait) {
+            C2B_LOGS("[c2b] k21: wait eng-h=0 (bridge skip) chal=");
+            C2B_LOGH(kch);
+            C2B_LOGS(" sent="); C2B_LOGN(g_krel_sent);
+            C2B_LOGS(" scans="); C2B_LOGN(g_k21_scan_cnt);
+            C2B_LOGS(" rearms="); C2B_LOGN(g_k21_rearm);
+            C2B_LOGS("\n");
+            return;
+        }
+    }
     for (z19 = 0; z19 < sizeof kcopy; z19++) kcopy[z19] = 0;
     for (z19 = 0; z19 < g_kfull_len; z19++) kcopy[z19] = g_kfull[z19];
     kn = g_kfull_len;
-    g_krel_chal = kch;
     g_krel_sent++;
     if (!g_krel_keep && g_g90_A_seq) {
         (void)c2b_krel_patchchal(kcopy, kn, g_g90_A_chal);
@@ -15282,12 +15323,6 @@ static void c2b_k19_relay(void)
     C2B_LOGH(kch);
     C2B_LOGS(") len=");
     C2B_LOGN(kn);
-    /* v21: цель = ЖИВАЯ сессия движка (скан), фолбэк = мостовая */
-    hsend = g_gns_conn_h;
-    if (g_k21_eng) {
-        he21 = c2b_k21_engscan();
-        if (he21) hsend = (uptr)he21;
-    }
     C2B_LOGS(" tgt=");
     C2B_LOGN((u32)hsend);
     rc19 = -999;
@@ -15332,7 +15367,11 @@ static void c2b_k19_relay(void)
             C2B_LOGS("[c2b] krel: detail SEGV\n");
         }
         C2B_LOGS("[c2b] krel: detail rc="); C2B_LOGN((u32)rcd21);
-        if (rcd21 == 0) {
+        /* v22: ascii на ЛЮБОМ непустом буфере (run358: slot-17 вернул rc=1
+         * на мёртвом хэндле = дамп пропущен; rc-семантика слота шире 0-ок) */
+        for (z19 = 0; z19 < 0x40; z19++)
+            if (md21[z19]) break;
+        if (rcd21 == 0 || z19 < 0x40) {
             C2B_LOGS("\n[c2b] krel: detail-ascii:");
             c2b_g97_log_ascii(md21, 0x400);
         }

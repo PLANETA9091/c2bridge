@@ -25,12 +25,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pcap_sns_decrypt import (read_pcap, game_flow, decrypt_stream,
                               parse_data_pkt, gcm_decrypt, FLAG_DATA)
 
-RE_KEY = re.compile(r"g124: KEY bits=256 key=([0-9a-f]{64}) ks=([0-9a-f]+)")
-RE_IV = re.compile(r"g124: IV gcm=([0-9a-f]+) len=([0-9a-f]+) iv=([0-9a-f]+)")
-RE_PATCH = re.compile(r"g124: PATCHED (\w+) base=([0-9a-f]+)")
+RE_KEY = re.compile(r"g12[46]: KEY bits=256 key=([0-9a-f]{64}) ks=([0-9a-f]+)")
+RE_IV = re.compile(r"g12[46]: IV gcm=([0-9a-f]+) len=([0-9a-f]+) iv=([0-9a-f]+)")
+RE_PATCH = re.compile(r"g12[46]: PATCHED (\w+) base=([0-9a-f]+)")
 
 
 def parse_g124_klog(path):
+    """the g124 (the cb0ca8 SNS lib) AND the g126 (the game's steamclient.so)
+    lines = the same format; the tags = interchangeable (the run = usually
+    one or the other = the hits)."""
     keys, ivs, patched = [], [], set()
     for ln in open(path, errors="replace"):
         m = RE_KEY.search(ln)

@@ -1495,6 +1495,341 @@ static void *c2b_g124_watch(void *arg)
 }
 #endif  /* __x86_64__ */
 
+/* ---------------- g126: THE TRUE CRYPTO HOME (the game's steamclient.so) --
+ * THE RUN334 VERDICT (the worklog 1740): the g124 = PATCHED x2 in the game
+ * pid (the cb0ca8 SNS lib = mapped) BUT the ZERO detour calls = the patched
+ * fns = NEVER EXECUTED = the cb0ca8 OpenSSL = the DECOY copy. The schedule
+ * builder = the GAME's OWN 64-bit steamclient.so (the d975c5, 46.7MB: 21x
+ * aeskeygenassist, the 'aes-256-gcm' string @file 0xd3bdee, the CCrypto
+ * strings x7, the order-L @0xd8e630 = the X25519 = also here) => THE g126 =
+ * the g124 recipe x THE NEW OFFSETS (the capstone RE = this round, the
+ * binary = the run334 bins steamclient.so__d975c5.so, va = file + 0x1000).
+ *
+ * THE RE (the sc_g126_*.py = /home/z/my-project/g124-re/):
+ *   SITE A  aesni_set_encrypt_key @0x201d780 (rdi=key, esi=bits, rdx=ks):
+ *           the sig = the file-verified 35B head (the null guards + the je
+ *           displacements 0x463/0x45a + the ia32cap const $0x10000800 —
+ *           the worklog's 48B head = TRUNCATED to 35B: the 48B head = CONTAINS
+ *           the rip-relative 'and r10d,[rip+0xd182fc]' @+41 => the tramp
+ *           re-exec = reads the WRONG ia32cap => the whole-instruction
+ *           boundary @35 = the LAST position-independent boundary; the two
+ *           rel32 je = the FORWARD jumps = the tramp-safe semantics (the
+ *           same property the g124-setkey proved on the real lib)).
+ *   SITE B  CRYPTO_gcm128_setiv @0x212d6c0 (rdi=gcm, rsi=iv, rdx=len): the
+ *           FOUND = the shape hunt (the cb0ca8 setiv @0x251f50 = the
+ *           reference): the 6-push prologue + mov rbp,rsi + mov rbx,rdi +
+ *           mov rax,[rdi+0x160] (the GCM128 block-fn ptr @+0x160 = THE SAME
+ *           offset as cb0ca8!) + movups [rdi+0x30],xmm0 (the Yi zero) +
+ *           cmp rdx,0xc (the J0 fast path) => the sig = the file-verified
+ *           31B head = ALL position-independent (the [rdi+0x160] = the
+ *           base-relative = the tramp-safe; the pxor = the 66-prefix 4B
+ *           form = the byte-exact gate = the build-time verification).
+ *   THE INIT FN (the setkey+setiv pairing): the setiv E8 callers = 10;
+ *           the fn @0x2106d90 = the EVP aes_gcm_init_key equivalent (call
+ *           0x2119ac0 = the EVP_C_DATA; lea r12,[rbx+0x100] = the gcm sub-ctx;
+ *           call 0x212d3d0 = the gcm128_init(gcm=r12, ks=rbx, block);
+ *           movsxd rdx,[rbx+0x2c0] = the ivlen @+0x2c0; call 0x212d6c0 =
+ *           setiv(gcm, iv, ivlen); the flags key_set @+0xf8 / iv_set @+0xfc)
+ *           => THE EVP_AES_GCM_CTX LAYOUT = IDENTICAL TO cb0ca8 (gcm @ks+0x100)
+ *           => THE (key,iv) PAIRING = gcm_ptr - 0x100 == ks_ptr = THE SAME
+ *           RULE the g124_recover.py consumer already implements.
+ * THE MAPS MATCH = 'steamclient.so' (the game's own copy = ONE per the game
+ * pid; the sig gate = the wrong-copy safety: the mismatch = NO patch + the
+ * log). The klog = the SAME shared sink, the tag = g126 (the format = the
+ * consumer-compatible: the KEY/IV lines = the identical fields).
+ * Killswitch: C2B_G126=0. The caps = 16 keys / 16 ivs (the dedup). */
+#if defined(__x86_64__)
+#define G126_SETKEY_OFF 0x201d780u
+#define G126_SETIV_OFF  0x212d6c0u
+static const u8 G126_SETKEY_SIG[35] = {
+    0x48, 0x83, 0xec, 0x08,              /* sub $0x8,%rsp */
+    0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff,  /* mov $-1,%rax */
+    0x48, 0x85, 0xff,                    /* test %rdi,%rdi */
+    0x0f, 0x84, 0x63, 0x04, 0x00, 0x00,  /* je +0x463 (the null-key out) */
+    0x48, 0x85, 0xd2,                    /* test %rdx,%rdx */
+    0x0f, 0x84, 0x5a, 0x04, 0x00, 0x00,  /* je +0x45a (the null-ks out) */
+    0x41, 0xba, 0x00, 0x08, 0x00, 0x10   /* mov $0x10000800,%r10d */
+};
+static const u8 G126_SETIV_SIG[31] = {
+    0x41, 0x57,                          /* push %r15 */
+    0x66, 0x0f, 0xef, 0xc0,              /* pxor %xmm0,%xmm0 (66-prefix) */
+    0x41, 0x56,                          /* push %r14 */
+    0x41, 0x55,                          /* push %r13 */
+    0x41, 0x54,                          /* push %r12 */
+    0x55,                                /* push %rbp */
+    0x48, 0x89, 0xf5,                    /* mov %rsi,%rbp (iv) */
+    0x53,                                /* push %rbx */
+    0x48, 0x89, 0xfb,                    /* mov %rdi,%rbx (gcm) */
+    0x48, 0x83, 0xec, 0x28,              /* sub $0x28,%rsp */
+    0x48, 0x8b, 0x87, 0x60, 0x01, 0x00, 0x00  /* mov 0x160(%rdi),%rax */
+};
+static u8 g126_tramp_a[64] __attribute__((aligned(4096)));
+static u8 g126_tramp_b[64] __attribute__((aligned(4096)));
+static u32 g126_patched;      /* bit0 = the setkey, bit1 = the setiv */
+static u32 g126_nsetkey;
+static u32 g126_nsetiv;
+static u32 g126_prof_k;
+static u32 g126_prof_i;
+#define G126_KEY_CAP 16
+#define G126_IV_CAP  16
+static u8  g126_keyseen[G126_KEY_CAP][32];
+static u32 g126_nkeys;
+static u8  g126_ivseen[G126_IV_CAP][16];
+static u32 g126_nivs;
+
+static void c2b_g126_key_capture(i32 bits, const void *key, const void *ks)
+{
+    u32 n = __atomic_add_fetch(&g126_nsetkey, 1, __ATOMIC_RELAXED);
+    u32 z, j, dup;
+
+    (void)n;
+    if (g126_prof_k < 8) {
+        u32 idx = __atomic_add_fetch(&g126_prof_k, 1, __ATOMIC_RELAXED);
+        klog_s("[c2b] g126: setkey#");
+        klog_h(idx);
+        klog_s(" bits=");
+        klog_h((u32)bits);
+        klog_s("\n");
+    }
+    if (!key || bits != 256 || g126_nkeys >= G126_KEY_CAP) return;
+    dup = 0;
+    for (j = 0; j < g126_nkeys; j++) {
+        u32 same = 0;
+        for (z = 0; z < 32; z++)
+            same |= (u32)(g126_keyseen[j][z] ^ ((const u8 *)key)[z]);
+        if (!same) { dup = 1; break; }
+    }
+    if (dup) return;
+    for (z = 0; z < 32; z++)
+        g126_keyseen[g126_nkeys][z] = ((const u8 *)key)[z];
+    g126_nkeys++;
+    klog_s("[c2b] g126: KEY bits=256 key=");
+    klog_x((const u8 *)key, 32);
+    klog_s(" ks=");
+    klog_p((uptr)ks);
+    klog_s("\n");
+}
+
+static void c2b_g126_iv_capture(const void *gcm, const void *iv, sz_t len)
+{
+    u32 n = __atomic_add_fetch(&g126_nsetiv, 1, __ATOMIC_RELAXED);
+    u8  buf[16];
+    u32 cl, z, j, dup;
+
+    (void)n;
+    if (g126_prof_i < 8) {
+        u32 idx = __atomic_add_fetch(&g126_prof_i, 1, __ATOMIC_RELAXED);
+        klog_s("[c2b] g126: setiv#");
+        klog_h(idx);
+        klog_s(" len=");
+        klog_h((u32)len);
+        klog_s("\n");
+    }
+    if (!iv || g126_nivs >= G126_IV_CAP) return;
+    for (z = 0; z < 16; z++) buf[z] = 0;
+    cl = len > 16 ? 16 : (u32)len;
+    if (cl) memcpy(buf, iv, cl);
+    dup = 0;
+    for (j = 0; j < g126_nivs; j++) {
+        u32 same = 0;
+        for (z = 0; z < 16; z++)
+            same |= (u32)(g126_ivseen[j][z] ^ buf[z]);
+        if (!same) { dup = 1; break; }
+    }
+    if (dup) return;
+    for (z = 0; z < 16; z++) g126_ivseen[g126_nivs][z] = buf[z];
+    g126_nivs++;
+    klog_s("[c2b] g126: IV gcm=");
+    klog_p((uptr)gcm);
+    klog_s(" len=");
+    klog_h((u32)len);
+    klog_s(" iv=");
+    klog_x(buf, 16);
+    klog_s("\n");
+}
+
+static i32 c2b_g126_setkey_detour(const void *key, i32 bits, void *ks);
+static i32 c2b_g126_setkey_detour(const void *key, i32 bits, void *ks)
+{
+    i32 (*tramp)(const void *, i32, void *) =
+        (i32 (*)(const void *, i32, void *))g126_tramp_a;
+    c2b_g126_key_capture(bits, key, ks);
+    if (g126_tramp_a[sizeof(G126_SETKEY_SIG)] == 0xff)
+        return tramp(key, bits, ks);
+    return -2;
+}
+static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len);
+static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len)
+{
+    void (*tramp)(void *, const void *, sz_t) =
+        (void (*)(void *, const void *, sz_t))g126_tramp_b;
+    c2b_g126_iv_capture(gcm, iv, len);
+    if (g126_tramp_b[sizeof(G126_SETIV_SIG)] == 0xff)
+        tramp(gcm, iv, len);
+}
+
+static void c2b_g126_patch(u8 *tgt, const u8 *sig, u32 siglen, u8 *tramp,
+                           uptr detour, const char *name, u32 bit, uptr base)
+{
+    u32 k;
+
+    if (memcmp(tgt, sig, siglen) != 0) {
+        klog_s("[c2b] g126: SIG-MISMATCH ");
+        klog_s(name);
+        klog_s(" have=");
+        klog_x(tgt, 16);
+        klog_s("\n");
+        return;
+    }
+    if (tgt[0] == 0xff) {           /* the already-patched */
+        __atomic_or_fetch(&g126_patched, bit, __ATOMIC_RELAXED);
+        return;
+    }
+    for (k = 0; k < siglen; k++) tramp[k] = tgt[k];
+    {
+        uptr da = (uptr)(tgt + siglen);
+        tramp[siglen + 0] = 0xff; tramp[siglen + 1] = 0x25;
+        tramp[siglen + 2] = 0; tramp[siglen + 3] = 0;
+        tramp[siglen + 4] = 0; tramp[siglen + 5] = 0;
+        for (k = 0; k < 8; k++) tramp[siglen + 6 + k] = (u8)(da >> (8 * k));
+    }
+    if (mprotect((void *)tramp, 4096,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        klog_s("[c2b] g126: tramp mprotect fail\n");
+        return;
+    }
+    if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
+                 PROT_READ | PROT_WRITE) != 0) {
+        klog_s("[c2b] g126: site mprotect fail\n");
+        return;
+    }
+    {
+        uptr da = detour;
+        tgt[0] = 0xff; tgt[1] = 0x25;
+        tgt[2] = 0; tgt[3] = 0; tgt[4] = 0; tgt[5] = 0;
+        for (k = 0; k < 8; k++) tgt[6 + k] = (u8)(da >> (8 * k));
+        for (k = 14; k < siglen; k++) tgt[k] = 0x90;
+    }
+    if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
+                 PROT_READ | PROT_EXEC) != 0) {
+        klog_s("[c2b] g126: site mprotect RX fail\n");
+    }
+    __atomic_or_fetch(&g126_patched, bit, __ATOMIC_RELAXED);
+    klog_s("[c2b] g126: PATCHED ");
+    klog_s(name);
+    klog_s(" base=");
+    klog_p(base);
+    klog_s(" pid=");
+    klog_h((u32)getpid());
+    klog_s("\n");
+}
+
+/* the maps-line match: 'steamclient.so' in the path part (14 chars) */
+static i32 line_is_sc(const char *s, i32 n, uptr *out_lo)
+{
+    uptr a = 0, b = 0;
+    i32 k = 0, c, i, nhex = 0;
+
+    while (k < n && s[k] != '-') {
+        c = s[k];
+        if (c >= '0' && c <= '9') a = (a << 4) | (uptr)(c - '0');
+        else if (c >= 'a' && c <= 'f') a = (a << 4) | (uptr)(c - 'a' + 10);
+        else return 0;
+        k++; nhex++;
+    }
+    if (k >= n || s[k] != '-' || nhex < 1) return 0;
+    k++;
+    while (k < n && s[k] != ' ') {
+        c = s[k];
+        if (c >= '0' && c <= '9') b = (b << 4) | (uptr)(c - '0');
+        else if (c >= 'a' && c <= 'f') b = (b << 4) | (uptr)(c - 'a' + 10);
+        else return 0;
+        k++;
+    }
+    if (k >= n || s[k] != ' ' || b <= a) return 0;
+    for (i = k; i + 14 <= n; i++) {
+        if (s[i] == 's' && s[i + 1] == 't' && s[i + 2] == 'e' &&
+            s[i + 3] == 'a' && s[i + 4] == 'm' && s[i + 5] == 'c' &&
+            s[i + 6] == 'l' && s[i + 7] == 'i' && s[i + 8] == 'e' &&
+            s[i + 9] == 'n' && s[i + 10] == 't' && s[i + 11] == '.' &&
+            s[i + 12] == 's' && s[i + 13] == 'o' &&
+            (i + 14 >= n || s[i + 14] != '2')) {   /* not steamclient2? */
+            *out_lo = a;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void *c2b_g126_watch(void *arg)
+{
+    int round;
+    (void)arg;
+
+    /* the game's steamclient.so = mapped at the boot (the run334 bins = the
+     * game pid's dump) => the poll = short; 360 x 500ms = 3 min = the margin */
+    for (round = 0; round < 360; round++) {
+        i32 fdm = open("/proc/self/maps", O_RDONLY);
+        char chunk[65536], line[4096];
+        i32 llen = 0;
+        uptr liblo = 0;
+        ssz_t r;
+
+        if ((g126_patched & 3) == 3) return (void *)0;
+        if (fdm < 0) return (void *)0;
+        while ((r = read(fdm, chunk, sizeof(chunk))) > 0) {
+            sz_t i = 0;
+            while (i < (sz_t)r) {
+                sz_t j = i, seg;
+                while (j < (sz_t)r && chunk[j] != '\n') j++;
+                seg = j - i;
+                if (llen + (i32)seg > (i32)sizeof(line) - 1)
+                    seg = (sz_t)sizeof(line) - 1 - (sz_t)llen;
+                if (seg) {
+                    memcpy(line + llen, chunk + i, seg);
+                    llen += (i32)seg;
+                }
+                if (j == (sz_t)r) break;
+                i = j + 1;
+                {
+                    uptr a;
+                    if (line_is_sc(line, llen, &a) &&
+                        (!liblo || a < liblo)) liblo = a;
+                }
+                llen = 0;
+            }
+        }
+        close(fdm);
+        if (llen > 0) {
+            uptr a;
+            if (line_is_sc(line, llen, &a) && (!liblo || a < liblo))
+                liblo = a;
+        }
+        if (!liblo) {
+            struct timespec ts = { 0, 500000000 };
+            nanosleep(&ts, 0);
+            continue;
+        }
+        if (!(g126_patched & 1))
+            c2b_g126_patch((u8 *)(liblo + G126_SETKEY_OFF), G126_SETKEY_SIG,
+                           sizeof(G126_SETKEY_SIG), g126_tramp_a,
+                           (uptr)&c2b_g126_setkey_detour, "setkey", 1,
+                           liblo);
+        if (!(g126_patched & 2))
+            c2b_g126_patch((u8 *)(liblo + G126_SETIV_OFF), G126_SETIV_SIG,
+                           sizeof(G126_SETIV_SIG), g126_tramp_b,
+                           (uptr)&c2b_g126_setiv_detour, "setiv", 2,
+                           liblo);
+        if ((g126_patched & 3) == 3) return (void *)0;
+        if (g126_patched) return (void *)0;
+        return (void *)0;
+    }
+    if ((g126_patched & 3) != 3)
+        klog_s("[c2b] g126: nomap 3min\n");
+    return (void *)0;
+}
+#endif  /* __x86_64__ */
+
 __attribute__((constructor)) static void c2b_g110_init(void)
 {
     const char *e = (const char *)getenv("C2B_G110");
@@ -1566,6 +1901,19 @@ __attribute__((constructor)) static void c2b_g110_init(void)
                 pthread_detach(t24);
             else
                 klog_s("[c2b] g124: pthread_create FAILED\n");
+        }
+    }
+    /* g126: the TRUE CRYPTO HOME watcher (the game's steamclient.so: the
+     * setkey @0x201d780 + the setiv @0x212d6c0 = the run334 verdict: the
+     * cb0ca8 SNS OpenSSL = the decoy). The killswitch = C2B_G126=0. */
+    {
+        const char *e26 = (const char *)getenv("C2B_G126");
+        if (!(e26 && e26[0] == '0')) {
+            pthread_t t26;
+            if (pthread_create(&t26, 0, c2b_g126_watch, 0) == 0)
+                pthread_detach(t26);
+            else
+                klog_s("[c2b] g126: pthread_create FAILED\n");
         }
     }
 #endif

@@ -273,13 +273,17 @@ STEAM_SH="${C2B_STEAM_SH:-$GAME_HOME/.local/share/Steam/steam.sh}"
 # The warm client = NOT preloaded (the hook fires on harness-started ones).
 C2B_CLIENT_PRELOAD=""
 if [[ "${C2B_G110:-1}" != "0" ]]; then
-  # g111c (run318 lesson): the -m64 .so = DROPPED from the preload. The
-  # webhelper fork-storm (979x arch=64 loads/run = EVERY CEF child) x the
-  # 500ms maps-polls = the CPU/memory-bandwidth melt => the client boot =
-  # starved to ~10 min => the pipe never serves in the waits => the game =
-  # 'FATAL ERROR: Failed to connect with local Steam Client process!' at
-  # +5s. The 32-bit core = THE SDR endpoint (the g109b verdict + the
-  # run#316 'PATCHED arch=32'); the 64-bit = the later comm-gated variant.
+  # g112 (run319 autopsy): the fork-storm theory = DISPROVEN — the -m64 drop
+  # changed nothing (run319 = the same ~360s no-pipe). The REAL cause of the
+  # slow/'never' pipe = the client stuck in the LOGON-FAIL LOOP (the -login
+  # handshake leaves RememberPassword=0/AutoLogin=0 => the harness's
+  # controlled restart = no auto-login => 'Received logon failure response'
+  # every ~65s, the webhelper churn = the '979 arch=64 banners' = the
+  # SYMPTOM). Fixed in steam-login.sh (the vdf patch + the flush grace) +
+  # the logon-aware waits here. The 32-bit core = THE SDR endpoint (the
+  # g109b verdict + the run#316 'PATCHED arch=32' + the run319 PATCHED line
+  # in the LIVE core) — the -m64 = kept dropped (it = not the cause but =
+  # not needed either).
   [[ -f "$BRIDGE_DIR/c2b_client_hook.so" ]] && C2B_CLIENT_PRELOAD="$BRIDGE_DIR/c2b_client_hook.so"
 fi
 export C2B_CLIENT_PRELOAD
@@ -336,11 +340,14 @@ if [[ -n "$C2B_CLIENT_PRELOAD" && "${C2B_G110_NORESTART:-0}" != "1" ]] \
   # = created early but the pipe = NOT SERVING until the full init => the
   # game = 'FATAL ERROR: Failed to connect with local Steam Client process!'
   # at +5s (the clean FINI). The wait = the pipe CONNECTABLE (not the file).
-  until steam_client_alive && pipe_connect_ok; do
-    W=$((W+5)); (( W >= 360 )) && { log "WARNING: g110 hooked client not serving pipe after ${W}s"; break; }
+  # g112 (run319 lesson): the pipe = NOT ENOUGH either — the run319 client
+  # = connected the pipe while stuck in the logon-fail loop (steamid=0).
+  # The ready = pipe CONNECTABLE + the CM session LOGGED ON.
+  until steam_client_alive && pipe_connect_ok && client_logged_in; do
+    W=$((W+5)); (( W >= 360 )) && { log "WARNING: g110 hooked client not ready after ${W}s (pipe=$(pipe_connect_ok && echo ok || echo BAD) logon=$(client_logged_in && echo ok || echo BAD))"; break; }
     sleep 5
   done
-  log "g110 hooked client ready + pipe ok (~${W}s)"
+  log "g110 hooked client ready (~${W}s pipe=$(pipe_connect_ok && echo ok || echo BAD) logon=$(client_logged_in && echo ok || echo BAD))"
 fi
 # A client left over from a CI bootstrap step may be mid-self-update: the pipe
 # file flaps and the engine's SteamAPI_Init dies with "create pipe failed"
@@ -751,10 +758,38 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       fi
     fi
     WK=0
+    RECOV=0
     until pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \
           && pipe_connect_ok && client_logged_in; do
       (( WK += 1 ))
-      (( WK >= 48 )) && { log "attempt $ATTEMPT: WARNING: client/pipe not ready after $((WK*5))s (launching anyway)"; break; }
+      # g112 (run319 lesson): the client = up + the pipe = ok BUT the CM
+      # session = dead (the logon-fail loop, steamid=0) => the game =
+      # 'connect to global user failed' at +5s = the wasted attempt. ONE
+      # in-place recovery at 120s: fresh login (refreshes the tokens) +
+      # the hooked restart. The login script's client = HOOKLESS => the
+      # restart under $C2B_CLIENT_PRELOAD = MANDATORY for the keys.
+      if (( WK == 24 && ! RECOV )) && ! client_logged_in; then
+        RECOV=1
+        log "attempt $ATTEMPT: client NOT logged on at 120s -> g112 recovery: fresh login + hooked restart"
+        pkill -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' 2>/dev/null; sleep 3
+        pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' 2>/dev/null
+        pkill -9 -u "$GAME_USER" -f steamwebhelper 2>/dev/null
+        rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+        if [[ -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+          STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+          C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+            bash "$NODE_HOME/steam-login.sh" \
+            >>"$RUNDIR/steam-recovery.a${ATTEMPT}.log" 2>&1 || \
+            log "attempt $ATTEMPT: WARNING: recovery steam-login.sh rc=$?"
+        fi
+        pkill -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' 2>/dev/null; sleep 3
+        pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' 2>/dev/null
+        pkill -9 -u "$GAME_USER" -f steamwebhelper 2>/dev/null
+        rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+        sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" LD_PRELOAD="$C2B_CLIENT_PRELOAD" \
+          sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-recovery.a${ATTEMPT}.log' 2>&1 &"
+      fi
+      (( WK >= 48 )) && { log "attempt $ATTEMPT: WARNING: client/pipe/logon not ready after $((WK*5))s (pipe=$(pipe_connect_ok && echo ok || echo BAD) logon=$(client_logged_in && echo ok || echo BAD)) (launching anyway)"; break; }
       sleep 5
     done
     pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \

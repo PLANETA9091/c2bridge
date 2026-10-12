@@ -233,6 +233,26 @@ done
 
 # verify an actual account is logged in (loginusers.vdf: mostrecent=1 and not a stub)
 if (( SESSION )); then
+  # g112 (run319 lesson): the -login session = ephemeral RAM state. The
+  # -login handshake writes loginusers.vdf with RememberPassword=0 AND
+  # AutoLogin=0 => the NEXT client boot (the harness's controlled restart
+  # under the g110 hook) = NO auto-login => the logon-fail loop
+  # (steamui_login.txt 'Received logon failure response' every ~65s,
+  # webhelper --steamid=0) => the client = stuck at the invisible login
+  # UI => the pipe serves late/never AND the game's SteamAPI_Init =
+  # 'connect to global user failed' at +5s = the menu=0 x N attempts.
+  # Fix = (a) give the client ~12s to flush the refreshed auth tokens
+  # (config.vdf/sentry) to disk BEFORE the harness's pkill -9 lands;
+  # (b) patch loginusers.vdf to RememberPassword=1/AutoLogin=1 so every
+  # later boot = silent auto-logon of the just-authed account.
+  sleep 12
+  if [[ -e "$LUV" ]] && grep -aq '"AccountName"' "$LUV"; then
+    sed -i 's/"RememberPassword"[[:space:]]*"0"/"RememberPassword"\t\t"1"/g; \
+            s/"AutoLogin"[[:space:]]*"0"/"AutoLogin"\t\t"1"/g' "$LUV"
+    echo "[steam-login] g112: loginusers.vdf patched (RememberPassword=1 AutoLogin=1)"
+  else
+    echo "[steam-login] g112: WARNING: $LUV absent/no AccountName - auto-login not patched"
+  fi
   echo "[steam-login] OK: account logged in ($LUV)"
 else
   DIAG=/tmp/c2b-steam-login-diag.txt

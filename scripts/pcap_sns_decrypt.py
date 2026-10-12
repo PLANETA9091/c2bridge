@@ -567,7 +567,12 @@ def brute_keys(pkts, flow, cands):
                 for k in range(2):
                     pkt = seq + 0x10000 * k
                     iv = bytearray(ivc)
-                    v = int.from_bytes(iv[0:8], "little") + pkt
+                    # the wire counter = a 64-bit LE field: the addition =
+                    # modulo 2^64 (the run326 real-session ctr ~ 2^64-eps
+                    # + pkt = the OverflowError without the mask)
+                    v = (int.from_bytes(iv[0:8], "little") + pkt) & (
+                        (1 << 64) - 1
+                    )
                     iv[0:8] = v.to_bytes(8, "little")
                     if gcm_decrypt(key, bytes(iv), chunk) is not None:
                         return (key, bytes(ivc), d, idx, pkt)

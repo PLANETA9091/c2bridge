@@ -918,6 +918,37 @@ static void *c2b_g113_thread(void *arg)
 #if !defined(__x86_64__)
     go = 0;
 #endif
+    /* g121: the GO trigger = THE GAME PROCESS ONLY. THE RUN331 AUTOPSY:
+     * the klog (the FIXED path /tmp/c2b_client_keys.log) = INTERLEAVED
+     * from >= 2 scanning processes — the cxi address sequence = NOT
+     * ascending within any single pass (3a2565f0 -> 643e3270 -> ...
+     * -> 081164e8 -> 3a2565f0 = 2+ interleaved map walks) = the hook
+     * (LD_PRELOAD) = inherited by the steam-side 64-BIT children (the
+     * g118 exclusion = the 32-bit only). Each process = its OWN static
+     * registry + its own cycle-done in the SHARED klog: the run331
+     * done lines (pubs=3) = the STEAM-side scanner's registry (099204c9
+     * / a6b00ee9 / 4896f00e = the CM pubs), while the client session
+     * pub 61a7ac2d (cxi @0164a2c8) = only in the GAME's registry — the
+     * pubdup2 = hunted the WRONG process's registry => the client pub =
+     * ZERO dup windows. THE FIX: the comm check — the go-file fires the
+     * scan ONLY in csgo_linux64 (the substring 'csgo' = the suffix-safe
+     * match; no steam-side proc = csgo*). The steam-side scanners = off
+     * (their own klog noise + the CPU steal from the game = gone). The
+     * :6D76 path = untouched (self-selecting per run323). */
+#if defined(__x86_64__)
+    {
+        char comm[64];
+        i32 cfd = open("/proc/self/comm", O_RDONLY);
+        if (cfd >= 0) {
+            i32 nr = (i32)read(cfd, comm, (size_t)sizeof(comm) - 1);
+            close(cfd);
+            if (nr > 0) {
+                comm[nr] = 0;
+                if (!strstr(comm, "csgo")) go = 0;
+            }
+        }
+    }
+#endif
     if (!c2b_g113_ready) c2b_g113_init();
     for (cyc = 0; cyc < 24; cyc++) {
         /* g118: the gap 15s -> 8s = more lottery tickets in a short session

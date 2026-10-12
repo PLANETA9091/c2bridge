@@ -689,11 +689,21 @@ static void *c2b_g113_thread(void *arg)
     static char mp[262144];
     static u8 seg[1 << 20];
     u32 cyc;
+    const char *go;
     (void)arg;
     {
         const char *e = (const char *)getenv("C2B_G113");
         if (e && e[0] == '0') return (void *)0;
     }
+    /* g115: the trigger = DUAL. (a) the GO-FILE (C2B_G113_GO): the harness
+     * = touches it right after firing steam://connect — the exact session
+     * start, zero false triggers, zero boot-duty (the game-side mode =
+     * the 64-bit hook in csgo_linux64). (b) the :6D76 flow (the legacy,
+     * the client-side mode): the run323 autopsy = the SDR client socket =
+     * UNCONNECTED (rem=00000000:0000 in /proc/net/udp = the :6D76 rem =
+     * NEVER there; the ss probe = 0 lines for the same reason) => the
+     * client path = mostly a no-op = harmless belt+suspenders. */
+    go = (const char *)getenv("C2B_G113_GO");
     if (!c2b_g113_ready) c2b_g113_init();
     for (cyc = 0; cyc < 24; cyc++) {
         struct timespec ts = { 15, 0 };
@@ -705,8 +715,15 @@ static void *c2b_g113_thread(void *arg)
         struct timespec now;
 
         nanosleep(&ts, 0);
-        if (!c2b_g113_flow()) continue;
-        klog_s("[c2b] g113: flow :6D76 present, scan cycle\n");
+        if (go && go[0]) {
+            i32 gfd = open(go, O_RDONLY);
+            if (gfd < 0) continue;
+            close(gfd);
+            klog_s("[c2b] g113: go-file present, scan cycle\n");
+        } else {
+            if (!c2b_g113_flow()) continue;
+            klog_s("[c2b] g113: flow :6D76 present, scan cycle\n");
+        }
         if (!c2b_g113_ready) c2b_g113_init();
         fdm = open("/proc/self/maps", O_RDONLY);
         if (fdm < 0) continue;
@@ -822,4 +839,22 @@ __attribute__((constructor)) static void c2b_g110_init(void)
         pthread_detach(t);
     else
         klog_s("[c2b] g110: pthread_create FAILED\n");
+#if defined(__x86_64__)
+    /* g115: the GAME-side scan — the 64-bit hook = preloaded into the
+     * game (csgo_linux64 = THE SDR socket owner + THE SNS crypto home =
+     * the run323 ss_udp_all proof: 'UNCONN 0.0.0.0:51253 *:* users:((
+     * "csgo_linux64",pid=6219,fd=56))'). The 64-bit = NEVER patched
+     * (the site = the 32-bit core's ChaCha20) => the post-PATCH spawn
+     * = never fires here => the constructor spawn = REQUIRED. The
+     * trigger = the C2B_G113_GO go-file (the harness = touches it at
+     * the connect fire); no env = the flow mode = a no-op in the game
+     * (the unconnected rem = invisible) = zero idle duty. */
+    {
+        pthread_t t13;
+        if (pthread_create(&t13, 0, c2b_g113_thread, 0) == 0)
+            pthread_detach(t13);
+        else
+            klog_s("[c2b] g113: pthread_create FAILED (game)\n");
+    }
+#endif
 }

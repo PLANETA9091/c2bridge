@@ -682,6 +682,13 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   LDPREFIX=""
   [[ -f "$BIN_DST/shim/libtcmalloc_minimal.so.0" ]] && LDPREFIX="$BIN_DST/shim"
   LDPRELOAD="$BIN_DST/c2b_spy64.so $BRIDGE_SO"
+  # g115: the 64-bit hook = INTO THE GAME — the SDR socket = the GAME's
+  # (run323 ss_udp_all: 'UNCONN 0.0.0.0:51253 *:* users:(("csgo_linux64",
+  # pid=6219,fd=56))' = the owner = csgo_linux64) => the SNS AES-256-GCM
+  # keys = the game's steamclient64 heap => the scan = must run THERE.
+  # The hook64 = the g113 go-file mode (C2B_G113_GO below); the killswitch
+  # = C2B_G113=0 (the hook honors it in both arches).
+  [[ -f "$BIN_DST/c2b_client_hook64.so" ]] && LDPRELOAD="$LDPRELOAD $BIN_DST/c2b_client_hook64.so"
   EXTRA_ENV=""
   # Run 31 post-mortem + ABI fix: the ~5s segfault in steamclient.so called
   # from c2b_poll_thread was a MISSING-this in the GC slot hooks/pump
@@ -840,6 +847,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     SDL_AUDIODRIVER=dummy \
     C2B_G109="${C2B_G109:-1}" \
     C2B_G110="${C2B_G110:-1}" \
+    C2B_G113_GO="$RUNDIR/g113.go" \
     LD_PRELOAD="$LDPRELOAD" \
     $MODES $EXTRA_ENV $AUTH_VTIDX_ENV \
     sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug +sdr_spew_level 7" \
@@ -940,8 +948,15 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     log "attempt $ATTEMPT: engine UDP ports: $(tr '\n' ' ' < "$FARM_DIR/engine_ports.txt" 2>/dev/null)"
   fi
   log "attempt $ATTEMPT: firing steam://connect/$TARGET"
+  rm -f "$RUNDIR/g113.go" 2>/dev/null
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
     "$STEAM_SH" "steam://connect/$TARGET" >"$TMPD/steam-connect.a${ATTEMPT}.log" 2>&1 &
+  # g115: THE GO-FILE = the exact session-start signal for the game-side
+  # g113 AES-scan (the unconnected SDR socket = invisible in /proc/net/udp
+  # = the flow trigger = dead = the run322/323 zero-scan root cause). The
+  # game = launched with C2B_G113_GO pointing here; the hook = polls it
+  # every 15s and starts the heap scan the moment it exists.
+  touch "$RUNDIR/g113.go" 2>/dev/null || true
 
   END=$((SECONDS + DURATION))
   while (( SECONDS < END )); do

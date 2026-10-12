@@ -528,9 +528,9 @@ static void *c2b_g110_watch(void *arg)
  * zero false positives on the heap. The hit = the keybe=<64hex> dump (the
  * decryptor parse_g100_log = the format) + the ±512B window (the EVP
  * iv[16] = the base-IV recovery offline). THE SCAN = FLOW-TRIGGERED: the
- * /proc/net/udp must show the :6DC6 (28022) remote = the LIVE session —
+ * /proc/net/udp must show the :6D76 (28022) remote = the LIVE session —
  * no session = no scan = the g111c melt-lesson honored (the duty cycle =
- * ~0 while idle; the 20s cap/cycle x the 15s gap x 24 cycles = the ~8 min
+ * ~0 while idle; the 45s cap/cycle x the 15s gap x 24 cycles = the ~8 min
  * session window). The dedup = 8 distinct keys, the stop = 4+ (the both
  * directions + a rekey). The same keys log = the single artifact file. */
 
@@ -577,7 +577,9 @@ static void c2b_g113_hex(const u8 *p, u32 n)
     for (i = 0; i < n; i++) klog_x(p + i, 1);
 }
 
-/* 1 = the live SDR flow present (the udp table has the :6DC6 remote) */
+/* 1 = the live SDR flow present (the udp table has the :6D76 remote —
+ * 28022 = 0x6D76; the run322 g113 = the ':6DC6' typo = 0x6DC6 = 28102 =
+ * the trigger NEVER fired = the scan never ran = zero keys. FIXED here) */
 static i32 c2b_g113_flow(void)
 {
     static char b[262144];
@@ -598,7 +600,7 @@ static i32 c2b_g113_flow(void)
         b[n] = 0;
         for (off = 0; off + 5 <= n; off++)
             if (b[off] == ':' && b[off+1] == '6' && b[off+2] == 'D' &&
-                b[off+3] == 'C' && b[off+4] == '6' &&
+                b[off+3] == '7' && b[off+4] == '6' &&
                 (b[off+5] == ' ' || b[off+5] == '\n'))
                 return 1;
     }
@@ -696,7 +698,7 @@ static void *c2b_g113_thread(void *arg)
     for (cyc = 0; cyc < 24; cyc++) {
         struct timespec ts = { 15, 0 };
         u32 hits = 0;
-        i64 t0, cap = 20 * 1000000000ll;
+        i64 t0, cap = 45 * 1000000000ll;
         i32 fdm, stop = 0;
         char *p, *e2;
         i64 n = 0;
@@ -704,7 +706,7 @@ static void *c2b_g113_thread(void *arg)
 
         nanosleep(&ts, 0);
         if (!c2b_g113_flow()) continue;
-        klog_s("[c2b] g113: flow :6DC6 present, scan cycle\n");
+        klog_s("[c2b] g113: flow :6D76 present, scan cycle\n");
         if (!c2b_g113_ready) c2b_g113_init();
         fdm = open("/proc/self/maps", O_RDONLY);
         if (fdm < 0) continue;

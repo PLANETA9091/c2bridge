@@ -11566,44 +11566,160 @@ static uptr c2b_g47_obj[1];
 
 /* 58f-g84: полл GNS-очереди на фиксированном слоте (фактор из g71):
  * 200мс тик, каждая проверка под SEGV-гардой, rc<0 = конец сессии,
- * rc>0+ma[0] = дамп сообщения, тик-лог каждые 4с. */
+ * rc>0+ma[0] = дамп сообщения, тик-лог каждые 4с.
+ *
+ * =================== v7: g84v2 = DRAIN-AND-PUSH-BACK ===================
+ * RUN338 АВТОПСИЯ (первый РЕАЛЬНЫЙ серверный ответ в plaintext):
+ *  - C>S 'q' "connect0x00000000" @24.94s ДОШЁЛ (chn-sendm relay) ->
+ *    S>C 'A' [ff×4][41][chal=0][proto=3][val=0x00ee0a07] echo "connect..."
+ *    @25.13s = ПЕРВЫЙ настоящий C1-band ответ сервера, НА ПРОВОДЕ.
+ *  - НО: очередь приёма h=0x0de8e3ea НИКТО не дренил: g84 поллил ТОЛЬКО
+ *    слот 14 (rxn=0 сквозь прибытие 'A'), слот 12 = детур-пасс-through
+ *    (никем не зовётся), слот 13 = FLUSH (rc=1 + буфер нетронут = ОК;
+ *    v6 читал это как "GCI st=0 dead-h" -> ложные скипы g98). 'A' ОСТАЛАСЬ
+ *    В ОЧЕРЕДИ, движок её не увидел, challenge-response не ушёл, сервер
+ *    пробил 64x стоп-вейтом и ушёл. ПОЛОВИНА МОСТА = ОТСУТСТВОВАЛА.
+ *  - v7 = вторая половина: РОТАЦИЯ кандидатов приёма {12,14,15} (все —
+ *    класс read/recv, проверены на no-kill: 12 = собственный детур-pass-
+ *    through, 14 = 240с-полл без SEGV/kill (run338), 15 = Quick-класс
+ *    pure-read; ОПАСНЫЕ {1,2,3,4,5,6} — connect/accept/close — НЕ ЗОВЁМ,
+ *    урок v5), pull-валидация (rc 1..8 + ma[0] = правдоподобный heap-Ptr),
+ *    дамп через g71 (там же g90-детект 'A'), И PUSH-BACK: дейтаграммы
+ *    C1-band (ff×4) толкаются РЕАЛЬНЫМ sendto (g_clp_sendto, не хук!) в
+ *    приёмную очередь движкового сокета fd=g_clv2_fd, dst=127.0.0.1:27005
+ *    (UDP self-loop, механика 50k-g61v2 — run72/189 ПРОТЕСТИРОВАНА:
+ *    движок ПОТРЕБЛЯЕТ self-push из своей же очереди). 'B'-паддинг до
+ *    длины последнего pushed-'A' (41f-d урок: len-мисматч = тихий фейл).
+ *  - Killswitch: C2B_G84PUSH=0 = отключить ТОЛЬКО push-back (ротация
+ *    остаётся = диагностика карты слотов). */
+static u32 g_g84_push = 1;
+static u32 g_g84_push_init;
 static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 ticks)
 {
-    u32 tick7;
-    C2B_LOGS("[c2b] g84: poll slot="); C2B_LOGN(slot);
-    C2B_LOGS(" ticks="); C2B_LOGN(ticks);
+    static const u32 rot84[3] = { 12u, 14u, 15u };
+    u32 tick7, ri;
+    (void)slot;
+    if (!g_g84_push_init) {
+        const char *e = getenv("C2B_G84PUSH");
+        if (e && e[0] == '0') g_g84_push = 0;
+        g_g84_push_init = 1;
+    }
+    C2B_LOGS("[c2b] g84v2: rotate 12,14,15 pushback=");
+    C2B_LOGN(g_g84_push);
+    C2B_LOGS(" (base slot=");
+    C2B_LOGN(slot);
+    C2B_LOGS(") ticks=");
+    C2B_LOGN(ticks);
     C2B_LOGS("\n");
     for (tick7 = 0; tick7 < ticks; tick7++) {
         u64 ma[128];
-        i32 rc7 = -999;
         usleep(200000);
-        ma[0] = 0;
-        g_probe_active = 1;
-        if (__sigsetjmp(g_probe_jb, 1) == 0) {
-            rc7 = ((i32 (*)(void *, uptr, void **, i32))vt7[slot])(
-                ciface, ch7, (void **)ma, 1);
-        } else {
-            rc7 = -998;
+        for (ri = 0; ri < 3; ri++) {
+            u32 slot7 = rot84[ri];
+            i32 rc7 = -999;
+            ma[0] = 0;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rc7 = ((i32 (*)(void *, uptr, void **, i32))vt7[slot7])(
+                    ciface, ch7, (void **)ma, 1);
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g84v2: FAULT slot=");
+                C2B_LOGN(slot7);
+                C2B_LOGS(" @tick=");
+                C2B_LOGN(tick7);
+                C2B_LOGS(" — continuing\n");
+                continue;
+            }
+            g_probe_active = 0;
+            /* 58f-g77: rc==-998 = фолт НАШЕГО потока — печатаем и продолжаем */
+            if (rc7 == -998) {
+                C2B_LOGS("[c2b] g84v2: rx FAULT @tick=");
+                C2B_LOGN(tick7);
+                C2B_LOGS(" — continuing\n");
+                continue;
+            }
+            if (rc7 < 0) {
+                C2B_LOGS("[c2b] g84v2: session end @tick=");
+                C2B_LOGN(tick7);
+                C2B_LOGS(" slot=");
+                C2B_LOGN(slot7);
+                C2B_LOGS(" rc=");
+                C2B_LOGN((u32)(i32)rc7);
+                C2B_LOGS("\n");
+                return;
+            }
+            /* v7 pull-валидация: rc 1..8 + ma[0] = правдоподобный heap-Ptr.
+             * Геттеры (GCI/Quick/ConnName) кладут в ma СМАЛЛ-инты/зеро —
+             * отфильтровываются (не путать с приёмом; урок '12=селёдка'). */
+            if (rc7 >= 1 && rc7 <= 8 && ma[0] > 0x1000000ull &&
+                ma[0] < 0x800000000000ull) {
+                void *mp7 = (void *)ma[0];
+                (void)c2b_g71_dumpmsg(mp7);   /* дамп + g90 'A'-детект */
+                /* v7 PUSH-BACK: C1-band дейтаграмма (ff×4) -> приёмная
+                 * очередь движка (UDP self-loop 127.0.0.1:27005). */
+                if (g_g84_push && g_clp_sendto &&
+                    (uptr)g_clp_sendto != 1 && g_clv2_fd > 0) {
+                    u8 la7[16], sb7[2048];
+                    u32 sl7 = 0, z7;
+                    i32 pushed = 0;
+                    ssize_t pr7 = -1;
+                    for (z7 = 0; z7 < sizeof(la7); z7++) la7[z7] = 0;
+                    la7[0] = 2;                       /* AF_INET */
+                    la7[2] = 0x69; la7[3] = 0x7D;     /* порт 27005 BE */
+                    la7[4] = 127; la7[5] = 0;
+                    la7[6] = 0; la7[7] = 1;           /* 127.0.0.1 */
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        const u8 *pd7 = *(u8 *const *)((u8 *)mp7 + 0);
+                        u32 msz7 = *(const volatile u32 *)((const u8 *)mp7 + 8);
+                        if (pd7 && msz7 >= 5 && msz7 < (u32)sizeof(sb7) &&
+                            pd7[0] == 0xff && pd7[1] == 0xff &&
+                            pd7[2] == 0xff && pd7[3] == 0xff) {
+                            for (z7 = 0; z7 < msz7; z7++) sb7[z7] = pd7[z7];
+                            sl7 = msz7;
+                            if (pd7[4] == 'A') {
+                                g_clv2_last_A_len = sl7;   /* 41f-d: база паддинга */
+                            } else if (pd7[4] == 'B' &&
+                                       g_clv2_last_A_len > sl7 &&
+                                       g_clv2_last_A_len < (u32)sizeof(sb7)) {
+                                for (z7 = sl7; z7 < g_clv2_last_A_len; z7++)
+                                    sb7[z7] = 0;
+                                sl7 = g_clv2_last_A_len;
+                            }
+                            pr7 = ((c2b_sendto_fn)g_clp_sendto)(
+                                g_clv2_fd, sb7, sl7, 0,
+                                (const struct sockaddr *)la7, 16);
+                            pushed = 1;
+                        }
+                    } else {
+                        g_probe_active = 0;
+                        C2B_LOGS("[c2b] g84v2: msg/push FAULT @tick=");
+                        C2B_LOGN(tick7);
+                        C2B_LOGS(" — continuing\n");
+                        continue;
+                    }
+                    g_probe_active = 0;
+                    if (pushed) {
+                        C2B_LOGS("[c2b] g84v2: PUSH-BACK fd=");
+                        C2B_LOGN((u32)g_clv2_fd);
+                        C2B_LOGS(" len=");
+                        C2B_LOGN(sl7);
+                        C2B_LOGS(" rc=");
+                        C2B_LOGN((u32)(pr7 < 0 ? (u32)-1 : (u32)pr7));
+                        C2B_LOGS(" @tick=");
+                        C2B_LOGN(tick7);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
         }
-        g_probe_active = 0;
-        /* 58f-g77: rc==-998 = фолт НАШЕГО потока — печатаем и продолжаем */
-        if (rc7 == -998) {
-            C2B_LOGS("[c2b] g84: rx FAULT @tick=");
-            C2B_LOGN(tick7);
-            C2B_LOGS(" — continuing\n");
-            continue;
-        }
-        if (rc7 < 0) {
-            C2B_LOGS("[c2b] g84: session end @tick="); C2B_LOGN(tick7);
-            C2B_LOGS(" rc="); C2B_LOGN((u32)(i32)rc7);
-            C2B_LOGS("\n");
-            break;
-        }
-        if (rc7 > 0 && ma[0]) c2b_g71_dumpmsg((void *)ma[0]);
         /* 58f-g90: тик каждые 4с = сетка таймлайна для сверения с pcap */
         if ((tick7 % 20) == 19) {
-            C2B_LOGS("[c2b] g84: tick="); C2B_LOGN(tick7);
-            C2B_LOGS(" rxn="); C2B_LOGN(g_gns_rx_n);
+            C2B_LOGS("[c2b] g84: tick=");
+            C2B_LOGN(tick7);
+            C2B_LOGS(" rxn=");
+            C2B_LOGN(g_gns_rx_n);
             C2B_LOGS("\n");
         }
     }

@@ -612,17 +612,26 @@ static i32 c2b_g113_flow(void)
     return 0;
 }
 
-/* 0 = the deadline; the hit-dump = the keybe= + the ±512B window */
+/* g118: mode = 0 = the cxi byte-scan (THE PRIZE: the pubdup => the priv =>
+ * the KDF), 1 = the AES schedule scan. The two-pass split = the cxi = the
+ * guaranteed first budget (run327: the AES ate the 45s and the cxi = starved
+ * in ONE completed cycle). Return 1 = the deadline.
+ * g118 clock fix: the deadline check = every 64KB offset (the old
+ * ((*hits)&7)==0 = TRUE on EVERY iteration while hits=0 = the vDSO
+ * clock_gettime per 4 bytes = ~85% of the scan time = the coverage
+ * regression). g118: off starts at 0 (the old 512 = the dead leftover of
+ * the ±512 window = the first 512B of EVERY 1MB segment skipped). */
 static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
-                            i64 *ts, i64 cap)
+                            i64 *ts, i64 cap, u32 mode)
 {
     u64 off;
-    for (off = 512; off + 64 <= (u64)n; off += 4) {
+    if (mode == 1)
+    for (off = 0; off + 64 <= (u64)n; off += 4) {
         const u32 *w = (const u32 *)(buf + off);
         u32 t, s8, k;
         i32 isle;
         struct timespec now;
-        if (((*hits) & 7) == 0) {
+        if ((off & 0xFFFF) == 0) {
             clock_gettime(1, &now);
             if ((i64)now.tv_sec * 1000000000ll + (i64)now.tv_nsec - *ts > cap)
                 return 1;
@@ -699,7 +708,7 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
      * = the keys + THE IVs => the clean decrypt, no nonce models.
      * The unaligned serialization = the 4-step AES loop can miss it =>
      * the dedicated byte loop with the deadline checks (every 64K). */
-    {
+    if (mode == 0) {
         u64 o2;
         struct timespec tn;
         for (o2 = 0; o2 + 76 <= (u64)n; o2++) {
@@ -777,7 +786,13 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
 
 static void *c2b_g113_thread(void *arg)
 {
-    static char mp[262144];
+    /* g118: 256KB -> 16MB. THE PRIMARY run327 ROOT CAUSE: the game = ~92K
+     * maps lines (~8MB text) => the old 256KB read = the FIRST ~3% of the
+     * mappings ONLY = the per-boot coverage lottery (the SAME disease as
+     * the g102 probe crash, in the coverage form: run326 = the keys' region
+     * inside the window, run327 = beyond it = 0 hits with a live session).
+     * 16MB = ~180K lines headroom. */
+    static char mp[16 << 20];
     static u8 seg[1 << 20];
     u32 cyc;
     const char *go;
@@ -794,13 +809,25 @@ static void *c2b_g113_thread(void *arg)
      * UNCONNECTED (rem=00000000:0000 in /proc/net/udp = the :6D76 rem =
      * NEVER there; the ss probe = 0 lines for the same reason) => the
      * client path = mostly a no-op = harmless belt+suspenders. */
+    /* g118: the GO trigger = 64-BIT ONLY. The hook64 = the GAME build
+     * (csgo_linux64 = the right address space); the client32 procs inherit
+     * the exported C2B_G113_GO = 5 watchers x the full-heap scans = the CPU
+     * steal from the game + the klog noise (run327). The client32 = the
+     * :6D76 flow only (= a no-op per run323 = harmless). */
     go = (const char *)getenv("C2B_G113_GO");
+#if !defined(__x86_64__)
+    go = 0;
+#endif
     if (!c2b_g113_ready) c2b_g113_init();
     for (cyc = 0; cyc < 24; cyc++) {
-        struct timespec ts = { 15, 0 };
+        /* g118: the gap 15s -> 8s = more lottery tickets in a short session
+         * (run327: the client died at t+30s in the dwell = 2 cycles total). */
+        struct timespec ts = { 8, 0 };
         u32 hits = 0;
-        i64 t0, cap = 45 * 1000000000ll;
-        i32 fdm, stop = 0;
+        /* g118: the TWO-PASS caps: pass 0 = the cxi (THE PRIZE) = the first
+         * 20s guaranteed; pass 1 = the AES = the 45s overall from t0. */
+        i64 t0, caps[2];
+        i32 fdm, stop = 0, pass, mtrunc = 0;
         char *p, *e2;
         i64 n = 0;
         struct timespec now;
@@ -819,10 +846,11 @@ static void *c2b_g113_thread(void *arg)
         fdm = open("/proc/self/maps", O_RDONLY);
         if (fdm < 0) continue;
         for (;;) {
-            i32 r = (i32)read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
+            i32 r;
+            if (n >= (i64)sizeof(mp) - 1) { mtrunc = 1; break; }
+            r = (i32)read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
             if (r <= 0) break;
             n += r;
-            if (n >= (i64)sizeof(mp) - 1) break;
         }
         close(fdm);
         if (n <= 0) continue;
@@ -831,57 +859,85 @@ static void *c2b_g113_thread(void *arg)
         if (fdm < 0) continue;
         clock_gettime(1, &now);
         t0 = (i64)now.tv_sec * 1000000000ll + (i64)now.tv_nsec;
-        p = mp;
+        caps[0] = 20 * 1000000000ll;
+        caps[1] = 45 * 1000000000ll;
         e2 = mp + n;
-        while (p < e2 && !stop) {
-            uptr lo = 0, hi = 0;
-            i32 wr = 0, c, mfd;
-            while (p < e2 && *p == '\n') p++;
-            if (p >= e2) break;
-            while (p < e2 && *p != '-') {
-                c = *p;
-                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
-                else if (c >= 'a' && c <= 'f')
-                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
-                else break;
+        /* g118: the TWO full walks over the SAME maps snapshot: pass 0 = the
+         * cxi scan (the pubdup => the priv => the KDF = the actual decrypt
+         * path), pass 1 = the AES schedules (the fallback + the windows).
+         * The old single-pass = the AES first = the cxi = starved under the
+         * shared 45s cap. */
+        for (pass = 0; pass < 2; pass++) {
+            stop = 0;
+            p = mp;
+            while (p < e2 && !stop) {
+                uptr lo = 0, hi = 0;
+                i32 wr = 0, c, mfd;
+                while (p < e2 && *p == '\n') p++;
+                if (p >= e2) break;
+                while (p < e2 && *p != '-') {
+                    c = *p;
+                    if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                    else if (c >= 'a' && c <= 'f')
+                        lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                    else break;
+                    p++;
+                }
+                if (p >= e2 || *p != '-') break;
                 p++;
-            }
-            if (p >= e2 || *p != '-') break;
-            p++;
-            while (p < e2 && *p != ' ') {
-                c = *p;
-                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
-                else if (c >= 'a' && c <= 'f')
-                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
-                else break;
+                while (p < e2 && *p != ' ') {
+                    c = *p;
+                    if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                    else if (c >= 'a' && c <= 'f')
+                        hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                    else break;
+                    p++;
+                }
+                if (p >= e2 || *p != ' ') break;
                 p++;
-            }
-            if (p >= e2 || *p != ' ') break;
-            p++;
-            if (p < e2 && *p == 'r') p++;
-            if (p < e2 && *p == 'w') { wr = 1; p++; }
-            else if (p < e2 && *p == '-') p++;
-            while (p < e2 && *p != '\n') p++;
-            if (!wr || hi <= lo || (hi - lo) < 4096) continue;
-            if ((hi - lo) > (1ull << 30)) continue;   /* the guard */
-            mfd = fdm;
-            {
-                u64 pos = lo;
-                while (pos < hi && !stop) {
-                    u64 want = (hi - pos) > sizeof(seg) ? sizeof(seg) : (hi - pos);
-                    i64 r = pread64(mfd, seg, want, (int64_t)pos);
-                    if (r <= 0) break;
-                    stop = c2b_g113_scanbuf(seg, (u32)r, (uptr)pos,
-                                            &hits, &t0, cap);
-                    pos += (u64)r;
+                if (p < e2 && *p == 'r') p++;
+                if (p < e2 && *p == 'w') { wr = 1; p++; }
+                else if (p < e2 && *p == '-') p++;
+                while (p < e2 && *p != '\n') p++;
+                if (!wr || hi <= lo || (hi - lo) < 4096) continue;
+                /* g118: the guard 1GB -> 8GB (the run327 heap layout = the
+                 * keys' region can sit in a >1GB rw mapping; the deadline =
+                 * the real limiter, the guard = vs the absurd only). */
+                if ((hi - lo) > (8ull << 30)) continue;
+                mfd = fdm;
+                {
+                    u64 pos = lo;
+                    while (pos < hi && !stop) {
+                        u64 want = (hi - pos) > sizeof(seg) ? sizeof(seg) : (hi - pos);
+                        i64 r = pread64(mfd, seg, want, (int64_t)pos);
+                        if (r <= 0) break;
+                        stop = c2b_g113_scanbuf(seg, (u32)r, (uptr)pos,
+                                                &hits, &t0, caps[pass],
+                                                (u32)pass);
+                        pos += (u64)r;
+                    }
                 }
             }
         }
         close(fdm);
+        /* g118: the honest cycle diagnostics = the elapsed + the maps-window
+         * truncation + the deadline truncation (the run327 zero-hit = the
+         * invisible mix of the 256KB maps window + the coverage luck). */
+        clock_gettime(1, &now);
         klog_s("[c2b] g113: cycle done hits=");
         klog_h(hits);
         klog_s(" keys=");
         klog_h(c2b_g113_nkeys);
+        klog_s(" pubs=");
+        klog_h(c2b_g113_npubs);
+        {
+            i64 el = ((i64)now.tv_sec * 1000000000ll + (i64)now.tv_nsec - t0)
+                     / 1000000ll;
+            klog_s(" ms=");
+            klog_h((u32)el);
+        }
+        if (mtrunc) klog_s(" MAPSTRUNC");
+        if (stop) klog_s(" TRUNC");
         klog_s("\n");
         if (c2b_g113_nkeys >= 4) break;
     }

@@ -48,6 +48,8 @@ typedef unsigned int   uptr;
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+/* v18-g77fd: чей-сокет ридеры — объявлены в общем блоке ниже (рядом с
+ * собственными struct sockaddr/socklen_t моста) */
 static void c2b_segv(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)uc;
@@ -79,7 +81,6 @@ extern i32   sigaction(i32 sig, const void *act, void *oldact);
 extern i32   sigemptyset(void *set);   /* маска sa_mask */
 extern i64   pread(i32 fd, void *buf, uptr n, uptr off);   /* g24 v4.2: ssize_t/size_t/off_t = 64-bit */
 extern i32   vsnprintf(char *s, uptr n, const char *fmt, void *va);   /* g34v2: GNS lib-spew hook */
-
 static int g_logfd = 2;
 
 /* R30: line-буфер — один write() на строку. Слив по '\n' или при переполнении.
@@ -6064,6 +6065,10 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 #define C2B_AF_INET   2
 #define C2B_AF_INET6  10
 
+/* v18-g77fd: чей-сокет ридеры (после собственного struct sockaddr/socklen_t) */
+extern int getsockname(int, struct sockaddr *, socklen_t *);
+extern int getpeername(int, struct sockaddr *, socklen_t *);
+
 #define C2B_CL_DUMP_MAX  96    /* байт payload в hexdump (однострочный) */
 #define C2B_CL_LOG_FIRST 32    /* первые N connless-пакетов логируем всегда */
 
@@ -11873,6 +11878,55 @@ static i32 c2b_g81_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
     return rc;
 }
 
+/* v18-g82W: ReceiveMessagesOnConnection СЛОТ 14 ДЕТУР (g131-класс).
+ * run354: слот 12 = детур-тихий (движок НЕ тянет НИ ОДНИМ пуллом), 14 =
+ * g87-вердикт приёмник (run239-a1: 'A'-дамп), НО движковые пуллы 14 =
+ * НЕВИДИМЫ (детур был только на 12). Детур = passthrough + rc>0 полный
+ * дамп (c2b_g71_dumpmsg) + rc==0 счётчик (heartbeat каждые 4096) + rc<0
+ * однократно. Класс-vtable 006+009 = покрывает ВСЕ инстансы (мостовые И
+ * движковые). Оригы = ПЕР-vtable карта (двухклассный урок: g81 = один
+ * статический orig = второй арм перезаписывает — не повторяем).
+ * Киллисвитч C2B_G82W=0. */
+static void *g82w_vt_seen[2];
+static void *g82w_orig[2];
+static u32 g82w_n0, g82w_npos, g82w_neg;
+static i32 c2b_g82w_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
+{
+    void **vt = *(void ***)self;
+    i32 idx = -1, rc, k82;
+    if (g82w_vt_seen[0] == (void *)vt) idx = 0;
+    else if (g82w_vt_seen[1] == (void *)vt) idx = 1;
+    if (idx < 0 || !g82w_orig[idx]) return -997;   /* не наш класс */
+    rc = ((i32 (*)(void *, uptr, void **, i32))g82w_orig[idx])(
+        self, connH, pMsgs, nMax);
+    if (rc < 0) {
+        g82w_neg++;
+        if (g82w_neg == 1) {
+            C2B_LOGS("[c2b] g82w: recv14 rc<0 rc="); C2B_LOGD((u32)rc);
+            C2B_LOGS("conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
+            C2B_LOGS("\n");
+        }
+    } else if (rc == 0) {
+        g82w_n0++;
+        if ((g82w_n0 & 0xFFFu) == 1) {
+            C2B_LOGS("[c2b] g82w: recv14 empty hb n="); C2B_LOGD(g82w_n0);
+            C2B_LOGS("\n");
+        }
+    } else {
+        g82w_npos += (u32)rc;
+        C2B_LOGS("[c2b] g82w recv14 rc="); C2B_LOGD((u32)rc);
+        C2B_LOGS("conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
+        C2B_LOGS("\n");
+        if (pMsgs) {
+            for (k82 = 0; k82 < rc && k82 < 8; k82++) {
+                if (!pMsgs[k82]) continue;
+                (void)c2b_g71_dumpmsg(pMsgs[k82]);
+            }
+        }
+    }
+    return rc;
+}
+
 /* g32a-обёртка для pthread: spew_rearm держит auth-поток в 60x5s цикле
  * (run173: драйвер ПОСЛЕ rearm недостижим — попытка кончается раньше) */
 static void *c2b_g32_thread(void *arg)
@@ -12689,6 +12743,36 @@ static void c2b_g32_drive(void)
                         C2B_LOGS("\n");
                     } else {
                         C2B_LOGS("[c2b] g81: mprotect failed\n");
+                    }
+                }
+            }
+            /* v18-g82W: СЛОТ 14 ДЕТУР (та же класс-vtable механика: патч =
+             * общий для ВСЕХ инстансов класса). Оригы = пер-vtable карта
+             * (006/009 = разные классы — урок перезаписи g81). */
+            {
+                const char *e82w = getenv("C2B_G82W");
+                if (e82w && e82w[0] == '0') {
+                    C2B_LOGS("[c2b] g82w: disabled (C2B_G82W=0)\n");
+                } else {
+                    void **vt82w = *(void ***)iface;
+                    i32 slot82w = -1, w2;
+                    for (w2 = 0; w2 < 2; w2++)
+                        if (g82w_vt_seen[w2] == (void *)vt82w) slot82w = w2;
+                    if (slot82w < 0) slot82w = (g82w_vt_seen[0] ? 1 : 0);
+                    if (vt82w[14] == (void *)&c2b_g82w_recv_detour) {
+                        C2B_LOGS("[c2b] g82w: already armed (this class)\n");
+                    } else if (c2b_page_protect((uptr)&vt82w[14], 8, 0x07) == 0) {
+                        g82w_vt_seen[slot82w] = (void *)vt82w;
+                        g82w_orig[slot82w] = vt82w[14];
+                        vt82w[14] = (void *)&c2b_g82w_recv_detour;
+                        C2B_LOGS("[c2b] g82w: slot 14 DETOURED idx=");
+                        C2B_LOGD((u32)slot82w);
+                        C2B_LOGS("orig=0x");
+                        C2B_LOGH((u32)((uptr)g82w_orig[slot82w] >> 32));
+                        C2B_LOGH((u32)(uptr)g82w_orig[slot82w]);
+                        C2B_LOGS("\n");
+                    } else {
+                        C2B_LOGS("[c2b] g82w: mprotect failed\n");
                     }
                 }
             }
@@ -14867,6 +14951,112 @@ static void *c2b_g97_thread(void *arg)
     C2B_LOGS("[c2b] g97: exit t=");
     C2B_LOGD(t / 2);
     C2B_LOGS("st="); C2B_LOGD(prev);
+    C2B_LOGS("\n");
+    return (void *)0;
+}
+
+/* v18-g82WP: ШИРОКИЙ СЛОТ-ЗОНД {15,16} (g97-паттерн, arm-тред). Слоты
+ * 12/14 = детурнуты (g81/g82W), 13/17 = GCI/Detailed (g97) — 15/16 =
+ * НЕИССЛЕДОВАННЫЕ read-классы (rotation: 15 = rc=-1 getter-класс, 16 =
+ * девственник). Проба = uniform 4-arg вызов (iface, h, ma, 32): recv-класс
+ * пишет только массив указателей 32x8=256B, GCI-класс ~344B структуру —
+ * ma = 4KB хватает. SEGV = слот в блэклист. rc>0 + ma[0]=heap-ptr =
+ * ЖИВОЙ приёмник => дамп (g131-класс контент-тап) + 1/с полл далее.
+ * Темп: 1/с первые 10с, далее 1/10с, cap 33 итераций (~240с).
+ * Киллисвитч C2B_G82WP=0. */
+static u32 g82wp_n[2], g82wp_pos[2], g82wp_neg[2], g82wp_zero[2];
+static u32 g82wp_dead;
+static void *c2b_g82wp_thread(void *arg)
+{
+    static const u32 slots[2] = { 15u, 16u };
+    u32 t, sl, k;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G82WP");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g82wp: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (t = 0; t < 600; t++) {
+        if (g_gns_conn_h && g_gns_conn_iface) break;
+        usleep(500000);
+    }
+    if (!g_gns_conn_h || !g_gns_conn_iface) {
+        C2B_LOGS("[c2b] g82wp: no session in 5min — exit\n");
+        return (void *)0;
+    }
+    C2B_LOGS("[c2b] g82wp: armed h=0x");
+    C2B_LOGH((u32)g_gns_conn_h);
+    C2B_LOGS("slots={15,16} 1/s->1/10s cap~240s\n");
+    for (t = 0; t < 33; t++) {
+        void **vt;
+        usleep(t < 10 ? 1000000u : 10000000u);
+        if (!g_gns_conn_h || !g_gns_conn_iface) break;
+        vt = *(void ***)g_gns_conn_iface;
+        for (sl = 0; sl < 2; sl++) {
+            u64 ma[512];
+            i32 rc = -999;
+            u32 s = slots[sl];
+            if (g82wp_dead & (1u << sl)) continue;
+            for (k = 0; k < 64; k++) ma[k] = 0;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rc = ((i32 (*)(void *, uptr, void **, i32))vt[s])(
+                    g_gns_conn_iface, g_gns_conn_h, (void **)ma, 32);
+            } else {
+                g_probe_active = 0;
+                g82wp_dead |= (1u << sl);
+                C2B_LOGS("[c2b] g82wp: slot "); C2B_LOGD(s);
+                C2B_LOGS("SEGV — blacklisted\n");
+                continue;
+            }
+            g_probe_active = 0;
+            g82wp_n[sl]++;
+            if (rc > 0) {
+                g82wp_pos[sl]++;
+                C2B_LOGS("[c2b] g82wp: slot "); C2B_LOGD(s);
+                C2B_LOGS("rc>0 rc="); C2B_LOGD((u32)rc);
+                C2B_LOGS("ma0=0x");
+                C2B_LOGH((u32)((ma[0] >> 32) & 0xffffffffu));
+                C2B_LOGH((u32)(ma[0] & 0xffffffffu));
+                C2B_LOGS("\n");
+                if (ma[0] > 0x1000000ull && ma[0] < 0x800000000000ull) {
+                    C2B_LOGS("[c2b] g82wp: LIVE RECEIVER slot=");
+                    C2B_LOGD(s);
+                    C2B_LOGS("=> dump\n");
+                    (void)c2b_g71_dumpmsg((void *)(uptr)ma[0]);
+                }
+            } else if (rc < 0) {
+                g82wp_neg[sl]++;
+                if (g82wp_neg[sl] <= 2) {
+                    C2B_LOGS("[c2b] g82wp: slot "); C2B_LOGD(s);
+                    C2B_LOGS("rc<0 (getter-class) rc=");
+                    C2B_LOGD((u32)rc);
+                    C2B_LOGS("\n");
+                }
+            } else {
+                g82wp_zero[sl]++;
+                if (g82wp_zero[sl] <= 2) {
+                    C2B_LOGS("[c2b] g82wp: slot "); C2B_LOGD(s);
+                    C2B_LOGS("rc=0 (empty queue)\n");
+                }
+            }
+        }
+        if ((t % 12) == 11) {
+            C2B_LOGS("[c2b] g82wp: hb t="); C2B_LOGD(t);
+            C2B_LOGS("s15 n/p/n/0=");
+            C2B_LOGD(g82wp_n[0]); C2B_LOGD(g82wp_pos[0]);
+            C2B_LOGD(g82wp_neg[0]); C2B_LOGD(g82wp_zero[0]);
+            C2B_LOGS("s16=");
+            C2B_LOGD(g82wp_n[1]); C2B_LOGD(g82wp_pos[1]);
+            C2B_LOGD(g82wp_neg[1]); C2B_LOGD(g82wp_zero[1]);
+            C2B_LOGS("dead=0x"); C2B_LOGH(g82wp_dead);
+            C2B_LOGS("\n");
+        }
+    }
+    C2B_LOGS("[c2b] g82wp: exit t="); C2B_LOGD(t);
+    C2B_LOGS("dead=0x"); C2B_LOGH(g82wp_dead);
     C2B_LOGS("\n");
     return (void *)0;
 }
@@ -18690,6 +18880,73 @@ static void *c2b_g63_thread(void *arg)
 }
 #endif
 
+/* v18-g77fd: ЧЕЙ СОКЕТ (getsockname/getpeername, перв. 5 пак. на fd).
+ * run354: класс-81 S2-датаграммы = на ДВУХ fd (0x38 + 0x43) = движковый
+ * GNS-lib vs steamclient-встроенный GNS — ownership решает, ГДЕ живёт
+ * приёмная очередь (цель g82W). Формат = чистая ф-я (selftest):
+ * AF_INET -> "127.0.0.1:27005", иное -> "fm=000a". Киллисвитч C2B_G77FD=0. */
+static u8 g77fd_n[256];
+static u32 g77fd_gate = 1;
+static u32 g77fd_gate_init;
+static char c2b_hx(u32 n) { return (char)(n < 10 ? '0' + n : 'a' + n - 10); }
+static i32 c2b_g77fd_fmt(const u8 *sa, u32 sn, char *out, u32 on)
+{
+    u32 port, i = 0, q, fam;
+    if (!sa || sn < 8 || !out || on < 24) return -1;
+    fam = (u32)sa[0] | ((u32)sa[1] << 8);
+    if (fam != 2) {                       /* не AF_INET: fam=XXXX hex */
+        out[i++] = 'f'; out[i++] = 'm'; out[i++] = '=';
+        out[i++] = c2b_hx((fam >> 12) & 15); out[i++] = c2b_hx((fam >> 8) & 15);
+        out[i++] = c2b_hx((fam >> 4) & 15); out[i++] = c2b_hx(fam & 15);
+        out[i] = 0;
+        return (i32)i;
+    }
+    port = ((u32)sa[2] << 8) | (u32)sa[3];
+    for (q = 0; q < 4; q++) {
+        u32 v = sa[4 + q];
+        if (v >= 100) out[i++] = (char)('0' + v / 100);
+        if (v >= 10) out[i++] = (char)('0' + (v / 10) % 10);
+        out[i++] = (char)('0' + v % 10);
+        out[i++] = (q < 3) ? '.' : ':';
+    }
+    {
+        u32 p = port, dn = 0, d5[5];
+        do { d5[dn++] = p % 10; p /= 10; } while (p);
+        while (dn) out[i++] = (char)('0' + d5[--dn]);
+    }
+    out[i] = 0;
+    return (i32)i;
+}
+static void c2b_g77fd_map(int fd)
+{
+    u8 sa[32], sp[32];
+    u32 sl = (u32)sizeof sa, pl = (u32)sizeof sp, z;
+    char b1[40], b2[40];
+    i32 r1, r2;
+    u32 idx = (u32)fd & 255u;
+    if (g77fd_n[idx] >= 5) return;
+    g77fd_n[idx]++;
+    for (z = 0; z < sizeof sa; z++) { sa[z] = 0; sp[z] = 0; }
+    r1 = getsockname(fd, (void *)sa, &sl);
+    r2 = getpeername(fd, (void *)sp, &pl);
+    C2B_LOGS("[c2b] g77fd fd="); C2B_LOGH((u32)fd);
+    if (r1 == 0) {
+        if (c2b_g77fd_fmt(sa, sl, b1, sizeof b1) >= 0) {
+            C2B_LOGS("ln="); C2B_LOGS(b1);
+        }
+    } else {
+        C2B_LOGS("ln=ERR");
+    }
+    if (r2 == 0) {
+        if (c2b_g77fd_fmt(sp, pl, b2, sizeof b2) >= 0) {
+            C2B_LOGS(" pr="); C2B_LOGS(b2);
+        }
+    } else {
+        C2B_LOGS(" pr=none");
+    }
+    C2B_LOGS("\n");
+}
+
 /* 58f-g77/78: ОБЩИЙ сырой тап GNS-data (recvfrom + recvmmsg). run231:
  * тап в recvfrom поймал ТОЛЬКО 5B relay-кипэлайвы '82 00000000 0b' —
  * сессионные дата-пакеты (33-77B, 0x81/0x83) мимо -> читаются батчем
@@ -18700,6 +18957,14 @@ static void c2b_g77_rxraw_tap(int fd, const u8 *p, u32 n)
     u32 k77;
     if (n < 5 || !(p[0] & 0x80)) return;
     g_cl_rxraw_total++;
+    /* v18-g77fd: fd-map на ЛЮБОм GNS-пакете (вкл. кипэлайвы — fd 0x13
+     * тоже нужен). Гейт = разовый env-рид. */
+    if (!g77fd_gate_init) {
+        const char *e77fd = getenv("C2B_G77FD");
+        if (e77fd && e77fd[0] == '0') g77fd_gate = 0;
+        g77fd_gate_init = 1;
+    }
+    if (g77fd_gate) c2b_g77fd_map(fd);
     if (n == 5 && p[0] == 0x82) return;    /* relay-кипэлайв: не дампим */
     if (p[0] == 0xff) return; /* 58f-g80: движковый OOB (ff..) НЕ дампим —
                                * именно он выел лимит 96 в run233-a4
@@ -20261,6 +20526,10 @@ i32 c2b_main(void)
     {   /* 58f-g97: вотчер закрытия GNS-сессии (end-reason/end-debug) */
         void *t97 = 0;
         pthread_create(&t97, 0, c2b_g97_thread, 0);
+        {
+            void *t82wp;
+            pthread_create(&t82wp, 0, c2b_g82wp_thread, 0);
+        }
     }
     {   /* 58f-g98: S2 in-channel frame bisect (one shot per session) */
         void *t98 = 0;
@@ -24646,6 +24915,32 @@ static void test_g130_relay(void)
     g_clp_sendto = fst_save;
 }
 
+/* v18-g77fd: форматтер sockaddr_in = чистая ф-я (selftest).
+ * AF_INET {02 00 69 7d 7f 00 00 01} -> "127.0.0.1:27005";
+ * не-AF_INET {0a 00 ...} -> "fm=000a"; мусор -> -1. */
+static void test_g77fd(void)
+{
+    char b[40];
+    const u8 sa[16] = { 2, 0, 0x69, 0x7d, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const u8 sa6[8] = { 10, 0, 0, 0, 0, 0, 0, 0 };
+    i32 n = c2b_g77fd_fmt(sa, 16, b, sizeof b);
+    CHECK(n == 15, "g77fd: fmt len 15");
+    CHECK(strcmp(b, "127.0.0.1:27005") == 0, "g77fd: fmt 127.0.0.1:27005");
+    n = c2b_g77fd_fmt(sa6, 8, b, sizeof b);
+    CHECK(n == 7, "g77fd: fam-only len 7");
+    CHECK(strcmp(b, "fm=000a") == 0, "g77fd: fam=000a");
+    CHECK(c2b_g77fd_fmt(0, 16, b, sizeof b) == -1, "g77fd: null = -1");
+    CHECK(c2b_g77fd_fmt(sa, 4, b, sizeof b) == -1, "g77fd: короткий sock = -1");
+    CHECK(c2b_g77fd_fmt(sa, 16, b, 8) == -1, "g77fd: малый буфер = -1");
+    {   /* порт 65535 + 10.228.19.133 */
+        const u8 sb[8] = { 2, 0, 0xff, 0xff, 10, 228, 19, 133 };
+        n = c2b_g77fd_fmt(sb, 8, b, sizeof b);
+        CHECK(n == 19, "g77fd: fmt len 19 (10.228.19.133:65535)");
+        CHECK(strcmp(b, "10.228.19.133:65535") == 0,
+              "g77fd: fmt 10.228.19.133:65535");
+    }
+}
+
 /* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
    инструментированная пролог-часть (stolen bytes) невалидна вне родного фрейма
    (clang+ASan: SIGSEGV). Логика детура покрыта test_up_dispatch без патчей. */
@@ -24690,6 +24985,7 @@ int main(void)
     test_cl();          /* 41e-a: connectionless v1 (классификация/фильтр) */
     test_g129_g130();   /* 61a: спай-пара 'k'-пути (лог-фн + сиг-шейпы) */
     test_g130_relay();  /* 61b-v17: кантур-релей 'k' (kfull+фвд на фейк-sendto) */
+    test_g77fd();       /* v18: g77fd-форматтер sockaddr_in */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

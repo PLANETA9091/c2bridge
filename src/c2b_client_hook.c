@@ -1563,13 +1563,63 @@ static const u8 G126_SETIV_SIG[31] = {
     0x48, 0x83, 0xec, 0x28,              /* sub $0x28,%rsp */
     0x48, 0x8b, 0x87, 0x60, 0x01, 0x00, 0x00  /* mov 0x160(%rdi),%rax */
 };
+/* ---- v18-g126C/D: THE DECRYPT TAPS (SITE C = decrypt_ctr32, D = decrypt).
+ * THE RE (g126_dec_re*.py, this round, the run335 bins d975c5 = the SAME
+ * lib the g126 = verified on): the EVP aes_gcm_cipher @0x21063c0 = the
+ * dispatcher: the enc flag = [r15+0x10], the stream fn = [rax+0x2d0], the
+ * gcm sub-ctx = +0x100 (the SAME layout as cb0ca8). The enc==0 (DECRYPT)
+ * branches: stream!=0 => call 0x212eeb0 = CRYPTO_gcm128_decrypt_ctr32
+ * (gcm, in, out, len, ctr=r8); stream==0 => call 0x212e2e0 =
+ * CRYPTO_gcm128_decrypt (gcm, in, out, len). (The enc!=0 twins = 0x212e950
+ * encrypt_ctr32 / 0x212dc60 encrypt — NOT tapped.) The ctx reads in both
+ * = 0x160(key)/0x168(block)/0x180(stream) = the SAME offsets as cb0ca8.
+ * THE PRIZE: the out-buffer AFTER the tramp = THE DECRYPTED SERVER TRUTH
+ * (the S2's class-81 msgs the g77-tap sees encrypted on fd 0x38/0x43).
+ * The logs carry in= (the first 8B) => the direction-proof for free: the
+ * decrypt-in = the wire bytes (the g77-tap matches), the encrypt-in = the
+ * plaintext. The rate = the first 64 + every 8th per fn. The patch = the
+ * same c2b_g126_patch recipe (the sig = the whole-instruction head, the
+ * base-relative = tramp-safe; the boundary = 26B / 20B = the verified
+ * next-instr edges). Killswitch: shared C2B_G126=0. */
+#define G126_DEC_OFF    0x212e2e0u   /* CRYPTO_gcm128_decrypt      */
+#define G126_DECC32_OFF 0x212eeb0u   /* CRYPTO_gcm128_decrypt_ctr32 */
+static const u8 G126_DEC_SIG[26] = {
+    0x41, 0x57,                          /* push %r15 */
+    0x48, 0x89, 0xc8,                    /* mov %rcx,%rax (len) */
+    0x49, 0x89, 0xd7,                    /* mov %rdx,%r15 (out) */
+    0x41, 0x56,                          /* push %r14 */
+    0x48, 0x89, 0xc2,                    /* mov %rax,%rdx */
+    0x49, 0x89, 0xfe,                    /* mov %rdi,%r14 (gcm) */
+    0x41, 0x55,                          /* push %r13 */
+    0x41, 0x54,                          /* push %r12 */
+    0x55,                                /* push %rbp */
+    0x53,                                /* push %rbx */
+    0x48, 0x83, 0xec, 0x58               /* sub $0x58,%rsp */
+};
+static const u8 G126_DECC32_SIG[20] = {
+    0x41, 0x57,                          /* push %r15 */
+    0x41, 0x56,                          /* push %r14 */
+    0x41, 0x55,                          /* push %r13 */
+    0x49, 0x89, 0xd5,                    /* mov %rdx,%r13 (out) */
+    0x41, 0x54,                          /* push %r12 */
+    0x55,                                /* push %rbp */
+    0x48, 0x89, 0xcd,                    /* mov %rcx,%rbp (len) */
+    0x53,                                /* push %rbx */
+    0x48, 0x83, 0xec, 0x38               /* sub $0x38,%rsp */
+};
 static u8 g126_tramp_a[64] __attribute__((aligned(4096)));
 static u8 g126_tramp_b[64] __attribute__((aligned(4096)));
-static u32 g126_patched;      /* bit0 = the setkey, bit1 = the setiv */
+static u8 g126_tramp_c[64] __attribute__((aligned(4096)));
+static u8 g126_tramp_d[64] __attribute__((aligned(4096)));
+static u32 g126_patched;      /* bit0=setkey bit1=setiv bit2=dec bit3=decc32 */
 static u32 g126_nsetkey;
 static u32 g126_nsetiv;
 static u32 g126_prof_k;
 static u32 g126_prof_i;
+static u32 g126_ndecc32;      /* the decrypt_ctr32 calls seen */
+static u32 g126_ndecl;        /* the decrypt calls seen */
+static u32 g126_prof_dc;      /* the dec-profile lines logged (cap 8) */
+static u32 g126_prof_dcl;     /* the decl-profile lines logged (cap 8) */
 #define G126_KEY_CAP 16
 #define G126_IV_CAP  16
 static u8  g126_keyseen[G126_KEY_CAP][32];
@@ -1666,6 +1716,71 @@ static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len)
     c2b_g126_iv_capture(gcm, iv, len);
     if (g126_tramp_b[sizeof(G126_SETIV_SIG)] == 0xff)
         tramp(gcm, iv, len);
+}
+
+/* the decrypt capture: the out = THE PLAINTEXT (post-tramp), the in-head =
+ * the direction-proof; the rate = the first 64 + every 8th; the len-gate =
+ * the sane SNP range (1..2KB); the log = [c2b] g126: DEC32|DECL n=len= rc=
+ * gcm= in=<8hex> out=<24hex> */
+static void c2b_g126_dec_capture(const void *gcm, const void *in,
+                                 const void *out, sz_t len, i32 rc,
+                                 u32 tag32)
+{
+    u32 *ctr = tag32 ? &g126_ndecc32 : &g126_ndecl;
+    u32 *prof = tag32 ? &g126_prof_dc : &g126_prof_dcl;
+    const char *tag = tag32 ? "DEC32" : "DECL";
+    u32 n = __atomic_add_fetch(ctr, 1, __ATOMIC_RELAXED);
+    u8 bi[8], bo[24];
+    u32 cl, z;
+
+    if (!out || !len || len > 0x800) return;
+    if (n > 64 && (n & 7) != 0) return;
+    for (z = 0; z < 24; z++) bo[z] = 0;
+    cl = len < 24 ? (u32)len : 24;
+    memcpy(bo, out, cl);
+    if (*prof < 8) {
+        (*prof)++;
+        klog_s("[c2b] g126: "); klog_s(tag); klog_s("# prof n=");
+        klog_h(n); klog_s("\n");
+    }
+    klog_s("[c2b] g126: "); klog_s(tag);
+    klog_s(" n="); klog_h(n);
+    klog_s(" len="); klog_h((u32)len);
+    klog_s(" rc="); klog_h((u32)rc);
+    klog_s(" gcm="); klog_p((uptr)gcm);
+    if (in) {
+        for (z = 0; z < 8; z++) bi[z] = 0;
+        cl = len < 8 ? (u32)len : 8;
+        memcpy(bi, in, cl);
+        klog_s(" in="); klog_x(bi, 8);
+    }
+    klog_s(" out="); klog_x(bo, 24);
+    klog_s("\n");
+}
+
+/* SITE D = CRYPTO_gcm128_decrypt (the 4-arg non-stream path) */
+static i32 c2b_g126_dec_detour(void *gcm, const void *in, void *out, sz_t len);
+static i32 c2b_g126_dec_detour(void *gcm, const void *in, void *out, sz_t len)
+{
+    i32 (*tramp)(void *, const void *, void *, sz_t) =
+        (i32 (*)(void *, const void *, void *, sz_t))g126_tramp_c;
+    i32 rc = tramp(gcm, in, out, len);
+    c2b_g126_dec_capture(gcm, in, out, len, rc, 0);
+    return rc;
+}
+/* SITE C = CRYPTO_gcm128_decrypt_ctr32 (the 5-arg stream path = the SNP
+ * fast path — the dispatcher's enc==0 + stream!=0 = THE SNS inbound) */
+static i32 c2b_g126_decc32_detour(void *gcm, const void *in, void *out,
+                                  sz_t len, const void *ctrfn);
+static i32 c2b_g126_decc32_detour(void *gcm, const void *in, void *out,
+                                  sz_t len, const void *ctrfn)
+{
+    i32 (*tramp)(void *, const void *, void *, sz_t, const void *) =
+        (i32 (*)(void *, const void *, void *, sz_t, const void *))
+            g126_tramp_d;
+    i32 rc = tramp(gcm, in, out, len, ctrfn);
+    c2b_g126_dec_capture(gcm, in, out, len, rc, 1);
+    return rc;
 }
 
 static void c2b_g126_patch(u8 *tgt, const u8 *sig, u32 siglen, u8 *tramp,
@@ -1819,6 +1934,19 @@ static void *c2b_g126_watch(void *arg)
             c2b_g126_patch((u8 *)(liblo + G126_SETIV_OFF), G126_SETIV_SIG,
                            sizeof(G126_SETIV_SIG), g126_tramp_b,
                            (uptr)&c2b_g126_setiv_detour, "setiv", 2,
+                           liblo);
+        /* v18-g126C/D: the decrypt taps (the bits 4/8) — the same recipe;
+         * the sig-mismatch = the build drift = the skip (the log via the
+         * patch fn), the A/B bits = still the exit anchor */
+        if (!(g126_patched & 8))
+            c2b_g126_patch((u8 *)(liblo + G126_DECC32_OFF), G126_DECC32_SIG,
+                           sizeof(G126_DECC32_SIG), g126_tramp_d,
+                           (uptr)&c2b_g126_decc32_detour, "decc32", 8,
+                           liblo);
+        if (!(g126_patched & 4))
+            c2b_g126_patch((u8 *)(liblo + G126_DEC_OFF), G126_DEC_SIG,
+                           sizeof(G126_DEC_SIG), g126_tramp_c,
+                           (uptr)&c2b_g126_dec_detour, "dec", 4,
                            liblo);
         if ((g126_patched & 3) == 3) return (void *)0;
         if (g126_patched) return (void *)0;

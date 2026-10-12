@@ -7007,6 +7007,20 @@ __attribute__((used)) static void *volatile c2b_g130_tramp;
 static volatile u32 c2b_g129_n, c2b_g130_n, c2b_g130_kn;
 static u8 *g_g129_tramp_mem, *g_g130_tramp_mem;
 
+/* 61b-v17: КАНТУР-РЕЛЕЙ 'k'. RUN353-ПРИГОВОР: g129 = 20 scp-вызовов
+ * (s1c=0, na=127.0.0.1:27005, chal!=0, proto=3), g130 = 20 'k'-класс
+ * (len=0x201, bf0=ffffffff, bf4='k96') — а НА ПРОВОДЕ = 0 'k'-датаграмм,
+ * S1-капчер = 0, 0x22 = 0: движок дропает 'k' ВНУТРИ send-слоя 0x4bb170
+ * ПОСЛЕ входа (дальше entry-спая не видно). ФИКС: g130-лог на 'k'-классе
+ * ЗОВЁТ S1-кор (kfull-капчер + fwdk raw-forward + 0x22-перевод) НАПРЯМУЮ
+ * с fd=g_clv2_fd и addr=0 (=> dst=g_clv2_dst fallback). Семантика = ровно
+ * та же, что у sendto-хука на S1; send_connreq = rate-limit 250ms = дедуп.
+ * Гард = sigsetjmp (g84v2-класс: спай = на движковом потоке).
+ * Killswitch: C2B_G130RELAY=0. */
+static i32 c2b_clv2_on_s1_connect(i32 fd, const u8 *p, u32 len, i32 flags,
+                                  const void *addr, socklen_t addrlen);
+static u32 g_g130_relay = 1, g_g130_relay_init;
+
 void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
 {
     u32 n = ++c2b_g129_n;
@@ -7037,9 +7051,36 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
 void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
 {
     u32 n = ++c2b_g130_n;
+    if (!g_g130_relay_init) {
+        const char *e = getenv("C2B_G130RELAY");
+        if (e && e[0] == '0') g_g130_relay = 0;
+        g_g130_relay_init = 1;
+    }
     if (len >= 380) {
         if (c2b_g130_kn > 24) return;
         c2b_g130_kn++;
+        /* 61b-v17: КАНТУР-РЕЛЕЙ — 'k'-шейп (ff×4+'k') => S1-кор напрямую
+         * (fd=g_clv2_fd, addr=0 => dst=g_clv2_dst). ДО rate-гейта лога =
+         * релей живёт, пока живёт scp-ретрай-цикл. */
+        if (g_g130_relay && bf && len <= 1200 && g_clv2_fd >= 0 &&
+            g_clv2_dstlen >= 6 &&
+            *(volatile const u32 *)bf == 0xffffffffu &&
+            *(volatile const u8 *)(bf + 4) == (u8)'k') {
+#ifndef C2B_SELFTEST
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                g_probe_active = 1;
+                (void)c2b_clv2_on_s1_connect(g_clv2_fd, (const u8 *)bf,
+                                             len, 0, 0, 0);
+                g_probe_active = 0;
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g130: relay FAULT — continuing\n");
+            }
+#else
+            (void)c2b_clv2_on_s1_connect(g_clv2_fd, (const u8 *)bf,
+                                         len, 0, 0, 0);
+#endif
+        }
     } else {
         if (n > 1024 || (n & 0xFFu) != 1u) return;
     }
@@ -14229,6 +14270,125 @@ static void c2b_g40_sdt_note(i32 fd, u32 len, const void *addr, ssize_t r)
 #endif
 }
 
+/* 61b-v17: S1-'k'-капчер-КОР — вынесен из sendto-хука (43f-эра) как фн.
+ * Зовут: (а) хук — addr/addrlen капчура (движковый sendto-dst);
+ * (б) g130-релей — addr=0,addrlen=0 => dst = g_clv2_dst (qconnect-цель,
+ * fallback-ветка сработает сама). Возврат 1 = звонящий ОБЯЗАН дропнуть
+ * датаграмму (не слать). РОВНО та же семантика капчера/фвдк/0x22-перевода,
+ * что была инлайн (run168: 'k' 0x201B = целевой шейп; run353: хук-путь
+ * МЁРТВ для 'k' — движок дропает его в netsocket-слое ДО syscall'а). */
+static i32 c2b_clv2_on_s1_connect(i32 fd, const u8 *p, u32 len, i32 flags,
+                                  const void *addr, socklen_t addrlen)
+{
+    char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
+    c2b_cl_hexline(p, len, ln, (u32)sizeof(ln));
+    /* 58f-g90: ПОЛНЫЙ 'k' в буфер для in-channel релея (g70b
+     * капчурит только byte 17+; тут = ЦЕЛИКОМ, ff×4+'k'+...) */
+    if (len > 4 && len <= sizeof(g_kfull)) {
+        u32 k8;
+        memcpy(g_kfull, p, (u32)len);
+        g_kfull_len = (u32)len;
+        g_kfull_n++;
+        C2B_LOGS("[c2b] g90: full 'k' captured #");
+        C2B_LOGN(g_kfull_n);
+        C2B_LOGS(" len=");
+        C2B_LOGN(g_kfull_len);
+        C2B_LOGS(" head=");
+        for (k8 = 0; k8 < 24 && k8 < g_kfull_len; k8++)
+            C2B_LOGH(g_kfull[k8]);
+        C2B_LOGS("\n");
+    }
+    g_clv2_cap_connect++;
+    C2B_LOGS("[c2b] CLV2 S1 connect captured #");
+    C2B_LOGN(g_clv2_cap_connect);
+    C2B_LOGS(" len="); C2B_LOGN((u32)len);
+    if (addr && addrlen && addrlen <= 16) {
+        const u8 *ad = (const u8 *)addr;
+        u32 k2;
+        C2B_LOGS(" dst=");
+        for (k2 = 0; k2 < (u32)addrlen; k2++) C2B_LOGH(ad[k2]);
+    }
+    C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
+    if (g_clv2_fwdk) {
+        /* run169 (fbe6689): fwdk=1 ON, 10 captures, dst= ПРАВИЛЬНЫЙ
+         * (AF_INET 28022 152.233.19.133!), но fwd НЕ стрелял —
+         * g_clv2_dstlen=0: qconnect'овский addr >16Б скипнулся.
+         * ФИКС: приоритет — САМ addr капчура (engine's own sendto
+         * dst = цель по построению), g_clv2_dst как fallback. */
+        const void *da = 0;
+        u32 dl = 0;
+        if (addr && addrlen && addrlen <= 28) {
+            da = addr; dl = (u32)addrlen;
+        } else if (g_clv2_dstlen >= 6) {
+            da = (const void *)g_clv2_dst; dl = g_clv2_dstlen;
+        }
+        if (da && dl) {
+            ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
+                                          da, dl);
+            g_clv2_fwd_k++;
+            C2B_LOGS("[c2b] CLV2 'k'->target fwd #");
+            C2B_LOGN(g_clv2_fwd_k);
+            C2B_LOGS(" len=");
+            C2B_LOGN((u32)len);
+            C2B_LOGS("\n");
+        }
+    }
+    if (g_clv2_cr) {
+        /* g31: перевод — S2 0x22 ConnectRequest из капчуренного 'k'.
+         * steamid = самая длинная цифра-строка 'k' (sys-id). Затем:
+         * свежий challenge (<=3.5s) есть -> 0x22 СРАЗУ (тот же fd,
+         * addr капчура = цель); нет -> 0x20 сейчас + pending (0x22
+         * уйдёт по reply в recvfrom-хуке). */
+        c2b_clv2_note_sid(p, (u32)len);
+        /* g70b: ticket-zone 'k' (byte 17+ = после ff×4+'k'+proto+
+         * authproto+chal) в буфер — сырьё для будущего in-channel
+         * auth (В 0x22 ticket-полей НЕТ — дескриптор g70). Лог:
+         * длина + первые 32 байта hex. */
+        if (len > 17) {
+            /* g74: буферы подняты в файловый скоуп (g74b шлёт их
+             * из g32-драйвера как C2S_CONNECT-пробу) */
+            u32 cl = len - 17, k7;
+            if (cl > sizeof(g_kcap)) cl = sizeof(g_kcap);
+            memcpy(g_kcap, p + 17, cl);
+            g_kcap_len = cl;
+            g_kcap_n++;
+            C2B_LOGS("[c2b] g70: k-ticket captured #");
+            C2B_LOGN(g_kcap_n);
+            C2B_LOGS(" len=");
+            C2B_LOGN(g_kcap_len);
+            C2B_LOGS(" head=");
+            for (k7 = 0; k7 < 32 && k7 < g_kcap_len; k7++)
+                C2B_LOGH(g_kcap[k7]);
+            C2B_LOGS("\n");
+        }
+        {
+            const void *da2 = 0;
+            socklen_t dl2 = 0;
+            if (addr && addrlen && addrlen <= 28) {
+                da2 = addr; dl2 = (socklen_t)addrlen;
+            } else if (g_clv2_dstlen >= 6) {
+                da2 = (const void *)g_clv2_dst; dl2 = g_clv2_dstlen;
+            }
+            if (da2 && dl2) {
+                if (!c2b_clv2_send_connreq(fd, g_clv2_cr, flags,
+                                           da2, dl2, "k-capture")) {
+                    u8 out2[512];
+                    u32 cid2 = (c2b_clv2_rand32() | 1u);
+                    g_clv2_conn_id = cid2;
+                    (void)c2b_clv2_build_chalreq(out2);
+                    ((c2b_sendto_fn)g_clp_sendto)(fd, out2, 512,
+                                                  flags, da2, dl2);
+                    g_clv2_cr_pending = 1;
+                    C2B_LOGS("[c2b] CLV2 0x22 arm: no fresh ch -> 0x20 sent (cid=");
+                    C2B_LOGH(cid2);
+                    C2B_LOGS(", 0x22 on reply)\n");
+                }
+            }
+        }
+    }
+    return 1;               /* дроп без отправки */
+}
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
@@ -14379,120 +14539,15 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             if (g_clv2_enable && cls == C2B_CLQ_CONNECT) {
                 /* CLV2 phase A: S1 connect капчерим и ДРОПАЕМ (без перевода
                  * его нельзя слать в CS2; фаза B построит ConnectRequest).
-                 * g30 (run168 PROBE): 'k' ТЕПЕРЬ ДОХОДИТ СЮДА ЦЕЛЫМ (g28+g29
-                 * сломали адхок-дроп движка — 10 капчурей/attempt, 0x201
-                 * байт, chal+имя+прото). РЕШАЮЩИЙ ЭКСПЕРИМЕНТ:
-                 * C2B_CLV2_FWDK=1 — форвард СЫРОГО S1 'k' в РЕАЛЬНУЮ ЦЕЛЬ
-                 * (g_clv2_dst из qconnect; fd = движковый — порт-источник
-                 * всего потока). Ответ цели ('B'/reject/тишина) = данные
-                 * для фазы B. Дампим и dst движка (identity-конверсия!). */
-                char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
-                c2b_cl_hexline(p, (u32)len, ln, (u32)sizeof(ln));
-                /* 58f-g90: ПОЛНЫЙ 'k' в буфер для in-channel релея (g70b
-                 * капчурит только byte 17+; тут = ЦЕЛИКОМ, ff×4+'k'+...) */
-                if (len > 4 && len <= sizeof(g_kfull)) {
-                    u32 k8;
-                    memcpy(g_kfull, p, (u32)len);
-                    g_kfull_len = (u32)len;
-                    g_kfull_n++;
-                    C2B_LOGS("[c2b] g90: full 'k' captured #");
-                    C2B_LOGN(g_kfull_n);
-                    C2B_LOGS(" len=");
-                    C2B_LOGN(g_kfull_len);
-                    C2B_LOGS(" head=");
-                    for (k8 = 0; k8 < 24 && k8 < g_kfull_len; k8++)
-                        C2B_LOGH(g_kfull[k8]);
-                    C2B_LOGS("\n");
-                }
-                g_clv2_cap_connect++;
-                C2B_LOGS("[c2b] CLV2 S1 connect captured #");
-                C2B_LOGN(g_clv2_cap_connect);
-                C2B_LOGS(" len="); C2B_LOGN((u32)len);
-                if (addr && addrlen && addrlen <= 16) {
-                    const u8 *ad = (const u8 *)addr;
-                    u32 k2;
-                    C2B_LOGS(" dst=");
-                    for (k2 = 0; k2 < (u32)addrlen; k2++) C2B_LOGH(ad[k2]);
-                }
-                C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
-                if (g_clv2_fwdk) {
-                    /* run169 (fbe6689): fwdk=1 ON, 10 captures, dst= ПРАВИЛЬНЫЙ
-                     * (AF_INET 28022 152.233.19.133!), но fwd НЕ стрелял —
-                     * g_clv2_dstlen=0: qconnect'овский addr >16Б скипнулся.
-                     * ФИКС: приоритет — САМ addr капчура (engine's own sendto
-                     * dst = цель по построению), g_clv2_dst как fallback. */
-                    const void *da = 0;
-                    u32 dl = 0;
-                    if (addr && addrlen && addrlen <= 28) {
-                        da = addr; dl = (u32)addrlen;
-                    } else if (g_clv2_dstlen >= 6) {
-                        da = (const void *)g_clv2_dst; dl = g_clv2_dstlen;
-                    }
-                    if (da && dl) {
-                        ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
-                                                      da, dl);
-                        g_clv2_fwd_k++;
-                        C2B_LOGS("[c2b] CLV2 'k'->target fwd #");
-                        C2B_LOGN(g_clv2_fwd_k);
-                        C2B_LOGS(" len=");
-                        C2B_LOGN((u32)len);
-                        C2B_LOGS("\n");
-                    }
-                }
-                if (g_clv2_cr) {
-                    /* g31: перевод — S2 0x22 ConnectRequest из капчуренного 'k'.
-                     * steamid = самая длинная цифра-строка 'k' (sys-id). Затем:
-                     * свежий challenge (<=3.5s) есть -> 0x22 СРАЗУ (тот же fd,
-                     * addr капчура = цель); нет -> 0x20 сейчас + pending (0x22
-                     * уйдёт по reply в recvfrom-хуке). */
-                    c2b_clv2_note_sid(p, (u32)len);
-                    /* g70b: ticket-zone 'k' (byte 17+ = после ff×4+'k'+proto+
-                     * authproto+chal) в буфер — сырьё для будущего in-channel
-                     * auth (В 0x22 ticket-поля НЕТ — дескриптор g70). Лог:
-                     * длина + первые 32 байта hex. */
-                    if (len > 17) {
-                        /* g74: буферы подняты в файловый скоуп (g74b шлёт их
-                         * из g32-драйвера как C2S_CONNECT-пробу) */
-                        u32 cl = len - 17, k7;
-                        if (cl > sizeof(g_kcap)) cl = sizeof(g_kcap);
-                        memcpy(g_kcap, p + 17, cl);
-                        g_kcap_len = cl;
-                        g_kcap_n++;
-                        C2B_LOGS("[c2b] g70: k-ticket captured #");
-                        C2B_LOGN(g_kcap_n);
-                        C2B_LOGS(" len=");
-                        C2B_LOGN(g_kcap_len);
-                        C2B_LOGS(" head=");
-                        for (k7 = 0; k7 < 32 && k7 < g_kcap_len; k7++)
-                            C2B_LOGH(g_kcap[k7]);
-                        C2B_LOGS("\n");
-                    }
-                    {
-                        const void *da2 = 0;
-                        socklen_t dl2 = 0;
-                        if (addr && addrlen && addrlen <= 28) {
-                            da2 = addr; dl2 = (socklen_t)addrlen;
-                        } else if (g_clv2_dstlen >= 6) {
-                            da2 = (const void *)g_clv2_dst; dl2 = g_clv2_dstlen;
-                        }
-                        if (da2 && dl2) {
-                            if (!c2b_clv2_send_connreq(fd, g_clv2_cr, flags,
-                                                       da2, dl2, "k-capture")) {
-                                u8 out2[512];
-                                u32 cid2 = (c2b_clv2_rand32() | 1u);
-                                g_clv2_conn_id = cid2;
-                                (void)c2b_clv2_build_chalreq(out2);
-                                ((c2b_sendto_fn)g_clp_sendto)(fd, out2, 512,
-                                                              flags, da2, dl2);
-                                g_clv2_cr_pending = 1;
-                                C2B_LOGS("[c2b] CLV2 0x22 arm: no fresh ch -> 0x20 sent (cid=");
-                                C2B_LOGH(cid2);
-                                C2B_LOGS(", 0x22 on reply)\n");
-                            }
-                        }
-                    }
-                }
-                return (ssize_t)len;               /* дроп без отправки */
+                 * g30 (run168 PROBE): 'k' доходил сюда целым (0x201B).
+                 * 61b-v17: тело вынесено в c2b_clv2_on_s1_connect — ЕГО ЖЕ
+                 * зовёт g130-релей (движковый 'k' = умирает в netsocket-слое
+                 * ДО syscall'а, run353: 20 g130-fires/0 на проводе/0 капчурей
+                 * здесь). addr/addrlen капчура = приоритет-dst, g_clv2_dst =
+                 * fallback (внутри). */
+                if (c2b_clv2_on_s1_connect(fd, p, (u32)len, flags,
+                                           addr, addrlen))
+                    return (ssize_t)len;               /* дроп без отправки */
             }
             /* 58f-g98a (run259-урок): КАНАЛЬНЫЕ датаграммы движка — ЛЮБОЙ dst
              * (run255-эра: raw :28022; текущая: loopback 127.0.0.1:27005 —
@@ -24536,6 +24591,61 @@ static void test_g129_g130(void)
           "g130: push %r12 сиг 2Б shape");
 }
 
+/* 61b-v17: релей-тест — 'k'-шейп через g130_log => S1-кор => kfull+фвд
+ * (на фейковом sendto; cr-ветка = если arm'нута ранними тестами — тоже
+ * на фейковом). Восстанавливаем глобалы = гигиена тест-порядка. */
+static u32 c2b_st_fst_n, c2b_st_fst_len;
+static ssize_t c2b_st_fst(int fd, const void *buf, size_t len, int flags,
+                          const struct sockaddr *sa, socklen_t sl)
+{
+    (void)fd; (void)buf; (void)flags; (void)sa; (void)sl;
+    c2b_st_fst_n++;
+    c2b_st_fst_len = (u32)len;
+    return (ssize_t)len;
+}
+
+static void test_g130_relay(void)
+{
+    static u8 kf[513];
+    u32 i, kn0, kfn0, cap0, fw0, fst0;
+    void *fst_save = g_clp_sendto;
+    memset(kf, 0, sizeof kf);
+    kf[0] = kf[1] = kf[2] = kf[3] = 0xff;
+    kf[4] = (u8)'k';
+    for (i = 10; i < sizeof kf; i++) kf[i] = (u8)(i & 0xff);
+    {   /* sockaddr_in 127.0.0.1:27005 (16Б) в g_clv2_dst */
+        const u8 dst16[16] = { 2, 0, 0x69, 0x7d, 0x7f, 0, 0, 1,
+                               0, 0, 0, 0, 0, 0, 0, 0 };
+        memcpy(g_clv2_dst, dst16, sizeof dst16);
+    }
+    g_clv2_dstlen = 16;
+    g_clv2_fd = 7;
+    g_clv2_fwdk = 1;
+    g_clp_sendto = (void *)c2b_st_fst;
+    kn0 = c2b_g130_kn; kfn0 = g_kfull_n; cap0 = g_clv2_cap_connect;
+    fw0 = g_clv2_fwd_k; fst0 = c2b_st_fst_n;
+    c2b_g130_log(9u, (uptr)kf, (uptr)kf, 513u);   /* 'k'-класс => релей */
+    CHECK(g_kfull_n == kfn0 + 1, "g130-relay: полный 'k' капчернут (kfull_n+1)");
+    CHECK(g_kfull_len == 513, "g130-relay: kfull len=513");
+    CHECK(g_kfull[0] == 0xff && g_kfull[4] == 'k', "g130-relay: kfull шейп ff×4+'k'");
+    CHECK(g_clv2_cap_connect == cap0 + 1, "g130-relay: S1-capture счётчик+1");
+    CHECK(g_clv2_fwd_k == fw0 + 1, "g130-relay: fwdk выстрелил (+1)");
+    CHECK(c2b_st_fst_n >= fst0 + 1, "g130-relay: фейковый sendto звался");
+    CHECK(c2b_st_fst_len == 513, "g130-relay: fwd len=513");
+    CHECK(c2b_g130_kn == kn0 + 1, "g130-relay: kn-счётчик+1");
+    /* негатив: НЕ-'k' шейп => релей молчит */
+    kf[4] = (u8)'q';
+    kn0 = c2b_g130_kn; kfn0 = g_kfull_n; fw0 = g_clv2_fwd_k;
+    c2b_g130_log(9u, (uptr)kf, (uptr)kf, 513u);
+    CHECK(g_kfull_n == kfn0 && g_clv2_fwd_k == fw0 && c2b_g130_kn == kn0 + 1,
+          "g130-relay: не-'k' шейп = релей НЕ звался, kn живёт");
+    /* гигиена */
+    g_clv2_fwdk = 0;
+    g_clv2_fd = -1;
+    g_clv2_dstlen = 0;
+    g_clp_sendto = fst_save;
+}
+
 /* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
    инструментированная пролог-часть (stolen bytes) невалидна вне родного фрейма
    (clang+ASan: SIGSEGV). Логика детура покрыта test_up_dispatch без патчей. */
@@ -24579,6 +24689,7 @@ int main(void)
     test_gc_hello();    /* t42v10: автомат ClientHello-pump на дублях */
     test_cl();          /* 41e-a: connectionless v1 (классификация/фильтр) */
     test_g129_g130();   /* 61a: спай-пара 'k'-пути (лог-фн + сиг-шейпы) */
+    test_g130_relay();  /* 61b-v17: кантур-релей 'k' (kfull+фвд на фейк-sendto) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

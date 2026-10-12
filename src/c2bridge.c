@@ -11034,18 +11034,39 @@ static void *c2b_g24_thread(void *arg)
     c2b_g24_find_state();
     for (it = 0; it < 75 && !g_g24_nstate; it++) usleep(1000000);
     if (!g_g24_nstate) c2b_g24_find_state();
-    for (i = 0; i < g_g24_nstate; i++) {             /* базовая линия */
-        u32 cs = *(volatile const u32 *)(g_g24_state[i] + 0x1a0);
-        last_c[i] = cs;
-        last_h[i] = 0;                               /* форс первого chg-лога */
-        c2b_g24_dumpone(i, cs);
+    /* v5 (run335): базовая линия = ПРЯМЫЕ разыменования найденных стейтов
+     * + dumpone = SEGV-способные (false-positive стейт с мусорным 0x148 =
+     * мусорный arr -> обход каналов -> SEGV addr=0x1e9, ПРОЦЕСС УБИТ).
+     * Гард как в g97 (g_probe_jb = __thread): поймали -> стейты протухли
+     * -> nstate=0 -> рескан-путь добьёт. Процесс ЖИВЁТ. */
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        for (i = 0; i < g_g24_nstate; i++) {         /* базовая линия */
+            u32 cs = *(volatile const u32 *)(g_g24_state[i] + 0x1a0);
+            last_c[i] = cs;
+            last_h[i] = 0;                           /* форс первого chg-лога */
+            c2b_g24_dumpone(i, cs);
+        }
+    } else {
+        C2B_LOGS("[c2b] g24: SEGV in baseline — states dropped, rescan armed\n");
+        g_g24_nstate = 0;
     }
+    g_probe_active = 0;
     {   u32 scans = 2;
         for (it = 0; it < 4800; it++) {              /* 20 мин по 250мс */
             if (g_g24_nstate < 4 && scans < 10 && (it & 0xB7) == 0xB7) {
                 c2b_g24_find_state();                /* ~каждые 45с пока 0 */
                 scans++;
             }
+        /* v5 (run335): гард ВОКРУГ всего полла (хэш-чтения + g26/g29
+         * хирургия + обход каналов arr/0x68 + g28 scp-ВЫЗОВ + dumpone):
+         * движок рвёт соединение ~t+80с -> стейт-структуры освобождаются/
+         * порчатся -> UAF-SEGV в полле = ПРОЦЕСС УБИТ (run335: SNS-молчание
+         * с t=105, SEGV в первом успешном скане-дампе, stdout оборван).
+         * Поймали -> стейты протухли -> nstate=0 -> рескан-путь (45с) добьёт
+         * свежими. Процесс ЖИВЁТ, forensics полные. */
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
         for (i = 0; i < g_g24_nstate; i++) {
             uptr st = g_g24_state[i];
             u32 cs = *(volatile const u32 *)(st + 0x1a0);
@@ -11260,6 +11281,18 @@ static void *c2b_g24_thread(void *arg)
                 last_h[i] = h;
                 logged++;
                 if (logged <= 64 || (logged & 0x3F) == 1) c2b_g24_dumpone(i, cs);
+            }
+        }
+        g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g24: SEGV in poll — states dropped, rescan armed\n");
+            g_g24_nstate = 0;
+            {   u32 z2;
+                for (z2 = 0; z2 < 4; z2++) {
+                    last_c[z2] = 0xffffffffu;
+                    last_h[z2] = 0;
+                }
             }
         }
         usleep(250000);
@@ -14204,9 +14237,12 @@ static void c2b_g97_log_ascii(const u8 *p, u32 n)
     }
 }
 
+static u32 g97_slot = 3;   /* v5: калибруется пробой при арме (run335) */
+
 static void *c2b_g97_thread(void *arg)
 {
     u32 t, prev = 0xFFFFFFFFu, dead_run = 0, done = 0;
+    i32 prev_rc = -999;
     (void)arg;
     {
         const char *e = getenv("C2B_G97");
@@ -14226,6 +14262,47 @@ static void *c2b_g97_thread(void *arg)
     C2B_LOGS("[c2b] g97: armed h=");
     C2B_LOGH((u32)g_gns_conn_h);
     C2B_LOGS("\n");
+    /* v5 (run335): СЛОТ-КАЛИБРОВКА. Слот 3 = rc=0 ВСЮ сессию (t=0..94,
+     * буфер нулевой) = вотчер СЛЕПОЙ весь прогон; слоты дрейфуют между
+     * билдами (58f-карта = старый билд). Проба слотов {2,3,5,6} ОДИН раз
+     * (1=Connect и 4=CloseConnection = НЕ ТРОГАЕМ — проба=вызов!);
+     * слот = первый с rc==1 и ненулевым info[0..3] (state-enum в младшем
+     * слове SteamNetConnectionInfo_t). Каждая проба под sigsetjmp-гардом
+     * (чужой слот = чужие аргументы = возможен SEGV внутри). */
+    {   u32 s;
+        void **vtc = *(void ***)g_gns_conn_iface;
+        for (s = 2; s <= 6; s++) {
+            u8 mb[256];
+            i32 rr = -999;
+            u32 j2;
+            if (s == 4) continue;
+            for (j2 = 0; j2 < sizeof mb; j2++) mb[j2] = 0;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rr = ((i32 (*)(void *, uptr, void *))vtc[s])(
+                    g_gns_conn_iface, g_gns_conn_h, mb);
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] g97: slot-probe SEGV s=");
+                C2B_LOGD(s); C2B_LOGS("\n");
+                continue;
+            }
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g97: slot-probe s=");
+            C2B_LOGD(s);
+            C2B_LOGS(" rc="); C2B_LOGD(rr);
+            C2B_LOGS(" info0=");
+            for (j2 = 0; j2 < 8; j2++) C2B_LOGH(mb[j2]);
+            C2B_LOGS("\n");
+            if (rr == 1 && (mb[0] | mb[1] | mb[2] | mb[3]) != 0) {
+                g97_slot = s;
+                break;
+            }
+        }
+        C2B_LOGS("[c2b] g97: slot=");
+        C2B_LOGD(g97_slot);
+        C2B_LOGS("\n");
+    }
     for (t = 0; t < 720 && !done; t++) {   /* 720 x 0.5с = 6 мин максимум */
         void **vt97;
         i32 rc = -999, rcd = -999;
@@ -14238,7 +14315,7 @@ static void *c2b_g97_thread(void *arg)
         for (j = 0; j < sizeof md; j++) md[j] = 0;
         g_probe_active = 1;
         if (__sigsetjmp(g_probe_jb, 1) == 0) {
-            rc = ((i32 (*)(void *, uptr, void *))vt97[3])(
+            rc = ((i32 (*)(void *, uptr, void *))vt97[g97_slot])(
                 g_gns_conn_iface, g_gns_conn_h, ma);
         } else {
             g_probe_active = 0;
@@ -14248,7 +14325,12 @@ static void *c2b_g97_thread(void *arg)
         g_probe_active = 0;
         st = (u32)ma[0] | ((u32)ma[1] << 8) | ((u32)ma[2] << 16) |
              ((u32)ma[3] << 24);
-        if (prev == 0xFFFFFFFFu || st != prev || rc != 1 || (t % 60) == 0) {
+        /* v5 (run335): rc=0 = СЛЕПОЙ полл (слот не отвечает) — НЕ логируем
+         * каждый тик (было: 24912 строк stdout = 90% слепого спама t=0..94
+         * st=0 rc=0 каждые 0.5с); лог = переходы при живом слоте + 30с-
+         * heartbeat. Переход rc тоже = событие (слот ожил/умер). */
+        if ((rc == 1 && (prev == 0xFFFFFFFFu || st != prev)) ||
+            rc != prev_rc || (t % 60) == 0) {
             C2B_LOGS("[c2b] g97: t=");
             C2B_LOGD(t / 2);            /* секунды с арма */
             C2B_LOGS("st="); C2B_LOGD(st);
@@ -14283,6 +14365,7 @@ static void *c2b_g97_thread(void *arg)
             }
         }
         prev = st;
+        prev_rc = rc;
         if (st >= 3 && st <= 7) {
             dead_run++;
             if (dead_run >= 40) done = 1;   /* 20с мёртвого стейта = хватит */

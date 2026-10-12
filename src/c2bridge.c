@@ -11317,6 +11317,38 @@ extern i32 close(i32);
     C2B_LOGS("\n");
 #undef C2B_G24_RD64
 }
+/* v23 k23: ОДНОРАЗОВЫЙ дамп структуры netchan движка (0x180B) — внутри
+ * должен лежать хэндл/conn-id ЕГО GNS-сессии (wire run359: engine-сокет
+ * 55184 = SDR conn-id df0c8ed911eebf04-класс, 0x22->0x21->0x23 full
+ * handshake; bridge = 0xd98e0cdf-хэндл). Скан h=1..128 БЕСПОЛЕЗЕН:
+ * хэндлы GNS = непрозрачные u32-хэши (0xd98e0cdf/0xf0da72a9-класс), НЕ
+ * последовательные int — v23-курс: ЗАХВАТЫВАТЬ контекст, не перебирать.
+ * Оффлайн-матч дампа против wire conn-id => адрес хэндла в структуре. */
+static u32 g_k23_nc_dumped;
+static void c2b_k23_netchan_dump(uptr nc)
+{
+    u32 r23, c23;
+    g_k23_nc_dumped = 1;
+    C2B_LOGS("[c2b] k23: netchan dump @");
+    C2B_LOGH((u32)nc); C2B_LOGH((u32)((u64)nc >> 32));
+    C2B_LOGS("\n");
+    for (r23 = 0; r23 < 0x180; r23 += 32) {
+        C2B_LOGS("[c2b] k23: nc+");
+        C2B_LOGH(r23);
+        C2B_LOGS("=");
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            for (c23 = 0; c23 < 32; c23++)
+                C2B_LOGH(*(volatile const u8 *)(nc + r23 + c23));
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS(" FAULT");
+        }
+        C2B_LOGS("\n");
+    }
+}
+
 static void c2b_g24_dumpone(u32 i, u32 cs)
 {
     uptr st = g_g24_state[i];
@@ -11331,6 +11363,7 @@ static void c2b_g24_dumpone(u32 i, u32 cs)
     nc = *(volatile const u64 *)(st + 0x128);
     C2B_LOGS("netchan=");
     C2B_LOGH((u32)nc); C2B_LOGH((u32)(nc >> 32));
+    if (nc && !g_k23_nc_dumped) c2b_k23_netchan_dump((uptr)nc);
     g = *(volatile const u64 *)(st + 0x430);
     C2B_LOGS("gate=");
     C2B_LOGH((u32)g); C2B_LOGH((u32)(g >> 32));
@@ -14803,7 +14836,7 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
  * g98a-формат (не-connectionless, полный hex 400B, rate 1/8, кап 480).
  * NOTE: addr = msg_name (может быть NULL для connected-сокетов — скип
  * лога dst, дамп байтов остаётся). */
-static void c2b_g98_sendmsg_dump(const struct c2b_msghdr *msg, ssize_t r)
+static void c2b_g98_sendmsg_dump(int fd98, const struct c2b_msghdr *msg, ssize_t r)
 {
     static volatile u32 n98m;
     u32 c98m;
@@ -14841,6 +14874,10 @@ static void c2b_g98_sendmsg_dump(const struct c2b_msghdr *msg, ssize_t r)
     if ((c98m & 0x07) != 1 || c98m > 480) return;
     C2B_LOGS("[c2b] g98: chn-sendm #");
     C2B_LOGN(c98m);
+    /* v23 k23: fd В СТРОКУ — бинд кадр↔сокет через g77fd-карту (run359:
+     * engine-сессия = 55184, bridge = 27005 — ЧЬЯ сессия шлёт кадр) */
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)fd98);
     C2B_LOGS(" len=");
     C2B_LOGN(tot);
     if (ad98 && al98 >= 8) {
@@ -14884,7 +14921,7 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
                 tot += (u32)msg->msg_iov[k].iov_len;
         }
         c2b_g40_sdt_note(fd, tot ? tot : 1u, msg ? msg->msg_name : 0, r);
-        c2b_g98_sendmsg_dump(msg, r);
+        c2b_g98_sendmsg_dump(fd, msg, r);
         {
             /* 352-g109: ungated dst-перепись (SDR-отправитель: игра vs
              * сырой/packet-сокет). fd + msg_name + первый iov-базис. */

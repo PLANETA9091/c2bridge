@@ -1735,6 +1735,28 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
 
     if (!out || !len || len > 0x800) return;
     if (n > 64 && (n & 7) != 0) return;
+    {
+        /* v23 k23: ОДНОРАЗОВЫЙ снейкшот стека (24 qwords вверх от кадра)
+         * на ПЕРВОМ расшифре SNP-пути = GNS-контекст движка в старших
+         * кадрах: кандидаты = iface-инстанс/conn-объект (для v24-релея —
+         * хэндлы GNS непрозрачны, скан бесполезен, только захват). */
+        static u32 k23_stack_done;
+        if (tag32 &&
+            !__atomic_exchange_n(&k23_stack_done, 1u, __ATOMIC_RELAXED)) {
+            const void **fa = (const void **)__builtin_frame_address(0);
+            u32 q23;
+            klog_s("[c2b] k23: decstack gcm=");
+            klog_p((uptr)gcm);
+            klog_s("\n");
+            for (q23 = 0; q23 < 24; q23++) {
+                klog_s((q23 & 3) ? " " : "\n[c2b] k23: q");
+                klog_h(q23);
+                klog_s("=");
+                klog_p((uptr)fa[q23]);
+            }
+            klog_s("\n");
+        }
+    }
     for (z = 0; z < 24; z++) bo[z] = 0;
     cl = len < 24 ? (u32)len : 24;
     memcpy(bo, out, cl);

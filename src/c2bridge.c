@@ -7053,6 +7053,47 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
     C2B_LOGS("\n");
 }
 
+/* ---------- v19: IN-CHANNEL 'k'-РЕЛЕЙ (krel) ----------
+ * Run355-триангуляция: (1) сервер шлёт in-channel 'A' (DEC32-plaintext:
+ * ff×4+'A'+chal=0+val=00ee0a07+echo) и ЖДЁТ классический 'k'-ответ;
+ * (2) движковый 'k' (513B = 17B header ff×4+'k'+ver u16 0x3639+6Б+
+ * chal u32 @13 + 496B тикет-слот) = С РЕАЛЬНЫМ тикетом (g70-капчур
+ * len=0x1f0, SteamID3 687168219 внутри) — "ticketless"-вердикт = селёдка
+ * (tkt@snap+0x478=0 = поле стейта, НЕ содержание 'k'); (3) доставка =
+ * НЕТ: send-слой движка дропает 'k' (run353), connless-0x22 = игнор
+ * (0x23/0x24 = ноль в run355), g90-scp-триггер = DISABLED (parse-error-
+ * era 258/264; конфаунд = g98-пробы того же окна — сервер сам шлёт
+ * raw-S1 in-channel = DEC32-доказательство). ФИКС: релей капчуренного
+ * 'k' (g130-путь = живой capture-point) в GNS-канал через
+ * SendMessageToConnection (slot 11/10 по ver), reliable; chal в КОПИИ
+ * патчится в in-channel-'A'-chal (сервер-челлендж = источник истины;
+ * C2B_KREL_KEEP=1 = оставить движковый). Дедуп по ИСХОДНОМУ chal
+ * (ретраи движка = тот же chal), cap 12/сессия, SEGV-гард на send,
+ * killswitch C2B_KREL=0. */
+#ifndef C2B_SELFTEST
+static u32 g_krel_on = 1, g_krel_keep, g_krel_init;
+static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal;
+#define C2B_KREL_CAP 12
+#endif
+
+/* v19: патч challenge в КОПИИ 'k' (bytes 13-16 LE) + шейп-чек.
+ * 1 = запатчено, 0 = не 'k'/мало. Чистая ф-я = selftest. */
+static i32 c2b_krel_patchchal(u8 *k, u32 len, u32 chal)
+{
+    if (!k || len < 17) return 0;
+    if (k[0] != 0xff || k[1] != 0xff || k[2] != 0xff || k[3] != 0xff ||
+        k[4] != (u8)'k') return 0;
+    k[13] = (u8)chal;
+    k[14] = (u8)(chal >> 8);
+    k[15] = (u8)(chal >> 16);
+    k[16] = (u8)(chal >> 24);
+    return 1;
+}
+
+#ifndef C2B_SELFTEST
+static void c2b_k19_relay(void);       /* определение ниже (не-selftest) */
+#endif
+
 void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
 {
     u32 n = ++c2b_g130_n;
@@ -7081,6 +7122,9 @@ void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
                 g_probe_active = 0;
                 C2B_LOGS("[c2b] g130: relay FAULT — continuing\n");
             }
+            /* v19: отдельный гард (вложенный sigsetjmp на один jb =
+             * коррупт — релей зовётся ПОСЛЕ закрытия внешнего блока) */
+            c2b_k19_relay();
 #else
             (void)c2b_clv2_on_s1_connect(g_clv2_fd, (const u8 *)bf,
                                          len, 0, 0, 0);
@@ -15021,7 +15065,13 @@ static void *c2b_g82wp_thread(void *arg)
                 C2B_LOGH((u32)((ma[0] >> 32) & 0xffffffffu));
                 C2B_LOGH((u32)(ma[0] & 0xffffffffu));
                 C2B_LOGS("\n");
-                if (ma[0] > 0x1000000ull && ma[0] < 0x800000000000ull) {
+                /* v19-гейт: {8,16}-false-positive (u64 0x1000000008 из пары
+                 * малых интов) убит: low-half > 0xffff И high = 0 ИЛИ
+                 * > 0xffff (реальные heap-ptr: 0x14e82ee0-class high=0,
+                 * 0x7f..-class high>0xffff — оба проходят) */
+                if (ma[0] > 0x1000000ull && ma[0] < 0x800000000000ull &&
+                    (ma[0] & 0xffffffffull) > 0xffffull &&
+                    ((ma[0] >> 32) == 0 || (ma[0] >> 32) > 0xffffull)) {
                     C2B_LOGS("[c2b] g82wp: LIVE RECEIVER slot=");
                     C2B_LOGD(s);
                     C2B_LOGS("=> dump\n");
@@ -15061,6 +15111,73 @@ static void *c2b_g82wp_thread(void *arg)
     return (void *)0;
 }
 #endif
+
+/* ---------- v19: krel — РЕЛЕЙ 'k' IN-CHANNEL (см. блок у g130) ----------
+ * Определяем ЗДЕСЬ (все декларации видны: g_gns_conn_h/ver 8076-78,
+ * g_g90_A_seq/chal 11838-40, g_kfull 11834). Зовётся из c2b_g130_log
+ * после S1-кора; в selftest НЕ собирается (GNS-декларации garded). */
+#ifndef C2B_SELFTEST
+static void c2b_k19_relay(void)
+{
+    u32 kch, kn;
+    i32 rc19;
+    i64 out19;
+    u32 slot19, z19;
+    void **vt19;
+    u8 kcopy[640];
+    if (!g_krel_init) {
+        const char *e = getenv("C2B_KREL");
+        if (e && e[0] == '0') g_krel_on = 0;
+        e = getenv("C2B_KREL_KEEP");
+        if (e && e[0] == '1') g_krel_keep = 1;
+        g_krel_init = 1;
+    }
+    if (!g_krel_on || !g_gns_conn_h || !g_gns_conn_iface) return;
+    if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
+    if (g_krel_sent >= C2B_KREL_CAP) return;
+    kch = ((u32)g_kfull[13]) | ((u32)g_kfull[14] << 8) |
+          ((u32)g_kfull[15] << 16) | ((u32)g_kfull[16] << 24);
+    if (g_krel_sent && kch == g_krel_chal) return;   /* дедуп по chal */
+    vt19 = *(void ***)g_gns_conn_iface;
+    slot19 = (g_gns_conn_ver == 0) ? 11u : 10u;
+    for (z19 = 0; z19 < sizeof kcopy; z19++) kcopy[z19] = 0;
+    for (z19 = 0; z19 < g_kfull_len; z19++) kcopy[z19] = g_kfull[z19];
+    kn = g_kfull_len;
+    g_krel_chal = kch;
+    g_krel_sent++;
+    if (!g_krel_keep && g_g90_A_seq) {
+        (void)c2b_krel_patchchal(kcopy, kn, g_g90_A_chal);
+    }
+    C2B_LOGS("[c2b] krel: 'k' in-channel relay #");
+    C2B_LOGN(g_krel_sent);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(((u32)kcopy[13]) | ((u32)kcopy[14] << 8) |
+             ((u32)kcopy[15] << 16) | ((u32)kcopy[16] << 24));
+    C2B_LOGS(" (was ");
+    C2B_LOGH(kch);
+    C2B_LOGS(") len=");
+    C2B_LOGN(kn);
+    rc19 = -999;
+    out19 = -1;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc19 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt19[slot19])(
+            g_gns_conn_iface, g_gns_conn_h, kcopy, kn, 1, &out19);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS(" send SEGV");
+    }
+    C2B_LOGS(" slot=");
+    C2B_LOGN(slot19);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(i32)rc19);
+    C2B_LOGS(" Aseq=");
+    C2B_LOGN(g_g90_A_seq);
+    C2B_LOGS("\n");
+    if (rc19 == 1) g_krel_ok++;
+}
+#endif /* !C2B_SELFTEST */
 
 #ifndef C2B_SELFTEST
 /* ---------- 58f-g90: триггер+релей 'k' in-channel (тред) ----------
@@ -19418,7 +19535,23 @@ ssize_t recv(int fd, void *buf, size_t len, int flags)
              ((const u16 *)(const void *)ad)[0] == C2B_AF_INET6))
             return recvfrom(fd, buf, len, flags, (struct sockaddr *)ad, &al);
     }
-    return ((c2b_recv1_fn)g_clp_recv1)(fd, buf, len, flags);
+    {
+        /* v19: passthrough-ветка (НЕ-connected fd / не-AF_INET — g77fd-map
+         * run355: fd 0x3b = S2-сокет НЕ в карте = его чтения мимо тапа;
+         * делегация не сработала => тут прямое recv — тапаем и его).
+         * Гейт C2B_G134=0 (разовый env-рид). */
+        static u32 g134_off, g134_init;
+        ssize_t r;
+        if (!g134_init) {
+            const char *e = getenv("C2B_G134");
+            if (e && e[0] == '0') g134_off = 1;
+            g134_init = 1;
+        }
+        r = ((c2b_recv1_fn)g_clp_recv1)(fd, buf, len, flags);
+        if (r > 0 && buf && !g134_off)
+            c2b_g77_rxraw_tap(fd, (const u8 *)buf, (u32)r);
+        return r;
+    }
 }
 
 /* ---------- t42v2→t42v3: интерпозиция выдачи GC-интерфейса ----------
@@ -24941,6 +25074,25 @@ static void test_g77fd(void)
     }
 }
 
+/* v19: krel-patchchal — патч challenge (bytes 13-16 LE) в копии 'k'. */
+static void test_krelpatch(void)
+{
+    u8 k5[17];
+    u32 z5;
+    for (z5 = 0; z5 < sizeof k5; z5++) k5[z5] = 0;
+    k5[0] = k5[1] = k5[2] = k5[3] = 0xff;
+    k5[4] = (u8)'k';
+    CHECK(c2b_krel_patchchal(k5, 16, 0x11223344u) == 0,
+          "krel: len<17 = 0");
+    CHECK(c2b_krel_patchchal(k5, 17, 0x11223344u) == 1,
+          "krel: 17B 'k' = 1");
+    CHECK(k5[13] == 0x44 && k5[14] == 0x33 && k5[15] == 0x22 &&
+          k5[16] == 0x11, "krel: chal LE запатчен (44 33 22 11)");
+    k5[4] = (u8)'j';
+    CHECK(c2b_krel_patchchal(k5, 17, 1u) == 0, "krel: не-'k' = 0");
+    CHECK(c2b_krel_patchchal(0, 17, 1u) == 0, "krel: null = 0");
+}
+
 /* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
    инструментированная пролог-часть (stolen bytes) невалидна вне родного фрейма
    (clang+ASan: SIGSEGV). Логика детура покрыта test_up_dispatch без патчей. */
@@ -24986,6 +25138,7 @@ int main(void)
     test_g129_g130();   /* 61a: спай-пара 'k'-пути (лог-фн + сиг-шейпы) */
     test_g130_relay();  /* 61b-v17: кантур-релей 'k' (kfull+фвд на фейк-sendto) */
     test_g77fd();       /* v18: g77fd-форматтер sockaddr_in */
+    test_krelpatch();   /* v19: krel-patchchal (chal в копии 'k') */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

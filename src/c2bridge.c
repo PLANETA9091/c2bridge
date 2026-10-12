@@ -15449,6 +15449,36 @@ static void c2b_g102_detour_c(const void *key, int bits, void *rk, void *ra)
     (void)rc;
 }
 
+/* ---------- g116: THE SAFE PROBE ----------
+ * Runs 320/322/323/324/325: the game dies at +10s from SIGSEGV INSIDE the
+ * bridge itself (the dmesg: 'segfault ... in c2bridge64.so[199b8/19400,
+ * base+38000]' = c2b_g102_thread+0x198 / c2b_g105_thread+0x1a0; the stdout
+ * regs: rax=the fault ptr = cand+0x278160 / cand+0x3693e0 EXACTLY = the
+ * prologue-verify direct derefs). The game maps SMALL libsteam* libs
+ * (libsteam_api.so ~20KB, libsteamnetworkingsockets ~2MB) => the probe at
+ * base+0x278160/+0x3693e0/+0x21115b0 = past the mapping end = unmapped =
+ * the game's death pre-menu. The old design assumed the one big
+ * steamclient.so; the 256KB maps window (the game = ~92K map lines) decides
+ * WHICH libs land in the candidate set = the per-boot lottery = the flake
+ * (~half the attempts died pre-menu since run320; the same signature in the
+ * PASS runs 322/323 = the attempts that survived the lottery). FIX = the
+ * probe via pread(/proc/self/mem): an unmapped address = EIO = NO signal =
+ * the small libs = safely skipped; the big lib (the probe inside) =
+ * the identical behavior. The tramp/mprotect/patch path = only after the
+ * verified probe = the mapping is present = unchanged. */
+static i32 c2b_safe_probe(uptr addr, u8 *buf, u32 need)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    i32 fd = open("/proc/self/mem", 0);
+    i64 r = -1;
+    if (fd >= 0) {
+        r = pread(fd, buf, need, addr);
+        close(fd);
+    }
+    return (r == (i64)need);
+}
+
 static void *c2b_g102_thread(void *arg)
 {
     extern i32 open(const char *, i32, ...);
@@ -15535,15 +15565,19 @@ static void *c2b_g102_thread(void *arg)
         }
         for (ci = 0; ci < ncand; ci++) {
             u8 *tgt = (u8 *)(cand[ci] + 0x278160);
-            u8 *mkp = (u8 *)(cand[ci] + 0x278194);
-            u32 k, ok = 1;
+            u8 prb[0x40];
+            u32 k, ok;
+            /* g116: the safe probe — pread = no SIGSEGV on the past-end
+             * small libsteam* libs (the run325 dmesg = THIS thread's deref) */
+            if (!c2b_safe_probe(cand[ci] + 0x278160, prb, 0x3A)) continue;
+            ok = 1;
             for (k = 0; k < 14; k++)
-                if (tgt[k] != pro[k]) { ok = 0; break; }
+                if (prb[k] != pro[k]) { ok = 0; break; }
             if (ok)
                 for (k = 0; k < 6; k++)
-                    if (mkp[k] != mk[k]) { ok = 0; break; }
+                    if (prb[0x34 + k] != mk[k]) { ok = 0; break; }
             if (!ok) continue;
-            if (tgt[0] == 0xff && tgt[1] == 0x25) continue; /* уже наш патч */
+            if (prb[0] == 0xff && prb[1] == 0x25) continue; /* уже наш патч */
             if (c2b_g102_nbase >= 4) break;
             {
                 u8 *tp = c2b_g102_tramp[c2b_g102_nbase];
@@ -15964,15 +15998,18 @@ static void *c2b_g104_thread(void *arg)
         }
         for (ci = 0; ci < ncand; ci++) {
             u8 *tgt = (u8 *)(cand[ci] + 0x2ed200);
-            u8 *mkp = (u8 *)(cand[ci] + 0x2ed20e);
-            u32 k, ok = 1;
+            u8 prb[0x20];
+            u32 k, ok;
+            /* g116: the safe probe — pread = no SIGSEGV on the past-end libs */
+            if (!c2b_safe_probe(cand[ci] + 0x2ed200, prb, 0x15)) continue;
+            ok = 1;
             for (k = 0; k < 14; k++)
-                if (tgt[k] != pro[k]) { ok = 0; break; }
+                if (prb[k] != pro[k]) { ok = 0; break; }
             if (ok)
                 for (k = 0; k < 7; k++)
-                    if (mkp[k] != mk[k]) { ok = 0; break; }
+                    if (prb[0xE + k] != mk[k]) { ok = 0; break; }
             if (!ok) continue;
-            if (tgt[0] == 0xff && tgt[1] == 0x25) continue;
+            if (prb[0] == 0xff && prb[1] == 0x25) continue;
             if (c2b_g104_nbase >= 4) break;
             {
                 u8 *tp = c2b_g104_tramp[c2b_g104_nbase];
@@ -16202,15 +16239,19 @@ static void *c2b_g105_thread(void *arg)
         }
         for (ci = 0; ci < ncand; ci++) {
             u8 *tgt = (u8 *)(cand[ci] + 0x3693e0);
-            u8 *mkp = (u8 *)(cand[ci] + 0x3693f0);
-            u32 k, ok = 1;
+            u8 prb[0x20];
+            u32 k, ok;
+            /* g116: the safe probe — pread = no SIGSEGV on the past-end
+             * small libsteam* libs (the run325 dmesg = THIS thread's deref) */
+            if (!c2b_safe_probe(cand[ci] + 0x3693e0, prb, 0x15)) continue;
+            ok = 1;
             for (k = 0; k < 16; k++)
-                if (tgt[k] != pro[k]) { ok = 0; break; }
+                if (prb[k] != pro[k]) { ok = 0; break; }
             if (ok)
                 for (k = 0; k < 5; k++)
-                    if (mkp[k] != mk[k]) { ok = 0; break; }
+                    if (prb[0x10 + k] != mk[k]) { ok = 0; break; }
             if (!ok) continue;
-            if (tgt[0] == 0xff && tgt[1] == 0x25) continue;
+            if (prb[0] == 0xff && prb[1] == 0x25) continue;
             if (c2b_g105_nbase >= 4) break;
             {
                 u8 *tp = c2b_g105_tramp[c2b_g105_nbase];
@@ -17596,10 +17637,17 @@ static void *c2b_g107_thread(void *arg)
             }
             {   /* EVP init @+0x21115b0: 14B вериф + патч */
                 u8 *tgt = (u8 *)(cand[ci] + 0x21115b0);
-                u32 k, ok = 1;
-                for (k = 0; k < 14; k++)
-                    if (tgt[k] != pe[k]) { ok = 0; break; }
-                if (ok && tgt[0] == 0xff && tgt[1] == 0x25) ok = 0;
+                u8 prb[0x20];
+                u32 k, ok;
+                /* g116: the safe probe — pread = no SIGSEGV (the 34MB offset
+                 * = past the end for EVERY lib but steamclient64 itself) */
+                if (!c2b_safe_probe(cand[ci] + 0x21115b0, prb, 14)) ok = 0;
+                else {
+                    ok = 1;
+                    for (k = 0; k < 14; k++)
+                        if (prb[k] != pe[k]) { ok = 0; break; }
+                    if (ok && prb[0] == 0xff && prb[1] == 0x25) ok = 0;
+                }
                 evp_v = ok;
                 if (ok && evp_on) {
                     u8 *tp = c2b_g107_tramp_evp[c2b_g107_nbase];
@@ -17634,14 +17682,19 @@ static void *c2b_g107_thread(void *arg)
             }
             {   /* ChaCha20_ssse3 @+0x206bc74: 16B вериф + патч */
                 u8 *tgt = (u8 *)(cand[ci] + 0x206bc74);
-                u8 *mkp = (u8 *)(cand[ci] + 0x206bc84);
-                u32 k, ok = 1;
-                for (k = 0; k < 16; k++)
-                    if (tgt[k] != ps[k]) { ok = 0; break; }
-                if (ok)
-                    for (k = 0; k < 5; k++)
-                        if (mkp[k] != mk[k]) { ok = 0; break; }
-                if (ok && tgt[0] == 0xff && tgt[1] == 0x25) ok = 0;
+                u8 prb[0x20];
+                u32 k, ok;
+                /* g116: the safe probe — pread = no SIGSEGV on the past-end libs */
+                if (!c2b_safe_probe(cand[ci] + 0x206bc74, prb, 0x15)) ok = 0;
+                else {
+                    ok = 1;
+                    for (k = 0; k < 16; k++)
+                        if (prb[k] != ps[k]) { ok = 0; break; }
+                    if (ok)
+                        for (k = 0; k < 5; k++)
+                            if (prb[0x10 + k] != mk[k]) { ok = 0; break; }
+                    if (ok && prb[0] == 0xff && prb[1] == 0x25) ok = 0;
+                }
                 ssse_v = ok;
                 if (ok && ssse_on) {
                     u8 *tp = c2b_g107_tramp_ssse[c2b_g107_nbase];

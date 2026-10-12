@@ -18008,6 +18008,78 @@ static void *c2b_g107_thread(void *arg)
     }
 }
 
+/* ---------- v12 AUTHDIAG: GNS cert-path state (THE SIGNON-STALL ROOT HUNT) ----------
+ * THE 2309-ROUND RE: the engine's auth = stuck at "AuthStatus (steamid:...): Attempting
+ * (Requesting cert)" (the run343 stdout = ONE line, never advances; run341 = the same)
+ * => the engine never builds/sends the C2S_CONNECT 'k' => the app-level signon stall
+ * (the SNP transport = 100% healthy per the 2243 decode; the ticket = NOT the blocker:
+ * the bridge's own GetAuthSessionTicket = WORKS, h=2 len=0xfc in run343).
+ * THE RE (g124-re/sns.so = the era steamclient lib, the strings + the InitAuthentication
+ * disasm @0xcfb..0xcfe): "Requesting cert for %s from Steam" @0x400f78 = the VERBOSE-gated
+ * print (cmpl $5 -> the spew(6) line = normally INVISIBLE); the request path =
+ * [this+0x7d40] = m_pSteamNetworkingSocketsSerialized; NULL => "No ISteamNetworking-
+ * SocketsSerialized; old steam client binaries" @0x400f00 => the request NEVER issued;
+ * GetCertAsync = the Serialized vtable slot 2 (*0x10(%rax)) => the APICall handle stored
+ * [this+0x7d38]/[this+0x7d3c]; [this+0x7e14] = the identity type (0 = invalid identity;
+ * 3 = SteamID); the SteamID sanity = the universe byte 1..4 + the hi-nibble 0x10/0x30/0x70;
+ * "Running in anonymous mode, can't get cert from Steam." @0x400ec8 = the hi-nibble 0xa0.
+ * THE DIAG = READ-ONLY, SEGV-guarded, fires t0/t10/t30 in the g98 watch:
+ * (a) the raw class fields of g_gns_conn_iface (the SAME object the InitAuthentication
+ *     gets as this — the ISteamNetworkingSockets);
+ * (b) the FLAT dlsym SteamAPI_ISteamNetworkingSockets_GetAuthenticationStatus(iface,
+ *     &SteamNetAuthenticationStatus_t{i32 eAvail; char debugMsg[256]}) = the LIVE cert
+ *     state + the detail string from the GNS itself.
+ * THE EXPECTED VERDICTS: serialized=0 => the OLD-CLIENT branch (the fix = the interface
+ * injection = deep); serialized!=0 + the callid frozen + avail=2/"Requesting cert" =>
+ * the steam-client IPC answer never arrives; avail=3(Current) => the cert = fine, the
+ * stall = elsewhere (re-focus the hunt). */
+static void c2b_g_authdiag(const char *tag)
+{
+    u8 *iface = (u8 *)g_gns_conn_iface;
+    uptr serialized = 0, callid = 0;
+    u32 idtype = 0;
+    i32 avail = -1;
+    static char dbg[320];
+    static void *flat_auth;
+    u32 z;
+    if (!iface) return;
+    dbg[0] = 0;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        serialized = *(volatile uptr *)(iface + 0x7d40);
+        callid = *(volatile uptr *)(iface + 0x7d38);
+        idtype = *(volatile u32 *)(iface + 0x7e14);
+        if (!flat_auth)
+            flat_auth = dlsym((void *)0, "SteamAPI_ISteamNetworkingSockets_"
+                                       "GetAuthenticationStatus");
+        if (flat_auth) {
+            static u8 stbuf[512];
+            for (z = 0; z < sizeof(stbuf); z++) stbuf[z] = 0;
+            ((i32 (*)(void *, void *))flat_auth)(g_gns_conn_iface, stbuf);
+            avail = *(volatile i32 *)stbuf;
+            for (z = 0; z < 300; z++) {
+                char c = (char)stbuf[4 + z];
+                if (!c) break;
+                dbg[z] = (c >= 32 && c < 127) ? c : '.';
+            }
+            dbg[z] = 0;
+        }
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] AUTHDIAG: SEGV tag="); C2B_LOGS(tag); C2B_LOGS("\n");
+        return;
+    }
+    C2B_LOGS("[c2b] AUTHDIAG: "); C2B_LOGS(tag);
+    C2B_LOGS("serialized=");
+    C2B_LOGH((u32)(serialized >> 32)); C2B_LOGH((u32)serialized);
+    C2B_LOGS("callid=");
+    C2B_LOGH((u32)(callid >> 32)); C2B_LOGH((u32)callid);
+    C2B_LOGS("idtype="); C2B_LOGN(idtype);
+    C2B_LOGS("avail="); C2B_LOGN((u32)avail);
+    C2B_LOGS("msg=\""); C2B_LOGS(dbg); C2B_LOGS("\"\n");
+}
+
 static void *c2b_g98_thread(void *arg)
 {
     u32 it, frm = 0, msg = 0;
@@ -18044,6 +18116,9 @@ static void *c2b_g98_thread(void *arg)
     C2B_LOGS(" msg=");
     C2B_LOGN(msg);
     C2B_LOGS("\n");
+    /* v12 AUTHDIAG t0: the cert-path state AT the arm (theSerialized ptr, the
+     * GetCertAsync APICall handle, the identity type, the live AuthStatus). */
+    c2b_g_authdiag("t0 ");
     usleep(3000000);      /* 3s: the engine finishes the 0x20-0x23 handshake */
     /* 59f-g100v6: скан СРАЗУ после хэндшейка (t+6): ключи валидны; обратный
      * порядок регионов (арены = высокие адреса), pread, потолок 15с ->
@@ -18073,6 +18148,10 @@ static void *c2b_g98_thread(void *arg)
             for (w8 = 0; w8 < 30; w8++) {
                 usleep(1000000);
                 if (!g_gns_conn_h || !g_gns_conn_iface) break;
+                /* v12 AUTHDIAG t10/t30: the cert-state TIMELINE (the callid
+                 * frozen? the avail flips Attempting->Current/Failed?). */
+                if (w8 == 7) c2b_g_authdiag("t10");
+                if (w8 == 27) c2b_g_authdiag("t30");
                 if (w8 == 7 && !fired2) {
                     fired2 = 1;
                     if (msg == 0) {

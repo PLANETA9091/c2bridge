@@ -7011,11 +7011,6 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
 {
     u32 n = ++c2b_g129_n;
     if (n > 24 && (n & 0x3F) != 1) return;
-#ifndef C2B_SELFTEST
-    if (g_probe_active) return;
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
-#endif
     C2B_LOGS("[c2b] g129 scp #");
     C2B_LOGN(n);
     C2B_LOGS("st=");
@@ -7037,9 +7032,6 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
         C2B_LOGH((u32)(tk >> 32)); C2B_LOGH((u32)tk);
     }
     C2B_LOGS("\n");
-#ifndef C2B_SELFTEST
-    g_probe_active = 0;
-#endif
 }
 
 void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
@@ -7051,11 +7043,6 @@ void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
     } else {
         if (n > 1024 || (n & 0xFFu) != 1u) return;
     }
-#ifndef C2B_SELFTEST
-    if (g_probe_active) return;
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
-#endif
     C2B_LOGS("[c2b] g130 send #");
     C2B_LOGN(n);
     C2B_LOGS("fd=");
@@ -7070,9 +7057,6 @@ void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
     C2B_LOGH(*(volatile const u32 *)bf);
     C2B_LOGH(*(volatile const u32 *)(bf + 4));
     C2B_LOGS("\n");
-#ifndef C2B_SELFTEST
-    g_probe_active = 0;
-#endif
 }
 
 __asm__(
@@ -11537,6 +11521,20 @@ static void *c2b_g24_thread(void *arg)
                             *(volatile const u8 *)(st + 0x4c1));
                         g_g28_sends++;
                         C2B_LOGS("[c2b] g28: scp returned\n");
+                        /* 61b-g129v: ПЕР-КОЛЛ-ЧТЕНИЕ ПАТЧ-САЙТА 0x24aa20:
+                         * 14Б после возврата = ЦЕЛОСТНОСТЬ патча g129.
+                         * FF25... = патч жив (детур = активен, промах =
+                         * внутри трамплина/лога); 554889e5 = патч СТЁР
+                         * (чей-то рестор/перезапись) => детур мёртв.
+                         * Кап = 3 чтения (первые 3 колла). */
+                        if (g_g28_sends <= 3) {
+                            u32 b5;
+                            C2B_LOGS("[c2b] g129 site=");
+                            for (b5 = 0; b5 < 8; b5++)
+                                C2B_LOGH(*(volatile const u8 *)(
+                                    g_engine_base + 0x24aa20ull + b5));
+                            C2B_LOGS("\n");
+                        }
                     } else {
                         C2B_LOGS("[c2b] g28: fn rejected vt=");
                         C2B_LOGH((u32)(vt >> 32)); C2B_LOGH((u32)vt);

@@ -11639,15 +11639,24 @@ static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 t
                 C2B_LOGS(" — continuing\n");
                 continue;
             }
+            /* v9 (run340-урок): rc<0 = СИГНАТУРА СЛОТА (геттер вернул -1),
+             * НЕ конец сессии! run340: слот 15 = rc=-1 на tick=0 => 'session
+             * end' => РОТАЦИЯ УБИТА после ОДНОГО пулла ('A' спуллена и
+             * запушена rc=42 @tick=0, но дальше полл мёртв — heartbeats=0,
+             * следующие 'A'/'B' сервера = НЕ ДРЕНИЛИСЬ). Recv всегда >= 0;
+             * rc<0 = ошибка геттера = ПРОДОЛЖАЕМ ротацию. Лог = один раз
+             * на слот (спам-фильтр). */
             if (rc7 < 0) {
-                C2B_LOGS("[c2b] g84v2: session end @tick=");
-                C2B_LOGN(tick7);
-                C2B_LOGS(" slot=");
-                C2B_LOGN(slot7);
-                C2B_LOGS(" rc=");
-                C2B_LOGN((u32)(i32)rc7);
-                C2B_LOGS("\n");
-                return;
+                static u32 g84_neg_seen;
+                if (!(g84_neg_seen & (1u << (slot7 & 31u)))) {
+                    g84_neg_seen |= (1u << (slot7 & 31u));
+                    C2B_LOGS("[c2b] g84v2: slot rc<0 (getter sig, continuing) slot=");
+                    C2B_LOGN(slot7);
+                    C2B_LOGS(" rc=");
+                    C2B_LOGN((u32)(i32)rc7);
+                    C2B_LOGS("\n");
+                }
+                continue;
             }
             /* v7 pull-валидация: rc 1..8 + ma[0] = правдоподобный heap-Ptr.
              * Геттеры (GCI/Quick/ConnName) кладут в ma СМАЛЛ-инты/зеро —

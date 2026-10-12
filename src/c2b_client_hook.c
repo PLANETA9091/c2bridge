@@ -49,6 +49,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -541,7 +542,18 @@ static u32 c2b_g113_nkeys;
 /* g117: the crypt_inner X25519 pubs (the dedup set) — the pub = the KNOWN
  * 32B = the heap anchor for the priv hunt => the offline X25519 premaster
  * => the FULL KDF (the keys + THE IVs = no nonce models at all). */
-static u8 c2b_g113_pubs[8][32];
+/* g120: 8 -> 128 slots. THE RUN330 ROOT CAUSE #1: the 8-slot registry =
+ * filled IN SCAN ORDER and the cxi byte-literal = NOT zero-FP for the
+ * CONTENT: the binary-data overlaps registered the pattern garbage
+ * ('0000000038011220...' x-repeats) as pubs => the client session pub
+ * fc9d46df... = NEVER made it into the registry => the global dup scan
+ * = hunted the WRONG pubs (the run330 pubdup2 = 7 windows, ZERO for the
+ * client pub). 128 slots + the quality gate (>= 18 distinct bytes) =
+ * the real session pubs all fit; the residual gate-passing noise =
+ * HARMLESS for the bloom scan (the dumps = only on the full 32B
+ * matches; the bloom FP ~= npubs/65536). */
+#define C2B_G113_NPUBS_MAX 128
+static u8 c2b_g113_pubs[C2B_G113_NPUBS_MAX][32];
 static u32 c2b_g113_npubs;
 
 static void c2b_g113_init(void)
@@ -733,10 +745,24 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
                     if (c2b_g113_pubs[du2][z3] != pk[z3]) { eq = 0; break; }
                 if (eq) { same = 1; break; }
             }
-            if (!same && c2b_g113_npubs < 8) {
-                for (z2 = 0; z2 < 32; z2++)
-                    c2b_g113_pubs[c2b_g113_npubs][z2] = pk[z2];
-                c2b_g113_npubs++;
+            /* g120: the QUALITY GATE — the real X25519 pub = uniform
+             * random (E[distinct bytes in 32] ~= 20.4); the pattern
+             * garbage the old registry filled with (the run330 'pub='
+ * lines with the u16-ramps and the 0908-fragments) = <= 10
+             * distinct. The gate = 18 = the real keys pass, the noise
+             * = rejected BEFORE it eats a slot. */
+            if (!same && c2b_g113_npubs < C2B_G113_NPUBS_MAX) {
+                u8 seenb[256];
+                u32 distinct = 0, qb;
+                memset(seenb, 0, sizeof(seenb));
+                for (qb = 0; qb < 32; qb++) {
+                    if (!seenb[pk[qb]]) { seenb[pk[qb]] = 1; distinct++; }
+                }
+                if (distinct >= 18) {
+                    for (z2 = 0; z2 < 32; z2++)
+                        c2b_g113_pubs[c2b_g113_npubs][z2] = pk[z2];
+                    c2b_g113_npubs++;
+                }
             }
             klog_s("[c2b] g113: cxi @");
             klog_h((u32)(base + o2));
@@ -791,31 +817,55 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
      * hunt = blind. The ctx = ±512B (the CM layout = the priv 48B before
      * the pub; the wider window = the margin for the other shapes). */
     if (mode == 2) {
-        u32 pi;
+        /* g120: THE SINGLE-PASS BLOOM. THE RUN330 ROOT CAUSE #2: the old
+         * loop = PUBS-OUTER x HEAP-INNER = the FULL heap walk PER pub
+         * (8-64x the cost) = the 65s cap + TRUNC on BOTH cycles (vs the
+         * 2.5s single pass of the g118 era) => the dup pass = covered
+         * only a fraction of the heap EVEN for the pubs it had. THE FIX:
+         * ONE heap walk; per offset = the u64 load + the 65536-bit bloom
+         * (the registry pubs' first-u64 low-16-bits; FP ~= npubs/65536 ~=
+         * 0.1%) + on the bloom hit = the full verify against the registry.
+         * The per-offset cost ~= the AES pass cost (~2.5s/heap) => the
+         * 40s cap = the FULL heap per cycle, no truncation. The bitmap =
+         * rebuilt per chunk call (the registry grows across cycles). */
+        static u8 bmap[8192]; /* 65536 bits */
+        u64 o2;
         struct timespec tn;
+        u32 pi;
+        memset(bmap, 0, sizeof(bmap));
         for (pi = 0; pi < c2b_g113_npubs; pi++) {
-            u64 o2;
-            const u8 *P = c2b_g113_pubs[pi];
             u64 p0;
             u32 z2;
             for (z2 = 0; z2 < 8; z2++)
-                ((u8 *)&p0)[z2] = P[z2];
-            for (o2 = 0; o2 + 32 <= (u64)n; o2++) {
-                u64 q0;
-                u32 z3, eq;
-                u64 s3, e3;
-                if ((o2 & 0xFFFF) == 0) {
-                    clock_gettime(1, &tn);
-                    if ((i64)tn.tv_sec * 1000000000ll
-                        + (i64)tn.tv_nsec - *ts > cap)
-                        return 1;
-                }
-                for (z3 = 0; z3 < 8; z3++)
-                    ((u8 *)&q0)[z3] = buf[o2 + z3];
+                ((u8 *)&p0)[z2] = c2b_g113_pubs[pi][z2];
+            p0 &= 0xFFFF;
+            bmap[(p0 >> 3) & 8191] |= (u8)(1u << (p0 & 7));
+        }
+        for (o2 = 0; o2 + 32 <= (u64)n; o2++) {
+            u64 q0;
+            u32 z3, lo;
+            u64 s3, e3;
+            if ((o2 & 0xFFFF) == 0) {
+                clock_gettime(1, &tn);
+                if ((i64)tn.tv_sec * 1000000000ll
+                    + (i64)tn.tv_nsec - *ts > cap)
+                    return 1;
+            }
+            for (z3 = 0; z3 < 8; z3++)
+                ((u8 *)&q0)[z3] = buf[o2 + z3];
+            lo = (u32)(q0 & 0xFFFF);
+            if (!(bmap[(lo >> 3) & 8191] & (u8)(1u << (lo & 7))))
+                continue;
+            for (pi = 0; pi < c2b_g113_npubs; pi++) {
+                const u8 *P = c2b_g113_pubs[pi];
+                u32 z4, eq;
+                u64 p0;
+                for (z4 = 0; z4 < 8; z4++)
+                    ((u8 *)&p0)[z4] = P[z4];
                 if (q0 != p0) continue;
                 eq = 1;
-                for (z3 = 0; z3 < 32; z3++)
-                    if (buf[o2 + z3] != P[z3]) { eq = 0; break; }
+                for (z4 = 0; z4 < 32; z4++)
+                    if (buf[o2 + z4] != P[z4]) { eq = 0; break; }
                 if (!eq) continue;
                 klog_s("[c2b] g113: pubdup2 @");
                 klog_h((u32)(base + o2));
@@ -827,6 +877,7 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
                 if (e3 > (u64)n) e3 = n;
                 c2b_g113_hex(buf + s3, (u32)(e3 - s3));
                 klog_s("\n");
+                break;
             }
         }
     }

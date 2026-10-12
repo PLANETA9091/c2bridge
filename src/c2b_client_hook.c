@@ -247,78 +247,96 @@ static void c2b_g110_detour_c(const void *out, const void *in, u32 len,
 
 /* ---------------- the watcher / patcher ---------------- */
 
+/* the ABI-sized memcpy (the small fixed-size use only) */
+extern void *memcpy(void *, const void *, sz_t);
+
+/* the strict parse of ONE maps line: "7f..-7f.. r--p off dev ino path".
+ * Returns 1 + *out_lo = the start addr when the line = a steamclient.so
+ * mapping (the substring match in the path part). */
+static i32 line_is_steamclient(const char *s, i32 n, uptr *out_lo)
+{
+    uptr a = 0, b = 0;
+    i32 k = 0, c, i, nhex = 0;
+
+    while (k < n && s[k] != '-') {
+        c = s[k];
+        if (c >= '0' && c <= '9') a = (a << 4) | (uptr)(c - '0');
+        else if (c >= 'a' && c <= 'f') a = (a << 4) | (uptr)(c - 'a' + 10);
+        else return 0;
+        k++; nhex++;
+    }
+    if (k >= n || s[k] != '-' || nhex < 1) return 0;
+    k++;
+    while (k < n && s[k] != ' ') {
+        c = s[k];
+        if (c >= '0' && c <= '9') b = (b << 4) | (uptr)(c - '0');
+        else if (c >= 'a' && c <= 'f') b = (b << 4) | (uptr)(c - 'a' + 10);
+        else return 0;
+        k++;
+    }
+    if (k >= n || s[k] != ' ' || b <= a) return 0;
+    for (i = k; i + 14 <= n; i++) {
+        if (s[i] == 's' && s[i + 1] == 't' && s[i + 2] == 'e' &&
+            s[i + 3] == 'a' && s[i + 4] == 'm' && s[i + 5] == 'c' &&
+            s[i + 6] == 'l' && s[i + 7] == 'i' && s[i + 8] == 'e' &&
+            s[i + 9] == 'n' && s[i + 10] == 't' && s[i + 11] == '.' &&
+            s[i + 12] == 's' && s[i + 13] == 'o') {
+            *out_lo = a;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void *c2b_g110_watch(void *arg)
 {
-    static char mp[262144];
     int  round;
     (void)arg;
 
-    for (round = 0; round < 1200 && !g_patched; round++) {
+    /* g110c (run311 lesson): the STREAM parse — the run311 = the ZERO
+     * outcomes (not even the mismatch) = the maps buffer (256KB static)
+     * = the TAIL TRUNCATION (the g107d lesson = the SAME bug class) = the
+     * steamclient.so = never seen in ANY process (979x64 + 5x32 = all
+     * silent). The stream parse = the complete-line assembly = the tail-
+     * safe; the buffers = the STACK locals = no per-process .bss (the
+     * 979 processes x 256KB static = the memory blowup = the removed).
+     * The rounds cap = 240 (2 min): the steam core maps the lib at the
+     * boot; the webhelper fork-storm = the bounded pollers. */
+    for (round = 0; round < 240 && !g_patched; round++) {
         i32 fdm = open("/proc/self/maps", O_RDONLY);
-        ssz_t n = 0;
-        char *p, *e2;
+        char chunk[65536], line[4096];
+        i32 llen = 0;
         uptr liblo = 0;
-        char pb[512];
-        u32 pl, ps;
+        ssz_t r;
 
         if (fdm < 0) return (void *)0;
-        for (;;) {
-            ssz_t r = read(fdm, mp + n, (sz_t)sizeof(mp) - 1 - (sz_t)n);
-            if (r <= 0) break;
-            n += r;
-            if (n >= (i64)sizeof(mp) - 1) break;
+        while ((r = read(fdm, chunk, sizeof(chunk))) > 0) {
+            sz_t i = 0;
+            while (i < (sz_t)r) {
+                sz_t j = i, seg;
+                while (j < (sz_t)r && chunk[j] != '\n') j++;
+                seg = j - i;
+                if (llen + (i32)seg > (i32)sizeof(line) - 1)
+                    seg = (sz_t)sizeof(line) - 1 - (sz_t)llen;
+                if (seg) {
+                    memcpy(line + llen, chunk + i, seg);
+                    llen += (i32)seg;
+                }
+                if (j == (sz_t)r) break;      /* the incomplete = the next chunk */
+                i = j + 1;
+                {
+                    uptr a;
+                    if (line_is_steamclient(line, llen, &a) &&
+                        (!liblo || a < liblo)) liblo = a;
+                }
+                llen = 0;
+            }
         }
         close(fdm);
-        if (n <= 0) return (void *)0;
-        mp[n] = 0;
-
-        /* the scan: the LOWEST start among the steamclient.so lines */
-        p = mp; e2 = mp + n;
-        while (p < e2) {
-            uptr a = 0, b = 0;
-            i32 c;
-            while (p < e2 && *p == '\n') p++;
-            if (p >= e2) break;
-            while (p < e2 && *p != '-') {
-                c = *p;
-                if (c >= '0' && c <= '9') a = (a << 4) | (uptr)(c - '0');
-                else if (c >= 'a' && c <= 'f')
-                    a = (a << 4) | (uptr)(c - 'a' + 10);
-                else break;
-                p++;
-            }
-            if (p >= e2 || *p != '-') break;
-            p++;
-            while (p < e2 && *p != ' ') {
-                c = *p;
-                if (c >= '0' && c <= '9') b = (b << 4) | (uptr)(c - '0');
-                else if (c >= 'a' && c <= 'f')
-                    b = (b << 4) | (uptr)(c - 'a' + 10);
-                else break;
-                p++;
-            }
-            if (p >= e2 || *p != ' ') break;
-            p++;
-            pl = 0;
-            while (p < e2 && *p != '\n') {
-                if (pl < sizeof(pb) - 1) pb[pl++] = *p;
-                p++;
-            }
-            pb[pl] = 0;
-            if (p < e2) p++;
-            if (b <= a || pl < 26) continue;
-            for (ps = 0; ps + 25 < pl; ps++) {
-                if (pb[ps] == 's' && pb[ps + 1] == 't' &&
-                    pb[ps + 2] == 'e' && pb[ps + 3] == 'a' &&
-                    pb[ps + 4] == 'm' && pb[ps + 5] == 'c' &&
-                    pb[ps + 6] == 'l' && pb[ps + 7] == 'i' &&
-                    pb[ps + 8] == 'e' && pb[ps + 9] == 'n' &&
-                    pb[ps + 10] == 't' && pb[ps + 11] == '.' &&
-                    pb[ps + 12] == 's' && pb[ps + 13] == 'o') {
-                    if (!liblo || a < liblo) liblo = a;
-                    break;
-                }
-            }
+        if (llen > 0) {   /* the tail line without \n */
+            uptr a;
+            if (line_is_steamclient(line, llen, &a) &&
+                (!liblo || a < liblo)) liblo = a;
         }
         if (!liblo) {
             /* the steamclient.so = not mapped yet — the retry */
@@ -415,8 +433,14 @@ static void *c2b_g110_watch(void *arg)
         }
         return (void *)0;
     }
-    if (!g_patched)
-        klog_s("[c2b] g110: steamclient.so never mapped (10min cap)\n");
+    if (!g_patched) {
+        /* the no-find outcome = the 32-bit candidates ONLY (the 979x
+         * webhelper storm = the log-spam prevention; the 32-bit steam
+         * core = the real target = the diagnostic = required) */
+#if !defined(__x86_64__)
+        klog_s("[c2b] g110: no steamclient.so in 2min (arch=" ARCH_TAG ")\n");
+#endif
+    }
     return (void *)0;
 }
 

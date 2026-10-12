@@ -132,7 +132,19 @@ launch_client() {
   # 15 PASS / 5 смертей). setarch -R: детерминированная раскладка -> либо
   # всегда живы, либо всегда мертвы (и тогда слот дампится один раз).
   # personality наследуется через fork/exec — движок тоже без ASLR.
+  # g112b (runs 319/320 autopsy): the login client MUST be preloaded with
+  # the g110 hook (if the harness provides it). THE POINT = THE ADOPTION:
+  # the fresh -login session = RAM-ONLY (RememberPassword=0 at login time =
+  # the client stores NO refresh token; the vdf flags = NOT credentials) so
+  # ANY later client boot = the logon-fail loop (run319/320 = 5x 'Received
+  # logon failure response' every ~65s, steamid=0, the game dead at +6s).
+  # The ONLY surviving session = the login client ITSELF. A preloaded login
+  # client = ADOPTED by the harness (the /proc/<pid>/environ check skips
+  # the controlled restart = NO pkill = the session survives into the game
+  # launches = the menu + the connect + THE g110 KEYS). The 64-bit CEF
+  # children = the harmless wrong-ELF-class ld.so spam (the proven noise).
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
+    LD_PRELOAD="${C2B_CLIENT_PRELOAD:-}" \
     LIBGL_ALWAYS_SOFTWARE=1 \
     STEAM_FORCE_DESKTOPUI_SOFTWARE_RENDERING=1 \
     sh -c "ulimit -n 65535 2>/dev/null; exec setarch --addr-no-randomize '$STEAM_SH' -login '$STEAM_USER' '$STEAM_PASS' -silent -cef-disable-gpu -cef-disable-gpu-compositing -no-cef-sandbox" \
@@ -246,10 +258,14 @@ if (( SESSION )); then
   # (b) patch loginusers.vdf to RememberPassword=1/AutoLogin=1 so every
   # later boot = silent auto-logon of the just-authed account.
   sleep 12
+  # g112b: the sed = ONE line (the run320 recovery log = 'unterminated
+  # address regex' = the backslash-newline continuation INSIDE the quoted
+  # expr = the patch silently no-opped; the echo = unconditional = the
+  # false 'patched'). The &&-guarded echo = the honest rc.
   if [[ -e "$LUV" ]] && grep -aq '"AccountName"' "$LUV"; then
-    sed -i 's/"RememberPassword"[[:space:]]*"0"/"RememberPassword"\t\t"1"/g; \
-            s/"AutoLogin"[[:space:]]*"0"/"AutoLogin"\t\t"1"/g' "$LUV"
-    echo "[steam-login] g112: loginusers.vdf patched (RememberPassword=1 AutoLogin=1)"
+    sed -i 's/"RememberPassword"[[:space:]]*"0"/"RememberPassword"\t\t"1"/g; s/"AutoLogin"[[:space:]]*"0"/"AutoLogin"\t\t"1"/g' "$LUV" \
+      && echo "[steam-login] g112: loginusers.vdf patched (RememberPassword=1 AutoLogin=1)" \
+      || echo "[steam-login] g112: WARNING: the loginusers.vdf sed FAILED (rc=$?) - the flags = best-effort only, the adoption = the real fix"
   else
     echo "[steam-login] g112: WARNING: $LUV absent/no AccountName - auto-login not patched"
   fi

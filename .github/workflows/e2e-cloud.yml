@@ -258,6 +258,21 @@ jobs:
             echo "STEAM_USER not set — skipping login (smoke boots standalone; full mode needs the burner account)"
             exit 0
           fi
+          # g112b (runs 319/320 autopsy): the fresh -login session = RAM-ONLY
+          # (the client stores NO refresh token when RememberPassword=0 at
+          # login time; the vdf flags = NOT credentials) => ANY later client
+          # boot = the logon-fail loop => the game dead at +6s. The ONLY
+          # surviving session = the login client ITSELF => it MUST be
+          # preloaded with the g110 hook so the harness ADOPTS it (the
+          # /proc/<pid>/environ check skips the controlled restart = no
+          # pkill = the session survives into the game launches). The hook =
+          # built by the 'build bridge artifacts' step BEFORE this step.
+          if [ "${C2B_G110:-1}" != "0" ] && [ -f "$C2B_NODE_HOME/bridge/c2b_client_hook.so" ]; then
+            export C2B_CLIENT_PRELOAD="$C2B_NODE_HOME/bridge/c2b_client_hook.so"
+            echo "g112b: login client will be preloaded with $C2B_CLIENT_PRELOAD"
+          else
+            echo "g112b: hook not built or C2B_G110=0 - login client = hookless (the harness will do the controlled restart; the logon-fail risk = known)"
+          fi
           # run 39: a memory-starved client (mmap() failed x17 during boot on a
           # flaky runner VM) fails the logged-in check. Retry the login up to 3
           # times, killing the client between attempts.

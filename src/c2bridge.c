@@ -18036,22 +18036,39 @@ static void *c2b_g107_thread(void *arg)
 static void c2b_g_authdiag(const char *tag)
 {
     u8 *iface = (u8 *)g_gns_conn_iface;
-    uptr serialized = 0, callid = 0;
-    u32 idtype = 0;
+    u32 raw_avail = 0, raw_ok = 0;
     i32 avail = -1;
     static char dbg[320];
     static void *flat_auth;
     u32 z;
     if (!iface) return;
     dbg[0] = 0;
+    /* 1) THE FLAT FIRST: dlsym(0) does NOT see libsteam_api.so (RTLD_LOCAL,
+     * the run37 lesson) -> the g_gc_apih dlopen fallback (the SAME candidates
+     * as the GC section). The flat = the API entry = handles the wrapper vs
+     * the impl internally = the ONLY safe reader of the cert state. */
+    if (!flat_auth) {
+        flat_auth = dlsym((void *)0, "SteamAPI_ISteamNetworkingSockets_"
+                                   "GetAuthenticationStatus");
+        if (!flat_auth) {
+            if (!g_gc_apih) {
+                static const char *cands[3] = { "libsteam_api.so",
+                                                "steam_api.so",
+                                                "steam_api64.so" };
+                for (z = 0; z < 3 && !g_gc_apih; z++)
+                    g_gc_apih = dlopen(cands[z], C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+                if (g_gc_apih)
+                    C2B_LOGS("[c2b] AUTHDIAG: steam_api dlopen OK\n");
+            }
+            if (g_gc_apih)
+                flat_auth = dlsym(g_gc_apih, "SteamAPI_ISteamNetworkingSockets_"
+                                             "GetAuthenticationStatus");
+        }
+        if (!flat_auth)
+            C2B_LOGS("[c2b] AUTHDIAG: flat GetAuthenticationStatus NOT FOUND\n");
+    }
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        serialized = *(volatile uptr *)(iface + 0x7d40);
-        callid = *(volatile uptr *)(iface + 0x7d38);
-        idtype = *(volatile u32 *)(iface + 0x7e14);
-        if (!flat_auth)
-            flat_auth = dlsym((void *)0, "SteamAPI_ISteamNetworkingSockets_"
-                                       "GetAuthenticationStatus");
         if (flat_auth) {
             static u8 stbuf[512];
             for (z = 0; z < sizeof(stbuf); z++) stbuf[z] = 0;
@@ -18065,18 +18082,32 @@ static void c2b_g_authdiag(const char *tag)
             dbg[z] = 0;
         }
         g_probe_active = 0;
+        /* 2) THE CLASS-IDENTITY PROBE (the run344 lesson: [iface+0x7d40] SEGV =
+         * g_gns_conn_iface = the SMALL API wrapper, NOT the full 8KB
+         * CSteamNetworkingSockets class). +0x438 = m_CertStatus.m_eAvail =
+         * the smallest full-class offset. Survives AND matches the flat's
+         * eAvail => the iface = the impl class (the deep reads = valid next
+         * round); SEGV or mismatch => the wrapper confirmed (the raw reads =
+         * dead end, the flat = the only window). */
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            raw_avail = *(volatile u32 *)(iface + 0x438);
+            g_probe_active = 0;
+            raw_ok = 1;
+        } else {
+            g_probe_active = 0;
+            raw_ok = 0;
+        }
     } else {
         g_probe_active = 0;
-        C2B_LOGS("[c2b] AUTHDIAG: SEGV tag="); C2B_LOGS(tag); C2B_LOGS("\n");
+        C2B_LOGS("[c2b] AUTHDIAG: flat SEGV tag="); C2B_LOGS(tag); C2B_LOGS("\n");
         return;
     }
     C2B_LOGS("[c2b] AUTHDIAG: "); C2B_LOGS(tag);
-    C2B_LOGS("serialized=");
-    C2B_LOGH((u32)(serialized >> 32)); C2B_LOGH((u32)serialized);
-    C2B_LOGS("callid=");
-    C2B_LOGH((u32)(callid >> 32)); C2B_LOGH((u32)callid);
-    C2B_LOGS("idtype="); C2B_LOGN(idtype);
     C2B_LOGS("avail="); C2B_LOGN((u32)avail);
+    C2B_LOGS("raw438="); C2B_LOGN(raw_avail);
+    C2B_LOGS("rawok="); C2B_LOGN(raw_ok);
+    C2B_LOGS("match="); C2B_LOGN((u32)(raw_ok && (i32)raw_avail == avail));
     C2B_LOGS("msg=\""); C2B_LOGS(dbg); C2B_LOGS("\"\n");
 }
 

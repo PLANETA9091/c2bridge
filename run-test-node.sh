@@ -273,10 +273,14 @@ STEAM_SH="${C2B_STEAM_SH:-$GAME_HOME/.local/share/Steam/steam.sh}"
 # The warm client = NOT preloaded (the hook fires on harness-started ones).
 C2B_CLIENT_PRELOAD=""
 if [[ "${C2B_G110:-1}" != "0" ]]; then
+  # g111c (run318 lesson): the -m64 .so = DROPPED from the preload. The
+  # webhelper fork-storm (979x arch=64 loads/run = EVERY CEF child) x the
+  # 500ms maps-polls = the CPU/memory-bandwidth melt => the client boot =
+  # starved to ~10 min => the pipe never serves in the waits => the game =
+  # 'FATAL ERROR: Failed to connect with local Steam Client process!' at
+  # +5s. The 32-bit core = THE SDR endpoint (the g109b verdict + the
+  # run#316 'PATCHED arch=32'); the 64-bit = the later comm-gated variant.
   [[ -f "$BRIDGE_DIR/c2b_client_hook.so" ]] && C2B_CLIENT_PRELOAD="$BRIDGE_DIR/c2b_client_hook.so"
-  if [[ -f "$BRIDGE_DIR/c2b_client_hook64.so" ]]; then
-    C2B_CLIENT_PRELOAD="${C2B_CLIENT_PRELOAD:+$C2B_CLIENT_PRELOAD:}$BRIDGE_DIR/c2b_client_hook64.so"
-  fi
 fi
 export C2B_CLIENT_PRELOAD
 [[ -n "$C2B_CLIENT_PRELOAD" ]] \

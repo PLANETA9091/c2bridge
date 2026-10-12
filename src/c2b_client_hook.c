@@ -781,6 +781,55 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
             }
         }
     }
+    /* g119: mode 2 = THE GLOBAL DUP SCAN: the pub registry (the pubs =
+     * collected across ALL the cycles by the cxi pass) x the FULL heap =
+     * the cross-chunk instances of each pub. THE run328 LESSON: the client
+     * session pub e1485f89... = found ONLY in its own serialized
+     * crypt_inner (the self-match @d4eab6d8); the ECX key struct (the priv
+     * = the adjacent 32B, the run328-PROVEN layout for the CM pubs: {priv
+     * 32B, ptr, u64, pub 32B}) = in ANOTHER 1MB segment = the same-chunk
+     * hunt = blind. The ctx = ±512B (the CM layout = the priv 48B before
+     * the pub; the wider window = the margin for the other shapes). */
+    if (mode == 2) {
+        u32 pi;
+        struct timespec tn;
+        for (pi = 0; pi < c2b_g113_npubs; pi++) {
+            u64 o2;
+            const u8 *P = c2b_g113_pubs[pi];
+            u64 p0;
+            u32 z2;
+            for (z2 = 0; z2 < 8; z2++)
+                ((u8 *)&p0)[z2] = P[z2];
+            for (o2 = 0; o2 + 32 <= (u64)n; o2++) {
+                u64 q0;
+                u32 z3, eq;
+                u64 s3, e3;
+                if ((o2 & 0xFFFF) == 0) {
+                    clock_gettime(1, &tn);
+                    if ((i64)tn.tv_sec * 1000000000ll
+                        + (i64)tn.tv_nsec - *ts > cap)
+                        return 1;
+                }
+                for (z3 = 0; z3 < 8; z3++)
+                    ((u8 *)&q0)[z3] = buf[o2 + z3];
+                if (q0 != p0) continue;
+                eq = 1;
+                for (z3 = 0; z3 < 32; z3++)
+                    if (buf[o2 + z3] != P[z3]) { eq = 0; break; }
+                if (!eq) continue;
+                klog_s("[c2b] g113: pubdup2 @");
+                klog_h((u32)(base + o2));
+                klog_s(" pub=");
+                c2b_g113_hex(P, 32);
+                klog_s(" ctx=");
+                s3 = o2 >= 512 ? o2 - 512 : 0;
+                e3 = o2 + 512;
+                if (e3 > (u64)n) e3 = n;
+                c2b_g113_hex(buf + s3, (u32)(e3 - s3));
+                klog_s("\n");
+            }
+        }
+    }
     return 0;
 }
 
@@ -824,9 +873,11 @@ static void *c2b_g113_thread(void *arg)
          * (run327: the client died at t+30s in the dwell = 2 cycles total). */
         struct timespec ts = { 8, 0 };
         u32 hits = 0;
-        /* g118: the TWO-PASS caps: pass 0 = the cxi (THE PRIZE) = the first
-         * 20s guaranteed; pass 1 = the AES = the 45s overall from t0. */
-        i64 t0, caps[2];
+        /* g119: the THREE-pass caps: pass 0 = the cxi (the registry fill)
+         * = the first 20s; pass 1 = the GLOBAL dup (the cross-chunk priv
+         * hunt = THE actual prize) = the 40s; pass 2 = the AES schedules
+         * (the fallback + the keybe verification) = the 65s overall. */
+        i64 t0, caps[3];
         i32 fdm, stop = 0, pass, mtrunc = 0;
         char *p, *e2;
         i64 n = 0;
@@ -860,14 +911,13 @@ static void *c2b_g113_thread(void *arg)
         clock_gettime(1, &now);
         t0 = (i64)now.tv_sec * 1000000000ll + (i64)now.tv_nsec;
         caps[0] = 20 * 1000000000ll;
-        caps[1] = 45 * 1000000000ll;
+        caps[1] = 40 * 1000000000ll;
+        caps[2] = 65 * 1000000000ll;
         e2 = mp + n;
-        /* g118: the TWO full walks over the SAME maps snapshot: pass 0 = the
-         * cxi scan (the pubdup => the priv => the KDF = the actual decrypt
-         * path), pass 1 = the AES schedules (the fallback + the windows).
-         * The old single-pass = the AES first = the cxi = starved under the
-         * shared 45s cap. */
-        for (pass = 0; pass < 2; pass++) {
+        /* g119: the THREE full walks over the SAME maps snapshot: pass 0 =
+         * the cxi scan (the pubs), pass 1 = the global dup (the registry x
+         * the heap = the cross-chunk priv hunt), pass 2 = the AES. */
+        for (pass = 0; pass < 3; pass++) {
             stop = 0;
             p = mp;
             while (p < e2 && !stop) {

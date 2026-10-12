@@ -99,6 +99,7 @@ finish() { # $1 exit code, $2 verdict
     || cp -f /tmp/c2b_client_keys.log "$RUNDIR/client_keys.txt" 2>/dev/null || true
   [[ -f "$NODE_HOME/tmp/steam-start.log" ]] && cp -f "$NODE_HOME/tmp/steam-start.log" "$RUNDIR/" 2>/dev/null || true
   [[ -f "$NODE_HOME/tmp/steam-restart.log" ]] && cp -f "$NODE_HOME/tmp/steam-restart.log" "$RUNDIR/" 2>/dev/null || true
+  [[ -f "$NODE_HOME/tmp/steam-hookstart.log" ]] && cp -f "$NODE_HOME/tmp/steam-hookstart.log" "$RUNDIR/" 2>/dev/null || true
   # 41f: tcpdump teardown + summary (топ-разговоров по каждому pcap)
   sudo -n pkill -f "tcpdump -i any" 2>/dev/null || true
   for p in "$RUNDIR"/pcap.a*.pcap; do
@@ -309,6 +310,30 @@ if ! steam_client_alive; then
 else
   log "steam client already running (warm)"
 fi
+# g110b (run310 lesson): the WARM client = NOT preloaded (it = started before
+# this harness / by the CI bootstrap WITHOUT our LD_PRELOAD) = the hook = dead
+# = the keys = unobtainable for the whole run. The warm + the hook available =
+# the CONTROLLED RESTART under the preload (the existing unstable-path pattern:
+# the pkill + the start + the stability wait). The cost = ~30-90s; the prize =
+# the client-side chacha keys. C2B_G110_NORESTART=1 = skip (the bisect).
+if [[ -n "$C2B_CLIENT_PRELOAD" && "${C2B_G110_NORESTART:-0}" != "1" ]] \
+   && pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1 \
+   && ! pgrep -u "$GAME_USER" -f "c2b_client_hook" >/dev/null 2>&1 \
+   && ! tr '\0' '\n' < "/proc/$(pgrep -u "$GAME_USER" -f 'ubuntu12_32/steam( |$)' | head -1)/environ" 2>/dev/null \
+        | grep -aq "c2b_client_hook"; then
+  log "g110: warm client = NOT preloaded -> controlled restart under the hook"
+  pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+  sleep 3; pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
+  rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
+  sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" LD_PRELOAD="$C2B_CLIENT_PRELOAD" \
+    sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-hookstart.log' 2>&1 &"
+  W=0
+  until steam_client_alive; do
+    W=$((W+5)); (( W >= 240 )) && { log "WARNING: g110 hooked client not ready after ${W}s"; break; }
+    sleep 5
+  done
+  log "g110 hooked client ready (~${W}s)"
+fi
 # A client left over from a CI bootstrap step may be mid-self-update: the pipe
 # file flaps and the engine's SteamAPI_Init dies with "create pipe failed"
 # (run 37127120737, steamclient.so itself loaded OK; run 37128611184 showed the
@@ -380,14 +405,17 @@ if ! steam_client_stable; then
   done
   log "steam stability wait done (~${W}s)"
 fi
-# g110: FLAKE-PROOF relay anchor — the :dfff (:57343) listener = probed at
+# g110: FLAKE-PROOF relay anchor — the :57343 listener = probed at
 # the client-ready +45s +90s, BEFORE/INDEPENDENT of the game loop (the
 # marker-only probe = blind to the env-flakes: runs 308/309 = never armed;
 # the listener = alive from the client's start = the shots = the owner-pid
 # evidence regardless of the game's fate).
+# g110b RUN310 FIX: the ss = prints DECIMAL ports — the prior grep ":dfff "
+# (the hex = the bridge's census format) = NEVER matched = the anchor = empty
+# in all 3 shots. Both forms now (the decimal + the hex for the proc-net).
 ( for i in 1 2 3; do
     echo "=== shot$i t=$SECONDS ==="
-    sudo -n ss -upan 2>/dev/null | grep -a ":dfff "
+    sudo -n ss -upan 2>/dev/null | grep -aE ":57343 |:dfff "
     (( i < 3 )) && sleep 45
   done ) > "$RUNDIR/relay57343_owner_early.txt" 2>/dev/null &
 log "g110 early relay anchor armed (3 shots x45s): $(grep -ac . "$RUNDIR/relay57343_owner_early.txt" 2>/dev/null || echo 0) lines so far"
@@ -897,7 +925,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       ip -o link 2>/dev/null | head -10 > "$RUNDIR/ifnames.txt" || true
       ( while (( SECONDS < END )); do
           echo "=== t=$SECONDS ==="
-          sudo -n ss -upan 2>/dev/null | grep -aE ":$TPORT |:27005 |:27015 |:dfff "
+          sudo -n ss -upan 2>/dev/null | grep -aE ":$TPORT |:27005 |:27015 |:57343 |:dfff "
           sleep 5
         done ) > "$RUNDIR/ss_timeline.txt" 2>/dev/null & SSLOOP_PID=$!
       # g109b: run308-census verdict — the game's SDR datagrams = ALL to the
@@ -905,7 +933,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # ZERO direct :28022 sends => the real SDR endpoint = the :57343
       # receiver = THE STEAM CLIENT (the SNS-crypto holder). The :dfff
       # listener's pid = THE client-side campaign anchor.
-      sudo -n ss -upan 2>/dev/null | grep -a ":dfff " \
+      sudo -n ss -upan 2>/dev/null | grep -aE ":57343 |:dfff " \
         > "$RUNDIR/relay57343_owner.txt" 2>/dev/null || true
       log "attempt $ATTEMPT: :57343 relay owner: $(grep -ac . "$RUNDIR/relay57343_owner.txt" 2>/dev/null) lines: $(head -1 "$RUNDIR/relay57343_owner.txt" 2>/dev/null | cut -c1-140)"
       # g109: run307-вердикт — таймлайн с фильтром rem=:$TPORT слеп к

@@ -15128,7 +15128,7 @@ static void *c2b_g97_thread(void *arg)
             i64 out25 = -1;
             __atomic_store_n(&g_krel_pend, 0u, __ATOMIC_RELAXED);
             vt25 = *(void ***)g_gns_conn_iface;
-            slot25 = (g_gns_conn_ver == 0) ? 11u : 10u;
+            slot25 = 11u;   /* v26: слот 11 всегда (v6/run336-урок) */
             g_probe_active = 1;
             if (__sigsetjmp(g_probe_jb, 1) == 0) {
                 rc25 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))
@@ -15453,7 +15453,13 @@ static void c2b_k19_relay(void)
     g_krel_chal = kch;
     g_krel_chalv = 1;
     vt19 = *(void ***)g_gns_conn_iface;
-    slot19 = (g_gns_conn_ver == 0) ? 11u : 10u;
+    /* v26: СЛОТ 11 ВСЕГДА — ver-развилка (ver==0?11:10) = БАГ С v19:
+     * слот 10 = GetConnectionName (v6/run336-урок: rc=1 Bool-мусор, кадр
+     * НИКОГДА не доставляется; run362: 5x rc=1 слот=0x0a = ноль кадров на
+     * проводе; run363: 8x krel-ts rc=1 слот=0x0a = то же). run357 (слот 11)
+     * = ЕДИНСТВЕННАЯ реальная доставка. c2b_g98_send_msg убал развилку
+     * ещё в v6 — krel удержал. Мёртвый код g_gns_conn_ver тут не нужен. */
+    slot19 = 11u;
     /* v22: скан ДО копирования/лог-хедера — (a) wait-шот не тратит счётчик
      * релеев, (b) скан-строки не перехлёстываются с krel-строкой (run358:
      * интерлив потерял tgt/rc #1) */

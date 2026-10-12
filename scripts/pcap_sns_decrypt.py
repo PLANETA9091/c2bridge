@@ -565,14 +565,21 @@ def brute_keys(pkts, flow, cands):
 
 # ------------------------------------------------------------------ main --
 def parse_g103_log(path):
-    """-> [(key32, tail16)] from the c2b g103 chacha-state scan lines"""
+    """-> [(key32, tail16)] from the c2b chacha-capture log lines.
+    Accepts BOTH the g103 chacha-state scan lines ('g103: CHA' with the
+    explicit tail=) AND the g110 hook captures ('g110: KEYn ... key=<64hex>
+    ictx=<32hex>' — the ictx dump = the 16B ctr||nonce block = the tail)."""
     out = []
     import re
     for line in open(path, "r", errors="replace"):
-        if "g103: CHA" not in line:
+        if "g103: CHA" in line:
+            mk = re.search(r"key=([0-9a-f]{64})", line)
+            mt = re.search(r"tail=([0-9a-f]{32})", line)
+        elif "g110: KEY" in line:
+            mk = re.search(r"key=([0-9a-f]{64})", line)
+            mt = re.search(r"ictx=([0-9a-f]{32})", line)
+        else:
             continue
-        mk = re.search(r"key=([0-9a-f]{64})", line)
-        mt = re.search(r"tail=([0-9a-f]{32})", line)
         if not mk:
             continue
         tail = bytes.fromhex(mt.group(1)) if mt else b"\x00" * 16

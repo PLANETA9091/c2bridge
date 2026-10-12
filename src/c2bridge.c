@@ -12622,6 +12622,17 @@ static void c2b_g32_drive(void)
                         C2B_LOGS("[c2b] g85: receiver known, walk skipped\n");
                     } else if (e83 && e83[0] == '0') {
                         C2B_LOGS("[c2b] g85: walk disabled (C2B_G83=0)\n");
+                    } else if (!getenv("C2B_G85WALK")) {
+                        /* v8: поход = OPT-IN. run339-урок: поход (signon-wait 7с
+                         * + 80 слотов x 150мс) съел ~20с окна => arm g84v2 на
+                         * САМОЙ ПОСЛЕДНЕЙ строке лога = НОЛЬ циклов опроса
+                         * (первый poll slot-12 успел — detour-note rva=0x2136c —
+                         * и капча оборвалась). Карта = ДОСТАВЛЕНА run339:
+                         * 15=Quick-класс, 16=ASCII-геттер, 17=Detailed
+                         * (size-query 1698!), 20=ListenSocket-recv, 21=rc=100;
+                         * ротация {12,14,15} = охотник за картой теперь.
+                         * C2B_G85WALK=1 = ревербификация карты. */
+                        C2B_LOGS("[c2b] g85: walk SKIPPED (v8: g84v2 rotation hunts the map; C2B_G85WALK=1 = re-enable)\n");
                     } else {
                         u32 s83, wait8;
                         for (wait8 = 0; wait8 < 30u; wait8++) {
@@ -12683,7 +12694,26 @@ static void c2b_g32_drive(void)
                                     rc84 = -998;
                                 }
                                 g_probe_active = 0;
-                                if (rc84 > 0 && rc84 <= 4351) {
+                                if (rc84 == 0) {
+                                    /* v8: Detailed возвращает 0 = УСПЕХ и ТАБЛИЦУ в буфере
+                                     * (run339: size-query слот 17 rc=1698 -> повтор с 4KB ->
+                                     * rc=0 = '(no text)' = ТАБЛИЦА ПОТЕРЯНА — баг дамп-гейта) */
+                                    u32 off, e84 = 0;
+                                    while (e84 < 4095 && g_gns_stbuf[e84]) e84++;
+                                    C2B_LOGS("[c2b] g85 STATUS slot="); C2B_LOGN(s83);
+                                    C2B_LOGS(" rc=0 len="); C2B_LOGN(e84);
+                                    C2B_LOGS("\n");
+                                    g_gns_stbuf[e84] = 0;
+                                    for (off = 0; off < e84; off += 224) {
+                                        u32 cl = e84 - off; char sv;
+                                        if (cl > 224) cl = 224;
+                                        sv = g_gns_stbuf[off + cl];
+                                        g_gns_stbuf[off + cl] = 0;
+                                        c2b_log((const char *)&g_gns_stbuf[off]);
+                                        c2b_log("\n");
+                                        g_gns_stbuf[off + cl] = sv;
+                                    }
+                                } else if (rc84 > 0 && rc84 <= 4351) {
                                     u32 off, e84 = (u32)rc84;
                                     C2B_LOGS("[c2b] g85 STATUS slot="); C2B_LOGN(s83);
                                     C2B_LOGS(" len="); C2B_LOGN(e84);
@@ -12718,13 +12748,14 @@ static void c2b_g32_drive(void)
                     C2B_LOGS("\n");
                     rx_slot = (i32)g_gns_walk_slot;
                 }
-                if (rx_slot >= 0) {
-                    /* g85/g86: полл ВСЕГДА полный 240с (поход = до полла, под
-                     * гейтом знака; находка = переключение полла на приёмник) */
-                    c2b_g84_pollslot(vt7, ciface, ch7, (u32)rx_slot, 240u * 5u);
-                } else {
-                    C2B_LOGS("[c2b] g71: ни один кандидат не дал сообщений\n");
+                if (rx_slot < 0) {
+                    /* v8: полл ВСЕГДА запускается — g84v2 = ротация {12,14,15},
+                     * base-slot = информационный (урок run339: arm на последней
+                     * строке лога = ноль циклов опроса) */
+                    rx_slot = 14;
+                    C2B_LOGS("[c2b] g84v2: rx_slot unset -> default 14 (rotation ignores it)\n");
                 }
+                c2b_g84_pollslot(vt7, ciface, ch7, (u32)rx_slot, 240u * 5u);
             }
         }
         sigaction(11, &oldsa, (void *)0);
@@ -14389,11 +14420,11 @@ static void *c2b_g97_thread(void *arg)
     }
     C2B_LOGS("[c2b] g97: armed h=");
     C2B_LOGH((u32)g_gns_conn_h);
-    C2B_LOGS(" slot=13(GCI) detail=14 map:1=Conn,5=Close!,11=Send,12=Recv\n");
+    C2B_LOGS(" slot=13(Flush) detail=17(Detailed) map:1=Conn,5=Close!,11=Send,13=Flush,17=Detailed\n");
     for (t = 0; t < 720 && !done; t++) {   /* 720 x 0.5с = 6 мин максимум */
         void **vt97;
         i32 rc = -999, rcd = -999;
-        u8 ma[1024], md[1024];
+        u8 ma[1024], md[4096];   /* v8: md 4KB — Detailed слот 17 требует 1698B (run339 size-query) */
         u32 j, st;
         usleep(500000);
         if (!g_gns_conn_h || !g_gns_conn_iface) { done = 1; break; }
@@ -14445,11 +14476,15 @@ static void *c2b_g97_thread(void *arg)
              * строку. (Раньше тут стоял 13 = дубликат основного GCI-полла.) */
             g_probe_active = 1;
             if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                rcd = ((i32 (*)(void *, uptr, void *, uptr))vt97[14])(
+                /* v8: слот 17 = GetDetailedConnectionStatus (run339 walk:
+                 * size-query rc=1698; слот 14 = НЕ Detailed — rc-флип 1->0 на
+                 * живом конне = не-детейл-сигнатура). md = 4KB >= 1698 =>
+                 * rc=0 = ок + таблица = end-reason ВИДИМ. */
+                rcd = ((i32 (*)(void *, uptr, void *, uptr))vt97[17])(
                     g_gns_conn_iface, g_gns_conn_h, md, (uptr)sizeof md);
             } else {
                 g_probe_active = 0;
-                C2B_LOGS("[c2b] g97: GetDetailedConnectionStatus(14) SEGV\n");
+                C2B_LOGS("[c2b] g97: GetDetailedConnectionStatus(17) SEGV\n");
             }
             g_probe_active = 0;
             if (rcd == 0) {
@@ -14840,9 +14875,15 @@ static i32 c2b_g98_send_msg(u32 mtype, const u8 *body, u32 blen, u32 frm, u32 id
             C2B_LOGS("[c2b] g98: pre-send GCI SEGV\n");
             return -998;
         }
-        if (rchk == 1 && mchk[0] == 0 && mchk[1] == 0 && mchk[2] == 0 &&
-            mchk[3] == 0) {
-            C2B_LOGS("[c2b] g98: skip dead-h (GCI rc=1 st=0) msg #");
+        /* v8 (run339-урок): слот 13 = FLUSH, не GCI — rc=1 = k_ERResultOK =
+         * КОНН ЖИВ (буфер нетронут = НЕ 'st=0 dead'). run339: #1 отправлен
+         * rc=1 по слоту 11 при CONNECTING (Flush тогда != 1); при CONNECTED
+         * Flush = 1 ВСЕГДА => старый чек = ложный скип #1/#2/#0x63.
+         * Инверт: скип ТОЛЬКО на rc!=1 (мертвый хендл = Flush ошибка). */
+        if (rchk != 1) {
+            C2B_LOGS("[c2b] g98: skip dead-h (Flush13 rc=");
+            C2B_LOGN((u32)(i32)rchk);
+            C2B_LOGS(") msg #");
             C2B_LOGN(idx);
             C2B_LOGS("\n");
             return -996;

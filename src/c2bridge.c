@@ -7093,6 +7093,16 @@ static u32 g_k21_eng_h;
  * ретраит 'A' => scp => новый krel-шанс. C2B_K21WAIT=0 = старый фолбэк. */
 static u32 g_k21_wait = 1, g_k21_scan_cnt, g_k21_rearm;
 static u32 g_krel_raw;                   /* v24: 0 = стрип 17B хедера (A/B) */
+static u32 g_krel_sync;                  /* v25: 1 = инлайн (легаси), 0 = тред */
+/* v25: очередь поток-отправки — SendMessageToConnection из КОНТЕКСТА ДВИЖКА
+ * (g130/scp) = rc=1 (queued) НО НА ПРОВОД НЕ УХОДИТ (run362: 5x rc=1,
+ * ноль >100B OUT кадров на мостовой сессии за весь pcap); в run360 те же
+ * слоты с НАШЕГО g98-ТРЕДА = кадры 42/60B на проводе. Отправку делает
+ * g97-тред. SPSC: продюсер пишет буфер ДО release-стора pend; консюмер
+ * читает pend acquire => буфер; busy = продюсер не перезаписывает. */
+static u8 g_krel_pbuf[640];
+static u32 g_krel_plen;
+static volatile u32 g_krel_pend;
 static volatile u32 g_krel_dead;
 #endif
 
@@ -15109,6 +15119,66 @@ static void *c2b_g97_thread(void *arg)
                 C2B_LOGS("\n");
             }
         }
+        /* v25: ПОТОК-ОТПРАВКА krel (run362-урок: из контекста движка rc=1 но
+         * на провод не уходит; с нашего треда — уходит, run360 42/60B). */
+        if (__atomic_load_n(&g_krel_pend, __ATOMIC_ACQUIRE)) {
+            void **vt25;
+            u32 slot25;
+            i32 rc25 = -999;
+            i64 out25 = -1;
+            __atomic_store_n(&g_krel_pend, 0u, __ATOMIC_RELAXED);
+            vt25 = *(void ***)g_gns_conn_iface;
+            slot25 = (g_gns_conn_ver == 0) ? 11u : 10u;
+            g_probe_active = 1;
+            if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                rc25 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))
+                        vt25[slot25])(g_gns_conn_iface, g_gns_conn_h,
+                                      g_krel_pbuf, g_krel_plen, 1, &out25);
+                g_probe_active = 0;
+            } else {
+                g_probe_active = 0;
+                C2B_LOGS("[c2b] krel-ts: send SEGV\n");
+            }
+            C2B_LOGS("[c2b] krel-ts: 'k' thread-send len=");
+            C2B_LOGN(g_krel_plen);
+            C2B_LOGS(" tgt=");
+            C2B_LOGN((u32)g_gns_conn_h);
+            C2B_LOGS(" slot=");
+            C2B_LOGN(slot25);
+            C2B_LOGS(" rc=");
+            C2B_LOGN((u32)(i32)rc25);
+            C2B_LOGS("\n");
+            if (rc25 == 1) {
+                g_krel_ok++;
+            } else {
+                /* смерть целевого хэндла: стоп + detail (буфер-чек как v24b) */
+                i32 rcd25 = -999;
+                static u8 md25[4096];
+                u32 z25;
+                g_krel_dead = 1;
+                C2B_LOGS("[c2b] krel-ts: tgt dead, detail:\n");
+                for (z25 = 0; z25 < sizeof md25; z25++) md25[z25] = 0;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    rcd25 = ((i32 (*)(void *, uptr, void *, uptr))vt25[17])(
+                        g_gns_conn_iface, g_gns_conn_h, md25,
+                        (uptr)sizeof md25);
+                    g_probe_active = 0;
+                } else {
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] krel-ts: detail SEGV\n");
+                }
+                C2B_LOGS("[c2b] krel-ts: detail rc=");
+                C2B_LOGN((u32)rcd25);
+                for (z25 = 0; z25 < 0x40; z25++)
+                    if (md25[z25]) break;
+                if (z25 < 0x40) {
+                    C2B_LOGS("\n[c2b] krel-ts: detail-ascii:");
+                    c2b_g97_log_ascii(md25, 0x400);
+                }
+                C2B_LOGS("\n");
+            }
+        }
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -15360,6 +15430,8 @@ static void c2b_k19_relay(void)
         if (e && e[0] == '0') g_k21_wait = 0;
         e = getenv("C2B_KREL_RAW");
         if (e && e[0] == '1') g_krel_raw = 1;
+        e = getenv("C2B_KRELSYNC");
+        if (e && e[0] == '1') g_krel_sync = 1;
         g_krel_init = 1;
     }
     if (g_krel_dead) {
@@ -15444,6 +15516,22 @@ static void c2b_k19_relay(void)
     C2B_LOGN(live24);
     C2B_LOGS(" tgt=");
     C2B_LOGN((u32)hsend);
+    /* v25: НЕ слать из контекста движка — в очередь для g97-треда
+     * (run362-урок: инлайн rc=1 но на провод не уходит). Синку оставили
+     * через C2B_KRELSYNC=1. */
+    if (!g_krel_sync) {
+        u32 qn25;
+        if (__atomic_load_n(&g_krel_pend, __ATOMIC_ACQUIRE)) {
+            C2B_LOGS(" queued=busy\n");
+            return;
+        }
+        for (qn25 = 0; qn25 < kn; qn25++)
+            g_krel_pbuf[qn25] = kcopy[koff24 + qn25];
+        g_krel_plen = kn;
+        __atomic_store_n(&g_krel_pend, 1u, __ATOMIC_RELEASE);
+        C2B_LOGS(" queued=thread\n");
+        return;
+    }
     rc19 = -999;
     out19 = -1;
     g_probe_active = 1;

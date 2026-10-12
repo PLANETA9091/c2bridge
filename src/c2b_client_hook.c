@@ -51,6 +51,7 @@
 #include <stddef.h>
 
 typedef uint8_t  u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int32_t  i32;
 typedef uint64_t u64;
@@ -76,6 +77,11 @@ extern void *getenv(const char *);
 extern i32   getpid(void);
 extern int   memcmp(const void *, const void *, sz_t);
 extern i32   mprotect(void *, sz_t, i32);
+/* g113: pread64 = the explicit 64-bit-offset symbol (the i386 `pread`
+ * symbol = the 32-bit off_t variant = the 2GB cap = BELOW the 3GB VA
+ * split of the 32-bit core; pread64 = exported by the glibc on both
+ * the arches) */
+extern ssz_t pread64(i32, void *, sz_t, int64_t);
 
 #define O_RDONLY   0
 #define O_WRONLY   1
@@ -112,6 +118,9 @@ static const u8 SIGMA[16] = {
     'e', 'x', 'p', 'a', 'n', 'd', ' ', '3',
     '2', '-', 'b', 'y', 't', 'e', ' ', 'k'
 };
+
+/* the g113 forward decl (the thread = spawned from the watch fn below) */
+static void *c2b_g113_thread(void *arg);
 
 #define KEYS_PATH "/tmp/c2b_client_keys.log"
 #define KEY_CAP   24
@@ -483,6 +492,16 @@ static void *c2b_g110_watch(void *arg)
             klog_s("\n[c2b] g110: tramp30=");
             klog_x(g_tramp, 30);
             klog_s("\n");
+            /* g113: the AES-256-GCM key-schedule scan = the run321 verdict
+             * (the chacha = silent, the cipher = AES-GCM) — the flow-
+             * triggered heap scan = the keys = the decryptor --keys-from-log */
+            {
+                pthread_t t13;
+                if (pthread_create(&t13, 0, c2b_g113_thread, 0) == 0)
+                    pthread_detach(t13);
+                else
+                    klog_s("[c2b] g113: pthread_create FAILED\n");
+            }
         }
         return (void *)0;
     }
@@ -493,6 +512,268 @@ static void *c2b_g110_watch(void *arg)
 #if !defined(__x86_64__)
         klog_s("[c2b] g110: no steamclient.so in 2min (arch=" ARCH_TAG ")\n");
 #endif
+    }
+    return (void *)0;
+}
+
+/* ---------------- g113: the AES-256-GCM key-schedule scan ----------------
+ * THE RUN321 VERDICT (the first PASS!): the SDR session = REAL (the flow
+ * 10.1.0.243:42157 <-> 152.233.19.133:28022, the FULL handshake captured,
+ * 98 data packets) but the chacha = ZERO calls => the negotiated cipher =
+ * AES-256-GCM (the ciphers=2 = the original g100-era finding). The session
+ * keys = the EVP_AES_GCM_CTX = IN THE CLIENT's heap (the g100 lessons: the
+ * ctx = the tcmalloc arenas, the ks = 60 u32 inline). THE g100-PROVEN
+ * DETECTOR = the FIPS-197 schedule filter (the 96-bit: w[8]=w[0]^SubWord(
+ * RotWord(w[7]))^rcon10, w[9]=w[1]^w[8], w[10]=w[2]^w[9], both domains) =
+ * zero false positives on the heap. The hit = the keybe=<64hex> dump (the
+ * decryptor parse_g100_log = the format) + the ±512B window (the EVP
+ * iv[16] = the base-IV recovery offline). THE SCAN = FLOW-TRIGGERED: the
+ * /proc/net/udp must show the :6DC6 (28022) remote = the LIVE session —
+ * no session = no scan = the g111c melt-lesson honored (the duty cycle =
+ * ~0 while idle; the 20s cap/cycle x the 15s gap x 24 cycles = the ~8 min
+ * session window). The dedup = 8 distinct keys, the stop = 4+ (the both
+ * directions + a rekey). The same keys log = the single artifact file. */
+
+static u8 c2b_g113_sbox[256];
+static u32 c2b_g113_ready;
+static u8 c2b_g113_keys[8][32];
+static u32 c2b_g113_nkeys;
+
+static void c2b_g113_init(void)
+{
+    u8 alog[256], lg[256];
+    u16 i;
+    u8 v = 1;
+    for (i = 0; i < 255; i++) {
+        u8 lo;
+        alog[i] = v;
+        lg[v] = (u8)i;
+        lo = (u8)(v << 1);
+        if (v & 0x80) lo ^= 0x1b;
+        v = (u8)(lo ^ v);
+    }
+    for (i = 1; i < 256; i++) {
+        u8 s = alog[(u8)((u8)(255 - lg[i]) % 255)];
+        u8 b = s ^ (u8)((s << 1) | (s >> 7)) ^ (u8)((s << 2) | (s >> 6))
+             ^ (u8)((s << 3) | (s >> 5)) ^ (u8)((s << 4) | (s >> 4))
+             ^ 0x63;
+        c2b_g113_sbox[i] = b;
+    }
+    c2b_g113_sbox[0] = 0x63;
+    c2b_g113_ready = 1;
+}
+
+static u32 c2b_g113_subw(u32 x)
+{
+    return ((u32)c2b_g113_sbox[(x >> 24) & 0xff] << 24)
+         | ((u32)c2b_g113_sbox[(x >> 16) & 0xff] << 16)
+         | ((u32)c2b_g113_sbox[(x >> 8) & 0xff] << 8)
+         | (u32)c2b_g113_sbox[x & 0xff];
+}
+
+static void c2b_g113_hex(const u8 *p, u32 n)
+{
+    u32 i;
+    for (i = 0; i < n; i++) klog_x(p + i, 1);
+}
+
+/* 1 = the live SDR flow present (the udp table has the :6DC6 remote) */
+static i32 c2b_g113_flow(void)
+{
+    static char b[262144];
+    i32 fd, r, n = 0, off;
+    const char *paths[2] = { "/proc/net/udp", "/proc/net/udp6" };
+    u32 pi;
+    for (pi = 0; pi < 2; pi++) {
+        fd = open(paths[pi], O_RDONLY);
+        if (fd < 0) continue;
+        n = 0;
+        for (;;) {
+            r = (i32)read(fd, b + n, (i64)(sizeof(b) - 1 - (u64)n));
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i32)sizeof(b) - 1) break;
+        }
+        close(fd);
+        b[n] = 0;
+        for (off = 0; off + 5 <= n; off++)
+            if (b[off] == ':' && b[off+1] == '6' && b[off+2] == 'D' &&
+                b[off+3] == 'C' && b[off+4] == '6' &&
+                (b[off+5] == ' ' || b[off+5] == '\n'))
+                return 1;
+    }
+    return 0;
+}
+
+/* 0 = the deadline; the hit-dump = the keybe= + the ±512B window */
+static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
+                            i64 *ts, i64 cap)
+{
+    u64 off;
+    for (off = 512; off + 64 <= (u64)n; off += 4) {
+        const u32 *w = (const u32 *)(buf + off);
+        u32 t, s8, k;
+        i32 isle;
+        struct timespec now;
+        if (((*hits) & 7) == 0) {
+            clock_gettime(1, &now);
+            if ((i64)now.tv_sec * 1000000000ll + (i64)now.tv_nsec - *ts > cap)
+                return 1;
+        }
+        t = (w[7] << 8) | (w[7] >> 24);
+        s8 = c2b_g113_subw(t) ^ 0x01000000u;
+        if ((w[0] ^ s8) == w[8] && (w[1] ^ w[8]) == w[9] &&
+            (w[2] ^ w[9]) == w[10])
+            isle = 0;
+        else {
+            t = (w[7] >> 8) | (w[7] << 24);
+            s8 = c2b_g113_subw(t) ^ 0x00000001u;
+            if ((w[0] ^ s8) == w[8] && (w[1] ^ w[8]) == w[9] &&
+                (w[2] ^ w[9]) == w[10])
+                isle = 1;
+            else
+                continue;
+        }
+        /* the hit: the dedup vs the already-dumped keys */
+        {
+            u32 same = 0;
+            u32 z;
+            for (k = 0; k < c2b_g113_nkeys; k++) {
+                same = 1;
+                for (z = 0; z < 32; z++)
+                    if (c2b_g113_keys[k][z] != ((const u8 *)w)[z]) {
+                        same = 0; break;
+                    }
+                if (same) break;
+            }
+            if (same) { (*hits)++; continue; }
+        }
+        if (c2b_g113_nkeys < 8) {
+            for (k = 0; k < 32; k++)
+                c2b_g113_keys[c2b_g113_nkeys][k] = ((const u8 *)w)[k];
+            c2b_g113_nkeys++;
+        }
+        klog_s("[c2b] g113: aes256ks @");
+        klog_h((u32)(base + off));
+        klog_s(isle ? " le keybe=" : " be keybe=");
+        if (isle) {
+            c2b_g113_hex((const u8 *)w, 32);
+        } else {
+            u8 kb[32];
+            for (k = 0; k < 8; k++) {
+                kb[k*4+0] = (u8)(w[k] >> 24);
+                kb[k*4+1] = (u8)(w[k] >> 16);
+                kb[k*4+2] = (u8)(w[k] >> 8);
+                kb[k*4+3] = (u8)(w[k]);
+            }
+            c2b_g113_hex(kb, 32);
+        }
+        {
+            u64 s2 = off >= 512 ? off - 512 : 0;
+            u64 en = off + 512;
+            if (en > (u64)n) en = n;
+            klog_s(" win=");
+            c2b_g113_hex(buf + s2, (u32)(en - s2));
+            klog_s("\n");
+        }
+        (*hits)++;
+        if (*hits >= 32 || c2b_g113_nkeys >= 8) return 1;
+    }
+    return 0;
+}
+
+static void *c2b_g113_thread(void *arg)
+{
+    static char mp[262144];
+    static u8 seg[1 << 20];
+    u32 cyc;
+    (void)arg;
+    {
+        const char *e = (const char *)getenv("C2B_G113");
+        if (e && e[0] == '0') return (void *)0;
+    }
+    if (!c2b_g113_ready) c2b_g113_init();
+    for (cyc = 0; cyc < 24; cyc++) {
+        struct timespec ts = { 15, 0 };
+        u32 hits = 0;
+        i64 t0, cap = 20 * 1000000000ll;
+        i32 fdm, stop = 0;
+        char *p, *e2;
+        i64 n = 0;
+        struct timespec now;
+
+        nanosleep(&ts, 0);
+        if (!c2b_g113_flow()) continue;
+        klog_s("[c2b] g113: flow :6DC6 present, scan cycle\n");
+        if (!c2b_g113_ready) c2b_g113_init();
+        fdm = open("/proc/self/maps", O_RDONLY);
+        if (fdm < 0) continue;
+        for (;;) {
+            i32 r = (i32)read(fdm, mp + n, (i64)sizeof(mp) - 1 - n);
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i64)sizeof(mp) - 1) break;
+        }
+        close(fdm);
+        if (n <= 0) continue;
+        mp[n] = 0;
+        fdm = open("/proc/self/mem", O_RDONLY);
+        if (fdm < 0) continue;
+        clock_gettime(1, &now);
+        t0 = (i64)now.tv_sec * 1000000000ll + (i64)now.tv_nsec;
+        p = mp;
+        e2 = mp + n;
+        while (p < e2 && !stop) {
+            uptr lo = 0, hi = 0;
+            i32 wr = 0, c, mfd;
+            while (p < e2 && *p == '\n') p++;
+            if (p >= e2) break;
+            while (p < e2 && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    lo = (lo << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != '-') break;
+            p++;
+            while (p < e2 && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    hi = (hi << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != ' ') break;
+            p++;
+            if (p < e2 && *p == 'r') p++;
+            if (p < e2 && *p == 'w') { wr = 1; p++; }
+            else if (p < e2 && *p == '-') p++;
+            while (p < e2 && *p != '\n') p++;
+            if (!wr || hi <= lo || (hi - lo) < 4096) continue;
+            if ((hi - lo) > (1ull << 30)) continue;   /* the guard */
+            mfd = fdm;
+            {
+                u64 pos = lo;
+                while (pos < hi && !stop) {
+                    u64 want = (hi - pos) > sizeof(seg) ? sizeof(seg) : (hi - pos);
+                    i64 r = pread64(mfd, seg, want, (int64_t)pos);
+                    if (r <= 0) break;
+                    stop = c2b_g113_scanbuf(seg, (u32)r, (uptr)pos,
+                                            &hits, &t0, cap);
+                    pos += (u64)r;
+                }
+            }
+        }
+        close(fdm);
+        klog_s("[c2b] g113: cycle done hits=");
+        klog_h(hits);
+        klog_s(" keys=");
+        klog_h(c2b_g113_nkeys);
+        klog_s("\n");
+        if (c2b_g113_nkeys >= 4) break;
     }
     return (void *)0;
 }

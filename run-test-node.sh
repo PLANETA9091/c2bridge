@@ -93,6 +93,12 @@ finish() { # $1 exit code, $2 verdict
     log "A2S relay torn down (DNAT removed)"
   fi
   for f in "$NODE_HOME/tmp"/c2b-*.log; do [[ -f "$f" ]] && cp -f "$f" "$RUNDIR/"; done 2>/dev/null
+  # g110: the client-side chacha keys (the hook .so /tmp append log) + the
+  # client's stdout (the hook banner = the proof of WHICH process = hooked)
+  sudo -n cp -f /tmp/c2b_client_keys.log "$RUNDIR/client_keys.txt" 2>/dev/null \
+    || cp -f /tmp/c2b_client_keys.log "$RUNDIR/client_keys.txt" 2>/dev/null || true
+  [[ -f "$NODE_HOME/tmp/steam-start.log" ]] && cp -f "$NODE_HOME/tmp/steam-start.log" "$RUNDIR/" 2>/dev/null || true
+  [[ -f "$NODE_HOME/tmp/steam-restart.log" ]] && cp -f "$NODE_HOME/tmp/steam-restart.log" "$RUNDIR/" 2>/dev/null || true
   # 41f: tcpdump teardown + summary (топ-разговоров по каждому pcap)
   sudo -n pkill -f "tcpdump -i any" 2>/dev/null || true
   for p in "$RUNDIR"/pcap.a*.pcap; do
@@ -258,6 +264,23 @@ sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -model pc105 -layout us 2>/dev
 
 # ---------- 2b. steam client (auth) ----------
 STEAM_SH="${C2B_STEAM_SH:-$GAME_HOME/.local/share/Steam/steam.sh}"
+# g110: CLIENT-SIDE SDR-crypto hook — the chacha ctr32 capture in the
+# client's steamclient.so (the :57343 relay endpoint = the crypto holder,
+# the g109b census verdict). The hook .so = built in the workflow (-m32
+# + -m64; the wrong-arch .so = skipped by the loader). The preload = into
+# the steam chain ONLY (the game = preloaded separately at the game start).
+# The warm client = NOT preloaded (the hook fires on harness-started ones).
+C2B_CLIENT_PRELOAD=""
+if [[ "${C2B_G110:-1}" != "0" ]]; then
+  [[ -f "$BRIDGE_DIR/c2b_client_hook.so" ]] && C2B_CLIENT_PRELOAD="$BRIDGE_DIR/c2b_client_hook.so"
+  if [[ -f "$BRIDGE_DIR/c2b_client_hook64.so" ]]; then
+    C2B_CLIENT_PRELOAD="${C2B_CLIENT_PRELOAD:+$C2B_CLIENT_PRELOAD:}$BRIDGE_DIR/c2b_client_hook64.so"
+  fi
+fi
+export C2B_CLIENT_PRELOAD
+[[ -n "$C2B_CLIENT_PRELOAD" ]] \
+  && log "g110 client hook preload: $C2B_CLIENT_PRELOAD" \
+  || log "g110 client hook: NOT PRESENT (build failed or C2B_G110=0)"
 steam_client_alive() {
   pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1 \
     && [[ -e "$GAME_HOME/.steam/steam.pipe" ]]
@@ -270,7 +293,7 @@ if ! steam_client_alive; then
   fi
   if ! steam_client_alive; then
     log "starting steam client (silent)"
-    sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
+    sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" LD_PRELOAD="$C2B_CLIENT_PRELOAD" \
       sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-start.log' 2>&1 &"
     # g34v2-урок (run179): 'Cannot create IPv4 connection. epoll_ctl failed,
     # error 0x9' — fd-бюджет движка исчерпан (дефолт 1024): socket() -> EMFILE
@@ -348,7 +371,7 @@ if ! steam_client_stable; then
   pkill -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
   sleep 3; pkill -9 -u "$GAME_USER" -f "ubuntu12_32/stea[m]" 2>/dev/null
   rm -f "$GAME_HOME/.steam/steam.pipe" 2>/dev/null
-  sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
+  sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" LD_PRELOAD="$C2B_CLIENT_PRELOAD" \
     sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-restart.log' 2>&1 &"
   W=0
   until steam_client_stable; do
@@ -357,6 +380,17 @@ if ! steam_client_stable; then
   done
   log "steam stability wait done (~${W}s)"
 fi
+# g110: FLAKE-PROOF relay anchor — the :dfff (:57343) listener = probed at
+# the client-ready +45s +90s, BEFORE/INDEPENDENT of the game loop (the
+# marker-only probe = blind to the env-flakes: runs 308/309 = never armed;
+# the listener = alive from the client's start = the shots = the owner-pid
+# evidence regardless of the game's fate).
+( for i in 1 2 3; do
+    echo "=== shot$i t=$SECONDS ==="
+    sudo -n ss -upan 2>/dev/null | grep -a ":dfff "
+    (( i < 3 )) && sleep 45
+  done ) > "$RUNDIR/relay57343_owner_early.txt" 2>/dev/null &
+log "g110 early relay anchor armed (3 shots x45s): $(grep -ac . "$RUNDIR/relay57343_owner_early.txt" 2>/dev/null || echo 0) lines so far"
 # 41e-l/A2S_VER: версия бандла (нужна И релею, И шиму, И мосту) — до их блоков
 A2S_VER="1.38.0.4"
 STEAM_INF=$(find "$GAME_DIR" -name steam.inf 2>/dev/null | head -1)

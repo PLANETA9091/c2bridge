@@ -1,0 +1,432 @@
+/* c2b_client_hook.c — g110: THE CLIENT-SIDE SDR-CRYPTO HOOK (LD_PRELOAD
+ * into the steam client chain, NOT the game).
+ *
+ * WHY (the worklog g109b verdict, run308/309): the game's SDR datagrams =
+ * ALL to the loopback relay 127.0.0.1:57343 (0xdfff), ZERO direct :28022
+ * sends => the real SDR endpoint (the crypto + the socket) = the :57343
+ * receiver = THE STEAM CLIENT (the 32-bit ubuntu12_32/steam core; the
+ * engine = imports-only, cb0ca8 = the hooked-zero, sdk64 = never mapped
+ * in the pipe-mode runs). The client's SNS = statically linked into its
+ * steamclient.so => the game-side preload can NOT see it; THIS .so =
+ * preloaded into the CLIENT (the harness = the client's starter).
+ *
+ * WHAT: one patch site = ChaCha20_ctr32 (the chokepoint: every path —
+ * the EVP do_cipher chain AND the direct CCrypto calls — converges into
+ * it; the g104 verdict = the EVP-init hook = zero calls = the EVP = NOT
+ * the entry, the ctr32 = the funnel). The capture = the (key, ictx)
+ * pairs deduped by the key + the call profile. The session keys = the
+ * g100-decryptor input (the 0x83-decrypt pipeline = complete except the
+ * key extraction — THIS = the extraction).
+ *
+ * SITES (the offline RE = the run264 bins, the local prologue scan
+ * scripts/g110_prologue_scan.py, the PT_LOAD-corrected vaddrs):
+ *   -m32 steamclient.so__00a027 (the client's core lib):
+ *        ctr32 @0x2404b80, pro16 = 55 53 56 57 31 c0 3b 44 24 1c 0f 84 ba 04 00 00
+ *        (push ebp/ebx/esi/edi; xor eax,eax; cmp eax,[esp+0x1c]; je rel32
+ *        = the 5-stack-args (out,in,len,key,ictx) cdecl signature: the
+ *        key = [esp+0x10], the ictx = [esp+0x14] AT THE ENTRY)
+ *        version check: sigma 'expand 32-byte k' @0x2405a60
+ *   -m64 steamclient.so__d975c5 (steam/linux64 — the insurance variant):
+ *        ssse3-chain site @0x206bc74, pro16 = 41 54 41 55 41 56 41 57 48 83 ec 58 f3 0f 6f 09
+ *        + the marker f3 0f 6f 51 10 @+0x10 (the g105-exact pattern)
+ *        (rdi=out rsi=in rdx=len RCX=KEY R8=ICTX, r9 = the ra slot)
+ *        version check: sigma @0x206bbc0
+ * The base = the LOWEST mapped start among the 'steamclient.so' maps
+ * lines (the runtime patch = base + the vaddr).
+ *
+ * SAFETY: the watcher thread = polls the maps (500ms, 10 min cap); the
+ * patch = only on the EXACT pro16+sigma match (the version drift = the
+ * skip + the log); the capture = the bounded reads, no malloc, the raw
+ * write(2) + the /tmp append; the caps = 24 keys / 32 call-lines. The
+ * wrong-arch .so in LD_PRELOAD = the loader skips it (the warning only).
+ * Killswitch: C2B_G110=0. Log: stderr + /tmp/c2b_client_keys.log.
+ *
+ * Build (the workflow, BOTH):
+ *   gcc -m32 -O2 -shared -fPIC -o c2b_client_hook.so   src/c2b_client_hook.c -lpthread
+ *   gcc -m64 -O2 -shared -fPIC -o c2b_client_hook64.so src/c2b_client_hook.c -lpthread */
+
+#include <pthread.h>
+#include <time.h>
+#include <stdint.h>
+#include <stddef.h>
+
+typedef uint8_t  u8;
+typedef uint32_t u32;
+typedef int32_t  i32;
+typedef uint64_t u64;
+typedef int64_t  i64;
+typedef uintptr_t uptr;
+/* the ABI-sized types: ssize_t/size_t = 4B on the i386, 8B on the x86-64 */
+#if defined(__x86_64__)
+typedef i64 ssz_t;
+typedef u64 sz_t;
+#else
+typedef i32 ssz_t;
+typedef u32 sz_t;
+#endif
+
+/* the raw libc decls (the g105 style: no stdio in the hot path; the
+ * read/write/close = NOT visible without unistd.h = the raw externs =
+ * the glibc-compatible ABI-exact signatures) */
+extern i32   open(const char *, i32, ...);
+extern i32   close(i32);
+extern ssz_t read(i32, void *, sz_t);
+extern ssz_t write(i32, const void *, sz_t);
+extern void *getenv(const char *);
+extern i32   getpid(void);
+extern int   memcmp(const void *, const void *, sz_t);
+extern i32   mprotect(void *, sz_t, i32);
+
+#define O_RDONLY   0
+#define O_WRONLY   1
+#define O_CREAT    0100
+#define O_APPEND   02000
+#define PROT_READ  1
+#define PROT_WRITE 2
+#define PROT_EXEC  4
+
+/* the arch-specific site table */
+#if defined(__x86_64__)
+#define ARCH_TAG   "64"
+#define SITE_OFF   0x206bc74u
+#define SIGMA_OFF  0x206bbc0u
+#define MARKER_ON  1
+static const u8 PRO16[16] = {
+    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    0x48, 0x83, 0xec, 0x58, 0xf3, 0x0f, 0x6f, 0x09
+};
+static const u8 MARKER[5] = { 0xf3, 0x0f, 0x6f, 0x51, 0x10 };
+#else   /* the i386 */
+#define ARCH_TAG   "32"
+#define SITE_OFF   0x2404b80u
+#define SIGMA_OFF  0x2405a60u
+#define MARKER_ON  0
+static const u8 PRO16[16] = {
+    0x55, 0x53, 0x56, 0x57, 0x31, 0xc0, 0x3b, 0x44,
+    0x24, 0x1c, 0x0f, 0x84, 0xba, 0x04, 0x00, 0x00
+};
+static const u8 MARKER[5] = { 0 };
+#endif
+
+static const u8 SIGMA[16] = {
+    'e', 'x', 'p', 'a', 'n', 'd', ' ', '3',
+    '2', '-', 'b', 'y', 't', 'e', ' ', 'k'
+};
+
+#define KEYS_PATH "/tmp/c2b_client_keys.log"
+#define KEY_CAP   24
+#define CALL_CAP  32
+
+static u8   g_tramp[64] __attribute__((aligned(16)));
+static u8   g_key0[32];
+static u32  g_keys;      /* the distinct keys logged */
+static u32  g_calls;     /* the total calls seen */
+static u32  g_calllog;   /* the call-profile lines logged */
+static i32  g_patched;
+static i32  g_keysfd = -1;
+
+/* the log helper: the raw writes to the stderr + the /tmp append (the
+ * O_APPEND write = atomic-enough for the <512B lines) */
+static void klog(const char *s, u32 n)
+{
+    write(2, s, n);
+    if (g_keysfd < 0)
+        g_keysfd = open(KEYS_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (g_keysfd >= 0)
+        write(g_keysfd, s, n);
+}
+
+static void klog_s(const char *s) { u32 n = 0; while (s[n]) n++; klog(s, n); }
+
+static void klog_h(u32 v)
+{
+    static const char hx[] = "0123456789abcdef";
+    char b[8];
+    i32 i;
+    for (i = 0; i < 8; i++) b[i] = hx[(v >> (28 - 4 * i)) & 0xF];
+    klog(b, 8);
+}
+
+static void klog_x(const u8 *p, u32 n)
+{
+    static const char hx[] = "0123456789abcdef";
+    char b[128];
+    u32 i;
+    if (n > 64) n = 64;
+    for (i = 0; i < n; i++) {
+        b[2 * i]     = hx[p[i] >> 4];
+        b[2 * i + 1] = hx[p[i] & 0xF];
+    }
+    klog(b, 2 * n);
+}
+
+/* the shared capture: the dedup by the key, the caps, the log line =
+ * [c2b] g110: KEYn len=N key=<64hex> ictx=<32hex> */
+static void c2b_g110_capture(u64 len, const void *key, const void *ictx)
+{
+    u32 n = __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELAXED);
+    u32 z;
+
+    if (g_calllog < CALL_CAP) {
+        u32 idx = __atomic_add_fetch(&g_calllog, 1, __ATOMIC_RELAXED);
+        klog_s("[c2b] g110: call#");
+        klog_h(idx);
+        klog_s(" len=");
+        klog_h((u32)len);
+        klog_s("\n");
+    }
+    (void)n;
+    if (!key || g_keys >= KEY_CAP) return;
+    {
+        u32 same = 0;
+        u32 first;
+        for (z = 0; z < 32; z++)
+            same |= (u32)(g_key0[z] ^ ((const u8 *)key)[z]);
+        first = __atomic_load_n(&g_keys, __ATOMIC_RELAXED);
+        if (!same && first) return;              /* the dedupe */
+        /* the new distinct key (or the first ever) */
+        {
+            u32 idx = __atomic_add_fetch(&g_keys, 1, __ATOMIC_RELAXED);
+            klog_s("[c2b] g110: KEY");
+            klog_h(idx);
+            klog_s(" len=");
+            klog_h((u32)len);
+            klog_s(" key=");
+            klog_x((const u8 *)key, 32);
+            klog_s(" ictx=");
+            klog_x((const u8 *)ictx, ictx ? 16 : 0);
+            klog_s("\n");
+            for (z = 0; z < 32; z++) g_key0[z] = ((const u8 *)key)[z];
+        }
+    }
+}
+
+/* ---------------- the capture detours ---------------- */
+
+#if defined(__x86_64__)
+/* the g105 style: the asm stub passes the orig retaddr via r9 */
+extern void c2b_g110_stub(void);
+__asm__(
+    ".text\n"
+    ".globl c2b_g110_stub\n"
+    ".type c2b_g110_stub, @function\n"
+    "c2b_g110_stub:\n"
+    "  movq (%rsp), %r9\n"
+    "  jmp  c2b_g110_detour_c\n"
+);
+static void c2b_g110_detour_c(const void *out, const void *in, u64 len,
+                              const void *key, const void *ictx, void *ra)
+    __attribute__((used));
+static void c2b_g110_detour_c(const void *out, const void *in, u64 len,
+                              const void *key, const void *ictx, void *ra)
+{
+    void (*tramp)(const void *, const void *, u64, const void *,
+                  const void *) = (void (*)(const void *, const void *,
+                  u64, const void *, const void *))g_tramp;
+    (void)out; (void)in; (void)ra;
+    c2b_g110_capture(len, key, ictx);
+    if (g_tramp[16] == 0xe9)
+        tramp(out, in, len, key, ictx);
+}
+
+#else   /* the i386: the cdecl detour = the SAME stack layout as ctr32 */
+static void c2b_g110_detour_c(const void *out, const void *in, u32 len,
+                              const void *key, const void *ictx);
+static void c2b_g110_detour_c(const void *out, const void *in, u32 len,
+                              const void *key, const void *ictx)
+{
+    void (*tramp)(const void *, const void *, u32, const void *,
+                  const void *) = (void (*)(const void *, const void *,
+                  u32, const void *, const void *))g_tramp;
+    (void)out; (void)in;
+    c2b_g110_capture((u64)len, key, ictx);
+    if (g_tramp[16] == 0xe9)
+        tramp(out, in, len, key, ictx);
+}
+#endif
+
+/* ---------------- the watcher / patcher ---------------- */
+
+static void *c2b_g110_watch(void *arg)
+{
+    static char mp[262144];
+    int  round;
+    (void)arg;
+
+    for (round = 0; round < 1200 && !g_patched; round++) {
+        i32 fdm = open("/proc/self/maps", O_RDONLY);
+        ssz_t n = 0;
+        char *p, *e2;
+        uptr liblo = 0;
+        char pb[512];
+        u32 pl, ps;
+
+        if (fdm < 0) return (void *)0;
+        for (;;) {
+            ssz_t r = read(fdm, mp + n, (sz_t)sizeof(mp) - 1 - (sz_t)n);
+            if (r <= 0) break;
+            n += r;
+            if (n >= (i64)sizeof(mp) - 1) break;
+        }
+        close(fdm);
+        if (n <= 0) return (void *)0;
+        mp[n] = 0;
+
+        /* the scan: the LOWEST start among the steamclient.so lines */
+        p = mp; e2 = mp + n;
+        while (p < e2) {
+            uptr a = 0, b = 0;
+            i32 c;
+            while (p < e2 && *p == '\n') p++;
+            if (p >= e2) break;
+            while (p < e2 && *p != '-') {
+                c = *p;
+                if (c >= '0' && c <= '9') a = (a << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    a = (a << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != '-') break;
+            p++;
+            while (p < e2 && *p != ' ') {
+                c = *p;
+                if (c >= '0' && c <= '9') b = (b << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    b = (b << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                p++;
+            }
+            if (p >= e2 || *p != ' ') break;
+            p++;
+            pl = 0;
+            while (p < e2 && *p != '\n') {
+                if (pl < sizeof(pb) - 1) pb[pl++] = *p;
+                p++;
+            }
+            pb[pl] = 0;
+            if (p < e2) p++;
+            if (b <= a || pl < 26) continue;
+            for (ps = 0; ps + 25 < pl; ps++) {
+                if (pb[ps] == 's' && pb[ps + 1] == 't' &&
+                    pb[ps + 2] == 'e' && pb[ps + 3] == 'a' &&
+                    pb[ps + 4] == 'm' && pb[ps + 5] == 'c' &&
+                    pb[ps + 6] == 'l' && pb[ps + 7] == 'i' &&
+                    pb[ps + 8] == 'e' && pb[ps + 9] == 'n' &&
+                    pb[ps + 10] == 't' && pb[ps + 11] == '.' &&
+                    pb[ps + 12] == 's' && pb[ps + 13] == 'o') {
+                    if (!liblo || a < liblo) liblo = a;
+                    break;
+                }
+            }
+        }
+        if (!liblo) {
+            /* the steamclient.so = not mapped yet — the retry */
+            struct timespec ts = { 0, 500000000 };
+            nanosleep(&ts, 0);
+            continue;
+        }
+
+        /* the found: the version check + the patch (once) */
+        {
+            u8 *tgt = (u8 *)(liblo + SITE_OFF);
+            u8 *sig = (u8 *)(liblo + SIGMA_OFF);
+            u32 k;
+            i32 ok = 1;
+
+            if (memcmp(sig, SIGMA, 16) != 0) {
+                klog_s("[c2b] g110: sigma MISMATCH @+");
+                klog_h(SIGMA_OFF);
+                klog_s(" lib=");
+                klog_h((u32)liblo);
+                klog_s(" have=");
+                klog_x(sig, 16);
+                klog_s("\n");
+                return (void *)0;   /* the version drift = NO patch */
+            }
+            for (k = 0; k < 16; k++)
+                if (tgt[k] != PRO16[k]) { ok = 0; break; }
+            if (ok && MARKER_ON)
+                for (k = 0; k < 5; k++)
+                    if (tgt[0x10 + k] != MARKER[k]) { ok = 0; break; }
+            if (!ok) {
+                klog_s("[c2b] g110: prologue MISMATCH @+");
+                klog_h(SITE_OFF);
+                klog_s(" have=");
+                klog_x(tgt, 16);
+                klog_s("\n");
+                return (void *)0;
+            }
+            if (tgt[0] == 0xe9 || tgt[0] == 0xff) {
+                klog_s("[c2b] g110: already patched\n");
+                g_patched = 1;
+                return (void *)0;
+            }
+
+            /* the trampoline: the saved pro16 + the jmp back (entry+16) */
+            {
+                u8 *tp = g_tramp;
+                i32 rel = (i32)((uptr)(tgt + 16) - ((uptr)tp + 21));
+                for (k = 0; k < 16; k++) tp[k] = tgt[k];
+                tp[16] = 0xe9;
+                tp[17] = (u8)rel;
+                tp[18] = (u8)(rel >> 8);
+                tp[19] = (u8)(rel >> 16);
+                tp[20] = (u8)(rel >> 24);
+                if (mprotect((void *)tp, 4096,
+                             PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                    klog_s("[c2b] g110: tramp mprotect fail\n");
+                    return (void *)0;
+                }
+            }
+            /* the entry patch: e9 rel32 (to the stub) + the nop pad = 16B */
+            if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
+                         PROT_READ | PROT_WRITE) != 0) {
+                klog_s("[c2b] g110: mprotect fail\n");
+                return (void *)0;
+            }
+            {
+                i32 rel;
+#if defined(__x86_64__)
+                uptr dst = (uptr)&c2b_g110_stub;
+#else
+                uptr dst = (uptr)&c2b_g110_detour_c;
+#endif
+                rel = (i32)(dst - (uptr)tgt);
+                tgt[0] = 0xe9;
+                tgt[1] = (u8)rel;
+                tgt[2] = (u8)(rel >> 8);
+                tgt[3] = (u8)(rel >> 16);
+                tgt[4] = (u8)(rel >> 24);
+                for (k = 5; k < 16; k++) tgt[k] = 0x90;
+            }
+            if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
+                         PROT_READ | PROT_EXEC) != 0) {
+                klog_s("[c2b] g110: mprotect RX fail\n");
+            }
+            g_patched = 1;
+            klog_s("[c2b] g110: PATCHED arch=" ARCH_TAG " base=");
+            klog_h((u32)liblo);
+            klog_s(" site=+");
+            klog_h(SITE_OFF);
+            klog_s(" pid=");
+            klog_h((u32)getpid());
+            klog_s("\n");
+        }
+        return (void *)0;
+    }
+    if (!g_patched)
+        klog_s("[c2b] g110: steamclient.so never mapped (10min cap)\n");
+    return (void *)0;
+}
+
+__attribute__((constructor)) static void c2b_g110_init(void)
+{
+    const char *e = (const char *)getenv("C2B_G110");
+    pthread_t t;
+
+    if (e && e[0] == '0') return;
+    klog_s("[c2b] g110: hook loaded arch=" ARCH_TAG "\n");
+    if (pthread_create(&t, 0, c2b_g110_watch, 0) == 0)
+        pthread_detach(t);
+}

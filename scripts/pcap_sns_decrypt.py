@@ -187,23 +187,31 @@ def read_pcap(path):
 
 
 def game_flow(pkts):
-    """Pick the flow carrying the actual SNS connection (has 0x22 ConnectReq)."""
+    """Pick the flow carrying the actual SNS connection. The rank =
+    (the DATA 0x8x packets, the handshake 0x22/0x23 msgs) desc — the
+    run324 lesson: the pcap = MULTIPLE :28022 sessions (the aborted
+    :37343 + the live :55574); the aborted = the handshake-heavy
+    (the full challenge cycles) and won the (0x22/0x23, msgs) rank,
+    while the REAL session = the data-heavy = 0 oracle packets = the
+    decrypt silently skipped."""
     flows = {}
     for ts, pay, src, sp, dst, dp in pkts:
         if not pay:
             continue
         t = pay[0]
+        key = tuple(sorted([(src, sp), (dst, dp)]))
+        f = flows.setdefault(key, [0, 0, 0])
         if t in (ID_CONNECT_REQUEST, ID_CONNECT_OK, ID_CHALLENGE_REQUEST,
                  ID_CHALLENGE_REPLY):
-            key = tuple(sorted([(src, sp), (dst, dp)]))
-            flows.setdefault(key, [0, 0])
-            flows[key][0] += 1
+            f[1] += 1
             if t in (ID_CONNECT_REQUEST, ID_CONNECT_OK):
-                flows[key][1] += 1
+                f[2] += 1
+        if t & 0xF8 == 0x80 or (t & FLAG_DATA):
+            f[0] += 1
     if not flows:
         return None
-    # the flow with the real handshake (0x22/0x23) wins; else the most msgs
-    best = max(flows, key=lambda k: (flows[k][1], flows[k][0]))
+    # the data-carrying flow wins; the handshake-only flow = the fallback
+    best = max(flows, key=lambda k: (flows[k][0], flows[k][2], flows[k][1]))
     return best
 
 

@@ -328,11 +328,15 @@ if [[ -n "$C2B_CLIENT_PRELOAD" && "${C2B_G110_NORESTART:-0}" != "1" ]] \
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" LD_PRELOAD="$C2B_CLIENT_PRELOAD" \
     sh -c "ulimit -n 65535 2>/dev/null; nohup '$STEAM_SH' -silent >'$TMPD/steam-hookstart.log' 2>&1 &"
   W=0
-  until steam_client_alive; do
-    W=$((W+5)); (( W >= 240 )) && { log "WARNING: g110 hooked client not ready after ${W}s"; break; }
+  # g111 (run317 lesson): the cold client = the 2-4 min boot; the pipe-FILE
+  # = created early but the pipe = NOT SERVING until the full init => the
+  # game = 'FATAL ERROR: Failed to connect with local Steam Client process!'
+  # at +5s (the clean FINI). The wait = the pipe CONNECTABLE (not the file).
+  until steam_client_alive && pipe_connect_ok; do
+    W=$((W+5)); (( W >= 360 )) && { log "WARNING: g110 hooked client not serving pipe after ${W}s"; break; }
     sleep 5
   done
-  log "g110 hooked client ready (~${W}s)"
+  log "g110 hooked client ready + pipe ok (~${W}s)"
 fi
 # A client left over from a CI bootstrap step may be mid-self-update: the pipe
 # file flaps and the engine's SteamAPI_Init dies with "create pipe failed"
@@ -746,7 +750,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     until pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \
           && pipe_connect_ok && client_logged_in; do
       (( WK += 1 ))
-      (( WK >= 24 )) && { log "attempt $ATTEMPT: WARNING: client/pipe not ready after $((WK*5))s (launching anyway)"; break; }
+      (( WK >= 48 )) && { log "attempt $ATTEMPT: WARNING: client/pipe not ready after $((WK*5))s (launching anyway)"; break; }
       sleep 5
     done
     pgrep -u "$GAME_USER" -f 'ubuntu12_32/stea[m]' >/dev/null 2>&1 \

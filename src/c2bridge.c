@@ -13646,7 +13646,12 @@ static void c2b_g109_census(i32 fd, u32 len, const void *addr, const u8 *pl)
     static i32 on = -1;
     if (on < 0) {
         const char *e = getenv("C2B_G109");
-        on = !(e && e[0] == '0');
+        /* g111 (run317 bisect): C2B_G109=0 = ZERO 'SEGV foreign' (the runs
+         * 308-312 = the deterministic bridge+0x10400 crash, addr = past the
+         * cb0ca8 mapping end) => the census = THE crash cause => the OPT-IN
+         * default (the off unless C2B_G109=1). The SDR-sender verdict =
+         * delivered (the g109b-era); the re-enable = the env only. */
+        on = (e && e[0] == '1');
     }
     if (!on) return;
     if (!p || !len || len > 65536) return;

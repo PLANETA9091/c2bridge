@@ -11899,25 +11899,44 @@ static i32 c2b_g71_dumpmsg(void *mp); /* fwd (тело ниже, g71b) */
 static void c2b_g15_note(uptr ra, const char *tag); /* fwd (тело в interposes) */
 static i32 c2b_g81_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
 {
-    i32 rc;
+    /* v20: ВСЁ тело (ориг + дампы) под SEGV-гардой (g_probe_jb TLS).
+     * Run356-a3: смерть процесса в окне slot-12-вызова на golden-moment
+     * ('B'-accept -> LOADINGSCREEN, последний лог = R12-note). Фолт на
+     * умирающем конне = деградация rc=0, процесс ЖИВЕТ. */
+    static volatile u32 g81_faults;
+    i32 rc = 0;
     c2b_g15_note((uptr)__builtin_return_address(0), "R12 ");
-    rc = ((i32 (*)(void *, uptr, void **, i32))g_clp_orig_recv13)(
-        self, connH, pMsgs, nMax);
-    if (rc != 0) {
-        C2B_LOGS("[c2b] g82 recv12 rc="); C2B_LOGN((u32)rc);
-        C2B_LOGS(" conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
-        C2B_LOGS("\n");
-    }
-    if (rc > 0 && pMsgs) {
-        i32 k81;
-        for (k81 = 0; k81 < rc && k81 < 8; k81++) {
-            if (!pMsgs[k81]) continue;
-            g_gns_rxdet_n++;
-            C2B_LOGS("[c2b] g81 rx#"); C2B_LOGN(g_gns_rxdet_n);
+    if (!g_clp_orig_recv13) return 0;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc = ((i32 (*)(void *, uptr, void **, i32))g_clp_orig_recv13)(
+            self, connH, pMsgs, nMax);
+        if (rc != 0) {
+            C2B_LOGS("[c2b] g82 recv12 rc="); C2B_LOGN((u32)rc);
             C2B_LOGS(" conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
             C2B_LOGS("\n");
-            (void)c2b_g71_dumpmsg(pMsgs[k81]);
         }
+        if (rc > 0 && pMsgs) {
+            i32 k81;
+            for (k81 = 0; k81 < rc && k81 < 8; k81++) {
+                if (!pMsgs[k81]) continue;
+                g_gns_rxdet_n++;
+                C2B_LOGS("[c2b] g81 rx#"); C2B_LOGN(g_gns_rxdet_n);
+                C2B_LOGS(" conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
+                C2B_LOGS("\n");
+                (void)c2b_g71_dumpmsg(pMsgs[k81]);
+            }
+        }
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        if (g81_faults < 3) {
+            g81_faults++;
+            C2B_LOGS("[c2b] g81: FAULT recv12 orig/dump (degraded rc=0) n=");
+            C2B_LOGN(g81_faults);
+            C2B_LOGS("\n");
+        }
+        rc = 0;
     }
     return rc;
 }
@@ -11936,37 +11955,53 @@ static void *g82w_orig[2];
 static u32 g82w_n0, g82w_npos, g82w_neg;
 static i32 c2b_g82w_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
 {
+    /* v20: ориг + дампы под SEGV-гардой (g81-класс, run356-a3 урок:
+     * recv-пуллы на умирающем конне = окно смерти процесса). */
+    static volatile u32 g82w_faults;
     void **vt = *(void ***)self;
-    i32 idx = -1, rc, k82;
+    i32 idx = -1, rc = 0, k82;
     if (g82w_vt_seen[0] == (void *)vt) idx = 0;
     else if (g82w_vt_seen[1] == (void *)vt) idx = 1;
     if (idx < 0 || !g82w_orig[idx]) return -997;   /* не наш класс */
-    rc = ((i32 (*)(void *, uptr, void **, i32))g82w_orig[idx])(
-        self, connH, pMsgs, nMax);
-    if (rc < 0) {
-        g82w_neg++;
-        if (g82w_neg == 1) {
-            C2B_LOGS("[c2b] g82w: recv14 rc<0 rc="); C2B_LOGD((u32)rc);
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc = ((i32 (*)(void *, uptr, void **, i32))g82w_orig[idx])(
+            self, connH, pMsgs, nMax);
+        if (rc < 0) {
+            g82w_neg++;
+            if (g82w_neg == 1) {
+                C2B_LOGS("[c2b] g82w: recv14 rc<0 rc="); C2B_LOGD((u32)rc);
+                C2B_LOGS("conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
+                C2B_LOGS("\n");
+            }
+        } else if (rc == 0) {
+            g82w_n0++;
+            if ((g82w_n0 & 0xFFFu) == 1) {
+                C2B_LOGS("[c2b] g82w: recv14 empty hb n="); C2B_LOGD(g82w_n0);
+                C2B_LOGS("\n");
+            }
+        } else {
+            g82w_npos += (u32)rc;
+            C2B_LOGS("[c2b] g82w recv14 rc="); C2B_LOGD((u32)rc);
             C2B_LOGS("conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
             C2B_LOGS("\n");
-        }
-    } else if (rc == 0) {
-        g82w_n0++;
-        if ((g82w_n0 & 0xFFFu) == 1) {
-            C2B_LOGS("[c2b] g82w: recv14 empty hb n="); C2B_LOGD(g82w_n0);
-            C2B_LOGS("\n");
-        }
-    } else {
-        g82w_npos += (u32)rc;
-        C2B_LOGS("[c2b] g82w recv14 rc="); C2B_LOGD((u32)rc);
-        C2B_LOGS("conn=0x"); C2B_LOGH((u32)(connH & 0xffffffffu));
-        C2B_LOGS("\n");
-        if (pMsgs) {
-            for (k82 = 0; k82 < rc && k82 < 8; k82++) {
-                if (!pMsgs[k82]) continue;
-                (void)c2b_g71_dumpmsg(pMsgs[k82]);
+            if (pMsgs) {
+                for (k82 = 0; k82 < rc && k82 < 8; k82++) {
+                    if (!pMsgs[k82]) continue;
+                    (void)c2b_g71_dumpmsg(pMsgs[k82]);
+                }
             }
         }
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        if (g82w_faults < 3) {
+            g82w_faults++;
+            C2B_LOGS("[c2b] g82w: FAULT recv14 orig/dump (degraded rc=0) n=");
+            C2B_LOGN(g82w_faults);
+            C2B_LOGS("\n");
+        }
+        rc = 0;
     }
     return rc;
 }
@@ -12023,6 +12058,28 @@ static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 t
     static const u32 rot84[3] = { 12u, 14u, 15u };
     u32 tick7, ri;
     (void)slot;
+    /* v20: C2B_G84 гейт (default OFF). Run356-a3: смерть процесса в окне
+     * g84-полла (последний лог = slot-12 leg, rva 0x2423c =
+     * c2b_g84_pollslot) на golden-moment ('B'-accept -> LOADINGSCREEN).
+     * Миссия ротации = ВЫПОЛНЕНА (12 = g81-детур, 14 = g82w-детур,
+     * {15,16} = g82wp; push-back класс остаётся внутри гейта).
+     * C2B_G84=1 = ре-енейбл. */
+    {
+        static u32 g_g84_en, g_g84_en_init;
+        if (!g_g84_en_init) {
+            const char *e84 = getenv("C2B_G84");
+            g_g84_en = (e84 && e84[0] == '1') ? 1u : 0u;
+            g_g84_en_init = 1;
+        }
+        if (!g_g84_en) {
+            static u32 g84_off_logged;
+            if (!g84_off_logged) {
+                g84_off_logged = 1;
+                C2B_LOGS("[c2b] g84v2: DISABLED (v20 default: slot-12 leg = run356-a3 death-window suspect; 12/14 = g81/g82w detours, {15,16} = g82wp; C2B_G84=1 to re-enable)\n");
+            }
+            return;
+        }
+    }
     if (!g_g84_push_init) {
         const char *e = getenv("C2B_G84PUSH");
         if (e && e[0] == '0') g_g84_push = 0;

@@ -6969,6 +6969,286 @@ static void c2b_segv_guard_install(void)
 static void c2b_segv_guard_install(void) { }
 #endif
 
+/* ---------- 61a-g129/g130: SCP-СПАЙ-ПАРА (локализатор смерти 'k') ----------
+ * run346 ФАКТ-ЦЕПЬ: 'B'-accept = ПОЛНЫЙ (g62 '.'-байт OK -> g22 FullConnect
+ * FIRED -> cstate 1->2 -> netchan создан (g24: netchan=0xfabd52f0) -> SNM
+ * сигнон жив: t=15/6/7 отосланы, g98-дрейн 1/s релеит в GNS, rc=1). НО 'k' =
+ * НЕТ: 0 sendto-капчур, 0 "unexpected address"-Warning, 0 "[NET] Sending
+ * client connect packet"-DevMsg — при 10 g28 scp-call'ах ("scp returned"x10).
+ * Стат-RE (run346/bins objdump, engine 2cd041):
+ *  CL_SendConnectPacket = 0x24aa20 (vt+0x198): prologue 13Б
+ *  [55 48 89 e5 41 57 41 56 49 89 fe 41 55]; @+13 lea "SendConnectPacket"
+ *  (0x93713b, 7Б 48 8d 3d 07 c7 6e 00) -> COM_TimestampedLog @+0x51;
+ *  s1c = snap[0x1c] @24aa76: ==0 -> 24b071: 65eb80(snap) = cmpl $1,(%rdi)
+ *  (LOOPBACK-тест; 65eb80-соседи = OLD-нетадр акцессоры {type@0, ip BE@4,
+ *  port BE@8}); иначе identity 248330(reg@st+0x148, snap) -> al=0 -> je
+ *  24b2c7 = s1c-диспатч: 0 -> 24b428 65ea60 -> 24b2f0 Warning "Sending
+ *  connect packet to unexpected address %s" (0x938130) -> 24aaa3 CONTINUE
+ *  (т.е. identity-фейл НЕ фатален!). BF = external -0x9a0 (0x960Б), identity
+ *  НЕ используется (переписывается BF-инициализацией), цель send = САМ snap.
+ *  SEND = 0x4bb170 (fd, adr, BF, len, 0): prologue 13Б [55 48 89 e5 41 57 41
+ *  56 41 55 49 89 f5]; гейты: len>0x4b0 -> 4bb3e0; socket-list @0x41100c0
+ *  (первый el==self -> 4bb460); флаг-байт @0x411188e==0 -> 4bb240; send =
+ *  call *0x80(vtable 1-го el). DevMsg "[NET] Sending client connect packet
+ *  to %s, total size %u bytes" (0x938208) = прямо перед send-call.
+ *  В run346 НИ ОДНА из строк не напечатана => flow умирает МЕЖДУ scp-входом
+ *  и 24b2f0/24b0db. СПАИ = entry-детуры: g129 @0x24aa20 (per-call: s1c, na,
+ *  chal, proto, c0@0x4c0, tkt@0x478), g130 @0x4bb170 (per-call: fd, na, len,
+ *  bf0/bf4; len>=380 = 'k'-класс = всегда (кап 24), иначе 1/256 (кап 1024)).
+ *  Пара локализует смерть 'k' между scp-входом и send-входом + даёт
+ *  (fd,adr,len) реального send. ТРАМПЛИНЫ (патч = 14Б ест 1-й байт следующей
+ *  инструкции — компенсация в трамплине): g129 = stolen 13Б + movabs
+ *  base+0x93713b,%rdi (замена rip-rel lea @+13..19) + abs-jmp 0x24aa34;
+ *  g130 = stolen 13Б + push %r12 (41 54, @+13..14) + abs-jmp 0x4bb17f.
+ *  Сиг-верификация = полные 20/15Б (дрейф = give-up). Killswitches
+ *  C2B_G129=0 / C2B_G130=0. 64-бит only (как g48-класс). */
+static volatile uptr c2b_g129_tramp, c2b_g130_tramp;
+static volatile u32 c2b_g129_n, c2b_g130_n, c2b_g130_kn;
+static u8 *g_g129_tramp_mem, *g_g130_tramp_mem;
+
+void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
+{
+    u32 n = ++c2b_g129_n;
+    if (n > 24 && (n & 0x3F) != 1) return;
+#ifndef C2B_SELFTEST
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+#endif
+    C2B_LOGS("[c2b] g129 scp #");
+    C2B_LOGN(n);
+    C2B_LOGS("st=");
+    C2B_LOGH((u32)((uptr)st >> 32)); C2B_LOGH((u32)st);
+    C2B_LOGS("s1c=");
+    C2B_LOGH(*(volatile const u32 *)(snap + 0x1c));
+    C2B_LOGS("na=");
+    C2B_LOGH(*(volatile const u32 *)(snap));
+    C2B_LOGH(*(volatile const u32 *)(snap + 4));
+    C2B_LOGH(*(volatile const u32 *)(snap + 8));
+    C2B_LOGS("chal=");
+    C2B_LOGH(chal);
+    C2B_LOGS("proto=");
+    C2B_LOGH(proto);
+    C2B_LOGS("c0=");
+    C2B_LOGH(*(volatile const u8 *)(st + 0x4c0));
+    C2B_LOGS("tkt=");
+    {   u64 tk = *(volatile const u64 *)(st + 0x478);
+        C2B_LOGH((u32)(tk >> 32)); C2B_LOGH((u32)tk);
+    }
+    C2B_LOGS("\n");
+#ifndef C2B_SELFTEST
+    g_probe_active = 0;
+#endif
+}
+
+void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
+{
+    u32 n = ++c2b_g130_n;
+    if (len >= 380) {
+        if (c2b_g130_kn > 24) return;
+        c2b_g130_kn++;
+    } else {
+        if (n > 1024 || (n & 0xFFu) != 1u) return;
+    }
+#ifndef C2B_SELFTEST
+    if (g_probe_active) return;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
+#endif
+    C2B_LOGS("[c2b] g130 send #");
+    C2B_LOGN(n);
+    C2B_LOGS("fd=");
+    C2B_LOGN(fd);
+    C2B_LOGS("len=");
+    C2B_LOGN(len);
+    C2B_LOGS("na=");
+    C2B_LOGH(*(volatile const u32 *)(adr));
+    C2B_LOGH(*(volatile const u32 *)(adr + 4));
+    C2B_LOGH(*(volatile const u32 *)(adr + 8));
+    C2B_LOGS("bf0=");
+    C2B_LOGH(*(volatile const u32 *)bf);
+    C2B_LOGH(*(volatile const u32 *)(bf + 4));
+    C2B_LOGS("\n");
+#ifndef C2B_SELFTEST
+    g_probe_active = 0;
+#endif
+}
+
+__asm__(
+".text\n"
+".globl c2b_g129_thunk\n"
+".type  c2b_g129_thunk,@function\n"
+"c2b_g129_thunk:\n"   /* вход: rsp%16==8; rdi=st rsi=snap edx=chal ecx=proto — протаскиваем */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g129_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g129_tramp(%rip)\n"
+".size c2b_g129_thunk, .-c2b_g129_thunk\n"
+".globl c2b_g130_thunk\n"
+".type  c2b_g130_thunk,@function\n"
+"c2b_g130_thunk:\n"   /* вход: rsp%16==8; edi=fd rsi=adr rdx=bf ecx=len — протаскиваем */
+"  endbr64\n"
+"  sub  $0x58,%rsp\n"
+"  mov  %rax,0x00(%rsp)\n"
+"  mov  %rcx,0x08(%rsp)\n"
+"  mov  %rdx,0x10(%rsp)\n"
+"  mov  %rsi,0x18(%rsp)\n"
+"  mov  %rdi,0x20(%rsp)\n"
+"  mov  %r8, 0x28(%rsp)\n"
+"  mov  %r9, 0x30(%rsp)\n"
+"  mov  %r10,0x38(%rsp)\n"
+"  mov  %r11,0x40(%rsp)\n"
+"  call c2b_g130_log\n"
+"  mov  0x00(%rsp),%rax\n"
+"  mov  0x08(%rsp),%rcx\n"
+"  mov  0x10(%rsp),%rdx\n"
+"  mov  0x18(%rsp),%rsi\n"
+"  mov  0x20(%rsp),%rdi\n"
+"  mov  0x28(%rsp),%r8\n"
+"  mov  0x30(%rsp),%r9\n"
+"  mov  0x38(%rsp),%r10\n"
+"  mov  0x40(%rsp),%r11\n"
+"  add  $0x58,%rsp\n"
+"  jmp  *c2b_g130_tramp(%rip)\n"
+".size c2b_g130_thunk, .-c2b_g130_thunk\n"
+".previous\n"
+);
+extern void c2b_g129_thunk(void);
+extern void c2b_g130_thunk(void);
+
+#define C2B_G129_SCP_RVA 0x24aa20ull
+#define C2B_G130_SND_RVA 0x4bb170ull
+static const u8 c2b_g129_sig[13] = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x49, 0x89, 0xFE, 0x41, 0x55 };
+static const u8 c2b_g129_lea[7] = {
+    0x48, 0x8D, 0x3D, 0x07, 0xC7, 0x6E, 0x00 };       /* lea "SendConnectPacket" */
+static const u8 c2b_g130_sig[13] = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x49, 0x89, 0xF5 };
+static const u8 c2b_g130_p12[2] = { 0x41, 0x54 };     /* push %r12 */
+
+static void c2b_g129_apply(void)
+{
+    static u8 done, dump_shown;
+    uptr base, fa, tr;
+    if (done) return;
+    {   const char *e = getenv("C2B_G129");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g129: disabled by env\n");
+            done = 1;
+            return;
+        }
+    }
+    base = g_engine_base;
+    if (!base) return;
+    fa = base + C2B_G129_SCP_RVA;
+    if (memcmp((const void *)fa, c2b_g129_sig, sizeof c2b_g129_sig) != 0 ||
+        memcmp((const void *)(fa + sizeof c2b_g129_sig), c2b_g129_lea,
+               sizeof c2b_g129_lea) != 0) {
+        if (!dump_shown) {
+            u32 i;
+            dump_shown = 1;
+            C2B_LOGS("[c2b] g129: scp sig mismatch @0x24aa20, bytes:");
+            for (i = 0; i < 20; i++)
+                C2B_LOGH(*(volatile const u8 *)(fa + i));
+            C2B_LOGS("\n");
+        }
+        return;
+    }
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g129_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)fa, sizeof c2b_g129_sig);
+    {
+        u8 *p = (u8 *)tr + sizeof c2b_g129_sig;
+        u64 tgt = base + 0x93713bull;   /* "SendConnectPacket" (lea-замена) */
+        u32 i;
+        *p++ = 0x48; *p++ = 0xBF;       /* movabs tgt,%rdi */
+        for (i = 0; i < 8; i++) *p++ = (u8)(tgt >> (8 * i));
+        c2b_write_jmp((void *)p, (const void *)(fa + 20)); /* 13+7 = 0x24aa34 */
+    }
+    c2b_g129_tramp = (uptr)tr;
+    if (c2b_page_protect(fa, C2B_PATCH_LEN, 0x07) != 0) {
+        C2B_LOGS("[c2b] g129: page_protect failed\n");
+        done = 1;
+        return;
+    }
+    c2b_write_jmp((void *)fa, (const void *)&c2b_g129_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g129: armed scp spy base=");
+    C2B_LOGH((u32)base);
+    C2B_LOGS("\n");
+}
+
+static void c2b_g130_apply(void)
+{
+    static u8 done, dump_shown;
+    uptr base, fa, tr;
+    if (done) return;
+    {   const char *e = getenv("C2B_G130");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g130: disabled by env\n");
+            done = 1;
+            return;
+        }
+    }
+    base = g_engine_base;
+    if (!base) return;
+    fa = base + C2B_G130_SND_RVA;
+    if (memcmp((const void *)fa, c2b_g130_sig, sizeof c2b_g130_sig) != 0 ||
+        memcmp((const void *)(fa + sizeof c2b_g130_sig), c2b_g130_p12,
+               sizeof c2b_g130_p12) != 0) {
+        if (!dump_shown) {
+            u32 i;
+            dump_shown = 1;
+            C2B_LOGS("[c2b] g130: send sig mismatch @0x4bb170, bytes:");
+            for (i = 0; i < 16; i++)
+                C2B_LOGH(*(volatile const u8 *)(fa + i));
+            C2B_LOGS("\n");
+        }
+        return;
+    }
+    tr = (uptr)mmap(0, 4096, 0x07, 0x22, -1, 0);
+    if (tr == (uptr)-1) { done = 1; return; }
+    g_g130_tramp_mem = (u8 *)tr;
+    memcpy((void *)tr, (const void *)fa, sizeof c2b_g130_sig);
+    {
+        u8 *p = (u8 *)tr + sizeof c2b_g130_sig;
+        *p++ = c2b_g130_p12[0];         /* push %r12 */
+        *p++ = c2b_g130_p12[1];
+        c2b_write_jmp((void *)p, (const void *)(fa + 15)); /* 13+2 = 0x4bb17f */
+    }
+    c2b_g130_tramp = (uptr)tr;
+    if (c2b_page_protect(fa, C2B_PATCH_LEN, 0x07) != 0) {
+        C2B_LOGS("[c2b] g130: page_protect failed\n");
+        done = 1;
+        return;
+    }
+    c2b_write_jmp((void *)fa, (const void *)&c2b_g130_thunk);
+    done = 1;
+    C2B_LOGS("[c2b] g130: armed send spy base=");
+    C2B_LOGH((u32)base);
+    C2B_LOGS("\n");
+}
+
 #ifndef C2B_SELFTEST
 /* 41f-g: установка спью БЕЗ FUv — движок берёт NetworkingUtils через прямой
  * C-экспорт (run 100: FUv не увидел НИ ОДНОГО запроса SteamNetworkingUtils*).
@@ -11886,6 +12166,13 @@ static void c2b_g32_drive(void)
             C2B_LOGS("\n");
         }
     }
+    /* 61a-g129/g130: спай-пара на 'k'-пути (мотивация/трамплины у лог-фн).
+     * Патч = 14Б ест 1-й байт следующей инструкции: g129 = lea "SendConnect-
+     * Packet" @+13..19 (7Б) -> movabs-замена в трамплине; g130 = push %r12
+     * @+13..14 (2Б) -> push-реплика в трамплине. Оба = passthrough-спаи:
+     * стейт/аргументы логируются, flow = исходный. */
+    c2b_g129_apply();
+    c2b_g130_apply();
     /* 50j-g60: 'B'-кейс ЭХО-ЧЕКИ NOPED @0x25a8c8..25a914. ПОЛНЫЙ RE цепочки
      * (engine 2cd041, run211): cmpl cstate@25a8b0 (гейт ОСТАЁТСЯ — g50/g52
      * форсы) затем 5 x "jne 259f50" = МОЛЧАЛИВЫЙ reject: (1) @25a8c8
@@ -24212,6 +24499,38 @@ static void test_cl(void)
 #undef CL_N
 }
 
+/* 61a-g129/g130: спай-лог-фн smoke + сиг-шейпы (трамплины не патчатся —
+ * детур-класс, под санитайзерами нет; apply-фн = no-op без g_engine_base). */
+static void test_g129_g130(void)
+{
+    u8 snapf[32];
+    u8 stf[0x500];
+    memset(snapf, 0, sizeof snapf);
+    snapf[0] = 3; snapf[4] = 0x7f; snapf[7] = 1;   /* OLD-нетадр 127.0.0.1 */
+    snapf[8] = 0x69; snapf[9] = 0x7d;              /* порт BE 27005 */
+    memset(stf, 0, sizeof stf);
+    stf[0x4c0] = 1;                                /* connect-in-progress */
+    c2b_g129_log((uptr)stf, (uptr)snapf, 0x5a796c0fu, 3u);
+    c2b_g129_log((uptr)stf, (uptr)snapf, 0x5a796c0fu, 3u);
+    CHECK(c2b_g129_n == 2, "g129: счётчик вызовов лог-фн");
+    c2b_g130_log(7u, (uptr)snapf, (uptr)snapf, 513u);   /* 'k'-класс */
+    c2b_g130_log(7u, (uptr)snapf, (uptr)snapf, 33u);    /* мелкий: 1/256 */
+    c2b_g130_log(7u, (uptr)snapf, (uptr)snapf, 601u);   /* 'k'-класс #2 */
+    CHECK(c2b_g130_n == 3, "g130: счётчик вызовов лог-фн");
+    CHECK(c2b_g130_kn == 2, "g130: 'k'-класс (len>=380) посчитан 2x");
+    CHECK(sizeof c2b_g129_sig == 13 && c2b_g129_sig[0] == 0x55 &&
+          c2b_g129_sig[4] == 0x41 && c2b_g129_sig[8] == 0x49 &&
+          c2b_g129_sig[12] == 0x55, "g129: prologue-сиг 13Б shape");
+    CHECK(sizeof c2b_g129_lea == 7 && c2b_g129_lea[0] == 0x48 &&
+          c2b_g129_lea[1] == 0x8D && c2b_g129_lea[2] == 0x3D,
+          "g129: lea-замена сиг 7Б shape");
+    CHECK(sizeof c2b_g130_sig == 13 && c2b_g130_sig[0] == 0x55 &&
+          c2b_g130_sig[10] == 0x49 && c2b_g130_sig[12] == 0xF5,
+          "g130: prologue-сиг 13Б shape");
+    CHECK(c2b_g130_p12[0] == 0x41 && c2b_g130_p12[1] == 0x54,
+          "g130: push %r12 сиг 2Б shape");
+}
+
 /* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
    инструментированная пролог-часть (stolen bytes) невалидна вне родного фрейма
    (clang+ASan: SIGSEGV). Логика детура покрыта test_up_dispatch без патчей. */
@@ -24254,6 +24573,7 @@ int main(void)
     test_gc_policy();   /* t39: GC-транзит Фаза 2 (рой audit_t38) */
     test_gc_hello();    /* t42v10: автомат ClientHello-pump на дублях */
     test_cl();          /* 41e-a: connectionless v1 (классификация/фильтр) */
+    test_g129_g130();   /* 61a: спай-пара 'k'-пути (лог-фн + сиг-шейпы) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

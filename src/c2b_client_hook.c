@@ -538,6 +538,11 @@ static u8 c2b_g113_sbox[256];
 static u32 c2b_g113_ready;
 static u8 c2b_g113_keys[8][32];
 static u32 c2b_g113_nkeys;
+/* g117: the crypt_inner X25519 pubs (the dedup set) — the pub = the KNOWN
+ * 32B = the heap anchor for the priv hunt => the offline X25519 premaster
+ * => the FULL KDF (the keys + THE IVs = no nonce models at all). */
+static u8 c2b_g113_pubs[8][32];
+static u32 c2b_g113_npubs;
 
 static void c2b_g113_init(void)
 {
@@ -671,8 +676,11 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
             c2b_g113_hex(kb, 32);
         }
         {
-            u64 s2 = off >= 512 ? off - 512 : 0;
-            u64 en = off + 512;
+            /* g117: the window = ±2048B (the run326 lesson: the 512B window
+             * = missed the GCM ctx H/nonce blocks — the offline structure
+             * read needs the FULL context neighborhood) */
+            u64 s2 = off >= 2048 ? off - 2048 : 0;
+            u64 en = off + 2048;
             if (en > (u64)n) en = n;
             klog_s(" win=");
             c2b_g113_hex(buf + s2, (u32)(en - s2));
@@ -680,6 +688,89 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
         }
         (*hits)++;
         if (*hits >= 32 || c2b_g113_nkeys >= 8) return 1;
+    }
+    /* g117: the BYTE-STEP pattern pass — the serialized crypt_inner
+     * '08 01 12 20 <pub32>' (key_type=1, the field-1 len-32 = the X25519
+     * pub) = ZERO false positives (4B literal). The hit = the pub + the
+     * tail (the nonce) = the connection identity; THEN the pub-dup hunt
+     * IN THE SAME CHUNK (the u64 prefilter = ~zero cost): the OTHER pub
+     * instance = the ECX key struct (the priv = adjacent) => the offline
+     * X25519(priv, server_pub-from-pcap) = the premaster => the FULL KDF
+     * = the keys + THE IVs => the clean decrypt, no nonce models.
+     * The unaligned serialization = the 4-step AES loop can miss it =>
+     * the dedicated byte loop with the deadline checks (every 64K). */
+    {
+        u64 o2;
+        struct timespec tn;
+        for (o2 = 0; o2 + 76 <= (u64)n; o2++) {
+            u32 du2, z2;
+            u8 pk[32];
+            u32 same;
+            if ((o2 & 0xFFFF) == 0) {
+                clock_gettime(1, &tn);
+                if ((i64)tn.tv_sec * 1000000000ll + (i64)tn.tv_nsec - *ts
+                    > cap)
+                    return 1;
+            }
+            if (buf[o2] != 0x08 || buf[o2 + 1] != 0x01 ||
+                buf[o2 + 2] != 0x12 || buf[o2 + 3] != 0x20)
+                continue;
+            for (z2 = 0; z2 < 32; z2++) pk[z2] = buf[o2 + 4 + z2];
+            same = 0;
+            for (du2 = 0; du2 < c2b_g113_npubs; du2++) {
+                u32 z3;
+                u32 eq = 1;
+                for (z3 = 0; z3 < 32; z3++)
+                    if (c2b_g113_pubs[du2][z3] != pk[z3]) { eq = 0; break; }
+                if (eq) { same = 1; break; }
+            }
+            if (!same && c2b_g113_npubs < 8) {
+                for (z2 = 0; z2 < 32; z2++)
+                    c2b_g113_pubs[c2b_g113_npubs][z2] = pk[z2];
+                c2b_g113_npubs++;
+            }
+            klog_s("[c2b] g113: cxi @");
+            klog_h((u32)(base + o2));
+            klog_s(" pub=");
+            c2b_g113_hex(pk, 32);
+            klog_s(" tail=");
+            c2b_g113_hex(buf + o2 + 36, 32);
+            klog_s("\n");
+            /* the pub-dup hunt: the OTHER instances of the pub in this
+             * chunk = the key struct (the priv = the 32B neighbor) */
+            {
+                u64 o3;
+                u64 p0;
+                for (z2 = 0; z2 < 8; z2++)
+                    ((u8 *)&p0)[z2] = pk[z2];
+                for (o3 = 0; o3 + 32 <= (u64)n; o3++) {
+                    u64 q0;
+                    u32 z4, eq;
+                    u64 s3, e3;
+                    if ((o3 & 0xFFF) == 0) {
+                        clock_gettime(1, &tn);
+                        if ((i64)tn.tv_sec * 1000000000ll
+                            + (i64)tn.tv_nsec - *ts > cap)
+                            return 1;
+                    }
+                    for (z4 = 0; z4 < 8; z4++)
+                        ((u8 *)&q0)[z4] = buf[o3 + z4];
+                    if (q0 != p0) continue;
+                    eq = 1;
+                    for (z4 = 0; z4 < 32; z4++)
+                        if (buf[o3 + z4] != pk[z4]) { eq = 0; break; }
+                    if (!eq) continue;
+                    klog_s("[c2b] g113: pubdup @");
+                    klog_h((u32)(base + o3));
+                    klog_s(" ctx=");
+                    s3 = o3 >= 64 ? o3 - 64 : 0;
+                    e3 = o3 + 96;
+                    if (e3 > (u64)n) e3 = n;
+                    c2b_g113_hex(buf + s3, (u32)(e3 - s3));
+                    klog_s("\n");
+                }
+            }
+        }
     }
     return 0;
 }

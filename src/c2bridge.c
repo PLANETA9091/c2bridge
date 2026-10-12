@@ -7092,6 +7092,7 @@ static u32 g_k21_eng_h;
  * надёжном SNP-канале = яд для сервера) — ждать живой канал движка; сервер
  * ретраит 'A' => scp => новый krel-шанс. C2B_K21WAIT=0 = старый фолбэк. */
 static u32 g_k21_wait = 1, g_k21_scan_cnt, g_k21_rearm;
+static u32 g_krel_raw;                   /* v24: 0 = стрип 17B хедера (A/B) */
 static volatile u32 g_krel_dead;
 #endif
 
@@ -11363,7 +11364,7 @@ static void c2b_g24_dumpone(u32 i, u32 cs)
     nc = *(volatile const u64 *)(st + 0x128);
     C2B_LOGS("netchan=");
     C2B_LOGH((u32)nc); C2B_LOGH((u32)(nc >> 32));
-    if (nc && !g_k23_nc_dumped) c2b_k23_netchan_dump((uptr)nc);
+    if (nc && !g_k23_nc_dumped && cs == 2) c2b_k23_netchan_dump((uptr)nc);
     g = *(volatile const u64 *)(st + 0x430);
     C2B_LOGS("gate=");
     C2B_LOGH((u32)g); C2B_LOGH((u32)(g >> 32));
@@ -15285,12 +15286,51 @@ static u32 c2b_k21_engscan(void)
     return g_k21_eng_h;
 }
 
+/* v24: ЖИВОСТЬ мостовой сессии через slot-17 detail-ascii — ЕДИНСТВЕННЫЙ
+ * надёжный оракул (slot-13 info = нули даже на connected — run360 g97
+ * t=10 st=0 info=zeros ПРИ 'End-to-end connection: connected'; run339:
+ * slot-17 rc=0 = таблица с end-debug). 1 = 'connected' найден в ascii,
+ * 0 = нет/ошибка/SEGV/пусто. 'connecting' НЕ содержит 'connected' как
+ * подстроку — ручной матч достаточен, libc не нужен. */
+static u32 c2b_k24_brlive(void)
+{
+    void **vt24;
+    static u8 md24[4096];
+    i32 rc24;
+    u32 z24, nz24, i24;
+    if (!g_gns_conn_iface || !g_gns_conn_h) return 0;
+    vt24 = *(void ***)g_gns_conn_iface;
+    for (z24 = 0; z24 < sizeof md24; z24++) md24[z24] = 0;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc24 = ((i32 (*)(void *, uptr, void *, uptr))vt24[17])(
+            g_gns_conn_iface, g_gns_conn_h, md24, (uptr)sizeof md24);
+    } else {
+        g_probe_active = 0;
+        return 0;
+    }
+    g_probe_active = 0;
+    if (rc24 != 0) return 0;
+    nz24 = 0;
+    for (z24 = 0; z24 < 0x60; z24++)
+        if (md24[z24]) { nz24 = 1; break; }
+    if (!nz24) return 0;
+    for (i24 = 0; i24 + 9 < sizeof md24; i24++) {
+        if (md24[i24] == 'c' && md24[i24 + 1] == 'o' &&
+            md24[i24 + 2] == 'n' && md24[i24 + 3] == 'n' &&
+            md24[i24 + 4] == 'e' && md24[i24 + 5] == 'c' &&
+            md24[i24 + 6] == 't' && md24[i24 + 7] == 'e' &&
+            md24[i24 + 8] == 'd') return 1;
+    }
+    return 0;
+}
+
 static void c2b_k19_relay(void)
 {
     u32 kch, kn;
     i32 rc19;
     i64 out19;
-    u32 slot19, z19;
+    u32 slot19, z19, koff24, live24;
     void **vt19;
     u8 kcopy[640];
     uptr hsend;
@@ -15304,6 +15344,8 @@ static void c2b_k19_relay(void)
         if (e && e[0] == '0') g_k21_eng = 0;
         e = getenv("C2B_K21WAIT");
         if (e && e[0] == '0') g_k21_wait = 0;
+        e = getenv("C2B_KREL_RAW");
+        if (e && e[0] == '1') g_krel_raw = 1;
         g_krel_init = 1;
     }
     if (g_krel_dead) {
@@ -15330,18 +15372,29 @@ static void c2b_k19_relay(void)
      * релеев, (b) скан-строки не перехлёстываются с krel-строкой (run358:
      * интерлив потерял tgt/rc #1) */
     hsend = g_gns_conn_h;
+    live24 = 0;
     if (g_k21_eng) {
         he21 = c2b_k21_engscan();
         if (he21) {
             hsend = (uptr)he21;
-        } else if (g_k21_wait) {
-            C2B_LOGS("[c2b] k21: wait eng-h=0 (bridge skip) chal=");
-            C2B_LOGH(kch);
-            C2B_LOGS(" sent="); C2B_LOGN(g_krel_sent);
-            C2B_LOGS(" scans="); C2B_LOGN(g_k21_scan_cnt);
-            C2B_LOGS(" rearms="); C2B_LOGN(g_k21_rearm);
-            C2B_LOGS("\n");
-            return;
+        } else {
+            /* v24: СКАН СЛЕПОЙ (хэндлы = u32-хэши; slot-13 info = нули даже
+             * на connected — run360) — живость решает slot-17 detail-ascii
+             * на br-h ('End-to-end connection: connected'). Живая мостовая
+             * (run360: connected + НЕСЁТ сигнон-стрим g98-дрейна) = ЦЕЛЬ,
+             * не труп; ждём только когда И скан слеп И мост не жив. */
+            live24 = c2b_k24_brlive();
+            if (live24) {
+                hsend = g_gns_conn_h;
+            } else if (g_k21_wait) {
+                C2B_LOGS("[c2b] k24: wait (eng-h=0, br-live=0) chal=");
+                C2B_LOGH(kch);
+                C2B_LOGS(" sent="); C2B_LOGN(g_krel_sent);
+                C2B_LOGS(" scans="); C2B_LOGN(g_k21_scan_cnt);
+                C2B_LOGS(" rearms="); C2B_LOGN(g_k21_rearm);
+                C2B_LOGS("\n");
+                return;
+            }
         }
     }
     for (z19 = 0; z19 < sizeof kcopy; z19++) kcopy[z19] = 0;
@@ -15350,6 +15403,17 @@ static void c2b_k19_relay(void)
     g_krel_sent++;
     if (!g_krel_keep && g_g90_A_seq) {
         (void)c2b_krel_patchchal(kcopy, kn, g_g90_A_chal);
+    }
+    /* v24: RAW A/B — C2B_KREL_RAW=0 (default): в канал уходит
+     * ticket-protobuf БЕЗ 17B connless-хедера (ff×4+'k'+ver u16+6B+chal
+     * u32@13; run355-декод) — гипотеза: 513B С хедером = коррелят смерти
+     * сессии ~15с (run256/357). RAW=1 = полный 513B (форма run357).
+     * Chal-патч смыслён только при RAW=1 (в стрипнутой форме нет chal-поля). */
+    if (!g_krel_raw && kn > 17) {
+        koff24 = 17;
+        kn -= 17;
+    } else {
+        koff24 = 0;
     }
     C2B_LOGS("[c2b] krel: 'k' in-channel relay #");
     C2B_LOGN(g_krel_sent);
@@ -15360,6 +15424,10 @@ static void c2b_k19_relay(void)
     C2B_LOGH(kch);
     C2B_LOGS(") len=");
     C2B_LOGN(kn);
+    C2B_LOGS(" raw=");
+    C2B_LOGN(g_krel_raw);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live24);
     C2B_LOGS(" tgt=");
     C2B_LOGN((u32)hsend);
     rc19 = -999;
@@ -15367,7 +15435,7 @@ static void c2b_k19_relay(void)
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
         rc19 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt19[slot19])(
-            g_gns_conn_iface, hsend, kcopy, kn, 1, &out19);
+            g_gns_conn_iface, hsend, kcopy + koff24, kn, 1, &out19);
         g_probe_active = 0;
     } else {
         g_probe_active = 0;

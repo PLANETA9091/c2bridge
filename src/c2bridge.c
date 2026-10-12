@@ -15092,8 +15092,20 @@ static void *c2b_g97_thread(void *arg)
                 c2b_g97_log_ascii(md, 0x100);
                 C2B_LOGS("\n");
             } else {
+                /* v24b (run361-урок): slot-17 rc=1 ВЕСЬ РАН при живой сессии
+                 * — логировать буфер и при rc!=0, если он непуст (таблица
+                 * могла быть записана и при не-0 rc) */
+                u32 nzd = 0;
+                for (j = 0; j < 0x60; j++)
+                    if (md[j]) { nzd = 1; break; }
                 C2B_LOGS("[c2b] g97: detail rc=");
                 C2B_LOGD(rcd);
+                if (nzd) {
+                    C2B_LOGS(" info=");
+                    for (j = 0; j < 0x100; j++) C2B_LOGH(md[j]);
+                    C2B_LOGS("\n[c2b] g97: detail-ascii:");
+                    c2b_g97_log_ascii(md, 0x100);
+                }
                 C2B_LOGS("\n");
             }
         }
@@ -15289,9 +15301,11 @@ static u32 c2b_k21_engscan(void)
 /* v24: ЖИВОСТЬ мостовой сессии через slot-17 detail-ascii — ЕДИНСТВЕННЫЙ
  * надёжный оракул (slot-13 info = нули даже на connected — run360 g97
  * t=10 st=0 info=zeros ПРИ 'End-to-end connection: connected'; run339:
- * slot-17 rc=0 = таблица с end-debug). 1 = 'connected' найден в ascii,
- * 0 = нет/ошибка/SEGV/пусто. 'connecting' НЕ содержит 'connected' как
- * подстроку — ручной матч достаточен, libc не нужен. */
+ * slot-17 rc=0 = таблица с end-debug). v24b (run361-урок): RC-ГЕЙТ
+ * УБРАН — slot-17 вернул rc=1 ВЕСЬ РАН при живой на проводе сессии
+ * (0x23 ConnectOK pkt145 + in-channel 'A' pkt236) — решение ПО БУФЕРУ:
+ * непустой ascii + 'connected' = жива; мёртвый хэндл = буфер занулён
+ * API (run357/358-факты). */
 static u32 c2b_k24_brlive(void)
 {
     void **vt24;
@@ -15310,7 +15324,7 @@ static u32 c2b_k24_brlive(void)
         return 0;
     }
     g_probe_active = 0;
-    if (rc24 != 0) return 0;
+    (void)rc24;                     /* v24b: rc НЕ гейтит — решает буфер */
     nz24 = 0;
     for (z24 = 0; z24 < 0x60; z24++)
         if (md24[z24]) { nz24 = 1; break; }

@@ -117,7 +117,7 @@ static const u8 SIGMA[16] = {
 #define KEY_CAP   24
 #define CALL_CAP  32
 
-static u8   g_tramp[64] __attribute__((aligned(16)));
+static u8   g_tramp[64] __attribute__((aligned(4096)));
 static u8   g_key0[32];
 static u32  g_keys;      /* the distinct keys logged */
 static u32  g_calls;     /* the total calls seen */
@@ -225,7 +225,7 @@ static void c2b_g110_detour_c(const void *out, const void *in, u64 len,
                   u64, const void *, const void *))g_tramp;
     (void)out; (void)in; (void)ra;
     c2b_g110_capture(len, key, ictx);
-    if (g_tramp[16] == 0xe9)
+    if (g_tramp[16] == 0xff)   /* the abs-jump built = the tramp ready */
         tramp(out, in, len, key, ictx);
 }
 
@@ -240,7 +240,7 @@ static void c2b_g110_detour_c(const void *out, const void *in, u32 len,
                   u32, const void *, const void *))g_tramp;
     (void)out; (void)in;
     c2b_g110_capture((u64)len, key, ictx);
-    if (g_tramp[16] == 0xe9)
+    if (g_tramp[16] == 0xe9)   /* the rel-jump built = the tramp ready */
         tramp(out, in, len, key, ictx);
 }
 #endif
@@ -401,35 +401,59 @@ static void *c2b_g110_watch(void *arg)
                 return (void *)0;
             }
 
-            /* the trampoline: the saved pro16 + the jmp back (entry+16) */
+            /* the trampoline: the saved pro16 + the jump back (entry+16).
+             * g110e (the local-test crash): (1) the g_tramp = the 4096-
+             * aligned (the mprotect = the EINVAL on the 16-aligned = THE
+             * run313 'tramp mprotect fail' = the whole silent chain);
+             * (2) the x86-64 = the ABS jump ff25+8B (the g105-exact, the
+             * NO-range-limit) — the e9 rel32 = the ±2GB = the local test
+             * = the i32 truncation = the jump to the stack = the SIGSEGV;
+             * the i386 = the e9 rel32 = the always-within. */
             {
                 u8 *tp = g_tramp;
-                i32 rel = (i32)((uptr)(tgt + 16) - ((uptr)tp + 21));
                 for (k = 0; k < 16; k++) tp[k] = tgt[k];
-                tp[16] = 0xe9;
-                tp[17] = (u8)rel;
-                tp[18] = (u8)(rel >> 8);
-                tp[19] = (u8)(rel >> 16);
-                tp[20] = (u8)(rel >> 24);
+#if defined(__x86_64__)
+                {
+                    uptr da = (uptr)(tgt + 16);
+                    tp[16] = 0xff; tp[17] = 0x25;   /* jmp [rip+0] */
+                    tp[18] = 0; tp[19] = 0; tp[20] = 0; tp[21] = 0;
+                    for (k = 0; k < 8; k++) tp[22 + k] = (u8)(da >> (8 * k));
+                }
+#else
+                {
+                    i32 rel = (i32)((uptr)(tgt + 16) - ((uptr)tp + 21));
+                    tp[16] = 0xe9;
+                    tp[17] = (u8)rel;
+                    tp[18] = (u8)(rel >> 8);
+                    tp[19] = (u8)(rel >> 16);
+                    tp[20] = (u8)(rel >> 24);
+                }
+#endif
                 if (mprotect((void *)tp, 4096,
                              PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                    klog_s("[c2b] g110: tramp mprotect fail\n");
+                    klog_s("[c2b] g110: tramp mprotect fail errno-layout\n");
                     return (void *)0;
                 }
             }
-            /* the entry patch: e9 rel32 (to the stub) + the nop pad = 16B */
+            /* the entry patch: the x86-64 = ff25+abs8 + the 2x nop = 16B
+             * (the g105-exact, the range-free); the i386 = e9 rel32 + the
+             * nop pad = 16B */
             if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
                          PROT_READ | PROT_WRITE) != 0) {
                 klog_s("[c2b] g110: mprotect fail\n");
                 return (void *)0;
             }
             {
-                i32 rel;
 #if defined(__x86_64__)
-                uptr dst = (uptr)&c2b_g110_stub;
+                uptr da = (uptr)&c2b_g110_stub;
+                tgt[0] = 0xff; tgt[1] = 0x25;   /* jmp [rip+0] */
+                tgt[2] = 0; tgt[3] = 0; tgt[4] = 0; tgt[5] = 0;
+                for (k = 0; k < 8; k++) tgt[6 + k] = (u8)(da >> (8 * k));
+                tgt[14] = 0x90;
+                tgt[15] = 0x90;
 #else
+                i32 rel;
                 uptr dst = (uptr)&c2b_g110_detour_c;
-#endif
                 rel = (i32)(dst - (uptr)tgt);
                 tgt[0] = 0xe9;
                 tgt[1] = (u8)rel;
@@ -437,6 +461,7 @@ static void *c2b_g110_watch(void *arg)
                 tgt[3] = (u8)(rel >> 16);
                 tgt[4] = (u8)(rel >> 24);
                 for (k = 5; k < 16; k++) tgt[k] = 0x90;
+#endif
             }
             if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
                          PROT_READ | PROT_EXEC) != 0) {
@@ -449,6 +474,14 @@ static void *c2b_g110_watch(void *arg)
             klog_h(SITE_OFF);
             klog_s(" pid=");
             klog_h((u32)getpid());
+            klog_s("\n");
+            /* g110e: the patch self-check = the tramp + the site bytes
+             * (the local-test crash = the jmp-back = the corrupt; the
+             * bytes = THE decider) */
+            klog_s("[c2b] g110: site16=");
+            klog_x(tgt, 16);
+            klog_s("\n[c2b] g110: tramp30=");
+            klog_x(g_tramp, 30);
             klog_s("\n");
         }
         return (void *)0;

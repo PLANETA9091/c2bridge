@@ -7074,6 +7074,16 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
 static u32 g_krel_on = 1, g_krel_keep, g_krel_init;
 static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal;
 #define C2B_KREL_CAP 12
+/* v21: цель krel = ЖИВАЯ сессия ДВИЖКА (run357-урок: krel#1 rc=1 улетел в
+ * сессию моста, а ЖИВАЯ SDR-сессия = у движка: ConnectOK 0x23 (08 01 12 20
+ * <32B> = protobuf crypt-handshake) пришёл на ЕГО сокет 46476->28022 +
+ * in-channel 'A' (DEC32#1 = расшифровка 77B 0x80-пакета) + 512B OUT x66.
+ * Мост и движок = ОДИН per-user iface-синглтон => хэндлы перебираются
+ * чистыми slot-13 чтениями (h=1..64); ищем st=2 connected h != мостового.
+ * Killswitch C2B_K21ENG=0 = старое поведение (хэндл моста). */
+static u32 g_k21_eng = 1;
+static u32 g_k21_scan_done, g_k21_eng_h;
+static volatile u32 g_krel_dead;
 #endif
 
 /* v19: патч challenge в КОПИИ 'k' (bytes 13-16 LE) + шейп-чек.
@@ -15174,6 +15184,59 @@ static void *c2b_g82wp_thread(void *arg)
  * g_g90_A_seq/chal 11838-40, g_kfull 11834). Зовётся из c2b_g130_log
  * после S1-кора; в selftest НЕ собирается (GNS-декларации garded). */
 #ifndef C2B_SELFTEST
+/* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
+ * что у g97-полла; в run356 он же дал 'End-to-end connection: connected').
+ * Находим ЖИВУЮ сессию движка: rc==1 + непустой info + st==2 + h != моста.
+ * Логируем КАЖДЫЙ живой/ненулевой h с info[0..0x30] — адресная проверка
+ * (m_addrRemote = 152.233.19.133:28022) вручную по логу, если st-семантика
+ * вдруг иная. Один проход за сессию (g_k21_scan_done). */
+static u32 c2b_k21_engscan(void)
+{
+    void **vt21;
+    u8 mi[256];
+    u32 h21, j, hfound = 0;
+    if (g_k21_scan_done) return g_k21_eng_h;
+    g_k21_scan_done = 1;
+    if (!g_gns_conn_iface || !g_gns_conn_h) return 0;
+    vt21 = *(void ***)g_gns_conn_iface;
+    for (h21 = 1; h21 <= 64; h21++) {
+        i32 rc21 = -999;
+        for (j = 0; j < sizeof mi; j++) mi[j] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc21 = ((i32 (*)(void *, uptr, void *))vt21[g97_slot])(
+                g_gns_conn_iface, (uptr)h21, mi);
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] k21: scan h="); C2B_LOGN(h21);
+            C2B_LOGS(" SEGV — abort\n");
+            break;
+        }
+        g_probe_active = 0;
+        if (rc21 == 1) {
+            u32 st21 = (u32)mi[0] | ((u32)mi[1] << 8) |
+                       ((u32)mi[2] << 16) | ((u32)mi[3] << 24);
+            u32 nz21 = 0;
+            for (j = 0; j < 0x20; j++)
+                if (mi[j]) { nz21 = 1; break; }
+            if (st21 || nz21) {
+                C2B_LOGS("[c2b] k21: scan h="); C2B_LOGN(h21);
+                C2B_LOGS(" st="); C2B_LOGD(st21);
+                C2B_LOGS(" info=");
+                for (j = 0; j < 0x30; j++) C2B_LOGH(mi[j]);
+                C2B_LOGS("\n");
+                if (!hfound && st21 == 2 && (uptr)h21 != g_gns_conn_h)
+                    hfound = h21;
+            }
+        }
+    }
+    g_k21_eng_h = hfound;
+    C2B_LOGS("[c2b] k21: eng-scan done eng-h="); C2B_LOGN(g_k21_eng_h);
+    C2B_LOGS(" br-h="); C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS("\n");
+    return g_k21_eng_h;
+}
+
 static void c2b_k19_relay(void)
 {
     u32 kch, kn;
@@ -15182,13 +15245,18 @@ static void c2b_k19_relay(void)
     u32 slot19, z19;
     void **vt19;
     u8 kcopy[640];
+    uptr hsend;
+    u32 he21;
     if (!g_krel_init) {
         const char *e = getenv("C2B_KREL");
         if (e && e[0] == '0') g_krel_on = 0;
         e = getenv("C2B_KREL_KEEP");
         if (e && e[0] == '1') g_krel_keep = 1;
+        e = getenv("C2B_K21ENG");
+        if (e && e[0] == '0') g_k21_eng = 0;
         g_krel_init = 1;
     }
+    if (g_krel_dead) return;            /* v21: не спамить мёртвый хэндл */
     if (!g_krel_on || !g_gns_conn_h || !g_gns_conn_iface) return;
     if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
     if (g_krel_sent >= C2B_KREL_CAP) return;
@@ -15214,12 +15282,20 @@ static void c2b_k19_relay(void)
     C2B_LOGH(kch);
     C2B_LOGS(") len=");
     C2B_LOGN(kn);
+    /* v21: цель = ЖИВАЯ сессия движка (скан), фолбэк = мостовая */
+    hsend = g_gns_conn_h;
+    if (g_k21_eng) {
+        he21 = c2b_k21_engscan();
+        if (he21) hsend = (uptr)he21;
+    }
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)hsend);
     rc19 = -999;
     out19 = -1;
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
         rc19 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt19[slot19])(
-            g_gns_conn_iface, g_gns_conn_h, kcopy, kn, 1, &out19);
+            g_gns_conn_iface, hsend, kcopy, kn, 1, &out19);
         g_probe_active = 0;
     } else {
         g_probe_active = 0;
@@ -15232,7 +15308,36 @@ static void c2b_k19_relay(void)
     C2B_LOGS(" Aseq=");
     C2B_LOGN(g_g90_A_seq);
     C2B_LOGS("\n");
-    if (rc19 == 1) g_krel_ok++;
+    if (rc19 == 1) {
+        g_krel_ok++;
+    } else {
+        /* v21: 1-й не-ОК = мёртвый хэндл/отказ: стоп-релей + ОДНОРАЗОВЫЙ
+         * подробный дамп slot-17 (4-арг (iface,h,buf,len), run339: буфер
+         * 1698B+; у g97 тот же вызов) — там end-debug = ПРИЧИНА закрытия,
+         * которую run256/run357 так и не поймали */
+        i32 rcd21 = -999;
+        u8 md21[4096];
+        g_krel_dead = 1;
+        C2B_LOGS("[c2b] krel: tgt dead (rc=");
+        C2B_LOGN((u32)(i32)rc19);
+        C2B_LOGS("), stop relay, detail:\n");
+        for (z19 = 0; z19 < sizeof md21; z19++) md21[z19] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rcd21 = ((i32 (*)(void *, uptr, void *, uptr))vt19[17])(
+                g_gns_conn_iface, hsend, md21, (uptr)sizeof md21);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] krel: detail SEGV\n");
+        }
+        C2B_LOGS("[c2b] krel: detail rc="); C2B_LOGN((u32)rcd21);
+        if (rcd21 == 0) {
+            C2B_LOGS("\n[c2b] krel: detail-ascii:");
+            c2b_g97_log_ascii(md21, 0x400);
+        }
+        C2B_LOGS("\n");
+    }
 }
 #endif /* !C2B_SELFTEST */
 

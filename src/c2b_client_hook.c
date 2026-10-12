@@ -1828,6 +1828,246 @@ static void *c2b_g126_watch(void *arg)
         klog_s("[c2b] g126: nomap 3min\n");
     return (void *)0;
 }
+
+/* ---------------- g128: THE CA-CERT TRUST-TABLE DIAG ----------------
+ * THE RUN345 VERDICT (the rounds 2243->0008 worklog gap): the connect =
+ * 14x PASS, the AUTHDIAG = the client cert = HEALTHY (avail=0x64=Current
+ * msg="OK" @t10/t30, 'Certificate expires in 47h58m') — BUT the stdout =
+ * THE REAL WALL:
+ *   'problem detected locally (4003): Bad cert: CA key 13151444190962006299
+ *    is not known to us' + '[ConnectOK] Ignored bad ... Failed crypto init.'
+ * => the engine's GNS REJECTS the S2's ConnectOK (the server cert = signed
+ * by the CA key NOT in the client's trusted-CA table) => the connection =
+ * dead at the crypto-init => the C2S_CONNECT 'k' = never built => THE
+ * APP-LEVEL SIGNON STALL = THE CERT-TRUST WALL.
+ * THE RE (g124-re/sc_cert_re*.py, the d975c5 build): the check fn =
+ * steamclient.so @0x1fe80a0 (the 33B prologue-sig), the fail-tail = the
+ * 'CA key %llu is not known to us' string-lea (the ONLY xref @0x1fe8271),
+ * the return = 0=fail / the nonnull key-struct=ok (the caller @0x1fe83e8:
+ * test rax,rax; je = the kill-path). THE TABLE = the rip-rel globals:
+ *   fn+0x5a: 8b 05 d32 -> GATE   @+0x2c4bba4 (0 = the list never loaded)
+ *   fn+0x68: 8b 05 d32 -> COUNT  @+0x2c4bb70
+ *   fn+0x73: 4c 8d 3d d32 -> IDXARR @+0x2c4bb60 (the s32 index-array ptr)
+ *   fn+0x9b: 48 8b 15 d32 -> KEYTBL @+0x2c4bb90 (the 24B-stride entries:
+ *              [0]=the CA-key u64, [8]=the pubkey obj, [0x10]=the chain)
+ * THE DIAG = read-only, the 12 polls @15s (the table = populated by the
+ * network-config load = the timing = unknown), the exec-seg sig-scan
+ * (the 39B fail-tail, the 2x disp32 wildcards + the STRING-VERIFY = the
+ * build-independent confirmation), the entries-dump (<=12 CA-key u64s).
+ * THE VERDICT-MATRIX: the GATE=0/COUNT=0 => the table never populated =>
+ * the fix = the network-config-fetch hunt; the COUNT>0 && no the S2's key
+ * 0xb68350cff5aa391b => the fix = the entry-injection + the sig-verify
+ * bypass (the call @fn+0x126 = the crypto-verify, 0=ok). The killswitch =
+ * C2B_G128=0. */
+static const u8 G128_TAIL_A[8] = {
+    0x48, 0x8b, 0x7c, 0x24, 0x08,       /* mov 0x8(%rsp),%rdi */
+    0x48, 0x8d, 0x35                    /* lea disp32(%rip),%rsi */
+};
+static const u8 G128_TAIL_B[6] = {
+    0x4c, 0x89, 0xe2,                   /* mov %r12,%rdx */
+    0x31, 0xc0,                         /* xor %eax,%eax */
+    0xe8                                /* call rel32 */
+};
+static const u8 G128_TAIL_C[17] = {
+    0x31, 0xc0,                         /* xor %eax,%eax (the 0=fail ret) */
+    0x48, 0x83, 0xc4, 0x28,             /* add $0x28,%rsp */
+    0x5b, 0x5d,                         /* pop %rbx,%rbp */
+    0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, /* pop %r12-%r15 */
+    0xc3                                /* ret */
+};
+static const u8 G128_PRO[33] = {
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, /* push %r15..%r12 */
+    0x49, 0x89, 0xf4,                   /* mov %rsp,%r12 */
+    0x55,                               /* push %rbp */
+    0x48, 0x89, 0xfd,                   /* mov %rdi,%rbp */
+    0x53,                               /* push %rbx */
+    0x48, 0x89, 0xd3,                   /* mov %rdx,%rbx */
+    0x48, 0x83, 0xec, 0x28,             /* sub $0x28,%rsp */
+    0x48, 0x89, 0x4c, 0x24, 0x18,       /* mov %rcx,0x18(%rsp) */
+    0x4c, 0x89, 0x44, 0x24, 0x08        /* mov %r8,0x8(%rsp) */
+};
+
+static void c2b_g128_report(u8 *lo, uptr span, u32 pass)
+{
+    uptr i;
+    u8 *p, *fn = 0;
+    i32 disp;
+    const u8 *s;
+    u32 back;
+    uptr idxarr = 0, keytbl = 0;
+    u32 count = 0;
+
+    for (i = 0; i + 40 < span; i++) {
+        p = lo + i;
+        if (p[0] != 0x48 || p[5] != 0x48 || p[6] != 0x8d) continue;
+        if (memcmp(p, G128_TAIL_A, 8) != 0) continue;
+        if (memcmp(p + 12, G128_TAIL_B, 6) != 0) continue;
+        if (memcmp(p + 22, G128_TAIL_C, 17) != 0) continue;
+        memcpy(&disp, p + 8, 4);
+        s = (const u8 *)((uptr)(p + 12) + (uptr)(i32)disp);
+        if (memcmp(s, "CA key %llu is not known to us", 30) != 0) continue;
+        for (back = 0; back < 0x800; back++) {
+            u8 *q = p + 5 - back;
+            if (memcmp(q, G128_PRO, 33) == 0) { fn = q; break; }
+        }
+        klog_s("[c2b] g128: SITE str=");
+        klog_p((uptr)s);
+        klog_s(" fn=");
+        if (fn) klog_h((u32)((uptr)fn - (uptr)lo));
+        else klog_s("nofn");
+        klog_s(" pass=");
+        klog_h(pass);
+        klog_s("\n");
+        if (!fn) return;
+        /* the 4 rip-rel globals: the FIXED fn-rel offs + the SHAPE-check */
+        {
+            struct { u32 at; const u8 *sh; u32 shlen; const char *nm; } G[4] = {
+                { 0x5a, (const u8 *)"\x8b\x05", 2, "GATE" },
+                { 0x68, (const u8 *)"\x8b\x05", 2, "COUNT" },
+                { 0x73, (const u8 *)"\x4c\x8d\x3d", 3, "IDXARR" },
+                { 0x9b, (const u8 *)"\x48\x8b\x15", 3, "KEYTBL" }
+            };
+            u32 gi;
+            for (gi = 0; gi < 4; gi++) {
+                u8 *ip = fn + G[gi].at;
+                i32 d2;
+                uptr tgt;
+                if (memcmp(ip, G[gi].sh, G[gi].shlen) != 0) {
+                    klog_s("[c2b] g128: SHAPE-MISMATCH ");
+                    klog_s(G[gi].nm);
+                    klog_s(" have=");
+                    klog_x(ip, 8);
+                    klog_s("\n");
+                    continue;
+                }
+                memcpy(&d2, ip + G[gi].shlen, 4);
+                tgt = (uptr)ip + G[gi].shlen + 4 + (uptr)(i32)d2;
+                /* NO window-check: the globals = in .data/.bss = OUTSIDE
+                 * the exec-seg (the validator: the GATE @+0x2cbbba4 vs the
+                 * exec-end @+0x2ae14bf) — the SHAPE-match + the SITE
+                 * string-verify = the guards (the disp32 = the verified
+                 * compiler-emit). The klog = the module-rel via the fn. */
+                klog_s("[c2b] g128: ");
+                klog_s(G[gi].nm);
+                klog_s(" @+");
+                klog_h((u32)(tgt - (uptr)fn));
+                if (gi == 0) {
+                    u32 v = *(volatile u32 *)tgt;
+                    klog_s(" =");
+                    klog_h(v);
+                } else if (gi == 1) {
+                    count = *(volatile u32 *)tgt;
+                    klog_s(" =");
+                    klog_h(count);
+                } else if (gi == 2) {
+                    idxarr = *(volatile uptr *)tgt;
+                    klog_s(" =");
+                    klog_p(idxarr);
+                } else {
+                    keytbl = *(volatile uptr *)tgt;
+                    klog_s(" =");
+                    klog_p(keytbl);
+                }
+                klog_s("\n");
+            }
+        }
+        if (idxarr && keytbl && count && count < 0x1000) {
+            u32 e;
+            for (e = 0; e < count && e < 12; e++) {
+                i32 idx;
+                u64 key;
+                memcpy(&idx, (const void *)(idxarr + 4u * e), 4);
+                if (idx < 0 || idx > 0x10000) continue;
+                memcpy(&key, (const void *)(keytbl + 24u * (u32)idx), 8);
+                klog_s("[c2b] g128: CAKEY[");
+                klog_h(e);
+                klog_s("] idx=");
+                klog_h((u32)idx);
+                klog_s(" key=");
+                klog_h((u32)(key >> 32));
+                klog_h((u32)key);
+                klog_s("\n");
+            }
+        }
+        return;   /* the site = unique (the single string-xref) */
+    }
+    klog_s("[c2b] g128: nosite pass=");
+    klog_h(pass);
+    klog_s("\n");
+}
+
+static void *c2b_g128_watch(void *arg)
+{
+    u32 poll;
+    (void)arg;
+    for (poll = 1; poll <= 12; poll++) {
+        char buf[131072];
+        i32 fd = open("/proc/self/maps", O_RDONLY);
+        i32 n;
+        char *s;
+        u32 done = 0;
+
+        if (fd < 0) return 0;
+        n = (i32)read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return 0;
+        buf[n] = 0;
+        s = buf;
+        while (s && *s && !done) {
+            char *e = strchr(s, '\n');
+            uptr a = 0, b = 0;
+            i32 k = 0;
+            int isx = 0;
+            /* the maps-line: start-end perms ... path */
+            while (s[k] && s[k] != '-') {
+                char c = s[k];
+                if (c >= '0' && c <= '9') a = (a << 4) | (uptr)(c - '0');
+                else if (c >= 'a' && c <= 'f') a = (a << 4) | (uptr)(c - 'a' + 10);
+                else break;
+                k++;
+            }
+            if (s[k] == '-') {
+                k++;
+                while (s[k] && s[k] != ' ') {
+                    char c = s[k];
+                    if (c >= '0' && c <= '9') b = (b << 4) | (uptr)(c - '0');
+                    else if (c >= 'a' && c <= 'f') b = (b << 4) | (uptr)(c - 'a' + 10);
+                    else break;
+                    k++;
+                }
+                if (s[k] == ' ' && b > a) {
+                    /* the perms = r w x p: the x = @k+3 */
+                    isx = (s[k + 3] == 'x');
+                    if (isx) {
+                        i32 j;
+                        for (j = k; s[j] && s[j] != '\n'; j++) {
+                            if (s[j] == 's' && s[j + 1] == 't' &&
+                                s[j + 2] == 'e' && s[j + 3] == 'a' &&
+                                s[j + 4] == 'm' && s[j + 5] == 'c' &&
+                                s[j + 6] == 'l' && s[j + 7] == 'i' &&
+                                s[j + 8] == 'e' && s[j + 9] == 'n' &&
+                                s[j + 10] == 't' && s[j + 11] == '.' &&
+                                s[j + 12] == 's' && s[j + 13] == 'o' &&
+                                s[j + 14] != '2') {
+                                c2b_g128_report((u8 *)a, b - a, poll);
+                                done = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            s = e ? e + 1 : 0;
+        }
+        if (done && poll >= 4) return 0;  /* the repeats = the count-change watch */
+        {
+            struct timespec ts = { 15, 0 };
+            nanosleep(&ts, 0);
+        }
+    }
+    klog_s("[c2b] g128: exhausted 3min\n");
+    return 0;
+}
 #endif  /* __x86_64__ */
 
 __attribute__((constructor)) static void c2b_g110_init(void)
@@ -1914,6 +2154,19 @@ __attribute__((constructor)) static void c2b_g110_init(void)
                 pthread_detach(t26);
             else
                 klog_s("[c2b] g126: pthread_create FAILED\n");
+        }
+    }
+    /* g128: the CA-TRUST-TABLE diag (the run345 verdict: the 'Bad cert: CA
+     * key ... is not known to us' = THE signon wall). The killswitch =
+     * C2B_G128=0. */
+    {
+        const char *e28 = (const char *)getenv("C2B_G128");
+        if (!(e28 && e28[0] == '0')) {
+            pthread_t t28;
+            if (pthread_create(&t28, 0, c2b_g128_watch, 0) == 0)
+                pthread_detach(t28);
+            else
+                klog_s("[c2b] g128: pthread_create FAILED\n");
         }
     }
 #endif

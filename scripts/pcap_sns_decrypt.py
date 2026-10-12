@@ -505,11 +505,14 @@ def selftest2():
 
 # ------------------------------------------------------------ keys mode --
 def parse_g100_log(path):
-    """-> [(key32, window_bytes)] from the c2b g100 log lines"""
+    """-> [(key32, window_bytes)] from the c2b g100/g113 log lines.
+    The match = the bare 'aes256ks' substring: the g100 era = 'g100:
+    aes256ks', the g113 era (the client-hook AES scan) = 'g113: aes256ks'
+    — the prefix-bound filter = the run322-class silent-miss bug."""
     out = []
     import re
     for line in open(path, "r", errors="replace"):
-        if "g100: aes256ks" not in line:
+        if "aes256ks" not in line:
             continue
         mb = re.search(r"keybe=([0-9a-f]{64})", line)
         mw = re.search(r"win=([0-9a-f]*)", line)

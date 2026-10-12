@@ -1113,6 +1113,388 @@ static void *c2b_g113_thread(void *arg)
     return (void *)0;
 }
 
+/* ---------------- g124: THE LIVE-INTERCEPT (the AES-GCM EVP init) --------
+ * THE PIVOT (the worklog 1638 verdict): the offline heap hunt = EXHAUSTED
+ * (the priv = not in the pub ±16KB neighborhoods x 6 runs; the IV = not in
+ * the key ±512B neighborhoods x ~8M AEAD opens x 3 models). BOTH session
+ * secrets = wiped or in the opaque custom ctxs => the capture at the INIT
+ * = the only path through the wipe: the key + the IV = LIVE at the
+ * wire-speed init = NO heap race, NO nonce model, the decryptor input =
+ * DIRECT (ks/kr/ivs/ivr = the setkey/setiv args themselves).
+ *
+ * THE RE (the run333 bins libsteamnetworkingsockets.so__cb0ca8.so, the
+ * 64-bit game copy, LOAD1 off==va, the objdump = /home/z/my-project/
+ * g124-re/sns.asm): the SNS lib = a FULL statically-linked OpenSSL (the
+ * OBJ db names 'id-aes256-GCM' etc @0x4317xx; the algo-name link table
+ * {name_ptr, data_slot, 8} @0x15200+; NO curve25519 constants (the
+ * 121665/p25519/base-point = ZERO hits) => the X25519 = NOT in this lib
+ * (the game's = elsewhere; the cxi/pubdup line = continues separately)).
+ * The AES = pure AES-NI (no S-box): 1032 aesenc, 196 pclmul*, 31
+ * aeskeygenassist.
+ *
+ * THE MAPPED INIT PATH (aes_gcm_init_key @0x23d120 — the EVP_F_AES_INIT_KEY
+ * ERR call (lib=6 func=0xa5 reason=0x126) @0x23bbf0 = the sibling aes_init_key
+ * @0x23b9ad = the classifier):
+ *   AESNI branch: aesni_set_encrypt_key(key=rdi, bits=esi(=keylen<<3), ks=rdx)
+ *                 @0x2734b0 (rounds=14 @ks+0xf0 for bits=256)
+ *              -> CRYPTO_gcm128_init(gcm=rdi=&gctx->gcm(@+0x100), ks=rsi,
+ *                 block=rdx=aesni_encrypt@0x273b40) @0x251be0
+ *              -> CRYPTO_gcm128_setiv(gcm=rdi, iv=rsi, len=rdx=@gctx+0x2c0)
+ *                 @0x251f50 (the 12B fast path = J0 = iv||1; else the GHASH)
+ * THE EVP_AES_GCM_CTX LAYOUT (the direct observation): ks @+0x000,
+ * key_set @+0xf8, iv_set @+0xfc, gcm @+0x100 (sizeof(GCM128)=0x1b8),
+ * iv-saved @+0x2b8, ivlen @+0x2c0. => the (key,iv) PAIRING = the pure
+ * pointer arithmetic: gcm_ptr - 0x100 == ks_ptr (both = logged).
+ *
+ * THE HOOK SITES (the chokepoints BELOW the EVP layer = the funnel: every
+ * GCM user — the EVP or the direct CCrypto — passes both):
+ *   SITE A  setkey  @+0x2734b0  aesni_set_encrypt_key(rdi=key, esi=bits,
+ *                   rdx=ks): the capture = bits==256 (the SNS session =
+ *                   AES-256-GCM per the keybe) => key=<64hex> ks=<ptr>.
+ *   SITE B  setiv   @+0x251f50  CRYPTO_gcm128_setiv(rdi=gcm, rsi=iv,
+ *                   rdx=len): the capture = iv=<hex> len gcm=<ptr>.
+ * THE PROLOGUES (the raw bytes = the version-drift kill; the anchor =
+ * the DEEP sig = the whole 48B/28B head blocks incl. the cmp $0x100,%esi /
+ * the mov 0x160(%rdi),%rbp):
+ *   setkey 19B: 41 57 48 85 ff 41 56 41 55 41 54 55 53 0f 84 ad 04 00 00
+ *               (push r15; test rdi,rdi; push r14/r13/r12; push rbp/rbx;
+ *                je +0x4ad) = the WHOLE-INSTRUCTION boundary @19
+ *               (the g110 m64 lesson: its 16B patch SPLITS the 5B movdqa —
+ *                the latent bug = moot (the chacha = silent) but g124 =
+ *                correct-by-construction: the patch len = the boundary).
+ *   setiv 21B:  41 57 41 56 41 55 41 54 55 53 48 89 fb 48 83 ec 18
+ *               48 83 fa 0c (pushes; mov rdi,rbx; sub $0x18,rsp;
+ *                cmp $0xc,%rdx) = the boundary @21.
+ * THE PATCH = the g110 recipe: the site = ff25+abs8 (14B, the range-free)
+ * + the nop pad to the boundary; the tramp = the saved prologue + the abs
+ * jmp back to entry+N (N = 19/21). The detour = the C fn (the same regs
+ * ABI: at the entry rsp%16=8 = the call shape; the caller-saved = dead at
+ * any fn entry; the callee-saved = the C prologue preserves) = the log +
+ * the tramp call = the double-ret = the original ra = preserved.
+ * THE KLOG = the shared /tmp/c2b_client_keys.log (the g110 sink):
+ *   [c2b] g124: KEY bits=256 key=<64hex> ks=<16hex>
+ *   [c2b] g124: IV gcm=<16hex> len=<n> iv=<hex>
+ *   [c2b] g124: setkey#/setiv# = the call-profile (the cap 8 = the diag)
+ *   [c2b] g124: PATCHED setkey|setiv base= pid=  /  SIG-MISMATCH  /  nomap
+ * The decryptor (the next round): the pair (key,iv) by ks == gcm-0x100,
+ * decrypt_stream(pkts, flow, k_a, k_b, iv_a, iv_b) — the tag = the oracle.
+ * Killswitch: C2B_G124=0. The caps = 16 keys / 16 ivs (the dedup). */
+#if defined(__x86_64__)
+#define G124_SETKEY_OFF 0x2734b0u
+#define G124_SETIV_OFF  0x251f50u
+static const u8 G124_SETKEY_SIG[48] = {
+    0x41, 0x57,                   /* push %r15 */
+    0x48, 0x85, 0xff,             /* test %rdi,%rdi */
+    0x41, 0x56, 0x41, 0x55,       /* push %r14; push %r13 */
+    0x41, 0x54, 0x55, 0x53,       /* push %r12; push %rbp; push %rbx */
+    0x0f, 0x84, 0xad, 0x04, 0x00, 0x00,  /* je +0x4ad (the null-key out) */
+    0x48, 0x85, 0xd2,             /* test %rdx,%rdx */
+    0x0f, 0x84, 0xa4, 0x04, 0x00, 0x00,  /* je +0x4a4 (the null-ks out) */
+    0x89, 0xf0,                   /* mov %esi,%eax */
+    0x83, 0xe0, 0xbf,             /* and $0xffffffbf,%eax */
+    0x83, 0xc0, 0x80,             /* add $0xffffff80,%eax */
+    0x0f, 0x84, 0xa6, 0x01, 0x00, 0x00,  /* je (the bits=128 path) */
+    0x81, 0xfe, 0x00, 0x01, 0x00, 0x00   /* cmp $0x100,%esi */
+};
+static const u8 G124_SETIV_SIG[28] = {
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,  /* pushes r15..r12 */
+    0x55, 0x53,                                      /* push rbp; push rbx */
+    0x48, 0x89, 0xfb,             /* mov %rdi,%rbx */
+    0x48, 0x83, 0xec, 0x18,       /* sub $0x18,%rsp */
+    0x48, 0x83, 0xfa, 0x0c,       /* cmp $0xc,%rdx (the J0 fast path) */
+    0x48, 0x8b, 0xaf, 0x60, 0x01, 0x00, 0x00  /* mov 0x160(%rdi),%rbp */
+};
+static u8 g124_tramp_a[64] __attribute__((aligned(4096)));
+static u8 g124_tramp_b[64] __attribute__((aligned(4096)));
+static u32 g124_patched;      /* bit0 = the setkey, bit1 = the setiv */
+static u32 g124_nsetkey;      /* the total setkey calls seen */
+static u32 g124_nsetiv;       /* the total setiv calls seen */
+static u32 g124_prof_k;       /* the key-profile lines logged (cap 8) */
+static u32 g124_prof_i;       /* the iv-profile lines logged (cap 8) */
+#define G124_KEY_CAP 16
+#define G124_IV_CAP  16
+static u8  g124_keyseen[G124_KEY_CAP][32];
+static u32 g124_nkeys;
+static u8  g124_ivseen[G124_IV_CAP][16];
+static u32 g124_nivs;
+
+/* the 64-bit pointer print (the (key,iv) pairing = the ptr arithmetic) */
+static void klog_p(uptr v)
+{
+    static const char hx[] = "0123456789abcdef";
+    char b[16];
+    i32 i;
+    for (i = 0; i < 16; i++) b[i] = hx[(v >> (60 - 4 * i)) & 0xF];
+    klog(b, 16);
+}
+
+/* the setkey capture: the dedup by the 32B key, the caps, the ks ptr =
+ * the pairing anchor (gcm - 0x100 == ks) */
+static void c2b_g124_key_capture(i32 bits, const void *key, const void *ks)
+{
+    u32 n = __atomic_add_fetch(&g124_nsetkey, 1, __ATOMIC_RELAXED);
+    u32 z, j, dup;
+
+    (void)n;
+    if (g124_prof_k < 8) {
+        u32 idx = __atomic_add_fetch(&g124_prof_k, 1, __ATOMIC_RELAXED);
+        klog_s("[c2b] g124: setkey#");
+        klog_h(idx);
+        klog_s(" bits=");
+        klog_h((u32)bits);
+        klog_s("\n");
+    }
+    if (!key || bits != 256 || g124_nkeys >= G124_KEY_CAP) return;
+    dup = 0;
+    for (j = 0; j < g124_nkeys; j++) {
+        u32 same = 0;
+        for (z = 0; z < 32; z++)
+            same |= (u32)(g124_keyseen[j][z] ^ ((const u8 *)key)[z]);
+        if (!same) { dup = 1; break; }
+    }
+    if (dup) return;
+    for (z = 0; z < 32; z++)
+        g124_keyseen[g124_nkeys][z] = ((const u8 *)key)[z];
+    g124_nkeys++;
+    klog_s("[c2b] g124: KEY bits=256 key=");
+    klog_x((const u8 *)key, 32);
+    klog_s(" ks=");
+    klog_p((uptr)ks);
+    klog_s("\n");
+}
+
+/* the setiv capture: the dedup by the first-16B, the len = the logged */
+static void c2b_g124_iv_capture(const void *gcm, const void *iv, sz_t len)
+{
+    u32 n = __atomic_add_fetch(&g124_nsetiv, 1, __ATOMIC_RELAXED);
+    u8  buf[16];
+    u32 cl, z, j, dup;
+
+    (void)n;
+    if (g124_prof_i < 8) {
+        u32 idx = __atomic_add_fetch(&g124_prof_i, 1, __ATOMIC_RELAXED);
+        klog_s("[c2b] g124: setiv#");
+        klog_h(idx);
+        klog_s(" len=");
+        klog_h((u32)len);
+        klog_s("\n");
+    }
+    if (!iv || g124_nivs >= G124_IV_CAP) return;
+    for (z = 0; z < 16; z++) buf[z] = 0;
+    cl = len > 16 ? 16 : (u32)len;
+    if (cl) memcpy(buf, iv, cl);
+    dup = 0;
+    for (j = 0; j < g124_nivs; j++) {
+        u32 same = 0;
+        for (z = 0; z < 16; z++)
+            same |= (u32)(g124_ivseen[j][z] ^ buf[z]);
+        if (!same) { dup = 1; break; }
+    }
+    if (dup) return;
+    for (z = 0; z < 16; z++) g124_ivseen[g124_nivs][z] = buf[z];
+    g124_nivs++;
+    klog_s("[c2b] g124: IV gcm=");
+    klog_p((uptr)gcm);
+    klog_s(" len=");
+    klog_h((u32)len);
+    klog_s(" iv=");
+    klog_x(buf, 16);
+    klog_s("\n");
+}
+
+/* the detours: the same-signature C fns (the log + the tramp = the
+ * double-ret; the args = the regs at the entry = re-passed to the tramp) */
+static i32 c2b_g124_setkey_detour(const void *key, i32 bits, void *ks);
+static i32 c2b_g124_setkey_detour(const void *key, i32 bits, void *ks)
+{
+    i32 (*tramp)(const void *, i32, void *) =
+        (i32 (*)(const void *, i32, void *))g124_tramp_a;
+    c2b_g124_key_capture(bits, key, ks);
+    /* the tramp = the saved SIG (48B) + the ff25 abs-jmp => the ready
+     * check = @sizeof(G124_SETKEY_SIG) = 48 (NOT the 19B patch-shape —
+     * the hooktest round-1 bug: the check @19 = the saved-orig byte =
+     * never 0xff => the -2 = the tramp = never called) */
+    if (g124_tramp_a[sizeof(G124_SETKEY_SIG)] == 0xff)
+        return tramp(key, bits, ks);
+    return -2;
+}
+static void c2b_g124_setiv_detour(void *gcm, const void *iv, sz_t len);
+static void c2b_g124_setiv_detour(void *gcm, const void *iv, sz_t len)
+{
+    void (*tramp)(void *, const void *, sz_t) =
+        (void (*)(void *, const void *, sz_t))g124_tramp_b;
+    c2b_g124_iv_capture(gcm, iv, len);
+    if (g124_tramp_b[sizeof(G124_SETIV_SIG)] == 0xff)
+        tramp(gcm, iv, len);
+}
+
+/* the one-site patcher: the exact-sig gate (the version drift = the skip),
+ * the tramp = the saved sig + the abs jmp to entry+siglen, the site =
+ * ff25+abs8 + the nop pad to the boundary */
+static void c2b_g124_patch(u8 *tgt, const u8 *sig, u32 siglen, u8 *tramp,
+                           uptr detour, const char *name, u32 bit, uptr base)
+{
+    u32 k;
+
+    if (memcmp(tgt, sig, siglen) != 0) {
+        klog_s("[c2b] g124: SIG-MISMATCH ");
+        klog_s(name);
+        klog_s(" have=");
+        klog_x(tgt, 16);
+        klog_s("\n");
+        return;
+    }
+    if (tgt[0] == 0xff) {           /* the already-patched */
+        __atomic_or_fetch(&g124_patched, bit, __ATOMIC_RELAXED);
+        return;
+    }
+    for (k = 0; k < siglen; k++) tramp[k] = tgt[k];
+    {
+        uptr da = (uptr)(tgt + siglen);
+        tramp[siglen + 0] = 0xff; tramp[siglen + 1] = 0x25;
+        tramp[siglen + 2] = 0; tramp[siglen + 3] = 0;
+        tramp[siglen + 4] = 0; tramp[siglen + 5] = 0;
+        for (k = 0; k < 8; k++) tramp[siglen + 6 + k] = (u8)(da >> (8 * k));
+    }
+    if (mprotect((void *)tramp, 4096,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        klog_s("[c2b] g124: tramp mprotect fail\n");
+        return;
+    }
+    if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
+                 PROT_READ | PROT_WRITE) != 0) {
+        klog_s("[c2b] g124: site mprotect fail\n");
+        return;
+    }
+    {
+        uptr da = detour;
+        tgt[0] = 0xff; tgt[1] = 0x25;
+        tgt[2] = 0; tgt[3] = 0; tgt[4] = 0; tgt[5] = 0;
+        for (k = 0; k < 8; k++) tgt[6 + k] = (u8)(da >> (8 * k));
+        for (k = 14; k < siglen; k++) tgt[k] = 0x90;
+    }
+    if (mprotect((void *)((uptr)tgt & ~(uptr)0xFFF), 0x2000,
+                 PROT_READ | PROT_EXEC) != 0) {
+        klog_s("[c2b] g124: site mprotect RX fail\n");
+    }
+    __atomic_or_fetch(&g124_patched, bit, __ATOMIC_RELAXED);
+    klog_s("[c2b] g124: PATCHED ");
+    klog_s(name);
+    klog_s(" base=");
+    klog_p(base);
+    klog_s(" pid=");
+    klog_h((u32)getpid());
+    klog_s("\n");
+}
+
+/* the maps-line match: 'libsteamnetworkingsockets.so' in the path part */
+static i32 line_is_sns(const char *s, i32 n, uptr *out_lo)
+{
+    /* "libsteamnetworkingsockets.so" = 28 chars: s[11]='w' (after 'net'),
+     * ".so" = s[25..27] */
+    uptr a = 0, b = 0;
+    i32 k = 0, c, i, nhex = 0;
+
+    while (k < n && s[k] != '-') {
+        c = s[k];
+        if (c >= '0' && c <= '9') a = (a << 4) | (uptr)(c - '0');
+        else if (c >= 'a' && c <= 'f') a = (a << 4) | (uptr)(c - 'a' + 10);
+        else return 0;
+        k++; nhex++;
+    }
+    if (k >= n || s[k] != '-' || nhex < 1) return 0;
+    k++;
+    while (k < n && s[k] != ' ') {
+        c = s[k];
+        if (c >= '0' && c <= '9') b = (b << 4) | (uptr)(c - '0');
+        else if (c >= 'a' && c <= 'f') b = (b << 4) | (uptr)(c - 'a' + 10);
+        else return 0;
+        k++;
+    }
+    if (k >= n || s[k] != ' ' || b <= a) return 0;
+    for (i = k; i + 28 <= n; i++) {
+        if (s[i] == 'l' && s[i + 1] == 'i' && s[i + 2] == 'b' &&
+            s[i + 3] == 's' && s[i + 4] == 't' && s[i + 5] == 'e' &&
+            s[i + 6] == 'a' && s[i + 7] == 'm' && s[i + 11] == 'w' &&
+            s[i + 25] == '.' && s[i + 26] == 's' && s[i + 27] == 'o') {
+            *out_lo = a;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void *c2b_g124_watch(void *arg)
+{
+    int round;
+    (void)arg;
+
+    /* the SNS lib = mapped at the game boot (the run333 bins = the game's
+     * own dump) => the poll = short; 360 x 500ms = 3 min = the margin */
+    for (round = 0; round < 360; round++) {
+        i32 fdm = open("/proc/self/maps", O_RDONLY);
+        char chunk[65536], line[4096];
+        i32 llen = 0;
+        uptr liblo = 0;
+        ssz_t r;
+
+        if ((g124_patched & 3) == 3) return (void *)0;
+        if (fdm < 0) return (void *)0;
+        while ((r = read(fdm, chunk, sizeof(chunk))) > 0) {
+            sz_t i = 0;
+            while (i < (sz_t)r) {
+                sz_t j = i, seg;
+                while (j < (sz_t)r && chunk[j] != '\n') j++;
+                seg = j - i;
+                if (llen + (i32)seg > (i32)sizeof(line) - 1)
+                    seg = (sz_t)sizeof(line) - 1 - (sz_t)llen;
+                if (seg) {
+                    memcpy(line + llen, chunk + i, seg);
+                    llen += (i32)seg;
+                }
+                if (j == (sz_t)r) break;
+                i = j + 1;
+                {
+                    uptr a;
+                    if (line_is_sns(line, llen, &a) &&
+                        (!liblo || a < liblo)) liblo = a;
+                }
+                llen = 0;
+            }
+        }
+        close(fdm);
+        if (llen > 0) {
+            uptr a;
+            if (line_is_sns(line, llen, &a) && (!liblo || a < liblo))
+                liblo = a;
+        }
+        if (!liblo) {
+            struct timespec ts = { 0, 500000000 };
+            nanosleep(&ts, 0);
+            continue;
+        }
+        if (!(g124_patched & 1))
+            c2b_g124_patch((u8 *)(liblo + G124_SETKEY_OFF), G124_SETKEY_SIG,
+                           sizeof(G124_SETKEY_SIG), g124_tramp_a,
+                           (uptr)&c2b_g124_setkey_detour, "setkey", 1,
+                           liblo);
+        if (!(g124_patched & 2))
+            c2b_g124_patch((u8 *)(liblo + G124_SETIV_OFF), G124_SETIV_SIG,
+                           sizeof(G124_SETIV_SIG), g124_tramp_b,
+                           (uptr)&c2b_g124_setiv_detour, "setiv", 2,
+                           liblo);
+        if ((g124_patched & 3) == 3) return (void *)0;
+        /* the sig mismatch = the version drift = NO patch (the log = once
+         * via the patch fn) = the stop (the retry = the same verdict) */
+        if (g124_patched) return (void *)0;
+        return (void *)0;
+    }
+    if ((g124_patched & 3) != 3)
+        klog_s("[c2b] g124: nomap 3min\n");
+    return (void *)0;
+}
+#endif  /* __x86_64__ */
+
 __attribute__((constructor)) static void c2b_g110_init(void)
 {
     const char *e = (const char *)getenv("C2B_G110");
@@ -1171,6 +1553,20 @@ __attribute__((constructor)) static void c2b_g110_init(void)
             pthread_detach(t13);
         else
             klog_s("[c2b] g113: pthread_create FAILED (game)\n");
+    }
+    /* g124: the LIVE-INTERCEPT watcher (the AES-GCM init capture) —
+     * independent of the go-file: the patch = ASAP (the SNS lib = mapped
+     * at the boot; the session init = at the connect). The killswitch =
+     * C2B_G124=0. */
+    {
+        const char *e24 = (const char *)getenv("C2B_G124");
+        if (!(e24 && e24[0] == '0')) {
+            pthread_t t24;
+            if (pthread_create(&t24, 0, c2b_g124_watch, 0) == 0)
+                pthread_detach(t24);
+            else
+                klog_s("[c2b] g124: pthread_create FAILED\n");
+        }
     }
 #endif
 }

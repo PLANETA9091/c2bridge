@@ -795,6 +795,8 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
     LD_LIBRARY_PATH="${LDPREFIX:+$LDPREFIX:}$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
     SDL_AUDIODRIVER=dummy \
+    C2B_G109="${C2B_G109:-1}" \
+    C2B_G110="${C2B_G110:-1}" \
     LD_PRELOAD="$LDPRELOAD" \
     $MODES $EXTRA_ENV $AUTH_VTIDX_ENV \
     sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug +sdr_spew_level 7" \

@@ -553,6 +553,19 @@ static u32 c2b_g113_nkeys;
  * HARMLESS for the bloom scan (the dumps = only on the full 32B
  * matches; the bloom FP ~= npubs/65536). */
 #define C2B_G113_NPUBS_MAX 128
+/* g122: the ctx window 512 -> 16384. THE RUN332 DISAMBIGUATION: 39
+ * client-pub windows captured, 5541 32B slices bruted via the PURE
+ * X25519_base test (X25519(priv, BASE) = the client pub = ZERO KDF
+ * assumptions, priv_presence_test.py) = NO priv in ANY +/-512B window
+ * => the priv = NOT adjacent to any captured pub copy: the session
+ * keypair object = BIGGER than 512B or the priv = a separate
+ * allocation in the same arena. THE FIX: +/-16KB windows — the heap
+ * locality bet (the allocator arenas = the MB scale, the keygen = the
+ * priv + the pub = allocated together). The volume: ~115 pubdup2 x
+ * 32KB hex = ~3.7MB/cycle klog = acceptable. The offline brute = the
+ * X25519_base test (the same tool, the stride-4 = 4-aligned slices =
+ * the allocator granularity). */
+#define C2B_G113_DUPCTX 16384
 static u8 c2b_g113_pubs[C2B_G113_NPUBS_MAX][32];
 static u32 c2b_g113_npubs;
 
@@ -759,6 +772,29 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
                     if (!seenb[pk[qb]]) { seenb[pk[qb]] = 1; distinct++; }
                 }
                 if (distinct >= 18) {
+                    /* g122: the WIDE LOCALITY DUMP at the registration =
+                     * once per unique pub: +/-16KB around the FIRST
+                     * serialization copy. The run332 lesson: the priv =
+                     * NOT within +/-512B of ANY pub copy (the pure
+                     * X25519_base test over 5541 slices = NO hit) => the
+                     * arena-neighborhood bet. The cxi serializations =
+                     * the keygen's allocation neighborhood = the priv =
+                     * plausibly within 16KB. Volume: ~54 unique pubs x
+                     * 32KB hex = ~1.7MB/cycle. The offline = the same
+                     * X25519_base brute. */
+                    {
+                        u64 s5 = o2 >= C2B_G113_DUPCTX
+                                 ? o2 - C2B_G113_DUPCTX : 0;
+                        u64 e5 = o2 + 40 + C2B_G113_DUPCTX;
+                        if (e5 > (u64)n) e5 = n;
+                        klog_s("[c2b] g113: cxidump @");
+                        klog_h((u32)(base + o2));
+                        klog_s(" pub=");
+                        c2b_g113_hex(pk, 32);
+                        klog_s(" ctx=");
+                        c2b_g113_hex(buf + s5, (u32)(e5 - s5));
+                        klog_s("\n");
+                    }
                     for (z2 = 0; z2 < 32; z2++)
                         c2b_g113_pubs[c2b_g113_npubs][z2] = pk[z2];
                     c2b_g113_npubs++;
@@ -872,8 +908,8 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
                 klog_s(" pub=");
                 c2b_g113_hex(P, 32);
                 klog_s(" ctx=");
-                s3 = o2 >= 512 ? o2 - 512 : 0;
-                e3 = o2 + 512;
+                s3 = o2 >= C2B_G113_DUPCTX ? o2 - C2B_G113_DUPCTX : 0;
+                e3 = o2 + 512 + C2B_G113_DUPCTX;
                 if (e3 > (u64)n) e3 = n;
                 c2b_g113_hex(buf + s3, (u32)(e3 - s3));
                 klog_s("\n");
@@ -883,6 +919,7 @@ static i32 c2b_g113_scanbuf(const u8 *buf, u32 n, uptr base, u32 *hits,
     }
     return 0;
 }
+
 
 static void *c2b_g113_thread(void *arg)
 {

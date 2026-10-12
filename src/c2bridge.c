@@ -7002,7 +7002,8 @@ static void c2b_segv_guard_install(void) { }
  *  g130 = stolen 13Б + push %r12 (41 54, @+13..14) + abs-jmp 0x4bb17f.
  *  Сиг-верификация = полные 20/15Б (дрейф = give-up). Killswitches
  *  C2B_G129=0 / C2B_G130=0. 64-бит only (как g48-класс). */
-static volatile uptr c2b_g129_tramp, c2b_g130_tramp;
+__attribute__((used)) static void *volatile c2b_g129_tramp;
+__attribute__((used)) static void *volatile c2b_g130_tramp;
 static volatile u32 c2b_g129_n, c2b_g130_n, c2b_g130_kn;
 static u8 *g_g129_tramp_mem, *g_g130_tramp_mem;
 
@@ -7185,7 +7186,7 @@ static void c2b_g129_apply(void)
         for (i = 0; i < 8; i++) *p++ = (u8)(tgt >> (8 * i));
         c2b_write_jmp((void *)p, (const void *)(fa + 20)); /* 13+7 = 0x24aa34 */
     }
-    c2b_g129_tramp = (uptr)tr;
+    c2b_g129_tramp = (void *)tr;
     if (c2b_page_protect(fa, C2B_PATCH_LEN, 0x07) != 0) {
         C2B_LOGS("[c2b] g129: page_protect failed\n");
         done = 1;
@@ -7236,7 +7237,7 @@ static void c2b_g130_apply(void)
         *p++ = c2b_g130_p12[1];
         c2b_write_jmp((void *)p, (const void *)(fa + 15)); /* 13+2 = 0x4bb17f */
     }
-    c2b_g130_tramp = (uptr)tr;
+    c2b_g130_tramp = (void *)tr;
     if (c2b_page_protect(fa, C2B_PATCH_LEN, 0x07) != 0) {
         C2B_LOGS("[c2b] g130: page_protect failed\n");
         done = 1;

@@ -14237,11 +14237,23 @@ static void c2b_g97_log_ascii(const u8 *p, u32 n)
     }
 }
 
-static u32 g97_slot = 3;   /* v5: калибруется пробой при арме (run335) */
+static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-урок). Плоский порядок
+                             * ISteamNetworkingSockets (006/009 = ОДНА раскладка):
+                             * [1]=ConnectByIPAddress (g32, живые сессии=пруф),
+                             * [5]=CloseConnection (!!),
+                             * [11]=SendMessageToConnection (run335: кадр [07] НА
+                             * ПРОВОДЕ), [12]=ReceiveMessagesOnConnection (g82),
+                             * [13]=GetConnectionInfo (чистое чтение),
+                             * [14]=GetDetailedConnectionStatus (end-debug).
+                             * v5-проба слотов {2,3,5,6} = УБИЙЦА: s=3 = SEGV ->
+                             * "closed by app (1999)" (коннект умер на CONNECTING);
+                             * s=5 = CloseConnection = rc=1(Bool true)+info-нули =
+                             * ВТОРОЕ убийство ('GetInfo rc=1+state0' = мисрид).
+                             * Проба = УДАЛЕНА; полл = [13] + sigsetjmp-гард. */
 
 static void *c2b_g97_thread(void *arg)
 {
-    u32 t, prev = 0xFFFFFFFFu, dead_run = 0, done = 0;
+    u32 t, prev = 0xFFFFFFFFu, dead_run = 0, done = 0, h_seen = 0;
     i32 prev_rc = -999;
     (void)arg;
     {
@@ -14261,48 +14273,7 @@ static void *c2b_g97_thread(void *arg)
     }
     C2B_LOGS("[c2b] g97: armed h=");
     C2B_LOGH((u32)g_gns_conn_h);
-    C2B_LOGS("\n");
-    /* v5 (run335): СЛОТ-КАЛИБРОВКА. Слот 3 = rc=0 ВСЮ сессию (t=0..94,
-     * буфер нулевой) = вотчер СЛЕПОЙ весь прогон; слоты дрейфуют между
-     * билдами (58f-карта = старый билд). Проба слотов {2,3,5,6} ОДИН раз
-     * (1=Connect и 4=CloseConnection = НЕ ТРОГАЕМ — проба=вызов!);
-     * слот = первый с rc==1 и ненулевым info[0..3] (state-enum в младшем
-     * слове SteamNetConnectionInfo_t). Каждая проба под sigsetjmp-гардом
-     * (чужой слот = чужие аргументы = возможен SEGV внутри). */
-    {   u32 s;
-        void **vtc = *(void ***)g_gns_conn_iface;
-        for (s = 2; s <= 6; s++) {
-            u8 mb[256];
-            i32 rr = -999;
-            u32 j2;
-            if (s == 4) continue;
-            for (j2 = 0; j2 < sizeof mb; j2++) mb[j2] = 0;
-            g_probe_active = 1;
-            if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                rr = ((i32 (*)(void *, uptr, void *))vtc[s])(
-                    g_gns_conn_iface, g_gns_conn_h, mb);
-            } else {
-                g_probe_active = 0;
-                C2B_LOGS("[c2b] g97: slot-probe SEGV s=");
-                C2B_LOGD(s); C2B_LOGS("\n");
-                continue;
-            }
-            g_probe_active = 0;
-            C2B_LOGS("[c2b] g97: slot-probe s=");
-            C2B_LOGD(s);
-            C2B_LOGS(" rc="); C2B_LOGD(rr);
-            C2B_LOGS(" info0=");
-            for (j2 = 0; j2 < 8; j2++) C2B_LOGH(mb[j2]);
-            C2B_LOGS("\n");
-            if (rr == 1 && (mb[0] | mb[1] | mb[2] | mb[3]) != 0) {
-                g97_slot = s;
-                break;
-            }
-        }
-        C2B_LOGS("[c2b] g97: slot=");
-        C2B_LOGD(g97_slot);
-        C2B_LOGS("\n");
-    }
+    C2B_LOGS(" slot=13(GCI) detail=14 map:1=Conn,5=Close!,11=Send,12=Recv\n");
     for (t = 0; t < 720 && !done; t++) {   /* 720 x 0.5с = 6 мин максимум */
         void **vt97;
         i32 rc = -999, rcd = -999;
@@ -14310,6 +14281,18 @@ static void *c2b_g97_thread(void *arg)
         u32 j, st;
         usleep(500000);
         if (!g_gns_conn_h || !g_gns_conn_iface) { done = 1; break; }
+        /* v6: h-РЕБИНД. g32 переконнекчивает (run336: 006-h1 убит v5-пробой ->
+         * 009-h2 = ЖИВАЯ сессия 123с); g_gns_conn_h = обновляется g32
+         * автоматически при следующем ConnectByIPAddress. Ловим смену. */
+        if (h_seen && g_gns_conn_h != h_seen) {
+            C2B_LOGS("[c2b] g97: h-rebind old=");
+            C2B_LOGH((u32)h_seen);
+            C2B_LOGS(" new=");
+            C2B_LOGH((u32)g_gns_conn_h);
+            C2B_LOGS("\n");
+            prev = 0xFFFFFFFFu; prev_rc = -999; dead_run = 0;
+        }
+        h_seen = g_gns_conn_h;
         vt97 = *(void ***)g_gns_conn_iface;
         for (j = 0; j < sizeof ma; j++) ma[j] = 0;
         for (j = 0; j < sizeof md; j++) md[j] = 0;
@@ -14319,7 +14302,7 @@ static void *c2b_g97_thread(void *arg)
                 g_gns_conn_iface, g_gns_conn_h, ma);
         } else {
             g_probe_active = 0;
-            C2B_LOGS("[c2b] g97: GetConnectionInfo(slot3) SEGV — exit\n");
+            C2B_LOGS("[c2b] g97: GetConnectionInfo(slot13) SEGV — exit\n");
             break;
         }
         g_probe_active = 0;
@@ -14341,15 +14324,16 @@ static void *c2b_g97_thread(void *arg)
             C2B_LOGS("\n[c2b] g97: ascii:");
             c2b_g97_log_ascii(ma, 0x100);
             C2B_LOGS("\n");
-            /* 58f-g97b: слот 13 = GetDetailedConnectionStatus(h, st, cb) —
-             * теперь С размером (1024 >= sizeof struct); int rc (0 = ок) */
+            /* v6: слот 14 = GetDetailedConnectionStatus(h, buf, cb) — int rc
+             * (0 = ок), buf = ASCII-таблица статуса ВКЛЮЧАЯ end-reason/end-debug
+             * строку. (Раньше тут стоял 13 = дубликат основного GCI-полла.) */
             g_probe_active = 1;
             if (__sigsetjmp(g_probe_jb, 1) == 0) {
-                rcd = ((i32 (*)(void *, uptr, void *, uptr))vt97[13])(
+                rcd = ((i32 (*)(void *, uptr, void *, uptr))vt97[14])(
                     g_gns_conn_iface, g_gns_conn_h, md, (uptr)sizeof md);
             } else {
                 g_probe_active = 0;
-                C2B_LOGS("[c2b] g97: GetDetailedConnectionStatus SEGV\n");
+                C2B_LOGS("[c2b] g97: GetDetailedConnectionStatus(14) SEGV\n");
             }
             g_probe_active = 0;
             if (rcd == 0) {
@@ -14718,7 +14702,36 @@ static i32 c2b_g98_send_msg(u32 mtype, const u8 *body, u32 blen, u32 frm, u32 id
     for (i = 0; i < hlen; i++) pkt[plen++] = hdr[i];
     if (blen) memcpy(pkt + plen, body, blen);
     plen += blen;
-    send_slot = (g_gns_conn_ver == 0) ? 11u : 10u;
+    /* v6 (run336-урок): слот 11 = SendMessageToConnection в ОБОИХ 006/009
+     * (один плоский порядок ISteamNetworkingSockets; run335: кадр [07] через
+     * 11 НА ПРОВОДЕ). Слот 10 = GetConnectionName (rc=1 = Bool-мусор, кадр
+     * НИКОГДА не доставлялся) — ver-развилка УДАЛЕНА. */
+    send_slot = 11u;
+    /* v6: pre-send живость: GCI(13) -> state==0 (Invalid/мертв) = НЕ слать
+     * (run336: msg#1 rc=8 = посылка в h1, убитый v5-пробой ДО доставки). */
+    {
+        u8 mchk[256];
+        i32 rchk;
+        u32 k2;
+        for (k2 = 0; k2 < sizeof mchk; k2++) mchk[k2] = 0;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rchk = ((i32 (*)(void *, uptr, void *))vt[13])(
+                g_gns_conn_iface, g_gns_conn_h, mchk);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] g98: pre-send GCI SEGV\n");
+            return -998;
+        }
+        if (rchk == 1 && mchk[0] == 0 && mchk[1] == 0 && mchk[2] == 0 &&
+            mchk[3] == 0) {
+            C2B_LOGS("[c2b] g98: skip dead-h (GCI rc=1 st=0) msg #");
+            C2B_LOGN(idx);
+            C2B_LOGS("\n");
+            return -996;
+        }
+    }
     C2B_LOGS("[c2b] g98: msg #");
     C2B_LOGN(idx);
     C2B_LOGS(" t=");

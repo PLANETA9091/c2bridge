@@ -310,6 +310,26 @@ static void *c2b_g110_watch(void *arg)
         ssz_t r;
 
         if (fdm < 0) return (void *)0;
+#if !defined(__x86_64__)
+        /* the g110d: the one-shot start marker (the watcher = alive?) */
+        if (round == 0) {
+            klog_s("[c2b] g110: watch start arch=" ARCH_TAG " pid=");
+            {
+                char pids[11];
+                u32 v = (u32)getpid();
+                i32 i, started = 0;
+                for (i = 9; i >= 0; i--) { pids[i] = (char)('0' + (v % 10)); v /= 10; }
+                pids[10] = 0;
+                for (i = 0; i < 10; i++) {
+                    if (pids[i] != '0' || started || i == 9) {
+                        klog(pids + i, 1);
+                        started = 1;
+                    }
+                }
+            }
+            klog_s("\n");
+        }
+#endif
         while ((r = read(fdm, chunk, sizeof(chunk))) > 0) {
             sz_t i = 0;
             while (i < (sz_t)r) {
@@ -450,7 +470,40 @@ __attribute__((constructor)) static void c2b_g110_init(void)
     pthread_t t;
 
     if (e && e[0] == '0') return;
-    klog_s("[c2b] g110: hook loaded arch=" ARCH_TAG "\n");
+    /* g110d: the banner = the pid + the comm (WHO loaded = the 5x arch=32
+     * identity = the run312 unknown; the comm = /proc/self/comm = 16B) */
+    {
+        char comm[17];
+        i32 fd = open("/proc/self/comm", O_RDONLY);
+        i32 n = 0;
+        char pids[11];
+        u32 v = (u32)getpid();
+        i32 i, started = 0;
+
+        for (i = 9; i >= 0; i--) { pids[i] = (char)('0' + (v % 10)); v /= 10; }
+        pids[10] = 0;
+        klog_s("[c2b] g110: hook loaded arch=" ARCH_TAG " pid=");
+        for (i = 0; i < 10; i++) {
+            if (pids[i] != '0' || started || i == 9) {
+                klog(pids + i, 1);
+                started = 1;
+            }
+        }
+        klog_s(" comm=");
+        if (fd >= 0) {
+            n = (i32)read(fd, comm, 16);
+            close(fd);
+        }
+        if (n > 0) {
+            while (n > 0 && (comm[n - 1] == '\n' || comm[n - 1] == 0)) n--;
+            klog(comm, (u32)n);
+        } else {
+            klog_s("?");
+        }
+        klog_s("\n");
+    }
     if (pthread_create(&t, 0, c2b_g110_watch, 0) == 0)
         pthread_detach(t);
+    else
+        klog_s("[c2b] g110: pthread_create FAILED\n");
 }

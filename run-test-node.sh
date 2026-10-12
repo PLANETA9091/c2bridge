@@ -413,9 +413,28 @@ fi
 # g110b RUN310 FIX: the ss = prints DECIMAL ports — the prior grep ":dfff "
 # (the hex = the bridge's census format) = NEVER matched = the anchor = empty
 # in all 3 shots. Both forms now (the decimal + the hex for the proc-net).
+# g110d: THE GROUND-TRUTH CLIENT PROBE (the harness-side = can NOT lie):
+# the core steam pid = its LD_PRELOAD (the environ) + the steamclient.so
+# map count (the maps) + the maps tail (the last 3 lines = the lib's
+# position in the maps = the truncation check) + the /proc/net/udp line
+# for :57343 (the listener without the ss at all = the 2nd opinion).
 ( for i in 1 2 3; do
     echo "=== shot$i t=$SECONDS ==="
     sudo -n ss -upan 2>/dev/null | grep -aE ":57343 |:dfff "
+    SPID=$(pgrep -u "$GAME_USER" -f "ubuntu12_32/steam( |$)" | head -1)
+    if [[ -n "$SPID" ]]; then
+      echo "--- pid=$SPID environ LD_PRELOAD:"
+      tr '\0' '\n' < "/proc/$SPID/environ" 2>/dev/null | grep -a "^LD_PRELOAD=" || echo "(none)"
+      echo "--- pid=$SPID steamclient.so map lines:"
+      grep -ac "steamclient.so" "/proc/$SPID/maps" 2>/dev/null || echo 0
+      echo "--- pid=$SPID maps tail:"
+      tail -3 "/proc/$SPID/maps" 2>/dev/null
+      echo "--- /proc/net/udp :57343 (port 0xdfff):"
+      awk 'toupper($3) ~ /:DFFF$/ { print }' /proc/net/udp 2>/dev/null || true
+      sudo -n awk 'toupper($2) ~ /:DFFF$/ { print }' /proc/net/udp 2>/dev/null || true
+    else
+      echo "(no core steam pid)"
+    fi
     (( i < 3 )) && sleep 45
   done ) > "$RUNDIR/relay57343_owner_early.txt" 2>/dev/null &
 log "g110 early relay anchor armed (3 shots x45s): $(grep -ac . "$RUNDIR/relay57343_owner_early.txt" 2>/dev/null || echo 0) lines so far"

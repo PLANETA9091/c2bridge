@@ -69,6 +69,10 @@
 #define C2B_LDD_MAXSTOLEN 24u   /* кап окна (сиг-размер) */
 #define C2B_LDD_MAXTRAMP  96u   /* 24 + развороты + ff25(14) с запасом */
 #define C2B_LDD_NREAD     64u   /* байт читать с цели (якорь-скан + окно) */
+/* Макс. |tgt - tramp|: все фиксапы = rel32/disp32 = ±2ГБ; запас 0.25ГБ
+ * (CI-урок: mmap'ы на раннере = НЕ соседи; дальняя пара = усечённый disp
+ * = дикий riprel-рид = SIGSEGV @первом исполнении трампа) */
+#define C2B_LDD_MAXDIST   0x70000000ull
 
 /* класс инструкции */
 #define C2B_LDD_C_COPY   0u     /* копия вербатим */
@@ -236,6 +240,14 @@ static inline unsigned int c2b_ldd_build(const unsigned char *tgt,
     unsigned int o = 0u, t = 0u, i, j;
     if (!tgt || !tramp || !olen_out || !tlen_out || n < 8u) return 0u;
     *olen_out = 0u; *tlen_out = 0u;
+    /* ДИСТАНЦИЯ: rel32/disp32-фиксапы = ±2ГБ — дальняя пара = отказ ДО
+     * записи трампа (иначе усечённый disp = дикий рид на исполнении) */
+    {
+        unsigned long long d = (tgt_addr > tramp_addr)
+                                   ? (tgt_addr - tramp_addr)
+                                   : (tramp_addr - tgt_addr);
+        if (d > C2B_LDD_MAXDIST) return 0u;
+    }
     /* ЯКОРЬ идентичности: 'b8 <nr> 00 00 00 0f 05' (inline-syscall форма,
      * glibc 2.35/2.39) ИЛИ '6a <nr>' (push-nr обёртка, glibc 2.41) в пер-
      * вых 64 байтах. */

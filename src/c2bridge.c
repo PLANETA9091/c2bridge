@@ -27737,16 +27737,24 @@ static void test_lddet(void)
                             0x7f0000001000ull, btr, 0, 46u,
                             &olen, &tlen) == 0u,
               "ldd: чужой nr = 0");
+        /* дальняя пара (|tgt-tramp| > 1.75ГБ) = отказ ДО фиксапов (CI-
+         * урок: усечённый disp32 = дикий рид = SIGSEGV на исполнении) */
+        CHECK(c2b_ldd_build(tldd_g239_st, sizeof tldd_g239_st,
+                            0x7f0000001000ull, btr,
+                            0x7f8000000000ull, 44u,
+                            &olen, &tlen) == 0u,
+              "ldd: дальняя пара = 0");
     }
 #if defined(__x86_64__) && !defined(C2B_ST_NO_DETOUR) && \
     !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_UNDEFINED__)
-    /* ---- СИНТЕТИЧЕСКИЙ end-to-end (реальный syscall через UDP) ---- */
+    /* ---- СИНТЕТИЧЕСКИЙ end-to-end (реальный syscall через UDP) ----
+     * pg+trx = ОДНА 8192-mmap (соседи ГАРАНТИРОВАННО: дистанция < 2ГБ =
+     * контракт фиксапов; два отдельных mmap на раннере = разные арены =
+     * ГБ-дистанция = отказ билдера или усечённые фиксапы) ---- */
     {
-        u8 *pg = (u8 *)mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+        u8 *pg = (u8 *)mmap(0, 8192, PROT_READ | PROT_WRITE | PROT_EXEC,
                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        u8 *trx = (u8 *)mmap(0, 4096,
-                             PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        u8 *trx = pg + 4096;
         unsigned int olen = 0, tlen = 0, q;
         u8 site[14], saved[24];
         unsigned long long det;
@@ -27761,10 +27769,10 @@ static void test_lddet(void)
                               const void *, unsigned int);
 #define TLDL_HTONS(v) ((unsigned short)((((v) & 0xffu) << 8) | \
                                          (((v) >> 8) & 0xffu)))
-        CHECK(pg != (u8 *)-1 && trx != (u8 *)-1,
-              "ldd: RWX-страницы (код+трамп)");
-        if (pg == (u8 *)-1 || trx == (u8 *)-1) return;
-        memset(pg, 0x90, 4096);
+        CHECK(pg != (u8 *)-1,
+              "ldd: RWX-страницы (код+трамп, соседи)");
+        if (pg == (u8 *)-1) return;
+        memset(pg, 0x90, 8192);
         /* пролог формы 2.39-SENDTO (endbr+cmpb-riprel+mov-ecx->r10d;
          * je @14 = ВНЕ окна 14B) + тело sendto-синтетики:
          *   st-байт @0x40 (disp = 0x40-11 = 0x35), je -> slow @0x28
@@ -27800,7 +27808,7 @@ static void test_lddet(void)
                             trx, (unsigned long long)(uptr)trx, 44u,
                             &olen, &tlen) == 14u,
               "ldd: синтетика build=14");
-        if (olen != 14u) { munmap(pg, 4096); munmap(trx, 4096); return; }
+        if (olen != 14u) { munmap(pg, 8192); return; }
         memcpy(saved, pg, 24);
         site[0] = 0xff; site[1] = 0x25;
         site[2] = 0; site[3] = 0; site[4] = 0; site[5] = 0;
@@ -27850,7 +27858,7 @@ static void test_lddet(void)
               "ldd: slow-ветка = дейтаграмма (riprel-фикс исполнением)");
         close(sfd); close(rfd);
         memcpy(pg, saved, 24);          /* рестор сайта (дисциплина) */
-        munmap(pg, 4096); munmap(trx, 4096);
+        munmap(pg, 8192);
 #undef TLDL_HTONS
     }
 #else

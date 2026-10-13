@@ -499,13 +499,34 @@ static inline unsigned int c2b_ldd_site_build(const unsigned char *tgt,
     t = c2b_ldd_site_prefix(tramp, tramp_addr, logger_addr);
     /* окно БЕЗ якоря: тот же декодер, та же граница >= 14 */
     for (;;) {
-        unsigned int ilen, tlen, cc, doff, kind;
+        unsigned int ilen, tlen, cc, doff, kind, pad;
         unsigned char k = c2b_ldd_class(tgt, n, o, &ilen, &tlen, &cc,
                                         &doff);
         if (k == 0xffu) return 0u;
         kind = (unsigned int)k;
         if (o + ilen > C2B_LDD_MAXSTOLEN) return 0u;
-        if (t + tlen + 14u > C2B_LDD_MAXTRAMP) return 0u;
+        /* v61: ERESTART-PAD — если украденная инсн = syscall (окно
+         * кончается '0f 05'), в трампе ПЕРЕД '0f 05' вставляется 2B-nop
+         * '66 90'. ПРИЧИНА: ядро на ERESTARTSYS/ERESTART_RESTARTBLOCK
+         * перезапускает прерванный syscall РЕВАЙНОМ RIP-2 (rax = orig nr
+         * / 219 восстанавливает САМО ядро) — в трампе -2 от '0f 05' =
+         * хвост 'b8 <nr> 00 00 00' = '00 00' = add %al,(%rax) = ДИКИЙ
+         * рид = SIGSEGV, проглоченный crash-хэндлером движка = ЧИСТЫЙ
+         * инстант-выход (run420/421: wr2 = menu=0 x4/5, dmesg = zero
+         * segv; wr2 = write()-cancellable-путь = ЕДИНСТВЕННЫЙ ИСПОЛНЯЕМЫЙ
+         * сайт с syscall в окне). '66 90' = xchg %ax,%ax = полный 2B-insn:
+         * ревайн садится НА НЕГО, фоллсру = '0f 05' с ядерными rax = к о
+         * р р е к т н ы й рестарт. Ложноположит. детект (imm64-хвост
+         * '0f 05') = безвреден (+2B nop в трампе). v52-энтри = окно БЕЗ
+         * syscall (пролог) => пад не нужен, оригинальный syscall не
+         * патчен. */
+        pad = (ilen >= 2u && tgt[o + ilen - 2u] == 0x0fu &&
+               tgt[o + ilen - 1u] == 0x05u) ? 2u : 0u;
+        if (t + pad + tlen + 14u > C2B_LDD_MAXTRAMP) return 0u;
+        if (pad) {
+            tramp[t] = 0x66u; tramp[t + 1u] = 0x90u;
+            t += 2u;
+        }
         if (kind == C2B_LDD_C_COPY || kind == C2B_LDD_C_RIPREL) {
             for (j = 0u; j < ilen; j++) tramp[t + j] = tgt[o + j];
             if (kind == C2B_LDD_C_RIPREL) {

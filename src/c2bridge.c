@@ -15431,7 +15431,11 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
             return;
         }
     }
-    /* FIRE: доказательство живости детура (любой nr, кап 3/сайт) */
+    /* FIRE: доказательство живости детура (любой nr, кап 3/сайт).
+     * v61: + fd/len = профайл ВНУТРЕННЕГО write-пути (b8-класс: fd=rdi
+     * buf=rsi len=rdx; csp-класс: fd=rcx len=r9) — run421-урок: FIRE'ы =
+     * редкие write'ы мимо v52-entry = кандидат-механизм отправителя
+     * 0x22 => каждый FIRE = данные (fd/len) для офлайн-кросс-рефа. */
     if (tag < 8u && g_dsite_fires[tag] < 3u) {
         g_dsite_fires[tag]++;
         g_dsite_busy = 1u;
@@ -15439,6 +15443,18 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
         C2B_LOGS(g_dsite_tab[tag].tag);
         C2B_LOGS(" ax=");
         c2b_gp_lh64((unsigned long long)rax);
+        {
+            u64 ffd, flen;
+            if (rsi && rdx >= 40u && rdx <= 640u) {
+                ffd = rdi; flen = rdx;         /* b8-класс */
+            } else {
+                ffd = rcx; flen = r9v;         /* csp-класс */
+            }
+            C2B_LOGS(" fd=");
+            C2B_LOGN((u32)(ffd & 0xffffu));
+            C2B_LOGS(" len=");
+            C2B_LOGN((u32)flen);
+        }
         C2B_LOGS(" f=");
         C2B_LOGN(g_dsite_fires[tag]);
         C2B_LOGS("\n");
@@ -28891,8 +28907,8 @@ static void test_lddet(void)
                                  &olen, &tlen) == 21u,
               "v59: csp1 build=21 (SIB-фикс 11B-nop)");
         if (olen == 21u) {
-            CHECK(tlen == 75u + 27u + 14u,
-                  "v59: csp1 tlen=116 (75 префикс + 27 окно + ff25)");
+            CHECK(tlen == 75u + 29u + 14u,
+                  "v61: csp1 tlen=118 (75 префикс + 27 окно + 2 ERESTART-pad + ff25)");
             /* префикс байт-точно: 9 push + 6 arg-load + call */
             CHECK(str[0] == 0x50 && str[1] == 0x51 && str[2] == 0x52 &&
                   str[3] == 0x56 && str[4] == 0x57 &&
@@ -28945,17 +28961,20 @@ static void test_lddet(void)
                   str[74] == 0x58,
                   "v59: push rax (align) + push r10 r9 r8 + pop r8 r9 r10 "
                   "+ pop rax + restore 9 pop");
-            /* окно @75: 89 d0 | 0f 05 | eb f8 -> e9 (цель = site-2) */
-            CHECK(str[75] == 0x89 && str[76] == 0xd0 &&
-                  str[77] == 0x0f && str[78] == 0x05,
-                  "v59: stolen = mov eax,edx; syscall @75");
-            CHECK(str[79] == 0xe9,
-                  "v59: eb f8 развёрнут в e9 @79");
+            /* окно @75: 89 d0 | [v61: 66 90 pad] | 0f 05 | eb f8 -> e9 */
+            CHECK(str[75] == 0x89 && str[76] == 0xd0,
+                  "v59: stolen = mov eax,edx @75");
+            CHECK(str[77] == 0x66 && str[78] == 0x90,
+                  "v61: ERESTART-pad 66 90 @77 (ревайн RIP-2 = полный insn)");
+            CHECK(str[79] == 0x0f && str[80] == 0x05,
+                  "v61: syscall @79 (сразу после pad)");
+            CHECK(str[81] == 0xe9,
+                  "v59: eb f8 развёрнут в e9 @81");
             rel = (0x7f0000001002ll + 4ll + 2ll - 8ll) -
-                  (0x7f0000200000ll + 79ll + 5ll);
+                  (0x7f0000200000ll + 81ll + 5ll);
             v32 = 0;
             for (q = 0; q < 4u; q++)
-                v32 |= ((unsigned int)str[80u + q]) << (8 * q);
+                v32 |= ((unsigned int)str[82u + q]) << (8 * q);
             CHECK((long long)(int)v32 == rel,
                   "v59: eb f8 rel32 = спин-голова site-2");
             /* ff25-jmp-back -> site+21 (abs8 = 64-бит) */
@@ -29225,6 +29244,28 @@ static void test_lddet(void)
                                  &olen, &tlen) == 15u,
               "v59: синтетика build=15");
         if (olen != 15u) { munmap(pg, 8192); return; }
+        /* v61: ERESTART-pad байт-точно в трампе (gid-окно = b8+0f05+cmp+
+         * ja = wr2-форма): префикс 75 | b8 27 00 00 00 (5) | 66 90 (pad
+         * @80-81) | 0f 05 @82-83 | 48 3d.. (cmp @84-89) | 0f 87 (ja->
+         * jcc32 @90-95) | ff25 (jmp-back @96-109) = tlen 110 */
+        CHECK(trx[80] == 0x66 && trx[81] == 0x90 &&
+              trx[82] == 0x0f && trx[83] == 0x05,
+              "v61: ERESTART-pad 66 90 перед syscall (wr2-форма)");
+        CHECK(trx[84] == 0x48 && trx[85] == 0x3d &&
+              trx[90] == 0x0f && trx[91] == 0x87,
+              "v61: cmp rax,-4096 @84 + ja->jcc32 @90 (цель = errno-путь)");
+        {   /* ja +5 -> цель = site+15+5 = site+20 (абсолютная);
+             * rel32 = site+20 - (tramp+90+6) */
+            long long jrel;
+            unsigned int q;
+            unsigned int v32 = 0;
+            for (q = 0; q < 4u; q++)
+                v32 |= ((unsigned int)trx[92u + q]) << (8 * q);
+            jrel = ((long long)(uptr)pg + 20ll) -
+                   ((long long)(uptr)trx + 90ll + 6ll);
+            CHECK((long long)(int)v32 == jrel,
+                  "v61: ja rel32 = errno-путь site+20");
+        }
         memcpy(saved, pg, 32);
         site[0] = 0xff; site[1] = 0x25;
         site[2] = 0; site[3] = 0; site[4] = 0; site[5] = 0;

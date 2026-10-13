@@ -23,14 +23,20 @@ typedef struct c2b_k27_A {
     volatile unsigned int       seq;    /* +1 на каждый новый 'A' */
     volatile unsigned int       chal;   /* LE u32 @ 'A'+5 */
     volatile unsigned int       proto;  /* байт @ 'A'+9 */
-    volatile unsigned int       val;    /* LE u32 @ 'A'+10 */
+    volatile unsigned int       val;    /* LE u32 @ 'A'+15 (v41b: РЕАЛЬНЫЙ
+                                         * офсет — run379/380 полный 54B-dump:
+                                         * [10..14] = 5 нулей, val='07 0a ee
+                                         * 00'=0x00ee0a07 @15; старый +10 чи-
+                                         * тал 0 = v41 выстрелил qconnect0x0
+                                         * и сервер ре-челленджил 2-й 'A') */
     volatile unsigned long long gcm;    /* gcm-контекст расшифровки (пост-фактум
                                          * атрибуция сессии: in=<8B> ↔ pcap) */
 } c2b_k27_A_t;
 
 /* Чистый сканер одного вхождения ff×4+'A'|'B' с offset off в буфере p[0..n).
  * Возвращает 1 и заполняет cls/chal/proto/val; 0 = нет вхождения.
- * Мин. длина хвоста = 14B (ff×4 + класс + chal4 + proto + val4). */
+ * 'A'-форма (run379/380 54B): ff×4+cls+chal4+proto+pad5+val4 = мин. хвост 19B
+ * (для 'B' хвост короче, но общий гейт 19 = безопасен: скан по ff×4+'A'/'B'). */
 static inline int c2b_k27_scan_clv2(const unsigned char *p, unsigned n,
                                     unsigned off, unsigned char *cls,
                                     unsigned int *chal, unsigned int *proto,
@@ -47,10 +53,20 @@ static inline int c2b_k27_scan_clv2(const unsigned char *p, unsigned n,
                     ((unsigned int)p[i + 7] << 16) |
                     ((unsigned int)p[i + 8] << 24);
             *proto = p[i + 9];
-            *val = (unsigned int)p[i + 10] |
-                   ((unsigned int)p[i + 11] << 8) |
-                   ((unsigned int)p[i + 12] << 16) |
-                   ((unsigned int)p[i + 13] << 24);
+            if (p[i + 4] == 'B' || i + 19 > n) {
+                /* 'B': val = u32 @+10 (старая модель, не используется) либо
+                 * 'A' короче 19B: val = то, что осталось (гейт выше) */
+                *val = (unsigned int)p[i + 10] |
+                       ((unsigned int)p[i + 11] << 8) |
+                       ((unsigned int)p[i + 12] << 16) |
+                       ((unsigned int)p[i + 13] << 24);
+            } else {
+                /* 'A' v41b: pad5 @[10..14], val = LE u32 @[15..18] */
+                *val = (unsigned int)p[i + 15] |
+                       ((unsigned int)p[i + 16] << 8) |
+                       ((unsigned int)p[i + 17] << 16) |
+                       ((unsigned int)p[i + 18] << 24);
+            }
             return 1;
         }
     }

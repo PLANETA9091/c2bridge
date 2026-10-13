@@ -26003,13 +26003,15 @@ static void test_k27scan(void)
 {
     unsigned char cls = 0;
     u32 chal = 0, proto = 0, val = 0;
-    /* SNP-префикс 12B + ff×4+'A'+chal+proto+val (форма run361 DEC32#1) */
-    const u8 buf_a[26] = { 0x80, 0x00, 0x98, 0x02, 0x00, 0xf8, 0x00, 0x37,
+    /* SNP-префикс 12B + ff×4+'A'+chal+proto+pad5+val (форма run379/380
+     * DEC32 54B: [10..14]=5 нулей, val=0x00ee0a07 @15 — v41b-модель) */
+    const u8 buf_a[31] = { 0x80, 0x00, 0x98, 0x02, 0x00, 0xd4, 0x00, 0x37,
                            0x01, 0x00, 0x00, 0x00,
                            0xff, 0xff, 0xff, 0xff, 'A',
                            0x00, 0x00, 0x00, 0x00,   /* chal=0 */
                            0x03,                      /* proto=3 */
-                           0x07, 0x0a, 0xee, 0x00 };  /* val=0x00ee0a07 */
+                           0x00, 0x00, 0x00, 0x00, 0x00,  /* pad5 @10..14 */
+                           0x07, 0x0a, 0xee, 0x00 };  /* val=0x00ee0a07 @15 */
     CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 0, &cls, &chal, &proto,
                             &val) == 1, "k27: 'A' найден за SNP-префиксом");
     CHECK(cls == 'A', "k27: cls='A'");

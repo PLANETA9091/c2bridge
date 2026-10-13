@@ -45,6 +45,7 @@ typedef unsigned int   uptr;
  * мост резолвит dlsym(0, "g_c2b_k27_A") на первом тике g97. */
 #include "c2b_k27.h"
 #include "c2b_crt.h"
+#include "c2b_lddet.h"
 
 #ifdef C2B_SELFTEST
 /* ---------- режим selftest: нормальная libc ---------- */
@@ -56,6 +57,8 @@ typedef unsigned int   uptr;
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+/* v52: udp-сокеты теста = РУЧНЫЕ decls (house = свои sockaddr/socklen_t;
+ * sys/socket.h = конфликтует с хуками sendto/recvfrom) */
 /* v18-g77fd: чей-сокет ридеры — объявлены в общем блоке ниже (рядом с
  * собственными struct sockaddr/socklen_t моста) */
 static void c2b_segv(int sig, siginfo_t *si, void *uc)
@@ -14979,11 +14982,352 @@ static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
     return on;
 }
 
+/* ---------- v52: LIBC-PROLOGUE DETOUR (c2b_lddet.h) ----------
+ * Патч ТОЧЕК ВХОДА sendto/sendmsg/send в самой libc.so.6 (адреса =
+ * dlsym(RTLD_NEXT) — те же указатели, что и у хуков; трамп = переноск-
+ * а окна + ff25-jmp-back, декодер = c2b_ldd_build). ПОСЛЕ v51-рефута-
+ * ций (ни одного чужого GOT-слота, ни одного raw-syscall-сайта) единс-
+ * твенный оставшийся класс отправителя 0x22-класса = ПРЯМОЙ укатель на
+ * libc-send (dlopen-хэндл dlsym / pre-resolved pointer в анонимном ко-
+ * де) — единственное место, где такой вызов ещё проходит = тело libc-
+ * функции. Детур-фн = та же crt-логика, что в хуках (капчер серта +
+ * rewrite [22][4c 00] -> принятая форма); tramp зовётся НАПРЯМУЮ (не
+ * entry) = петли нет. ra-гвард: кадры, чей return-address внутри текста
+ * моста (.so вкл. хуки) = passthrough — хук-слой УЖЕ отработал crt-кла-
+ * сс, а собственные connreq моста = неприкосновенны (f2=0x11 != 0x12
+ * движкового, но гвард = дешёвая страховка). write НЕ патчится (stdout/
+ * лог-путь горячий; 0x22 = sendto-формы 512B). Гейт C2B_LIBCDET=1 (ar-
+ * med-класс: меняет чужой текст). Лог: '[c2b] v52: ARMED <fn>@<p> sto-
+ * len=<n> tramp=<p>' (per-fn), '[c2b] v52: HIT <fn> len=<n> ra=<hex>'
+ * (кап 12 = доказательство прямого-укателя), '[c2b] v52: <fn> build=0
+ * have=<hex>' (дрифт-протокол g124), '[c2b] v52: install done armed=<n>'
+ * (сводка). Установка = при ПЕРВОМ sendto-хуке (раньше = лучше: окно
+ * гонки с живыми callers = минимально; house-прецедент живого патча =
+ * g124-вотчер). Убийсвич = не задавать C2B_LIBCDET. */
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+struct c2b_ldd_dlinfo { const char *dli_fname; void *dli_fbase;
+                        const char *dli_sname; void *dli_saddr; };
+extern int dladdr(void *, struct c2b_ldd_dlinfo *);
+extern i32 munmap(void *, u32);
+static void *volatile g_ldd_tr_st;      /* tramp sendto */
+static void *volatile g_ldd_tr_sm;      /* tramp sendmsg */
+static void *volatile g_ldd_tr_sd;      /* tramp send   */
+static u32 g_ldd_init, g_ldd_arm, g_ldd_hits, g_ldd_armed;
+static uptr g_ldd_lo, g_ldd_hi;         /* текст моста (ra-гвард) */
+typedef ssize_t (*c2b_ldd_sd_fn)(int, const void *, size_t, int);
+
+static ssize_t c2b_ldd_dsendto(int fd, const void *buf, size_t len,
+                               int flags, const struct sockaddr *addr,
+                               socklen_t addrlen)
+{
+    c2b_sendto_fn tr = (c2b_sendto_fn)g_ldd_tr_st;
+    if (!tr) { *__errno_location() = 2; return -1; }
+    if (buf && len >= 40u && len <= 640u &&
+        ((const u8 *)buf)[0] == 0x22) {
+        uptr ra = (uptr)__builtin_return_address(0);
+        if (!g_ldd_lo || ra < g_ldd_lo || ra >= g_ldd_hi) {
+            const u8 *p = (const u8 *)buf;
+            u8 crtbuf[600];
+            u32 on;
+            if (g_ldd_hits < 12u) {
+                g_ldd_hits++;
+                C2B_LOGS("[c2b] v52: HIT sendto len=");
+                C2B_LOGN((u32)len);
+                C2B_LOGS("fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS("ra=");
+                c2b_gp_lh64((unsigned long long)ra);
+                C2B_LOGS("\n");
+            }
+            if (!g_crt_init) {
+                const char *ec = getenv("C2B_CRTFIX");
+                if (ec && ec[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
+            c2b_crt_maybe_capture(p, (u32)len);
+            on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
+                                       (u32)sizeof crtbuf);
+            if (on) return tr(fd, crtbuf, on, flags, addr, addrlen);
+        }
+    }
+    return tr(fd, buf, len, flags, addr, addrlen);
+}
+
+static ssize_t c2b_ldd_dsend(int fd, const void *buf, size_t len,
+                             int flags)
+{
+    c2b_ldd_sd_fn tr = (c2b_ldd_sd_fn)g_ldd_tr_sd;
+    if (!tr) { *__errno_location() = 2; return -1; }
+    if (buf && len >= 40u && len <= 640u &&
+        ((const u8 *)buf)[0] == 0x22) {
+        uptr ra = (uptr)__builtin_return_address(0);
+        if (!g_ldd_lo || ra < g_ldd_lo || ra >= g_ldd_hi) {
+            const u8 *p = (const u8 *)buf;
+            u8 crtbuf[600];
+            u32 on;
+            if (g_ldd_hits < 12u) {
+                g_ldd_hits++;
+                C2B_LOGS("[c2b] v52: HIT send len=");
+                C2B_LOGN((u32)len);
+                C2B_LOGS("fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS("ra=");
+                c2b_gp_lh64((unsigned long long)ra);
+                C2B_LOGS("\n");
+            }
+            if (!g_crt_init) {
+                const char *ec = getenv("C2B_CRTFIX");
+                if (ec && ec[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
+            c2b_crt_maybe_capture(p, (u32)len);
+            on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
+                                       (u32)sizeof crtbuf);
+            if (on) return tr(fd, crtbuf, on, flags);
+        }
+    }
+    return tr(fd, buf, len, flags);
+}
+
+static ssize_t c2b_ldd_dsendmsg(int fd, const struct c2b_msghdr *msg,
+                                int flags)
+{
+    c2b_sendmsg_fn tr = (c2b_sendmsg_fn)g_ldd_tr_sm;
+    if (!tr) { *__errno_location() = 2; return -1; }
+    if (msg && msg->msg_iov && msg->msg_iovlen >= 1 &&
+        msg->msg_iovlen <= 8 && msg->msg_iov[0].iov_base) {
+        /* v50d-паттерн: конкат до 8 чанков, crt-класс на конкате, подмена
+         * iov -> tramp -> restore (0x22 движка = sendmsg gather-форма). */
+        u8 cat[900];
+        u8 crtbuf[600];
+        u32 tot = 0, k, on;
+        uptr ra = (uptr)__builtin_return_address(0);
+        for (k = 0; k < (u32)msg->msg_iovlen; k++) {
+            u32 cl = (u32)msg->msg_iov[k].iov_len;
+            if (!msg->msg_iov[k].iov_base || cl > 640u) { tot = 0; break; }
+            if (tot + cl > sizeof cat) { tot = 0; break; }
+            memcpy(cat + tot, msg->msg_iov[k].iov_base, cl);
+            tot += cl;
+        }
+        if (tot >= 40u && tot <= 640u && cat[0] == 0x22 &&
+            (!g_ldd_lo || ra < g_ldd_lo || ra >= g_ldd_hi)) {
+            const u8 *p = (const u8 *)cat;
+            if (g_ldd_hits < 12u) {
+                g_ldd_hits++;
+                C2B_LOGS("[c2b] v52: HIT sendmsg len=");
+                C2B_LOGN(tot);
+                C2B_LOGS("fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS("ra=");
+                c2b_gp_lh64((unsigned long long)ra);
+                C2B_LOGS("\n");
+            }
+            if (!g_crt_init) {
+                const char *ec = getenv("C2B_CRTFIX");
+                if (ec && ec[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
+            c2b_crt_maybe_capture(p, tot);
+            on = c2b_crt_maybe_rewrite(p, tot, crtbuf,
+                                       (u32)sizeof crtbuf);
+            if (on) {
+                struct c2b_iovec sv[8];
+                u32 k2, n2 = (u32)msg->msg_iovlen;
+                ssize_t r2;
+                if (n2 > 8u) n2 = 8u;
+                for (k2 = 0; k2 < n2; k2++) sv[k2] = msg->msg_iov[k2];
+                ((struct c2b_iovec *)msg->msg_iov)[0].iov_base = crtbuf;
+                ((struct c2b_iovec *)msg->msg_iov)[0].iov_len = on;
+                ((struct c2b_msghdr *)msg)->msg_iovlen = 1;
+                r2 = tr(fd, msg, flags);
+                for (k2 = 0; k2 < n2; k2++)
+                    ((struct c2b_iovec *)msg->msg_iov)[k2] = sv[k2];
+                ((struct c2b_msghdr *)msg)->msg_iovlen = n2;
+                return r2;
+            }
+        }
+    }
+    return tr(fd, msg, flags);
+}
+
+/* установка одного детура: имя, nr якоря, tramp-глобал, детур-фн. */
+static void c2b_ldd_install1(const char *name, u32 nr,
+                             void *volatile *trslot, void *detour)
+{
+    void *fa = dlsym(C2B_CL_RTLD_NEXT, name);
+    u8 rbuf[64];
+    u8 site[14];
+    u8 *tramp;
+    unsigned int olen = 0, tlen = 0, q;
+    i32 fdm;
+    i64 rn;
+    extern i32 close(i32);
+    (void)tlen;
+    if (!fa || (uptr)fa < 4096u) {
+        C2B_LOGS("[c2b] v52: ");
+        C2B_LOGS(name);
+        C2B_LOGS(" resolve=0\n");
+        return;
+    }
+    fdm = open("/proc/self/mem", 0 /*O_RDONLY*/);
+    if (fdm < 0) {
+        C2B_LOGS("[c2b] v52: mem open fail\n");
+        return;
+    }
+    rn = pread(fdm, rbuf, (uptr)sizeof rbuf, (i64)(uptr)fa);
+    close(fdm);
+    if (rn < 32) {
+        C2B_LOGS("[c2b] v52: ");
+        C2B_LOGS(name);
+        C2B_LOGS(" pread short\n");
+        return;
+    }
+    tramp = (u8 *)mmap(0, 4096u, 0x07u /*RWX*/, 0x22u /*PRIV|ANON*/,
+                       -1, 0u);
+    if (tramp == (u8 *)-1) {
+        C2B_LOGS("[c2b] v52: mmap fail\n");
+        return;
+    }
+    if (!c2b_ldd_build(rbuf, (u32)rn, (unsigned long long)(uptr)fa,
+                       tramp, (unsigned long long)(uptr)tramp, nr,
+                       &olen, &tlen)) {
+        C2B_LOGS("[c2b] v52: ");
+        C2B_LOGS(name);
+        C2B_LOGS(" build=0 have=");
+        for (q = 0; q < 16u && (i32)q < rn; q++)
+            C2B_LOGH((u32)rbuf[q]);
+        C2B_LOGS("\n");
+        munmap(tramp, 4096u);
+        return;
+    }
+    /* сайт-патч = ff25+abs8 -> ДЕТУР (не jmp-back! трамп-хвост = возврат
+     * в entry+olen — на сайт идёт копия с адресом детур-фн) */
+    site[0] = 0xffu; site[1] = 0x25u;
+    site[2] = 0u; site[3] = 0u; site[4] = 0u; site[5] = 0u;
+    {
+        unsigned long long v = (unsigned long long)(uptr)detour;
+        for (q = 0; q < 8u; q++)
+            site[6u + q] = (u8)((v >> (8 * q)) & 0xffu);
+    }
+    /* tramp-глобал ДО патча сайта (окно гонки = ноль) */
+    *trslot = (void *)tramp;
+    {
+        uptr pg = (uptr)fa & ~(uptr)0xFFFu;
+        if (mprotect((void *)pg, 0x2000u, 0x03u /*RW*/) != 0) {
+            C2B_LOGS("[c2b] v52: ");
+            C2B_LOGS(name);
+            C2B_LOGS(" mprotect RW fail\n");
+            *trslot = 0;
+            munmap(tramp, 4096u);
+            return;
+        }
+        memcpy((void *)fa, site, C2B_LDD_MINSTOLEN);
+        for (q = C2B_LDD_MINSTOLEN; q < olen; q++)
+            ((u8 *)fa)[q] = 0x90u;               /* nop до края окна */
+        mprotect((void *)pg, 0x2000u, 0x05u /*RX*/);
+    }
+    g_ldd_armed++;
+    C2B_LOGS("[c2b] v52: ARMED ");
+    C2B_LOGS(name);
+    C2B_LOGS(" stolen=");
+    C2B_LOGN(olen);
+    C2B_LOGS("entry=");
+    c2b_gp_lh64((unsigned long long)(uptr)fa);
+    C2B_LOGS("tramp=");
+    c2b_gp_lh64((unsigned long long)(uptr)tramp);
+    C2B_LOGS("\n");
+}
+
+static void c2b_ldd_maybe(void)
+{
+    const char *ec;
+    struct c2b_ldd_dlinfo di;
+    i32 fdm;
+    if (g_ldd_init) return;
+    g_ldd_init = 1;
+    ec = getenv("C2B_LIBCDET");
+    if (!ec || ec[0] != '1') return;
+    g_ldd_arm = 1;
+    /* ra-гвард: r-xp-диапазон собственного модуля (по dladdr-fname) */
+    if (dladdr((void *)&c2b_ldd_maybe, &di) && di.dli_fname) {
+        extern i64 read(i32, void *, u64);
+        extern i32 close(i32);
+        fdm = open("/proc/self/maps", 0 /*O_RDONLY*/);
+        if (fdm >= 0) {
+            char chunk[65536], line[4096];
+            i32 llen = 0;
+            i64 r;
+            const char *fn = di.dli_fname;
+            u32 fnl = (u32)strlen(fn);
+            while ((r = read(fdm, chunk, (uptr)sizeof chunk)) > 0) {
+                u32 i = 0;
+                while (i < (u32)r) {
+                    u32 j = i, seg, k, pexp;
+                    while (j < (u32)r && chunk[j] != '\n') j++;
+                    seg = j - i;
+                    if (llen + (i32)seg > (i32)sizeof line - 1)
+                        seg = (u32)(sizeof line - 1u - (u32)llen);
+                    if (seg) {
+                        memcpy(line + llen, chunk + i, seg);
+                        llen += (i32)seg;
+                    }
+                    if (j == (u32)r) break;   /* строка не докачалась */
+                    i = j + 1;
+                    /* r-xp-строка, путь содержит dli_fname = наш текст */
+                    pexp = 0;
+                    for (k = 0; k + 4u <= (u32)llen; k++)
+                        if (line[k] == 'r' && line[k + 1u] == '-' &&
+                            line[k + 2u] == 'x' &&
+                            line[k + 3u] == 'p') pexp = k;
+                    if (pexp && fnl && fnl <= (u32)llen &&
+                        (!g_ldd_lo || !g_ldd_hi)) {
+                        for (k = 0; k + fnl <= (u32)llen; k++) {
+                            u32 m2, same = 1u;
+                            for (m2 = 0; m2 < fnl; m2++)
+                                if (line[k + m2] != fn[m2]) {
+                                    same = 0u; break;
+                                }
+                            if (same) {
+                                unsigned long lo = 0, hi2 = 0;
+                                if (c2b_gp_lohi(line, llen, &lo, &hi2)) {
+                                    g_ldd_lo = (uptr)lo;
+                                    g_ldd_hi = (uptr)hi2;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    llen = 0;
+                }
+            }
+            close(fdm);
+        }
+    }
+    C2B_LOGS("[c2b] v52: bridge text=[");
+    c2b_gp_lh64((unsigned long long)g_ldd_lo);
+    C2B_LOGS(",");
+    c2b_gp_lh64((unsigned long long)g_ldd_hi);
+    C2B_LOGS(")\n");
+    c2b_ldd_install1("sendto", 44u, &g_ldd_tr_st,
+                     (void *)&c2b_ldd_dsendto);
+    c2b_ldd_install1("sendmsg", 46u, &g_ldd_tr_sm,
+                     (void *)&c2b_ldd_dsendmsg);
+    c2b_ldd_install1("send", 44u, &g_ldd_tr_sd,
+                     (void *)&c2b_ldd_dsend);
+    C2B_LOGS("[c2b] v52: install done armed=");
+    C2B_LOGN(g_ldd_armed);
+    C2B_LOGS("\n");
+}
+#else   /* selftest / i386: no-op */
+static void c2b_ldd_maybe(void) { }
+#endif  /* v52 */
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
     c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
+    c2b_ldd_maybe();    /* v52: свиньячок — детур прологов libc */
     c2b_g15_note((uptr)__builtin_return_address(0), "s");
     if (!g_clp_sendto) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "sendto");
@@ -20735,6 +21079,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
 {
     c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
+    c2b_ldd_maybe();    /* v52: свиньячок — детур прологов libc */
     c2b_g15_note((uptr)__builtin_return_address(0), "r");
     if (!g_clp_recvfrom) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "recvfrom");
@@ -27243,6 +27588,268 @@ static void test_gp(void)
 #endif
 }
 
+/* v52: libc-prologue detour — c2b_ldd_build на РЕАЛЬНЫХ прологах
+ * (2.35/2.39/2.41 дизасмы; фиксапы riprel/jcc8 байт-точно) + СИНТЕТИ-
+ * ЧЕСКИЙ end-to-end: RWX-страница, пролог формы 2.39 (riprel-cmpb на
+ * __libc_single_threaded-аналог + je В ОКНЕ), патч сайта, вызов через
+ * НАСТОЯЩИЙ UDP-сокет, обе ветки je (fast/slow по st-байту) => фиксапы
+ * доказаны исполнением. Exec-часть = класс детура => гейт как test_-
+ * detour/detour2 (санитайзеры = self-modifying = пропуск). */
+static const u8 tldd_g239_st[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x80,0x3d,0x15,0xfd,0x0d,0x00,0x00,
+    0x41,0x89,0xca, 0x74,0x10, 0xb8,0x2c,0x00,0x00,0x00,0x0f,0x05,
+    0x48,0x3d,0x00,0xf0,0xff,0xff, 0x77,0x69, 0xc3 };
+static const u8 tldd_g239_sm[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x80,0x3d,0xb5,0xfd,0x0d,0x00,0x00,
+    0x74,0x13, 0xb8,0x2e,0x00,0x00,0x00,0x0f,0x05,
+    0x48,0x3d,0x00,0xf0,0xff,0xff, 0x77,0x4c, 0xc3 };
+static const u8 tldd_g239_sd[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x80,0x3d,0x15,0xff,0x0d,0x00,0x00,
+    0x41,0x89,0xca, 0x74,0x20, 0x45,0x31,0xc9, 0x45,0x31,0xc0,
+    0xb8,0x2c,0x00,0x00,0x00,0x0f,0x05, 0xc3 };
+static const u8 tldd_g235_st[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x41,0x89,0xca,
+    0x64,0x8b,0x04,0x25,0x18,0x00,0x00,0x00,
+    0x85,0xc0, 0x75,0x15, 0xb8,0x2c,0x00,0x00,0x00,0x0f,0x05,
+    0x48,0x3d,0x00,0xf0,0xff,0xff, 0x77,0x7e, 0xc3 };
+static const u8 tldd_g235_sm[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x64,0x8b,0x04,0x25,0x18,0x00,0x00,0x00,
+    0x85,0xc0, 0x75,0x10, 0xb8,0x2e,0x00,0x00,0x00,0x0f,0x05,
+    0x48,0x3d,0x00,0xf0,0xff,0xff, 0x77,0x51, 0xc3 };
+static const u8 tldd_g235_sd[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x41,0x89,0xca,
+    0x64,0x8b,0x04,0x25,0x18,0x00,0x00,0x00,
+    0x85,0xc0, 0x75,0x1d, 0x45,0x31,0xc9, 0x45,0x31,0xc0,
+    0xb8,0x2c,0x00,0x00,0x00,0x0f,0x05, 0xc3 };
+static const u8 tldd_g241_st[] = {
+    0x48,0x83,0xec,0x10, 0x48,0x63,0xc9, 0x48,0x63,0xff,
+    0x45,0x89,0xc9, 0x6a,0x2c, 0xe8,0xdc,0xd3,0xf7,0xff,
+    0x48,0x83,0xc4,0x18, 0xc3 };
+static const u8 tldd_g241_sm[] = {
+    0x48,0x83,0xec,0x10, 0x48,0x63,0xd2, 0x48,0x63,0xff,
+    0x45,0x31,0xc9, 0x6a,0x2e, 0x45,0x31,0xc0, 0x31,0xc9,
+    0xe8,0xf7,0xd3,0xf7,0xff, 0x48,0x83,0xc4,0x18, 0xc3 };
+static const u8 tldd_g241_sd[] = {
+    0x48,0x83,0xec,0x10, 0x48,0x63,0xc9, 0x48,0x63,0xff,
+    0x45,0x31,0xc9, 0x6a,0x2c, 0x45,0x31,0xc0,
+    0xe8,0x49,0xd4,0xf7,0xff, 0x48,0x83,0xc4,0x18, 0xc3 };
+
+static void tldd_run(const char *nm, const u8 *c, u32 cl, u32 nr,
+                     u32 want)
+{
+    u8 tr[C2B_LDD_MAXTRAMP];
+    unsigned int olen = 0, tlen = 0;
+    unsigned int got = c2b_ldd_build(c, cl, 0x7f0000001000ull, tr,
+                                     0x7f0000200000ull, nr, &olen,
+                                     &tlen);
+    (void)nm;
+    CHECK(got == want && olen == want, "ldd: форма строится");
+    if (got)
+        CHECK(tr[tlen - 14u] == 0xff && tr[tlen - 13u] == 0x25,
+              "ldd: хвост трампа = ff25");
+}
+
+/* детур синтетики: фиксирует факт вызова + форвард в трамп (RWX-mmap) */
+static u32 g_tldd_hit;
+static void *volatile g_tldd_tramp;
+typedef long (*tldd_det_fn)(int, const void *, unsigned long, int,
+                            const void *, unsigned int);
+static long tldd_detour(int fd, const void *buf, unsigned long len,
+                        int flags, const void *addr, unsigned int alen)
+{
+    tldd_det_fn tr = (tldd_det_fn)g_tldd_tramp;
+    g_tldd_hit++;
+    return tr(fd, buf, len, flags, addr, alen);
+}
+
+static void test_lddet(void)
+{
+    printf("[t] lddet v52 (prologue detour)\n");
+    /* ---- чистые формы (все сборки) ---- */
+    tldd_run("2.39 sendto", tldd_g239_st, sizeof tldd_g239_st, 44u, 14u);
+    tldd_run("2.39 send",   tldd_g239_sd, sizeof tldd_g239_sd, 44u, 14u);
+    tldd_run("2.39 sendmsg",tldd_g239_sm, sizeof tldd_g239_sm, 46u, 18u);
+    tldd_run("2.35 sendto", tldd_g235_st, sizeof tldd_g235_st, 44u, 15u);
+    tldd_run("2.35 send",   tldd_g235_sd, sizeof tldd_g235_sd, 44u, 15u);
+    tldd_run("2.35 sendmsg",tldd_g235_sm, sizeof tldd_g235_sm, 46u, 14u);
+    tldd_run("2.41 sendto", tldd_g241_st, sizeof tldd_g241_st, 44u, 15u);
+    tldd_run("2.41 send",   tldd_g241_sd, sizeof tldd_g241_sd, 44u, 15u);
+    tldd_run("2.41 sendmsg",tldd_g241_sm, sizeof tldd_g241_sm, 46u, 15u);
+    /* ---- фиксапы байт-точно (2.39) ---- */
+    {
+        u8 tr[C2B_LDD_MAXTRAMP];
+        unsigned int olen = 0, tlen = 0, q;
+        unsigned int v32;
+        memset(tr, 0, sizeof tr);
+        CHECK(c2b_ldd_build(tldd_g239_st, sizeof tldd_g239_st,
+                            0x7f0000001000ull, tr, 0x7f0000200000ull,
+                            44u, &olen, &tlen) == 14u,
+              "ldd: 2.39 st build");
+        {   /* riprel: disp32' = (TGT+11+0xdfd15) - (TRA+11) */
+            long long nu = (0x7f0000001000ll + 11ll + 0x000dfd15ll) -
+                           (0x7f0000200000ll + 11ll);
+            v32 = 0;
+            for (q = 0; q < 4u; q++)
+                v32 |= ((unsigned int)tr[6u + q]) << (8 * q);
+            CHECK((long long)(int)v32 == nu,
+                  "ldd: riprel disp32 пересчитан");
+        }
+        memset(tr, 0, sizeof tr);
+        CHECK(c2b_ldd_build(tldd_g239_sm, sizeof tldd_g239_sm,
+                            0x7f0000001000ull, tr, 0x7f0000200000ull,
+                            46u, &olen, &tlen) == 18u,
+              "ldd: 2.39 sm build");
+        {   /* je (disp 0x13 @11) -> 0f 84 rel32 на entry+0x20 */
+            long long rel = (0x7f0000001000ll + 0x20ll) -
+                            (0x7f0000200000ll + 17ll);
+            CHECK(tr[11u] == 0x0f && tr[12u] == 0x84,
+                  "ldd: je развёрнут в 0f 84");
+            v32 = 0;
+            for (q = 0; q < 4u; q++)
+                v32 |= ((unsigned int)tr[13u + q]) << (8 * q);
+            CHECK((long long)(int)v32 == rel,
+                  "ldd: je rel32 пересчитан");
+        }
+    }
+    /* ---- негативы ---- */
+    {
+        u8 bad[48], btr[C2B_LDD_MAXTRAMP];
+        unsigned int olen = 0, tlen = 0;
+        memset(bad, 0x90, sizeof bad);
+        CHECK(c2b_ldd_build(bad, sizeof bad, 0x7f0000001000ull, btr, 0,
+                            44u, &olen, &tlen) == 0u,
+              "ldd: без якоря = 0");
+        bad[0] = 0xb8; bad[1] = 0x2c; bad[2] = 0; bad[3] = 0;
+        bad[4] = 0; bad[5] = 0x0f; bad[6] = 0x05; bad[7] = 0xe8;
+        CHECK(c2b_ldd_build(bad, sizeof bad, 0x7f0000001000ull, btr, 0,
+                            44u, &olen, &tlen) == 0u,
+              "ldd: e8 в окне = 0");
+        bad[7] = 0x0f; bad[8] = 0x0b;
+        CHECK(c2b_ldd_build(bad, sizeof bad, 0x7f0000001000ull, btr, 0,
+                            44u, &olen, &tlen) == 0u,
+              "ldd: ud2 в окне = 0");
+        CHECK(c2b_ldd_build(tldd_g239_st, 8u, 0x7f0000001000ull, btr, 0,
+                            44u, &olen, &tlen) == 0u,
+              "ldd: короткое чтение = 0");
+        CHECK(c2b_ldd_build(tldd_g239_st, sizeof tldd_g239_st,
+                            0x7f0000001000ull, btr, 0, 46u,
+                            &olen, &tlen) == 0u,
+              "ldd: чужой nr = 0");
+    }
+#if defined(__x86_64__) && !defined(C2B_ST_NO_DETOUR) && \
+    !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_UNDEFINED__)
+    /* ---- СИНТЕТИЧЕСКИЙ end-to-end (реальный syscall через UDP) ---- */
+    {
+        u8 *pg = (u8 *)mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        u8 *trx = (u8 *)mmap(0, 4096,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        unsigned int olen = 0, tlen = 0, q;
+        u8 site[14], saved[24];
+        unsigned long long det;
+        int sfd, rfd, r;
+        struct sockaddr sa, ra;   /* house-типы (16B, sa_data = порт/ip) */
+        socklen_t slen;
+        u8 snd[24], rcv[64];
+        extern int socket(int, int, int);
+        extern int bind(int, const struct sockaddr *, socklen_t);
+        extern int connect(int, const struct sockaddr *, socklen_t);
+        typedef long (*st_fn)(int, const void *, unsigned long, int,
+                              const void *, unsigned int);
+#define TLDL_HTONS(v) ((unsigned short)((((v) & 0xffu) << 8) | \
+                                         (((v) >> 8) & 0xffu)))
+        CHECK(pg != (u8 *)-1 && trx != (u8 *)-1,
+              "ldd: RWX-страницы (код+трамп)");
+        if (pg == (u8 *)-1 || trx == (u8 *)-1) return;
+        memset(pg, 0x90, 4096);
+        /* пролог формы 2.39-sendmsg (je В ОКНЕ) + тело sendto-синтетики:
+         * st-байт @0x40 (disp = 0x40-11 = 0x35), je -> slow @0x28
+         * (rip-after = 13, disp8 = 0x28-13 = 0x1b) */
+        pg[0] = 0xf3; pg[1] = 0x0f; pg[2] = 0x1e; pg[3] = 0xfa;
+        pg[4] = 0x80; pg[5] = 0x3d;
+        pg[6] = 0x35; pg[7] = 0; pg[8] = 0; pg[9] = 0; pg[10] = 0x00;
+        pg[11] = 0x74; pg[12] = 0x1b;
+        pg[13] = 0xb8; pg[14] = 0x2c; pg[15] = 0; pg[16] = 0;
+        pg[17] = 0;
+        pg[18] = 0x0f; pg[19] = 0x05;
+        pg[20] = 0x48; pg[21] = 0x3d; pg[22] = 0x00; pg[23] = 0xf0;
+        pg[24] = 0xff; pg[25] = 0xff;
+        pg[26] = 0x77; pg[27] = 0x01;
+        pg[28] = 0xc3;
+        pg[29] = 0x0f; pg[30] = 0x0b;
+        pg[0x28] = 0xb8; pg[0x29] = 0x2c; pg[0x2a] = 0; pg[0x2b] = 0;
+        pg[0x2c] = 0;
+        pg[0x2d] = 0x0f; pg[0x2e] = 0x05;
+        pg[0x2f] = 0x48; pg[0x30] = 0x3d; pg[0x31] = 0x00;
+        pg[0x32] = 0xf0; pg[0x33] = 0xff; pg[0x34] = 0xff;
+        pg[0x35] = 0x77; pg[0x36] = 0x01;
+        pg[0x37] = 0xc3;
+        pg[0x38] = 0x0f; pg[0x39] = 0x0b;
+        pg[0x40] = 1;                                    /* st = fast */
+        CHECK(c2b_ldd_build(pg, 64u, (unsigned long long)(uptr)pg,
+                            trx, (unsigned long long)(uptr)trx, 44u,
+                            &olen, &tlen) == 18u,
+              "ldd: синтетика build=18");
+        if (olen != 18u) { munmap(pg, 4096); munmap(trx, 4096); return; }
+        memcpy(saved, pg, 24);
+        site[0] = 0xff; site[1] = 0x25;
+        site[2] = 0; site[3] = 0; site[4] = 0; site[5] = 0;
+        det = (unsigned long long)(uptr)&tldd_detour;
+        for (q = 0; q < 8u; q++)
+            site[6u + q] = (u8)((det >> (8 * q)) & 0xffu);
+        g_tldd_tramp = (void *)trx;
+        memcpy(pg, site, 14);
+        for (q = 14; q < 18u; q++) pg[q] = 0x90;
+        /* сокет-пара loopback (адрес = 16B: family=2, порт BE, ip, пад) */
+        sfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+        rfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+        CHECK(sfd >= 0 && rfd >= 0, "ldd: udp-сокеты");
+        memset(&ra, 0, sizeof ra);
+        ra.sa_family = C2B_AF_INET;
+        ra.sa_data[0] = (char)0; ra.sa_data[1] = (char)0;  /* порт = 0 */
+        ra.sa_data[2] = (char)127; ra.sa_data[3] = (char)0;
+        ra.sa_data[4] = (char)0; ra.sa_data[5] = (char)1;
+        r = bind(rfd, &ra, (socklen_t)sizeof ra);
+        CHECK(r == 0, "ldd: bind rx");
+        slen = (socklen_t)sizeof ra;
+        r = getsockname(rfd, &ra, &slen);
+        CHECK(r == 0, "ldd: getsockname rx (порт получен)");
+        r = connect(sfd, &ra, (socklen_t)sizeof ra);
+        CHECK(r == 0, "ldd: connect tx");
+        for (q = 0; q < sizeof snd; q++) snd[q] = (u8)(0xa0 + q);
+        g_tldd_hit = 0;
+        r = (int)((st_fn)(uptr)pg)(sfd, snd, sizeof snd, 0, &ra,
+                                   (unsigned int)sizeof ra);
+        CHECK(r >= 0, "ldd: fast-ветка rv>=0");
+        CHECK(g_tldd_hit == 1, "ldd: детур видел вызов (fast)");
+        memset(rcv, 0, sizeof rcv);
+        slen = (socklen_t)sizeof sa;
+        r = (int)recvfrom(rfd, rcv, sizeof rcv, 0, &sa, &slen);
+        CHECK(r == (int)sizeof snd && memcmp(rcv, snd, sizeof snd) == 0,
+              "ldd: fast-ветка = дейтаграмма через трамп+syscall");
+        /* slow-ветка: st=0 => je берётся => slow-стаб @0x28 */
+        pg[0x40] = 0;
+        g_tldd_hit = 0;
+        r = (int)((st_fn)(uptr)pg)(sfd, snd, sizeof snd, 0, &ra,
+                                   (unsigned int)sizeof ra);
+        CHECK(r >= 0, "ldd: slow-ветка rv>=0");
+        CHECK(g_tldd_hit == 1, "ldd: детур видел вызов (slow)");
+        memset(rcv, 0, sizeof rcv);
+        slen = (socklen_t)sizeof sa;
+        r = (int)recvfrom(rfd, rcv, sizeof rcv, 0, &sa, &slen);
+        CHECK(r == (int)sizeof snd && memcmp(rcv, snd, sizeof snd) == 0,
+              "ldd: slow-ветка = дейтаграмма (riprel-фикс исполнением)");
+        close(sfd); close(rfd);
+        memcpy(pg, saved, 24);          /* рестор сайта (дисциплина) */
+        munmap(pg, 4096); munmap(trx, 4096);
+#undef TLDL_HTONS
+    }
+#else
+    printf("[i] lddet exec skipped: self-modifying under sanitizers\n");
+#endif
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -27353,6 +27960,7 @@ int main(void)
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
+    test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

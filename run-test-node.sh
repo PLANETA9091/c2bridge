@@ -910,8 +910,20 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # run405-урок: 0x22 = 40 фреймов на проводе при НУЛЕ sendto
       # (0x200) / write (count 512 — формат ДЕСЯТИЧНЫЙ!) / send (0)
       # / sendmsg (5 в окне) system-wide => sendmmsg или io_uring.
-      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable; echo 1 > tracing_on' 2>/dev/null || true
-      log "attempt $ATTEMPT: tracefs send+write+sendmmsg+io_uring census ARMED (ptrace-free, buf=8M)"
+      # v55d: (1) write = ФИЛЬТР count==512 (ftrace-фильтр = ядро;
+      # run406: 6M write-событий = МОСТОВЫЕ ЛОГИ + консоль = ринг
+      # выдавил окно 0x22 трижды — фильтр = поток мёртв);
+      # (2) KPROBE на do_syscall_64: rip=+128(+0(%di)) = pt_regs->ip
+      # = ПОЛЬЗОВАТЕЛЬСКИЙ RIP КАЖДОГО syscall + nr=+120 (orig_ax) —
+      # универсальный инструмент (БЕЗ ptrace = анти-дебуг слеп;
+      # работает и для '?'-стабов с переменным nr, и для io_uring,
+      # и для ВСЕГО что не поймали отдельные трейспойнты); фильтр =
+      # только send-класс nr — поток копеечный. Это замена умершего
+      # perf (run406: probe failed all variants, stderr пуст).
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo "count == 512" > events/syscalls/sys_enter_write/filter; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable' 2>/dev/null || true
+      # kprobe: pt_regs = arg1 (%di) do_syscall_64; ip @ +128, orig_ax @ +120
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip do_syscall_64 rip=+128(+0(%di)):u64 nr=+120(+0(%di)):u64" >> kprobe_events 2>/dev/null; echo "nr==1||nr==41||nr==44||nr==46||nr==307||nr==425" > events/kprobes/c2b_rip/filter 2>/dev/null; echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null' 2>/dev/null || true
+      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512-filtered] + io_uring + KPROBE rip/nr)"
     else
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi
@@ -939,35 +951,31 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     if [[ -n "$PERF_BIN" ]]; then
       rm -f "$RUNDIR/perf_send.a${ATTEMPT}.data"
       PERF_OUT="$RUNDIR/perf_record.a${ATTEMPT}.err"
-      # v55c: КАСКАД ФЛАГОВ — run404/405: перф умирал молча (заголовок
-      # 10KB, 0 сэмплов); подозреваемый = -I/-g dwarf на трейспойнте.
-      # Проба 2s на вариант; первый живой = вооружаем; stderr пробы ->
-      # артефакт (perf_record.a*.err) = диагноз ВИДЕН.
+      # v55d: каскад БЕЗ фильтров (run406: probe failed all = общий
+      # множитель = сам --filter под подозрением) и ТОЛЬКО редкие
+      # классы (sendto+sendmmsg ~1.3k/ран; write = 6M = убил бы ринг
+      # — write ловит отфильтрованный tracefs + kprobe).
       PERF_FLAGS=""
       for _pf in "-g dwarf -I" "-g dwarf" "-I" ""; do
         rm -f "$RUNDIR/perf_send.a${ATTEMPT}.data"
         if sudo -n "$PERF_BIN" record -q -o "$RUNDIR/perf_send.a${ATTEMPT}.data" \
           -e syscalls:sys_enter_sendto -c 1 $_pf \
-          --filter 'len == 512' \
           -e syscalls:sys_enter_sendmmsg -c 1 $_pf \
-          -e syscalls:sys_enter_write -c 1 $_pf \
-          --filter 'count == 512' -- sleep 2 >"$PERF_OUT" 2>&1; then
+          -- sleep 2 >"$PERF_OUT" 2>&1; then
           PERF_FLAGS="$_pf"; break
         fi
       done
       if [[ -n "$PERF_FLAGS" ]]; then
         sudo -n "$PERF_BIN" record -q -o "$RUNDIR/perf_send.a${ATTEMPT}.data" \
           -e syscalls:sys_enter_sendto -c 1 $PERF_FLAGS \
-          --filter 'len == 512' \
           -e syscalls:sys_enter_sendmmsg -c 1 $PERF_FLAGS \
-          -e syscalls:sys_enter_write -c 1 $PERF_FLAGS \
-          --filter 'count == 512' -- sleep $((DURATION + 30)) >/dev/null 2>&1 &
+          -- sleep $((DURATION + 30)) >/dev/null 2>&1 &
         PERF_PID=$!
         sleep 2
         if ! sudo -n kill -0 "$PERF_PID" 2>/dev/null; then
           log "attempt $ATTEMPT: perf record EXITED early (flags=[$PERF_FLAGS])"
         fi
-        log "attempt $ATTEMPT: perf callchain ARMED (pid $PERF_PID, flags=[$PERF_FLAGS], sendto len=512 + sendmmsg + write count=512)"
+        log "attempt $ATTEMPT: perf callchain ARMED (pid $PERF_PID, flags=[$PERF_FLAGS], sendto+sendmmsg no-filter)"
       else
         log "attempt $ATTEMPT: perf PROBE FAILED all variants; err: $(tail -c 240 "$PERF_OUT" 2>/dev/null | tr '\n' ' ')"
       fi
@@ -1097,6 +1105,13 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     if grep -aqiE 'Connected\(|Signing up to server|Connected to' "$OUT" 2>/dev/null \
        || sudo -n grep -aqiE 'Connected\(|Signing up to server|Connected to' "$CONLOG" 2>/dev/null; then
       CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"
+      # v55d: карты движка = СЕЙЧАС (живой pid) — кросс-реф rip
+      # (kprobe c2b_rip) -> модуль+офсет офлайн.
+      _EPID="$(pgrep -x csgo_linux64 | head -1 || true)"
+      if [[ -n "$_EPID" ]]; then
+        sudo -n cat "/proc/$_EPID/maps" > "$RUNDIR/engine_maps.txt" 2>/dev/null || true
+        log "attempt $ATTEMPT: engine maps dumped (pid $_EPID, $(wc -l < "$RUNDIR/engine_maps.txt" 2>/dev/null || echo 0) lines)"
+      fi
       # g108: THE SDR-socket owner at the LIVE moment — the runs 297-304
       # chain: the pcap source socket = invisible in the game's /proc/net/udp
       # view and the in-game w2 scan = never ran during the live session
@@ -1219,7 +1234,7 @@ done
 if [[ "${TRACEFS_GAME:-0}" = "1" ]] && sudo -n test -d /sys/kernel/tracing/events/syscalls 2>/dev/null; then
   sudo -n sh -c 'echo 0 > /sys/kernel/tracing/tracing_on' 2>/dev/null || true
   sudo -n cat /sys/kernel/tracing/trace > "$RUNDIR/tracefs_send.log" 2>/dev/null || true
-  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_sendmmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable; echo 0 > events/syscalls/sys_enter_write/enable; echo 0 > events/syscalls/sys_enter_io_uring_enter/enable; echo 0 > events/syscalls/sys_enter_io_uring_setup/enable' 2>/dev/null || true
+  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_sendmmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable; echo 0 > events/syscalls/sys_enter_write/enable; echo 0 > events/syscalls/sys_enter_io_uring_enter/enable; echo 0 > events/syscalls/sys_enter_io_uring_setup/enable; echo 0 > events/kprobes/c2b_rip/enable; echo > events/syscalls/sys_enter_write/filter; echo -:c2b_rip >> kprobe_events' 2>/dev/null || true
   log "tracefs send-census collected: $(wc -l < "$RUNDIR/tracefs_send.log" 2>/dev/null || echo 0) lines"
 fi
 

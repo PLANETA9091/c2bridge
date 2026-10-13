@@ -886,6 +886,26 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   else
     log "attempt $ATTEMPT: tcpdump NOT available (GNS wire visibility skipped)"
   fi
+  # v54: TRACEFS = the kernel-side send-census WITHOUT ptrace (run401/402-
+  # урок: strace = TracerPid != 0 = the engine's anti-debug = the 0x22
+  # sender NEVER FIRES under any tracer — the wire = 0, the strace = 0,
+  # while no-strace run400 = 40 frames). The tracefs syscalls tracepoint =
+  # NO ptrace = NO TracerPid = the anti-debug = BLIND. The runner = a full
+  # VM = the tracefs = mountable. The system-wide sendto/sendmsg/send
+  # trace = the CI VM = low-noise. The trace lines = pid+tid+fd+len+
+  # timestamp (the args = pointers; the contents = not logged) = the
+  # len=512-at-the-0x22-timestamps + the fd->/proc/pid/fd->:27005 match =
+  # THE SENDER NAMED (the pid+tid+fd) without touching the process.
+  if [[ "${TRACEFS_GAME:-0}" = "1" ]]; then
+    sudo -n mkdir -p /sys/kernel/tracing 2>/dev/null || true
+    sudo -n mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true
+    if sudo -n test -d /sys/kernel/tracing/events/syscalls; then
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo 1 > tracing_on' 2>/dev/null || true
+      log "attempt $ATTEMPT: tracefs send-census ARMED (ptrace-free)"
+    else
+      log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
+    fi
+  fi
   log "attempt $ATTEMPT: client launched (launch pid $ENGINE_PID), waiting up to ${DURATION}s for menu"
 
   # wait for the main menu (modals may cover it — steam://connect still works)
@@ -1125,6 +1145,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   done
   (( CONNECTED )) && { VERDICT_CODE=0; VERDICT_TEXT="PASS: connected to $TARGET (attempt $ATTEMPT)"; break; }
 done
+
+# v54: tracefs collect (the whole-run kernel send-census -> the artifact)
+if [[ "${TRACEFS_GAME:-0}" = "1" ]] && sudo -n test -d /sys/kernel/tracing/events/syscalls 2>/dev/null; then
+  sudo -n sh -c 'echo 0 > /sys/kernel/tracing/tracing_on' 2>/dev/null || true
+  sudo -n cat /sys/kernel/tracing/trace > "$RUNDIR/tracefs_send.log" 2>/dev/null || true
+  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable' 2>/dev/null || true
+  log "tracefs send-census collected: $(wc -l < "$RUNDIR/tracefs_send.log" 2>/dev/null || echo 0) lines"
+fi
 
 (( VERDICT_CODE != 0 )) && VERDICT_TEXT="FAIL: no connection to ${TARGET:-<smoke>} (menu=$MENU, logs: $RUNDIR)"
 if (( FARM )); then

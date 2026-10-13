@@ -6078,6 +6078,8 @@ struct c2b_msghdr {
     int msg_flags;
 };
 typedef ssize_t (*c2b_sendmsg_fn)(int, const struct c2b_msghdr *, int);
+/* 50b-v50: третий член send-семейства (compat-GNS шлёт 0x20/0x22 через send) */
+typedef ssize_t (*c2b_send_fn)(int, const void *, size_t, int);
 
 /* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
  * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
@@ -15271,34 +15273,47 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
         return -1;
     }
     {
-        /* v50: pre-send crt-класс — капчер серта моста + переписывание
-         * сломанного 0x22 движка (swap iov[0] -> собранный кадр -> send ->
-         * restore). 0x22 = не SNM-кадр (g98-дамп = мимо, потерь нет). */
-        if (msg && msg->msg_iov && msg->msg_iovlen == 1 &&
-            msg->msg_iov[0].iov_base) {
-            const u8 *sp = (const u8 *)msg->msg_iov[0].iov_base;
-            u32 sl = (u32)msg->msg_iov[0].iov_len;
-            if (!g_crt_init) {
-                const char *ec = getenv("C2B_CRTFIX");
-                if (ec && ec[0] == '1') g_crt_fix = 1;
-                g_crt_init = 1;
+        /* v50d: pre-send crt-класс — КАТЕНЕНАЦИЯ iov-чанков (run392-урок:
+         * compat-GNS шлёт 0x22 через sendmsg с nChunks=2 (заголовок-чанк
+         * [0x22] + тело-чанк [4c 00 ...]) — гвард iovlen==1 (v50a) ПРОПУ-
+         * СКАЛ весь класс: на проводе x42, в хуках ноль). Собираем до 8
+         * чанков в стековый буфер, сигнатура/капчер/сборка на конкате;
+         * при переписывании = подмена ВСЕГО iov на один чанк -> send ->
+         * restore. 0x22 = не SNM-кадр (g98-дамп = мимо, потерь нет). */
+        if (msg && msg->msg_iov && msg->msg_iovlen >= 1 &&
+            msg->msg_iovlen <= 8 && msg->msg_iov[0].iov_base) {
+            u8 cat[900];
+            u8 crtbuf[600];
+            u32 tot = 0, k, on;
+            for (k = 0; k < (u32)msg->msg_iovlen; k++) {
+                u32 cl = (u32)msg->msg_iov[k].iov_len;
+                if (!msg->msg_iov[k].iov_base || cl > 640u) { tot = 0; break; }
+                if (tot + cl > sizeof cat) { tot = 0; break; }
+                memcpy(cat + tot, msg->msg_iov[k].iov_base, cl);
+                tot += cl;
             }
-            if (sl >= 40u && sl <= 640u && sp[0] == 0x22) {
-                u8 crtbuf[600];
-                u32 on;
-                c2b_crt_maybe_capture(sp, sl);
-                on = c2b_crt_maybe_rewrite(sp, sl, crtbuf,
+            if (tot >= 40u && tot <= 640u && cat[0] == 0x22) {
+                if (!g_crt_init) {
+                    const char *ec = getenv("C2B_CRTFIX");
+                    if (ec && ec[0] == '1') g_crt_fix = 1;
+                    g_crt_init = 1;
+                }
+                c2b_crt_maybe_capture(cat, tot);
+                on = c2b_crt_maybe_rewrite(cat, tot, crtbuf,
                                            (u32)sizeof crtbuf);
                 if (on) {
-                    struct c2b_iovec sv = msg->msg_iov[0];
+                    struct c2b_iovec sv[8];
+                    u32 k2, n2 = (u32)msg->msg_iovlen;
                     ssize_t r2;
+                    if (n2 > 8u) n2 = 8u;
+                    for (k2 = 0; k2 < n2; k2++) sv[k2] = msg->msg_iov[k2];
                     ((struct c2b_iovec *)msg->msg_iov)[0].iov_base = crtbuf;
                     ((struct c2b_iovec *)msg->msg_iov)[0].iov_len = on;
+                    ((struct c2b_msghdr *)msg)->msg_iovlen = 1;
                     r2 = ((c2b_sendmsg_fn)g_clp_sendmsg)(fd, msg, flags);
-                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_base =
-                        sv.iov_base;
-                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_len =
-                        sv.iov_len;
+                    for (k2 = 0; k2 < n2; k2++)
+                        ((struct c2b_iovec *)msg->msg_iov)[k2] = sv[k2];
+                    ((struct c2b_msghdr *)msg)->msg_iovlen = n2;
                     return r2;
                 }
             }

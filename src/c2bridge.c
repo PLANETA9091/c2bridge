@@ -15730,11 +15730,17 @@ static void c2b_k27_maybe_fire(void)
         kcopy27[0] = 0xff; kcopy27[1] = 0xff;
         kcopy27[2] = 0xff; kcopy27[3] = 0xff;
         if (form27 == 2) {
-            /* v40: 'q'-твин = ff×4 + "qconnect0x%08x\0" = 23B (г76-форма) */
+            /* v41 (run379-вердикт, ветвь (b)): сервер ОТВЕТИЛ на post-'A'
+             * qconnect(chal=0) ВТОРОЙ 'A' (DEC32 n=2, msg_num=2) = РЕ-ЧЕЛЛЕНДж
+             * => значение в строке НЕПРАВИЛЬНОЕ: chal-поле 'A' = 0 = unused,
+             * РЕАЛЬНЫЙ challenge = VAL (0x00ee0a07 = relay-session challenge,
+             * теория v32; байты '07 0a ee 00' в DEC32 'A' @0x14). v40 (chal)
+             * vs v41 (val) = единственный живой дискриминатор string-пути.
+             * 'q'-твин = ff×4 + "qconnect0x<VAL>\0" = 23B (г76-форма) */
             kcopy27[4] = 'q';
             memcpy(kcopy27 + 5, "connect0x", 9);
             for (z27 = 0; z27 < 8; z27++)
-                kcopy27[14 + z27] = hx39[(chal >> (28 - z27 * 4)) & 0xf];
+                kcopy27[14 + z27] = hx39[(val >> (28 - z27 * 4)) & 0xf];
             kcopy27[22] = 0;
             kn27 = 23;
         } else {
@@ -15763,11 +15769,13 @@ static void c2b_k27_maybe_fire(void)
             C2B_LOGS("[c2b] k27: ascii send SEGV\n");
             return;
         }
-        C2B_LOGS(form27 == 2 ? "[c2b] k27: A-fire form=qconnect #"
+        C2B_LOGS(form27 == 2 ? "[c2b] k27: A-fire form=qconnect-val #"
                              : "[c2b] k27: A-fire form=ascii #");
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
+        C2B_LOGS(" val=");
+        C2B_LOGH(val);
         C2B_LOGS(form27 == 2 ? " len=23 fl=1 live=" : " len=22 fl=1 live=");
         C2B_LOGN(live27);
         C2B_LOGS(" tgt=");

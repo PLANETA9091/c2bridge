@@ -8179,7 +8179,16 @@ static u32 g_gns_connect_go;            /* драйвер вооружён */
  * (class-vtable receive-детуры — видят и сессию движка), g126 dec/enc
  * тапы, g77fd-карта, pcap. krel-ts/k27/g90/g98/g99/g76/g71 = сами мертвы
  * при h=0 (гварды на месте). */
-static u32 g_c2b_nog32 = 1;             /* v33 default ON; C2B_NOG32=0 = легаси */
+/* v35 (run372-autopsy): native engine SDR path = DEAD BY CONSTRUCTION —
+ * engine's own ConnectRequest (27005-loop, zero-stripped 79B) = (a) extra
+ * u16-LE len prefix '4c 00' after type byte (relay reads key 0x4c = f9/wt4
+ * = instant parse fail), (b) challenge written as key 0x12 (wt2) with NO
+ * length byte + 8 raw bytes (second parse fail), (c) NO cert field at all
+ * (compat-GNS has no CM cert hookup; relay re-challenges forever by design).
+ * Bridge session (ConnectByIPAddress) = the ONLY path that gets ConnectOK
+ * (run370: 3/3 clean protobufs: f1 connid, f2 chal f64, f3 steamid, f4
+ * cert[174B], f5 ts, f6 ping, f7 crypt[117B]). => default OFF (legаси). */
+static u32 g_c2b_nog32 = 0;             /* v35 default OFF; C2B_NOG32=1 = v33-эксперимент */
 static u32 g_gns_conn_ver;              /* g71: версия сработавшего интерфейса (0=006 1=009) */
 static void *g_gns_conn_iface;          /* g71: iface сработавшего коннекта */
 static uptr  g_gns_conn_h;              /* g71: хэндл GNS-соединения */
@@ -15525,7 +15534,15 @@ static u32 c2b_k24_brlive(void)
  * на новый 'A'), кап 6/ран, killswitch C2B_K27A=0. Смерть = общий
  * death-stop (g_krel_dead). Атрибуция сессии-источника 'A' (мост vs
  * движок) = пост-фактум: gcm + in=<8B> ↔ pcap. */
-static u32 g_k27_init, g_k27_on = 1, g_k27_seen, g_k27_fires;
+/* v35: k27 raw-'k' in-channel relay = DEFAULT OFF. Матрица исчерпана
+ * (run365/368/369/370: chal=0/connless-chal/val × reliable/unreliable —
+ * ВСЕ = 0x24 PARSE_ERROR 2047, дискриминатор = КОНТЕНТ ff×4-'k', не chal).
+ * Каждый выстрел = смерть сессии (run258: 0x24 через 0.05s после доставки;
+ * run264: 'k' = единственный фактор смерти; run370: 5×2047). Сессия без
+ * 'k' живёт 20+s (run260-контроль). Пока не синтезирован правильный
+ * контент (нужны поля in-channel 'A' из 'q'-танца = g76+DECC32), 'k'
+ * не стреляем. C2B_K27A=1 = реармить вручную. */
+static u32 g_k27_init, g_k27_on = 0, g_k27_seen, g_k27_fires;
 static u32 g_k27_wait;                /* v30: тики ожидания g_kfull/g_kcap на тек. 'A' */
 static c2b_k27_A_t *g_k27_Ap;
 #define C2B_K27_CAP 6
@@ -15541,6 +15558,7 @@ static void c2b_k27_maybe_fire(void)
     if (!g_k27_init) {
         const char *e = getenv("C2B_K27A");
         if (e && e[0] == '0') g_k27_on = 0;
+        else if (e && e[0] == '1') g_k27_on = 1;   /* v35: A/B реарм вручную */
         g_k27_init = 1;
     }
     if (!g_k27_on) return;

@@ -577,5 +577,29 @@ static inline unsigned int c2b_ldd_site_build(const unsigned char *tgt,
     return o;
 }
 
+/* v60: C2B_DSITES-фильтр сайтов = bisect-рычаг flake-vs-v59 (run417/418
+ * FAIL menu=0 при чистом exit = вину v59 НЕ доказана; run419 = сайты-off
+ * = точная копия PASS-дерева 404-416 => PASS = v59 виновен => site-
+ * bisect; FAIL = runner-флак). Семантика: unset = все 8 (v59b), "" =
+ * НОЛЬ сайтов, "wr1,wr2" = подмножество. Plain-substring достаточен:
+ * теги csp1/csp2/csp3/snd/smg/smsg/wr1/wr2 = без кросс-подстрок (smg
+ * НЕ сабстринг smsg и наоборот — проверено selftest'ом). Pure = в
+ * хедере (static inline) = живёт в ОБЕИХ компиляциях (.so + selftest). */
+static inline unsigned int c2b_dsite_pass(const char *flt, const char *tag)
+{
+    unsigned int tl, i, j;
+    if (!flt) return 1u;            /* unset = фильтра нет = все */
+    if (!flt[0]) return 0u;         /* "" = ноль сайтов */
+    tl = 0u;
+    while (tag[tl]) tl++;
+    for (i = 0u; flt[i]; i++) {
+        unsigned int same = 1u;
+        for (j = 0u; j < tl; j++)
+            if (flt[i + j] != tag[j]) { same = 0u; break; }
+        if (same) return 1u;
+    }
+    return 0u;
+}
+
 #endif /* __x86_64__ */
 #endif /* C2B_LDD_H */

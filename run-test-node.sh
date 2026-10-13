@@ -662,6 +662,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # (скип init -> s_hEpoll=-1 -> epoll_ctl EBADF -> ConnectByIPAddress h=0,
   # RE run181); больше не выставлять ни в каких MODES.
   [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27FORM=4 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
+  # v60: bisect-рычаг C2B_DSITES (workflow input dsites -> C2B_DSITES_V).
+  # СЕМАНТИКА-СЕНТИНЕЛ (УРОК: ${VAR:-all} И inputs.x||'all' СЪЕДАЮТ
+  # пустую строку => '' НЕВЫРАЗИМ через воркфлоу): 'all' (дефолт) = НЕ
+  # прокидывать = v59b-поведение (все 8 сайтов); 'none' ИЛИ "" = сайты-
+  # OFF (run419 flake-vs-v59: точная копия PASS-дерева 404-416);
+  # 'wr1,wr2' = подмножество (site-bisect: wr-only/send-only/csp-only).
+  case "${C2B_DSITES_V-all}" in
+    all)      : ;;
+    ""|none)  MODES="$MODES C2B_DSITES=" ;;
+    *)        MODES="$MODES C2B_DSITES=$C2B_DSITES_V" ;;
+  esac
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"

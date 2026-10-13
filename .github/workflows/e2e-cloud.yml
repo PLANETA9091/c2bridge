@@ -47,6 +47,11 @@ on:
         default: "1"
         type: choice
         options: ["1", "0"]
+      dsites:
+        description: "v60: C2B_DSITES site-filter: 'all' = v59b (8 sites); 'none' = sites-OFF (flake-vs-v59 bisect); 'wr1,wr2' = subset"
+        default: "all"
+        required: false
+        type: string
   schedule:
     - cron: "0 4 * * *"   # daily 04:00 UTC smoke
 
@@ -83,6 +88,12 @@ jobs:
       # символика на раннере) = module+offset отправителя = ЦЕЛЬ v56.
       PERFCALL: "1"
       C2B_GAME_DIR: ${{ github.workspace }}/csgo-lite
+      # v60: the C2B_DSITES bisect lever (run417/418 FAIL menu=0 = the v59
+      # guilt UNPROVEN — clean-exit profile = flake plausible). 'all' = the
+      # v59b behavior (all 8 sites); '' = the sites OFF (run419 = the exact
+      # copy of the PASS-tree 404-416 => PASS = v59 guilty => site-bisect;
+      # FAIL = the runner flake); 'wr1,wr2' = the subset (site-bisect).
+      C2B_DSITES_V: ${{ inputs.dsites || 'all' }}
       STEAM_USER: ${{ secrets.STEAM_USER }}
       STEAM_PASS: ${{ secrets.STEAM_PASS }}
       STEAM_GUARD_CODE: ${{ inputs.steam_guard_code || secrets.STEAM_GUARD_CODE }}

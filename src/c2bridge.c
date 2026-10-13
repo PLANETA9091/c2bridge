@@ -15352,6 +15352,9 @@ static void *volatile g_dsite_tr[8];    /* tramp'ы (ra->site-маппинг) */
 static u32 g_dsite_fires[8];            /* FIRE-кап = 3/сайт */
 static volatile u32 g_dsite_busy;       /* ре-вход гвард */
 
+/* v60: C2B_DSITES-фильтр (c2b_dsite_pass) = в c2b_lddet.h (static
+ * inline, обе компиляции); рычаг flake-vs-v59, семантика там же. */
+
 static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
                           u64 sp, u64 r8v, u64 r9v, u64 r10v)
 {
@@ -15448,9 +15451,16 @@ static u32 g_dsite_armed;
 static void c2b_ldd_dsite_install(u8 *libc_base)
 {
     u32 i;
+    const char *flt = getenv("C2B_DSITES");
     extern i32 close(i32);
     extern i32 open(const char *, i32, ...);
     for (i = 0u; i < 8u; i++) {
+        if (!c2b_dsite_pass(flt, g_dsite_tab[i].tag)) {
+            C2B_LOGS("[c2b] v59: ");
+            C2B_LOGS(g_dsite_tab[i].tag);
+            C2B_LOGS(" skip (dsites-filter)\n");
+            continue;
+        }
         u8 rbuf[32];
         u8 site[14];
         u8 *tramp;
@@ -28855,6 +28865,21 @@ static void test_lddet(void)
         unsigned int olen = 0, tlen = 0, q;
         unsigned int v32;
         long long rel;
+        /* v60: C2B_DSITES-фильтр (pure): unset/""/подмножество/кросс */
+        CHECK(c2b_dsite_pass(0, "snd") == 1u, "v60: unset = все сайты");
+        CHECK(c2b_dsite_pass("", "snd") == 0u, "v60: empty = ноль сайтов");
+        CHECK(c2b_dsite_pass("wr1,wr2", "wr2") == 1u,
+              "v60: подмножество = in");
+        CHECK(c2b_dsite_pass("wr1,wr2", "snd") == 0u,
+              "v60: подмножество = out");
+        CHECK(c2b_dsite_pass("csp1,csp2,csp3", "csp3") == 1u,
+              "v60: csp-класс = in");
+        CHECK(c2b_dsite_pass("smsg", "smg") == 0u,
+              "v60: smg НЕ сабстринг smsg");
+        CHECK(c2b_dsite_pass("smg", "smsg") == 0u,
+              "v60: smsg НЕ сабстринг smg");
+        CHECK(c2b_dsite_pass("snd", "csp1") == 0u,
+              "v60: чужой класс = out");
         /* csp1: окно = 2+2+2+2+2+11 = 21 (SIB-фикс: 11B-nop = ЦЕЛЫЙ) */
         memset(str, 0, sizeof str);
         CHECK(c2b_ldd_site_build(tldd_site_csp1 + 2u,

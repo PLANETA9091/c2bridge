@@ -7140,6 +7140,21 @@ void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
     if (len >= 380) {
         if (c2b_g130_kn > 24) return;
         c2b_g130_kn++;
+        /* v30 (run367-урок): k-шейп ушёл мимо релея МОЛЧА (гейт dstlen/fd)
+         * — одноразовая диагностика значений гейта на k-шейп-сендах */
+        if (bf && len <= 1200 &&
+            *(volatile const u32 *)bf == 0xffffffffu &&
+            *(volatile const u8 *)(bf + 4) == (u8)'k' &&
+            (g_clv2_fd < 0 || g_clv2_dstlen < 6)) {
+            static u32 k30dbg;
+            if (k30dbg++ < 3) {
+                C2B_LOGS("[c2b] g130: k-shape relay SKIP clv2_fd=");
+                C2B_LOGN((u32)(i32)g_clv2_fd);
+                C2B_LOGS(" dstlen=");
+                C2B_LOGN((u32)g_clv2_dstlen);
+                C2B_LOGS("\n");
+            }
+        }
         /* 61b-v17: КАНТУР-РЕЛЕЙ — 'k'-шейп (ff×4+'k') => S1-кор напрямую
          * (fd=g_clv2_fd, addr=0 => dst=g_clv2_dst). ДО rate-гейта лога =
          * релей живёт, пока живёт scp-ретрай-цикл. */
@@ -15456,8 +15471,10 @@ static u32 c2b_k24_brlive(void)
  * death-stop (g_krel_dead). Атрибуция сессии-источника 'A' (мост vs
  * движок) = пост-фактум: gcm + in=<8B> ↔ pcap. */
 static u32 g_k27_init, g_k27_on = 1, g_k27_seen, g_k27_fires;
+static u32 g_k27_wait;                /* v30: тики ожидания g_kfull/g_kcap на тек. 'A' */
 static c2b_k27_A_t *g_k27_Ap;
 #define C2B_K27_CAP 6
+#define C2B_K27_WAIT_TICKS 600   /* v30: ~5 мин на 'A'; дальше — consumed+skip */
 
 static void c2b_k27_maybe_fire(void)
 {
@@ -15489,25 +15506,66 @@ static void c2b_k27_maybe_fire(void)
     val = g_k27_Ap->val;
     s2 = __atomic_load_n(&g_k27_Ap->seq, __ATOMIC_ACQUIRE);
     if (s1 != s2) return;              /* гонка — возьмём на следующем тике */
-    g_k27_seen = s1;
+    /* v30 (run367-урок): 'A' НЕ consumed до готовности прекомпонент.
+     * run367: DEC-A пришёл ДО первого 'k' движка => g_kfull пуст => fire
+     * потерян навсегда (seen уже выставлен, сервер больше не перечеллен-
+     * джил). Теперь: ждём g_kfull/синтез до 600 тиков, потом consumed. */
     if (!g_gns_conn_iface || !g_gns_conn_h) return;
-    if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
-    if (g_k27_fires >= C2B_K27_CAP) return;
-    if (g_krel_dead) return;           /* общий death-stop */
-    /* консистентный снепшот g_kfull (писатель = контекст движка, гонка
-     * возможна): n до/после копии должен совпасть, иначе скип — сервер
-     * перечелленджит 'A' => новый seq => повтор */
+    if (g_k27_fires >= C2B_K27_CAP) { g_k27_seen = s1; return; }
+    if (g_krel_dead) { g_k27_seen = s1; return; }  /* общий death-stop */
     {
-        u32 n1 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
-        u32 n2;
-        if (!n1) return;
-        for (z27 = 0; z27 < sizeof kcopy27; z27++) kcopy27[z27] = 0;
-        for (z27 = 0; z27 < g_kfull_len; z27++) kcopy27[z27] = g_kfull[z27];
-        kn27 = g_kfull_len;
-        n2 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
-        if (n1 != n2) { g_k27_seen = 0; return; }   /* ретрай этого же 'A' */
+        u32 synth30 = 0;
+        if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) {
+            /* v30: СИНТЕЗ 513B = 17B-хедер-шаблон (ff×4+'k'+ver u32 0x3639
+             * +proto u32 3 — константы с провода run366/367: 'ffffffff6b39
+             * 36000003000000'+chal@13) + g70-ticket (g_kcap, 496B). Не зави-
+             * сит от flaky g_kfull-капчера (run367: 0 капчур при 14 'k'). */
+            if (!g_kcap_n || g_kcap_len < 400 || g_kcap_len > 640) {
+                if (++g_k27_wait >= C2B_K27_WAIT_TICKS) g_k27_seen = s1;
+                return;                    /* ждём тикет/капчер — 'A' жив */
+            }
+            synth30 = 1;
+        }
+        /* консистентный снепшот источника (писатель = контекст движка) */
+        {
+            u32 n1 = __atomic_load_n(synth30 ? &g_kcap_n : &g_kfull_n,
+                                     __ATOMIC_ACQUIRE);
+            u32 n2, srclen;
+            const u8 *src;
+            if (synth30) {
+                static const u8 khdr30[13] = {
+                    0xff, 0xff, 0xff, 0xff, 'k',
+                    0x39, 0x36, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00
+                };
+                srclen = 17u + g_kcap_len;
+                if (srclen > sizeof kcopy27) { g_k27_seen = s1; return; }
+                for (z27 = 0; z27 < sizeof kcopy27; z27++) kcopy27[z27] = 0;
+                for (z27 = 0; z27 < 13; z27++) kcopy27[z27] = khdr30[z27];
+                kcopy27[13] = 0; kcopy27[14] = 0;   /* chal патчится ниже */
+                kcopy27[15] = 0; kcopy27[16] = 0;
+                for (z27 = 0; z27 < g_kcap_len; z27++)
+                    kcopy27[17 + z27] = g_kcap[z27];
+                kn27 = srclen;
+            } else {
+                src = g_kfull;
+                srclen = g_kfull_len;
+                for (z27 = 0; z27 < sizeof kcopy27; z27++) kcopy27[z27] = 0;
+                for (z27 = 0; z27 < srclen; z27++) kcopy27[z27] = src[z27];
+                kn27 = srclen;
+            }
+            n2 = __atomic_load_n(synth30 ? &g_kcap_n : &g_kfull_n,
+                                 __ATOMIC_ACQUIRE);
+            if (n1 != n2) return;      /* гонка — ретрай этого же 'A' */
+        }
+        g_k27_seen = s1;               /* consume ТОЛЬКО при состоявшемся выстреле */
+        g_k27_wait = 0;
+        g_k27_fires++;
+        if (synth30) {
+            C2B_LOGS("[c2b] k27: SYNTH 513B from g70-ticket len=");
+            C2B_LOGN(kn27);
+            C2B_LOGS("\n");
+        }
     }
-    g_k27_fires++;
     /* полная форма (ff×4-хедер на месте, RAW=1) + chal = chal из 'A' */
     (void)c2b_krel_patchchal(kcopy27, kn27, chal);
     live27 = c2b_k24_brlive();         /* тот же тред — вложений нет */

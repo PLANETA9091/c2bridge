@@ -19,6 +19,12 @@
 #ifndef C2B_K27_H
 #define C2B_K27_H
 
+/* v43: raw-капчер — ПОЛНЫЙ wire-'A' (от ff×4) для релея в движок
+ * (a2e = A-to-Engine). Серверский 'A' = 42B (run379/381 DEC32 полный
+ * plaintext: ff×4+'A'+chal4+proto+pad5+val4+00 00 30 01 01+echo NUL) —
+ * 72 = запас на будущие формы. rawlen=0 = не захвачено. */
+#define C2B_K27_RAWMAX 72
+
 typedef struct c2b_k27_A {
     volatile unsigned int       seq;    /* +1 на каждый новый 'A' */
     volatile unsigned int       chal;   /* LE u32 @ 'A'+5 */
@@ -31,22 +37,28 @@ typedef struct c2b_k27_A {
                                          * и сервер ре-челленджил 2-й 'A') */
     volatile unsigned long long gcm;    /* gcm-контекст расшифровки (пост-фактум
                                          * атрибуция сессии: in=<8B> ↔ pcap) */
+    volatile unsigned int       rawlen; /* v43: байт в raw (42 = сервер 'A');
+                                         * пишется ДО seq-bump (контракт) */
+    volatile unsigned char      raw[C2B_K27_RAWMAX]; /* v43: 'A' от ff×4 */
 } c2b_k27_A_t;
 
 /* Чистый сканер одного вхождения ff×4+'A'|'B' с offset off в буфере p[0..n).
  * Возвращает 1 и заполняет cls/chal/proto/val; 0 = нет вхождения.
+ * v43: mo (если не NULL) = офсет НАЧАЛА вхождения (ff×4) в p — нужен
+ * продюсеру для капчера полных байт 'A' (raw от ff×4).
  * 'A'-форма (run379/380 54B): ff×4+cls+chal4+proto+pad5+val4 = мин. хвост 19B
  * (для 'B' хвост короче, но общий гейт 19 = безопасен: скан по ff×4+'A'/'B'). */
 static inline int c2b_k27_scan_clv2(const unsigned char *p, unsigned n,
                                     unsigned off, unsigned char *cls,
                                     unsigned int *chal, unsigned int *proto,
-                                    unsigned int *val)
+                                    unsigned int *val, unsigned int *mo)
 {
     unsigned i;
     if (!p || n < 14 || off + 14 > n) return 0;
     for (i = off; i + 14 <= n; i++) {
         if (p[i] == 0xff && p[i + 1] == 0xff && p[i + 2] == 0xff &&
             p[i + 3] == 0xff && (p[i + 4] == 'A' || p[i + 4] == 'B')) {
+            if (mo) *mo = i;
             *cls = p[i + 4];
             *chal = (unsigned int)p[i + 5] |
                     ((unsigned int)p[i + 6] << 8) |

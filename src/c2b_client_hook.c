@@ -1735,14 +1735,15 @@ static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len)
 static void c2b_g126_k27_sniff(const void *gcm, const void *in,
                                const void *out, sz_t len)
 {
-    static u32 sn_n, sn_chal, sn_val, sn_proto;
+    static u32 sn_n, sn_chal, sn_val, sn_proto, sn_rawlen;
     static const void *sn_gcm;
+    static unsigned char sn_raw[C2B_K27_RAWMAX];
     static u32 sn_have;
-    u32 off = 0, chal, val, proto;
+    u32 off = 0, chal, val, proto, mo = 0, rl;
     unsigned char cls;
     if (!out || len < 14) return;
     if (!c2b_k27_scan_clv2((const unsigned char *)out, (unsigned)len, off,
-                           &cls, &chal, &proto, &val))
+                           &cls, &chal, &proto, &val, &mo))
         return;
     if (cls == (unsigned char)'B') {
         if (sn_n < 16) {
@@ -1757,11 +1758,23 @@ static void c2b_g126_k27_sniff(const void *gcm, const void *in,
         }
         return;
     }
-    /* 'A': дедап (та же четвёрка = повторный расшифр того же пакета) */
+    /* v43: капчер ПОЛНОГО wire-'A' (от ff×4) — ДО дедапа, чтобы сравнивать
+     * сырые байты: run381-факт — 'A'#1 и 'A'#2 отличаются ТОЛЬКО echo
+     * (chal/val/proto/gcm равны) => старый дедап по четвёрке ГЛОТИЛ 'A'#2.
+     * rl = len-mo (сканер гарантирует mo+14 <= len => rl >= 14 > 0);
+     * единственный кламп = RAWMAX => memcpy-границы доказуемы. */
+    rl = (u32)len - mo;
+    if (rl > C2B_K27_RAWMAX) rl = C2B_K27_RAWMAX;
+    /* 'A': дедап (тот же gcm + те же сырые байты = повторный расшифр) */
     if (sn_have && sn_chal == chal && sn_val == val &&
-        sn_proto == proto && sn_gcm == gcm)
+        sn_proto == proto && sn_gcm == gcm && sn_rawlen == rl &&
+        rl <= C2B_K27_RAWMAX &&
+        memcmp(sn_raw, (const unsigned char *)out + mo, rl) == 0)
         return;
-    sn_gcm = gcm; sn_chal = chal; sn_val = val; sn_proto = proto; sn_have = 1;
+    sn_gcm = gcm; sn_chal = chal; sn_val = val; sn_proto = proto;
+    sn_rawlen = rl;
+    if (rl) memcpy(sn_raw, (const unsigned char *)out + mo, rl);
+    sn_have = 1;
     if (sn_n < 16) {
         sn_n++;
         klog_s("[c2b] g126: DEC-A n=");
@@ -1784,13 +1797,23 @@ static void c2b_g126_k27_sniff(const void *gcm, const void *in,
             klog_s(" in=");
             klog_x(bi27, 8);
         }
+        /* v43: raw-хвост после первых 19B (val-конец + флаги + echo) —
+         * байты @19+ в лог = верификация патчей a2e пост-фактум */
+        if (rl > 19) {
+            klog_s(" raw19=");
+            klog_x(sn_raw + 19, rl - 19 > 23 ? 23 : rl - 19);
+        }
         klog_s("\n");
     }
-    /* нота мосту: поля, ЗАТЕМ seq (release) — см. c2b_k27.h */
+    /* нота мосту: поля + raw, ЗАТЕМ seq (release) — см. c2b_k27.h */
     g_c2b_k27_A.chal = chal;
     g_c2b_k27_A.proto = proto;
     g_c2b_k27_A.val = val;
     g_c2b_k27_A.gcm = (unsigned long long)(uptr)gcm;
+    if (rl <= C2B_K27_RAWMAX) {
+        memcpy((void *)g_c2b_k27_A.raw, sn_raw, rl);
+        g_c2b_k27_A.rawlen = rl;
+    }
     (void)__atomic_add_fetch(&g_c2b_k27_A.seq, 1u, __ATOMIC_RELEASE);
 }
 

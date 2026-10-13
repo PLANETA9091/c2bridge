@@ -7174,6 +7174,50 @@ static i32 c2b_krel_patchchal(u8 *k, u32 len, u32 chal)
     return 1;
 }
 
+/* ---------- v43: a2e — РЕЛЕЙ СЕРВЕРНОГО 'A' В ДВИЖОК (чистая часть) ----------
+ * run382-вердикт: строковый путь ('q'/echo-мимикрия) живой, но САМОЗАМКНУТ
+ * (rolling 44-bit token = бесконечная погоня); танец замыкается ТОЛЬКО
+ * движком. ФАКТ run378: движковый win-флаг 0x4b9=1 УЖЕ стреляет на
+ * СИНТЕТИЧЕСКОМ fmt-9 ('A'-pre g63), НО chal/echo в стейте = НАШИ фейки —
+ * сервер видит signon с чужими токенами и молчит (7B ack-keepalives до
+ * конца dwell). Задача: отдать движку НАСТОЯЩИЙ серверный 'A'.
+ *
+ * Серверский wire-'A' (run379/381 DEC32 полный plaintext, 42B от ff×4):
+ *   ff×4 'A' chal4(=0) proto(=3) pad5 val4(=0x00ee0a07) 00 00 30 01 01
+ *   "connect0x00ee0a07\0"  <- НА echo NUL всё, ХВОСТА НЕТ
+ * Отличия от ПРОВЕРЕННОГО fmt-9 (синтетика, win run202/208):
+ *   @22-23: сервер 01 01 vs fmt-9 00 00 (g53: @23 = сплит-флаг, 0x01 ->
+ *           482410()==false в песочнице = ТИХИЙ bail run199/200; g55:
+ *           @22 = старший байт u64-value, 0x01 -> v>>48=0x130 -> отказ
+ *           24b6a7 "cannot connect"). ПАТЧИМ оба в 00.
+ *   @42+:   у сервера ПУСТО — движок же читает "96\0"(ver)+expire+pw+
+ *           b2+lobby (g56-раскладка: @42..44 "96\0", @45 0, @46 pw NUL,
+ *           @47 b2=0xFF, @48..58 lobby=0). ДОБАВЛЯЕМ хвост.
+ * Результат = 59B: серверные chal/val/echo + легальность fmt-9. */
+static u32 c2b_a2e_patch(const u8 *raw, u32 rl, u8 *out, u32 cap)
+{
+    u32 k, i;
+    if (!raw || !out || rl < 25 || cap < 60) return 0;
+    if (raw[0] != 0xff || raw[1] != 0xff || raw[2] != 0xff ||
+        raw[3] != 0xff || raw[4] != (u8)'A') return 0;
+    /* конец echo: первый NUL от @24 (строка "connect0x..."); если его нет
+     * в капчуре — считаем весь rl телом (без хвоста не соберём вер-чек) */
+    k = 0;
+    for (i = 24; i < rl && i < 46; i++) {
+        if (raw[i] == 0) { k = i + 1; break; }
+    }
+    if (!k) return 0;                 /* echo не терминирован = не 'A'-форма */
+    for (i = 0; i < k; i++) out[i] = raw[i];
+    while (k < 24) out[k++] = 0;      /* теоретически короткий echo — пад */
+    if (k > 22) { out[22] = 0; out[23] = 0; }   /* g53/g55-легальность */
+    out[k++] = 0x39; out[k++] = 0x36; out[k++] = 0;   /* "96\0" ver u32 */
+    out[k++] = 0;                     /* @45: 4-й байт expire u32 */
+    out[k++] = 0;                     /* @46: pw NUL (pw="") */
+    out[k++] = 0xFF;                  /* @47: b2 (setne-маска, g56-урок) */
+    while (k < 59) out[k++] = 0;      /* @48..58: lobby u64 = 0, b3/b4, пад */
+    return k;                         /* 59 */
+}
+
 #ifndef C2B_SELFTEST
 static void c2b_k19_relay(void);       /* определение ниже (не-selftest) */
 #endif
@@ -8798,6 +8842,17 @@ static volatile u32 g_g95_consumed;   /* последний seq, взятый g9
 void c2b_g49_log(uptr state, uptr buf)
 {
     u32 k;
+    /* v43: C2B_C2FIX (default 1): расширение entry-форса — cstate=2 ('B'-
+     * accept оставляет 2, run378 g49-хвост) ТОЖЕ мапим в 1: входной гейт
+     * 'A'-кейса = cmpl $1,0x1a0 (run197), при 2 каждый поздний 'A' (в т.ч.
+     * РЕЛЬНЫЙ серверный из a2e-релея) отскакивает ДО парса. 'B'-кейс сам
+     * ставит 2 на следующем accept — флап 1<->2 = тот же, что в run378. */
+    static u32 c2fix_init, c2fix = 1;
+    if (!c2fix_init) {
+        const char *e43 = getenv("C2B_C2FIX");
+        if (e43 && e43[0] == '0') c2fix = 0;
+        c2fix_init = 1;
+    }
     if (!g_engine_base || !state || !buf) return;
     c2b_g49_state = state;   /* g50: захват инстанса ДЛЯ ФОРСА cstate */
     /* 48f-g52: ENTRY-ФОРС cstate — run199 a1 ФАКТ: fmt-9 'A' (первый 'A'
@@ -8812,6 +8867,10 @@ void c2b_g49_log(uptr state, uptr buf)
     if (*(volatile u32 *)(state + 0x1a0) == 0) {
         *(volatile u32 *)(state + 0x1a0) = 1;
         C2B_LOGS("[c2b] g52: cstate 0->1 @'A' entry (pre-gate, engine thread)\n");
+    } else if (c2fix &&
+               *(volatile u32 *)(state + 0x1a0) == 2) {
+        *(volatile u32 *)(state + 0x1a0) = 1;
+        C2B_LOGS("[c2b] g52v2: cstate 2->1 @'A' entry (pre-gate, engine thread)\n");
     }
     if (g_probe_active) return;
     g_probe_active = 1;
@@ -15201,6 +15260,7 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 
 /* v27: A-driven 'k'-fire — объявление (тело = после c2b_k24_brlive) */
 static void c2b_k27_maybe_fire(void);
+static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 
 /* v28 (run365-декод SNP_WIRE_FORMAT.md): серверный in-channel 'A' = UNRELIABLE
  * message (0x37-сегмент, msg_num 1, payload = raw ff×4 'A'). Надёжный поток =
@@ -15399,6 +15459,7 @@ static void *c2b_g97_thread(void *arg)
          * + сохраненный движковый 'k' (g_kfull) => RAW=1 513B с chal из 'A'.
          * Тот же тред = проверенный контекст отправки. См. блок у brlive. */
         c2b_k27_maybe_fire();
+        c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -15904,6 +15965,91 @@ static void c2b_k27_maybe_fire(void)
         g_krel_dead = 1;
         C2B_LOGS("[c2b] k27: tgt dead — общий death-stop (detail у krel/g97)\n");
     }
+}
+
+/* ---------- v43: a2e — РЕЛЕЙ СЕРВЕРНОГО 'A' В ДВИЖОК (g97-тред) ----------
+ * Триггер = новый 'A' в g_c2b_k27_A (seq, продюсер = g126-dec-tap хука).
+ * Действие: c2b_a2e_patch(raw) -> 59B fmt-9-легальная копия серверного 'A'
+ * -> РЕАЛЬНЫЙ sendto на движковый fd (g_clv2_fd) loopback 127.0.0.1:27005 —
+ * ТОТ ЖЕ канал, что у g63 self-push (run215: 39/39 доходят до диспетчера;
+ * ядро кладёт в приёмную очередь того же сокета). Движок парсит СВОИМ
+ * fmt-9-путём: chal/proto/val/echo = СЕРВЕРНЫЕ (не фейки) -> win-хвост
+ * 0x4b9=1 c реальным контекстом сессии. g50-форс перед пушем (=g63).
+ * Дедап по seq; кап 6/сессию; киллисвитч C2B_A2E=0. На провод к серверу
+ * НЕ попадает (loopback) — риск wire-смертей нулевой по построению. */
+static u32 g_a2e_init, g_a2e_on = 1, g_a2e_seen, g_a2e_fires;
+static c2b_k27_A_t *g_a2e_Ap;
+#define C2B_A2E_CAP 6
+
+static void c2b_a2e_maybe(void)
+{
+    u32 s1, s2, rl;
+    u8 blob[96];
+    u8 la[16];
+    u32 i, alen;
+    ssize_t sr;
+    if (!g_a2e_init) {
+        const char *e = getenv("C2B_A2E");
+        if (e && e[0] == '0') g_a2e_on = 0;
+        g_a2e_init = 1;
+        if (g_a2e_on)
+            C2B_LOGS("[c2b] a2e: ARMED (v43 relay server-'A'->engine, cap 6)\n");
+    }
+    if (!g_a2e_on) return;
+    if (!g_a2e_Ap) {
+        /* RTLD_DEFAULT = 0: hook = LD_PRELOAD = глобальный скоуп */
+        g_a2e_Ap = (c2b_k27_A_t *)dlsym((void *)0, "g_c2b_k27_A");
+        if (!g_a2e_Ap) return;         /* хук без сниффа — молча ждём */
+    }
+    s1 = __atomic_load_n(&g_a2e_Ap->seq, __ATOMIC_ACQUIRE);
+    if (!s1 || s1 == g_a2e_seen) return;
+    rl = g_a2e_Ap->rawlen;
+    s2 = __atomic_load_n(&g_a2e_Ap->seq, __ATOMIC_ACQUIRE);
+    if (s1 != s2) return;              /* гонка — возьмём на следующем тике */
+    g_a2e_seen = s1;                   /* consume независимо от исхода */
+    if (g_a2e_fires >= C2B_A2E_CAP) return;
+    if (rl < 25) {
+        C2B_LOGS("[c2b] a2e: seq bump но rawlen=");
+        C2B_LOGN(rl);
+        C2B_LOGS(" <25 — скип\n");
+        return;
+    }
+    alen = c2b_a2e_patch((const u8 *)g_a2e_Ap->raw, rl, blob,
+                         (u32)sizeof blob);
+    if (!alen) {
+        C2B_LOGS("[c2b] a2e: patch=0 (шейп не 'A') rawlen=");
+        C2B_LOGN(rl);
+        C2B_LOGS("\n");
+        return;
+    }
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1) {
+        g_a2e_seen = s1 - 1;           /* НЕ consume: ретрай след. тиком */
+        return;
+    }
+    for (i = 0; i < sizeof(la); i++) la[i] = 0;
+    la[0] = 2;                     /* AF_INET (LE) */
+    la[2] = 0x69; la[3] = 0x7D;    /* порт 27005 BE */
+    la[4] = 127; la[5] = 0; la[6] = 0; la[7] = 1;
+    c2b_g50_force_cstate();        /* ворота cstate=1 ДО парса (=g63) */
+    sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, blob, alen, 0,
+                                       (const struct sockaddr *)la, 16);
+    g_a2e_fires++;
+    C2B_LOGS("[c2b] a2e: relay 'A' #");
+    C2B_LOGN(g_a2e_fires);
+    C2B_LOGS(" rawlen=");
+    C2B_LOGN(rl);
+    C2B_LOGS(" len=");
+    C2B_LOGN(alen);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(g_a2e_Ap->chal);
+    C2B_LOGS(" val=");
+    C2B_LOGH(g_a2e_Ap->val);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)g_clv2_fd);
+    C2B_LOGS("\n");
 }
 
 static void c2b_k19_relay(void)
@@ -26020,7 +26166,7 @@ static void test_krelpatch(void)
 static void test_k27scan(void)
 {
     unsigned char cls = 0;
-    u32 chal = 0, proto = 0, val = 0;
+    u32 chal = 0, proto = 0, val = 0, mo = 99;
     /* SNP-префикс 12B + ff×4+'A'+chal+proto+pad5+val (форма run379/380
      * DEC32 54B: [10..14]=5 нулей, val=0x00ee0a07 @15 — v41b-модель) */
     const u8 buf_a[31] = { 0x80, 0x00, 0x98, 0x02, 0x00, 0xd4, 0x00, 0x37,
@@ -26031,18 +26177,19 @@ static void test_k27scan(void)
                            0x00, 0x00, 0x00, 0x00, 0x00,  /* pad5 @10..14 */
                            0x07, 0x0a, 0xee, 0x00 };  /* val=0x00ee0a07 @15 */
     CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 0, &cls, &chal, &proto,
-                            &val) == 1, "k27: 'A' найден за SNP-префиксом");
+                            &val, &mo) == 1, "k27: 'A' найден за SNP-префиксом");
     CHECK(cls == 'A', "k27: cls='A'");
     CHECK(chal == 0u, "k27: chal=0 (run361 форма)");
     CHECK(proto == 3u, "k27: proto=3");
     CHECK(val == 0x00ee0a07u, "k27: val=0x00ee0a07 (LE)");
+    CHECK(mo == 12u, "k27: mo=12 (v43: офсет ff×4 для raw-капчера)");
     /* 'B' accept */
     {
         const u8 buf_b[14] = { 0xff, 0xff, 0xff, 0xff, 'B',
                                0x11, 0x22, 0x33, 0x44, 0x05,
                                0x78, 0x56, 0x34, 0x12 };
         CHECK(c2b_k27_scan_clv2(buf_b, sizeof buf_b, 0, &cls, &chal, &proto,
-                                &val) == 1, "k27: 'B' найден");
+                                &val, 0) == 1, "k27: 'B' найден (mo=NULL ok)");
         CHECK(cls == 'B', "k27: cls='B'");
         CHECK(chal == 0x44332211u, "k27: 'B' chal LE");
     }
@@ -26051,19 +26198,79 @@ static void test_k27scan(void)
         const u8 buf_n[14] = { 0xff, 0xff, 0xff, 0x00, 'A', 1, 2, 3, 4, 5,
                                6, 7, 8, 9 };
         CHECK(c2b_k27_scan_clv2(buf_n, sizeof buf_n, 0, &cls, &chal, &proto,
-                                &val) == 0, "k27: неполный ff×4 = 0");
+                                &val, 0) == 0, "k27: неполный ff×4 = 0");
         CHECK(c2b_k27_scan_clv2(buf_a, 13, 0, &cls, &chal, &proto,
-                                &val) == 0, "k27: короткий = 0");
+                                &val, 0) == 0, "k27: короткий = 0");
         CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 26, &cls, &chal,
-                                &proto, &val) == 0, "k27: off за краем = 0");
+                                &proto, &val, 0) == 0, "k27: off за краем = 0");
         CHECK(c2b_k27_scan_clv2(0, 26, 0, &cls, &chal, &proto,
-                                &val) == 0, "k27: null = 0");
+                                &val, 0) == 0, "k27: null = 0");
     }
     /* off=12 = ровно на ff×4 — находит; off=13 (за первым ff) = мимо */
     CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 12, &cls, &chal, &proto,
-                            &val) == 1, "k27: off=12 (на ff×4) находит 'A'");
+                            &val, &mo) == 1, "k27: off=12 (на ff×4) находит 'A'");
+    CHECK(mo == 12u, "k27: off=12 -> mo=12");
     CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 13, &cls, &chal, &proto,
-                            &val) == 0, "k27: off=13 (за ff) = 0");
+                            &val, 0) == 0, "k27: off=13 (за ff) = 0");
+}
+
+/* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
+ * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
+static void test_a2epatch(void)
+{
+    /* РЕАЛЬНЫЙ серверный 'A' #2 (run381 DEC32 n=2, байт-в-байт из
+     * out=...: 12B SNP-префикс + 42B 'A'-кадр; тут только кадр) */
+    const u8 real_a[42] = {
+        0xff, 0xff, 0xff, 0xff, 'A',
+        0x00, 0x00, 0x00, 0x00,                   /* chal=0 */
+        0x03,                                     /* proto=3 */
+        0x00, 0x00, 0x00, 0x00, 0x00,             /* pad5 @10..14 */
+        0x07, 0x0a, 0xee, 0x00,                   /* val @15..18 */
+        0x00, 0x00, 0x30, 0x01, 0x01,             /* @19..23 */
+        'c', 'o', 'n', 'n', 'e', 'c', 't', '0', 'x',   /* echo @24.. */
+        '0', '0', 'e', 'e', '0', 'a', '0', '7', 0x00    /* "00ee0a07" NUL @41 */
+    };
+    u8 out[96];
+    u32 i, n;
+    for (i = 0; i < sizeof out; i++) out[i] = 0xAA;
+    n = c2b_a2e_patch(real_a, sizeof real_a, out, sizeof out);
+    CHECK(n == 59u, "a2e: серверный 42B -> 59B");
+    CHECK(out[0] == 0xff && out[4] == 'A', "a2e: ff×4+'A' сохранены");
+    CHECK(out[5] == 0x00 && out[8] == 0x00, "a2e: chal=0 серверный");
+    CHECK(out[9] == 0x03, "a2e: proto=3 серверный");
+    CHECK(out[15] == 0x07 && out[16] == 0x0a && out[17] == 0xee &&
+          out[18] == 0x00, "a2e: val=0x00ee0a07 серверный");
+    CHECK(out[19] == 0x00 && out[20] == 0x00 && out[21] == 0x30,
+          "a2e: @19-21 серверные (00 00 30)");
+    CHECK(out[22] == 0x00 && out[23] == 0x00,
+          "a2e: @22-23 запатчены 01 01 -> 00 00 (g53/g55-легальность)");
+    CHECK(out[24] == 'c' && out[33] == '0' && out[40] == '7' &&
+          out[41] == 0x00, "a2e: echo 'connect0x00ee0a07' сохранён");
+    CHECK(out[42] == 0x39 && out[43] == 0x36 && out[44] == 0x00,
+          "a2e: хвост '96\\0' добавлен");
+    CHECK(out[45] == 0x00 && out[46] == 0x00,
+          "a2e: expire-байт + pw NUL (pw=\"\")");
+    CHECK(out[47] == 0xFF, "a2e: b2=0xFF (g56-урок)");
+    {   u32 z = 0;
+        for (i = 48; i < 59; i++) if (out[i] != 0x00) z = 1;
+        CHECK(z == 0, "a2e: lobby u64=0 + пад до 59");
+        CHECK(out[59] == 0xAA, "a2e: за 59 не пишем");
+    }
+    /* негативы: шейп/размер/cap */
+    CHECK(c2b_a2e_patch(0, 42, out, sizeof out) == 0, "a2e: null raw = 0");
+    CHECK(c2b_a2e_patch(real_a, 24, out, sizeof out) == 0, "a2e: rl<25 = 0");
+    CHECK(c2b_a2e_patch(real_a, sizeof real_a, out, 59) == 0,
+          "a2e: cap<60 = 0");
+    {   u8 bad[42];
+        for (i = 0; i < sizeof bad; i++) bad[i] = real_a[i];
+        bad[4] = 'B';
+        CHECK(c2b_a2e_patch(bad, sizeof bad, out, sizeof out) == 0,
+              "a2e: не-'A' = 0");
+        for (i = 0; i < sizeof bad; i++) bad[i] = real_a[i];
+        bad[41] = 0x01;                /* NUL echo убит */
+        CHECK(c2b_a2e_patch(bad, sizeof bad, out, sizeof out) == 0,
+              "a2e: echo без NUL = 0");
+    }
 }
 
 /* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
@@ -26113,6 +26320,7 @@ int main(void)
     test_g77fd();       /* v18: g77fd-форматтер sockaddr_in */
     test_krelpatch();   /* v19: krel-patchchal (chal в копии 'k') */
     test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
+    test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

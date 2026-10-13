@@ -1,3 +1,5 @@
+/* v38: backtrace = ручной extern рядом с last-gasp (боевой билд = nostdlib-стиль
+ * с ручными декларациями libc; адреса маппятся оффлайн по syms-файлам). */
 /* c2bridge.c — STEP E: каркас транслятора S2->S1 для CS:GO-клиента (Source 1).
  *
  * Механизм:
@@ -5449,6 +5451,10 @@ static void c2b_print_gcfini(void)
 static volatile uptr g2e_bytesize_p, g2e_serialize_p, g2e_writebytes_p;
 static i32 g_up_mode = 0;                    /* 0=observe, 1=translate (C2B_UPLINK=1) */
 static u32 g2_busy = 0;
+/* v38 (run376-a1): t=15-forgе = путь смерти ('free(): invalid pointer' сразу
+ * после первого БЕЗФОЛТНОГО bsz LoadingProgress). Default = 0 (passthrough,
+ * историческое поведение Run218-эры). C2B_UPK15=1 = реарм translate-пути. */
+static u32 g_c2b_upk15 = 0;
 
 typedef u32 (*c2b_e_bytesize_t)(uptr pb);
 typedef void *(*c2b_e_serialize_t)(uptr pb, void *dst);
@@ -5590,6 +5596,20 @@ u64 c2b_up_dispatch(const void *blk)
         t = gt ? gt((void *)msg) : -1;
     }
     c2b_up_obs_note(t, (void *)msg, rel_a, voice);
+    /* v38 (run376-a1-autopsy): t=15 = CCLCMsg_LoadingProgress ИСКЛЮЧЁН из
+     * translate-сета. Хронология: Run218/224 — bsz @1ef9f0 (чужой класс) на
+     * LoadingProgress ГАРАНТИРОВАННО фолтил (obj+0x18=NULL) -> SEGV-гарда ->
+     * passthrough; run371-a1/376-a1 — bsz ВПЕРВЫЕ ВЕРНУЛ n=4 без фолта ->
+     * сработал ПОЛНЫЙ forge-путь (ser -> translate(t=15->27) -> forge ->
+     * orig(&f)) -> движок умер 'free(): invalid pointer' SIGABRT НА ГЛАВНОМ
+     * ТРЕДЕ МГНОВЕННО ПОСЛЕ тапа (fatal rdi=rsi=tid SNM-принта; в run376-a2
+     * до фазы лоадинга не дошёл = PASS мимо). t=15-forge = единственный
+     * новый путь в момент смерти; историческое поведение (все прогоны до
+     * 371) = passthrough сырого msg. Восстанавливаем: t=15 -> orig без
+     * CAS/сериализации. C2B_UPK15=1 = реарм translate-пути (A/B). */
+    if (t == 15 && !g_c2b_upk15) {
+        return (u64)(u32)orig(chan, msg, rel_a, voice);
+    }
     if (t < 0 || !vt)
         return (u64)(u32)orig(chan, msg, rel_a, voice);
 
@@ -6904,6 +6924,10 @@ static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
 #endif  /* C2B_SELFTEST */
 
 #ifndef C2B_SELFTEST
+/* v38: raw-address backtrace для last-gasp (боевой билд = ручные extern,
+ * libc линкуется к .so как и прежде; адреса маппятся оффлайн по syms). */
+extern int backtrace(void **__array, int __size);
+
 /* 58f-g78: ласт-газп для фатальных НЕ-SEGV сигналов (SIGILL=4/SIGABRT=6/
  * SIGBUS=7): печатаем RIP ОДИН РАЗ (латч на сигнал) и возвращаемся —
  * SIG_DFL-чейн добьёт процесс штатно. run230/231: тихие смерти в окне
@@ -6942,6 +6966,27 @@ static void c2b_lastgasp(i32 sig, void *si, void *uc)
             C2B_LOGH((u32)(rsp78 >> 32)); C2B_LOGH((u32)rsp78);
             C2B_LOGS("\n");
         }
+        /* v38 (run376-a1): цепочка КОГо вызвал abort — сырые адреса БЕЗ
+         * backtrace_symbols (тот malloc'ит = дедлок на malloc-lock, который
+         * УЖЕ держит glibc free() внутри abort). Оффлайн-мэппинг = по
+         * bridge64.syms.txt / ldd-базам (та же схема, что g79-RIP). */
+#if defined(__x86_64__) && defined(__linux__)
+        {
+            void *bt38[24];
+            int nb38 = backtrace(bt38, 24);
+            int i38;
+            C2B_LOGS("[c2b] fatal bt n="); C2B_LOGN((u32)(nb38 > 0 ? nb38 : 0));
+            C2B_LOGS("\n");
+            for (i38 = 0; i38 < nb38; i38++) {
+                uptr a38 = (uptr)bt38[i38];
+                C2B_LOGS("[c2b] bt#");
+                C2B_LOGN((u32)i38);
+                C2B_LOGS("=0x");
+                C2B_LOGH((u32)(a38 >> 32)); C2B_LOGH((u32)a38);
+                C2B_LOGS("\n");
+            }
+        }
+#endif
     }
     {
         struct c2b_sigaction dfl;
@@ -21187,6 +21232,11 @@ i32 c2b_main(void)
             C2B_LOGS("[c2b] uplink mode=translate\n");
         } else {
             C2B_LOGS("[c2b] uplink mode=observe\n");
+        }
+        e = getenv("C2B_UPK15");
+        if (e && e[0] == '1') {
+            g_c2b_upk15 = 1;
+            C2B_LOGS("[c2b] uplink k15-forge REARMED (v38 A/B)\n");
         }
     }
     {   /* downlink v1: 0=observe (по умолчанию), 1=translate */

@@ -28895,7 +28895,7 @@ static u32 g_tsn_recv, g_tsn_22, g_tsn_sendok, g_tsn_fbk;
 static void *tsn_thread(void *a)
 {
     extern int ioctl(int, unsigned long, ...);
-    extern i64 syscall(i64, ...);
+    /* syscall = glibc unistd.h (selftest = нормальная libc) */
     struct c2b_sn_notif req;
     struct c2b_sn_resp rsp;
     i32 lfd, fdm;
@@ -28966,7 +28966,7 @@ static void test_seccomp(void)
         extern int ioctl(int, unsigned long, ...);
         extern int pthread_create(void *, const void *,
                                   void *(*)(void *), void *);
-        extern i64 syscall(i64, ...);
+        /* syscall = glibc unistd.h (конфликт типов с i64 = CI-урок) */
         extern int prctl(int, unsigned long, unsigned long,
                          unsigned long, unsigned long);
         extern int socket(int, int, int);

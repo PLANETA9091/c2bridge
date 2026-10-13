@@ -1806,7 +1806,7 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
     u32 *prof = tag32 ? &g126_prof_dc : &g126_prof_dcl;
     const char *tag = tag32 ? "DEC32" : "DECL";
     u32 n = __atomic_add_fetch(ctr, 1, __ATOMIC_RELAXED);
-    u8 bi[8], bo[24];
+    u8 bi[8], bo[64];   /* v28: 64B — полный хвост 'A' (echo) для декода конверта */
     u32 cl, z;
 
     if (!out || !len || len > 0x800) return;
@@ -1835,8 +1835,8 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
             klog_s("\n");
         }
     }
-    for (z = 0; z < 24; z++) bo[z] = 0;
-    cl = len < 24 ? (u32)len : 24;
+    for (z = 0; z < 64; z++) bo[z] = 0;
+    cl = len < 64 ? (u32)len : 64;
     memcpy(bo, out, cl);
     if (*prof < 8) {
         (*prof)++;
@@ -1854,7 +1854,7 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
         memcpy(bi, in, cl);
         klog_s(" in="); klog_x(bi, 8);
     }
-    klog_s(" out="); klog_x(bo, 24);
+    klog_s(" out="); klog_x(bo, 64);
     klog_s("\n");
 }
 

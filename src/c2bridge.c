@@ -44,6 +44,7 @@ typedef unsigned int   uptr;
  * Инсанс живёт в c2b_client_hook64.so (LD_PRELOAD = глобальный скоуп);
  * мост резолвит dlsym(0, "g_c2b_k27_A") на первом тике g97. */
 #include "c2b_k27.h"
+#include "c2b_crt.h"
 
 #ifdef C2B_SELFTEST
 /* ---------- режим selftest: нормальная libc ---------- */
@@ -14889,6 +14890,80 @@ static i32 c2b_clv2_on_s1_connect(i32 fd, const u8 *p, u32 len, i32 flags,
     return 1;               /* дроп без отправки */
 }
 
+/* ---------- v50: CRT-FIX — переписывание 0x22 движка (c2b_crt.h) ----------
+ * Глобалы: капчур f4-блоба сертификата моста с исходящих ЧИСТЫХ 0x22
+ * (сигнатура [22][0d...]) + переписывание СЛОМАННЫХ 0x22 движка
+ * ([22][4c 00], c2b_crt_is_eng) в принятую форму. Кап 12 переписываний/
+ * ран (движок ретраит 0x22 сам, x40/run391); капчер = once; killswitch
+ * C2B_CRTFIX=1 = арм (дефолт ВЫКЛ: wire-изменение = armed-класс как K27K).
+ * Капчер НЕ гейтится (пассивный, без wire-эффекта) — диагностическая
+ * ценность даже при C2B_CRTFIX=0. */
+static u32 g_crt_init, g_crt_fix, g_crt_n, g_crt_capn;
+static u8 g_crt_cert[C2B_CRT_CERTMAX];
+static u32 g_crt_certlen;
+#define C2B_CRT_CAP 12
+
+/* wire-хелпер: пассивный капчер серта (оба хука зовут на каждом 0x22). */
+static void c2b_crt_maybe_capture(const u8 *p, u32 n)
+{
+    u8 ctmp[C2B_CRT_CERTMAX];
+    u32 clen = 0;
+    if (g_crt_certlen || n < 30u || n > 640u || !p || p[0] != 0x22 ||
+        p[1] != 0x0d) return;
+    if (!c2b_crt_capture(p, n, ctmp, &clen)) return;
+    {   u32 q;
+        for (q = 0; q < clen; q++) g_crt_cert[q] = ctmp[q];
+        g_crt_certlen = clen;
+    }
+    g_crt_capn++;
+    C2B_LOGS("[c2b] crt-cap: cert blob #");
+    C2B_LOGN(g_crt_capn);
+    C2B_LOGS("len=");
+    C2B_LOGN(clen);
+    C2B_LOGS("head=");
+    {   u32 q, h = clen < 12u ? clen : 12u;
+        for (q = 0; q < h; q++) C2B_LOGH(g_crt_cert[q]);
+    }
+    C2B_LOGS("\n");
+}
+
+/* wire-хелпер: попытка переписывания СЛОМАННОГО 0x22 движка. Возврат:
+ * длина собранного кадра (buf заполнен) или 0 (не наш/отказ). Лог + кап
+ * внутри. buf/cap = стековый буфер вызывающего (>= 600B). */
+static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
+{
+    u32 on;
+    if (!g_crt_fix || g_crt_certlen == 0u || g_crt_n >= C2B_CRT_CAP)
+        return 0;
+    if (!c2b_crt_is_eng(p, n)) return 0;
+    on = c2b_crt_build(p, n, g_crt_cert, g_crt_certlen, buf, cap);
+    if (!on) {
+        g_crt_n++;   /* сигнатура совпала, сборка обломалась — не молчать */
+        C2B_LOGS("[c2b] crt-fix: 0x22 СИГНАТУРА есть, build=0 (len=");
+        C2B_LOGN(n);
+        C2B_LOGS("certlen=");
+        C2B_LOGN(g_crt_certlen);
+        C2B_LOGS("\n");
+        return 0;
+    }
+    g_crt_n++;
+    C2B_LOGS("[c2b] crt-fix: 0x22 rewrite #");
+    C2B_LOGN(g_crt_n);
+    C2B_LOGS("len=");
+    C2B_LOGN(n);
+    C2B_LOGS("->");
+    C2B_LOGN(on);
+    C2B_LOGS("cid=0x");
+    C2B_LOGH(((u32)p[4]) | ((u32)p[5] << 8) | ((u32)p[6] << 16) |
+             ((u32)p[7] << 24));
+    C2B_LOGS("sid=0x");
+    C2B_LOGH((u32)(g_crt_n * 0u + ((u32)p[18] | ((u32)p[19] << 8))));
+    C2B_LOGS(" certlen=");
+    C2B_LOGN(g_crt_certlen);
+    C2B_LOGS("\n");
+    return on;
+}
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
@@ -14907,6 +14982,26 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
         g_cl_s_total++;
         c2b_g109_census(fd, (u32)len, addr, (const u8 *)buf);
         const u8 *p = (const u8 *)buf;
+        /* v50: crt-класс до connless-обработки (0x22 = не-connless, но
+         * гвард раньше = дешевле и не зависит от порядка). */
+        if (!g_crt_init) {
+            const char *ec = getenv("C2B_CRTFIX");
+            if (ec && ec[0] == '1') g_crt_fix = 1;
+            g_crt_init = 1;
+        }
+        if (len >= 40u && len <= 640u && p[0] == 0x22) {
+            u8 crtbuf[600];
+            u32 on;
+            c2b_crt_maybe_capture(p, (u32)len);
+            on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
+                                       (u32)sizeof crtbuf);
+            if (on) {
+                ssize_t rc;
+                rc = ((c2b_sendto_fn)g_clp_sendto)(fd, crtbuf, on, flags,
+                                                   addr, addrlen);
+                return rc;      /* переписанный кадр ушёл вместо исходного */
+            }
+        }
         if (c2b_cl_is_connless(p, (u32)len)) {
             g_cl_s_cl++;
             i32 cls = c2b_cl_class_up(p, (u32)len);
@@ -15174,6 +15269,40 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
     if ((uptr)g_clp_sendmsg == 1) {
         *__errno_location() = 2;            /* ENOENT */
         return -1;
+    }
+    {
+        /* v50: pre-send crt-класс — капчер серта моста + переписывание
+         * сломанного 0x22 движка (swap iov[0] -> собранный кадр -> send ->
+         * restore). 0x22 = не SNM-кадр (g98-дамп = мимо, потерь нет). */
+        if (msg && msg->msg_iov && msg->msg_iovlen == 1 &&
+            msg->msg_iov[0].iov_base) {
+            const u8 *sp = (const u8 *)msg->msg_iov[0].iov_base;
+            u32 sl = (u32)msg->msg_iov[0].iov_len;
+            if (!g_crt_init) {
+                const char *ec = getenv("C2B_CRTFIX");
+                if (ec && ec[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
+            if (sl >= 40u && sl <= 640u && sp[0] == 0x22) {
+                u8 crtbuf[600];
+                u32 on;
+                c2b_crt_maybe_capture(sp, sl);
+                on = c2b_crt_maybe_rewrite(sp, sl, crtbuf,
+                                           (u32)sizeof crtbuf);
+                if (on) {
+                    struct c2b_iovec sv = msg->msg_iov[0];
+                    ssize_t r2;
+                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_base = crtbuf;
+                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_len = on;
+                    r2 = ((c2b_sendmsg_fn)g_clp_sendmsg)(fd, msg, flags);
+                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_base =
+                        sv.iov_base;
+                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_len =
+                        sv.iov_len;
+                    return r2;
+                }
+            }
+        }
     }
     {
         ssize_t r = ((c2b_sendmsg_fn)g_clp_sendmsg)(fd, msg, flags);
@@ -26577,6 +26706,165 @@ static void test_k27k(void)
           "k27k: NULL-источник = 0");
 }
 
+/* v50: crt-fix — 0x22 движка -> релей-принятая форма (c2b_crt.h).
+ * Фикстуры = РЕАЛЬНЫЕ байты run391-pcap (v50_fixture_extract.py):
+ * v50f_eng = сломанный 0x22 движка (79B: 0x22 + 4c00 + 76B proto),
+ * v50f_cert = f4-блоб сертификата моста (174B, релей-принятый),
+ * v50f_want = ОЖИДАЕМЫЙ переписанный кадр (252B, байт-в-байт). */
+static void test_crt(void)
+{
+    static const unsigned char v50f_eng[79] = {
+        0x22, 0x4c, 0x00, 0x0d, 0xb5, 0x64, 0xc2, 0x69, 0x12, 0xa9, 0x24,
+        0xac, 0xf6, 0xf1, 0x3a, 0x71, 0x19, 0x19, 0xdb, 0x5a, 0xf5, 0x28,
+        0x01, 0x00, 0x10, 0x01, 0x29, 0xa7, 0xbb, 0x4b, 0xe3, 0xff, 0x15,
+        0xce, 0x8f, 0x30, 0x14, 0x40, 0x0d, 0x3a, 0x26, 0x0a, 0x24, 0x08,
+        0x01, 0x12, 0x20, 0x5f, 0xcb, 0x44, 0x9c, 0xf5, 0xc6, 0x2e, 0x17,
+        0x3a, 0x07, 0x6a, 0x36, 0xf2, 0x4c, 0xc4, 0x24, 0x76, 0xad, 0x28,
+        0x0f, 0x5a, 0x6d, 0x41, 0x63, 0x48, 0x0f, 0x1b, 0xf2, 0xcf, 0x6d,
+        0xf0, 0x1e
+    };
+    static const unsigned char v50f_cert[174] = {
+        0x22, 0x61, 0x08, 0x01, 0x12, 0x20, 0x0f, 0x9d, 0x1d, 0xb0, 0xfc,
+        0x04, 0x2c, 0x76, 0xa3, 0x34, 0x11, 0x23, 0xc5, 0x93, 0x76, 0x12,
+        0xd5, 0xb3, 0xbb, 0xfa, 0x2c, 0xf2, 0xc6, 0x42, 0xfd, 0x52, 0x22,
+        0x16, 0xd0, 0xa2, 0x57, 0x34, 0x21, 0xdb, 0x5a, 0xf5, 0x28, 0x01,
+        0x00, 0x10, 0x01, 0x45, 0xfc, 0x1d, 0xce, 0x6a, 0x4d, 0xfc, 0xc0,
+        0xd0, 0x6a, 0x50, 0xda, 0x05, 0x5a, 0x0a, 0x81, 0x01, 0xdb, 0x5a,
+        0xf5, 0x28, 0x01, 0x00, 0x10, 0x01, 0x62, 0x19, 0x73, 0x74, 0x65,
+        0x61, 0x6d, 0x69, 0x64, 0x3a, 0x37, 0x36, 0x35, 0x36, 0x31, 0x31,
+        0x39, 0x38, 0x36, 0x34, 0x37, 0x34, 0x33, 0x33, 0x39, 0x34, 0x37,
+        0x29, 0x1b, 0x39, 0xaa, 0xf5, 0xcf, 0x50, 0x83, 0xb6, 0x32, 0x40,
+        0xe7, 0x8d, 0x54, 0xa6, 0xf7, 0x99, 0x8d, 0x64, 0xf4, 0x20, 0x39,
+        0x26, 0x5a, 0xb8, 0x27, 0x78, 0x79, 0xae, 0xcb, 0xb7, 0xc6, 0xb7,
+        0xec, 0xfd, 0x08, 0x32, 0x9d, 0xb5, 0xa3, 0x14, 0xa9, 0xb5, 0xe1,
+        0x04, 0x60, 0x7f, 0xf1, 0x90, 0x67, 0xa4, 0x32, 0x28, 0x94, 0x53,
+        0x08, 0x03, 0xdb, 0xd0, 0xd6, 0x28, 0x04, 0x5b, 0xe7, 0xf8, 0x35,
+        0x8a, 0xe1, 0x86, 0x95, 0xcb, 0x12, 0x00, 0xc1, 0x01
+    };
+    static const unsigned char v50f_want[252] = {
+        0x22, 0x0d, 0xb5, 0x64, 0xc2, 0x69, 0x11, 0xa9, 0x24, 0xac, 0xf6,
+        0xf1, 0x3a, 0x71, 0x19, 0x19, 0xdb, 0x5a, 0xf5, 0x28, 0x01, 0x00,
+        0x10, 0x01, 0x22, 0xae, 0x01, 0x22, 0x61, 0x08, 0x01, 0x12, 0x20,
+        0x0f, 0x9d, 0x1d, 0xb0, 0xfc, 0x04, 0x2c, 0x76, 0xa3, 0x34, 0x11,
+        0x23, 0xc5, 0x93, 0x76, 0x12, 0xd5, 0xb3, 0xbb, 0xfa, 0x2c, 0xf2,
+        0xc6, 0x42, 0xfd, 0x52, 0x22, 0x16, 0xd0, 0xa2, 0x57, 0x34, 0x21,
+        0xdb, 0x5a, 0xf5, 0x28, 0x01, 0x00, 0x10, 0x01, 0x45, 0xfc, 0x1d,
+        0xce, 0x6a, 0x4d, 0xfc, 0xc0, 0xd0, 0x6a, 0x50, 0xda, 0x05, 0x5a,
+        0x0a, 0x81, 0x01, 0xdb, 0x5a, 0xf5, 0x28, 0x01, 0x00, 0x10, 0x01,
+        0x62, 0x19, 0x73, 0x74, 0x65, 0x61, 0x6d, 0x69, 0x64, 0x3a, 0x37,
+        0x36, 0x35, 0x36, 0x31, 0x31, 0x39, 0x38, 0x36, 0x34, 0x37, 0x34,
+        0x33, 0x33, 0x39, 0x34, 0x37, 0x29, 0x1b, 0x39, 0xaa, 0xf5, 0xcf,
+        0x50, 0x83, 0xb6, 0x32, 0x40, 0xe7, 0x8d, 0x54, 0xa6, 0xf7, 0x99,
+        0x8d, 0x64, 0xf4, 0x20, 0x39, 0x26, 0x5a, 0xb8, 0x27, 0x78, 0x79,
+        0xae, 0xcb, 0xb7, 0xc6, 0xb7, 0xec, 0xfd, 0x08, 0x32, 0x9d, 0xb5,
+        0xa3, 0x14, 0xa9, 0xb5, 0xe1, 0x04, 0x60, 0x7f, 0xf1, 0x90, 0x67,
+        0xa4, 0x32, 0x28, 0x94, 0x53, 0x08, 0x03, 0xdb, 0xd0, 0xd6, 0x28,
+        0x04, 0x5b, 0xe7, 0xf8, 0x35, 0x8a, 0xe1, 0x86, 0x95, 0xcb, 0x12,
+        0x00, 0xc1, 0x01, 0x29, 0xa7, 0xbb, 0x4b, 0xe3, 0xff, 0x15, 0xce,
+        0x8f, 0x30, 0x14, 0x3a, 0x26, 0x0a, 0x24, 0x08, 0x01, 0x12, 0x20,
+        0x5f, 0xcb, 0x44, 0x9c, 0xf5, 0xc6, 0x2e, 0x17, 0x3a, 0x07, 0x6a,
+        0x36, 0xf2, 0x4c, 0xc4, 0x24, 0x76, 0xad, 0x28, 0x0f, 0x5a, 0x6d,
+        0x41, 0x63, 0x48, 0x0f, 0x1b, 0xf2, 0xcf, 0x6d, 0xf0, 0x1e
+    };
+    u8 out[600];
+    u8 wire512[512];      /* реальный wire-буфер: 79B + нулевой пад */
+    u8 cbuf[256];
+    u32 clen = 0, on, i;
+    /* --- сигнатура движкового 0x22 --- */
+    CHECK(c2b_crt_is_eng(v50f_eng, sizeof v50f_eng) == 1,
+          "crt: 79B сигнатура = 1");
+    for (i = 0; i < sizeof v50f_eng; i++) wire512[i] = v50f_eng[i];
+    for (i = sizeof v50f_eng; i < sizeof wire512; i++) wire512[i] = 0;
+    CHECK(c2b_crt_is_eng(wire512, sizeof wire512) == 1,
+          "crt: 512B wire-пад сигнатура = 1");
+    CHECK(c2b_crt_is_eng(v50f_eng, 78) == 0, "crt: короткий = 0");
+    {   u8 bad[79];
+        for (i = 0; i < 79; i++) bad[i] = v50f_eng[i];
+        bad[1] = 0x4d;      /* не 4c00-префикс */
+        CHECK(c2b_crt_is_eng(bad, 79) == 0, "crt: [1]!=4c = 0");
+        bad[1] = 0x4c; bad[8] = 0x13;
+        CHECK(c2b_crt_is_eng(bad, 79) == 0, "crt: [8]!=12 (f2-ключ) = 0");
+        bad[8] = 0x12; bad[17] = 0x1a;
+        CHECK(c2b_crt_is_eng(bad, 79) == 0, "crt: [17]!=19 (f3) = 0");
+        bad[17] = 0x19; bad[26] = 0x2a;
+        CHECK(c2b_crt_is_eng(bad, 79) == 0, "crt: [26]!=29 (f5) = 0");
+        bad[26] = 0x29; bad[35] = 0x31;
+        CHECK(c2b_crt_is_eng(bad, 79) == 0, "crt: [35]!=30 (f6) = 0");
+        bad[35] = 0x30; bad[39] = 0x3b;
+        CHECK(c2b_crt_is_eng(bad, 79) == 0, "crt: [39]!=3a (f7) = 0");
+    }
+    CHECK(c2b_crt_is_eng(0, 79) == 0, "crt: NULL = 0");
+    /* --- капчер серта с чистого 0x22 моста --- */
+    {   /* синтетический мостовой кадр: [22][0d cid4][11 chal8][19 sid8]
+         * [22 ae01 cert174] — голова = реальные байты run391 */
+        u8 br[201];
+        u32 q = 0;
+        static const u8 bhead[24] = {
+            0x22, 0x0d, 0x37, 0x62, 0x50, 0x5d, 0x11, 0x90, 0x24, 0x99,
+            0x76, 0x2c, 0xbe, 0x78, 0x0c, 0x19, 0xdb, 0x5a, 0xf5, 0x28,
+            0x01, 0x00, 0x10, 0x01
+        };
+        for (i = 0; i < sizeof bhead; i++) br[q++] = bhead[i];
+        br[q++] = 0x22; br[q++] = 0xae; br[q++] = 0x01;
+        for (i = 0; i < 174; i++) br[q++] = v50f_cert[i];
+        CHECK(q == sizeof br, "crt: мостовой фикс собран (201B)");
+        CHECK(c2b_crt_capture(br, sizeof br, cbuf, &clen) == 1,
+              "crt: капчер с 202B мостового = 1");
+        CHECK(clen == 174u, "crt: капчер clen=174");
+        {   u32 z = 0;
+            for (i = 0; i < 174; i++) if (cbuf[i] != v50f_cert[i]) z = 1;
+            CHECK(z == 0, "crt: блоб 1:1 с fixтурой");
+        }
+        CHECK(c2b_crt_capture(v50f_eng, sizeof v50f_eng, cbuf, &clen) == 0,
+              "crt: капчер со сломанного = 0 ([1]=4c)");
+        CHECK(c2b_crt_capture(br, 25, cbuf, &clen) == 0,
+              "crt: капчер обрезанного = 0");
+    }
+    /* --- сборка: движок+серт -> 252B байт-в-байт --- */
+    on = c2b_crt_build(v50f_eng, sizeof v50f_eng, v50f_cert, 174,
+                       out, (u32)sizeof out);
+    CHECK(on == 252u, "crt: сборка 79B+174 -> 252B");
+    CHECK(on == 252u && out[252] != 0xEE, "crt: за 252 не пишем (гвард)");
+    {   u32 z = 0;
+        for (i = 0; i < 252; i++) if (out[i] != v50f_want[i]) z = 1;
+        CHECK(z == 0, "crt: вывод байт-в-байт = v50f_want (run391-экземпляр)");
+    }
+    CHECK(out[1] == 0x0d && out[2] == 0xb5 && out[5] == 0x69,
+          "crt: f1 cid движка сохранён");
+    CHECK(out[6] == 0x11 && out[14] == 0x19,
+          "crt: f2 fixed64-фикс (11) + f3 ключ");
+    {   /* 512B wire-вариант = тот же вывод */
+        u8 out2[600];
+        u32 on2 = c2b_crt_build(wire512, sizeof wire512, v50f_cert, 174,
+                                out2, (u32)sizeof out2);
+        u32 z = 0;
+        CHECK(on2 == 252u, "crt: 512B wire-пад -> тоже 252B");
+        for (i = 0; i < 252 && on2 == 252u; i++)
+            if (out2[i] != v50f_want[i]) z = 1;
+        CHECK(on2 != 252u || z == 0, "crt: 512B вывод идентичен");
+    }
+    /* --- негативы сборки --- */
+    CHECK(c2b_crt_build(v50f_eng, sizeof v50f_eng, v50f_cert, 174,
+                        out, 100) == 0, "crt: узкий outcap = 0");
+    CHECK(c2b_crt_build(v50f_eng, sizeof v50f_eng, 0, 174,
+                        out, sizeof out) == 0, "crt: NULL-серт = 0");
+    CHECK(c2b_crt_build(v50f_eng, sizeof v50f_eng, v50f_cert, 0,
+                        out, sizeof out) == 0, "crt: clen=0 = 0");
+    {   u8 bad[79];
+        for (i = 0; i < 79; i++) bad[i] = v50f_eng[i];
+        bad[40] = 200;      /* f7len вне класса */
+        CHECK(c2b_crt_build(bad, sizeof bad, v50f_cert, 174,
+                            out, sizeof out) == 0, "crt: f7len>127 = 0");
+        bad[40] = 0x26;
+        CHECK(c2b_crt_build(bad, 45, v50f_cert, 174,
+                            out, sizeof out) == 0, "crt: f7 обрезан = 0");
+        bad[40] = 0x26;
+        bad[0] = 0x23;      /* не-0x22 класс */
+        CHECK(c2b_crt_build(bad, sizeof bad, v50f_cert, 174,
+                            out, sizeof out) == 0, "crt: класс!=0x22 = 0");
+    }
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -26685,6 +26973,7 @@ int main(void)
     test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
     test_decx();        /* v46/v47: DEC-X гейт верdict/relay-классов */
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
+    test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

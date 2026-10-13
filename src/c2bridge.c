@@ -12935,38 +12935,55 @@ static void c2b_g32_drive(void)
             C2B_LOGS("[c2b] g32: iface ver="); C2B_LOGS(vers[vi]);
             C2B_LOGS(" ok\n");
             vt = *(void ***)iface;
-            /* v37: STEAMCLIENT-GNS CONFIG-GATE (run374-разгадка смерти h1):
-             * iface-фабрика СТАРТУЕТ only-if-cached config-fetch, но
-             * ConnectByIPAddress стреляет МГНОВЕННО. ConnectOK приходит
-             * с relay-cert (CA key 13151444190962006299), CA-список в
-             * steamclient-GNS ещё ПУСТ => 'problem detected locally
-             * (4003): Bad cert: CA key ... is not known to us' => Failed
-             * crypto init => h1 умирает КАЖДЫЙ ран; config доезжает
-             * ПОЗЖЕ и h2 уже коннектится чисто (run373/374 = двойная
-             * сессия каждый ран; run373 h1-зомби + run374 h1-Bad-cert —
-             * ОДИН корень). Фикс: после фабрики, ДО ConnectByIPAddress,
-             * ждём g_sdr_cfg_ok — флаг ставит GNSLIB-spew хук ТОЛЬКО на
-             * steamclient-строку 'Got SDR network config' (движковая
-             * строка идёт мимо хука — v34-harness ждёт НЕ ТУ линию).
-             * Кап 90s (180x500ms); timeout = legacy-fallback (g75
-             * close+retry всё равно спасает). C2B_SDRWAIT2=0 = off. */
+            /* v37b: PRIME-CONNECT + CONFIG-GATE (run374+run375 два урока):
+             * (1) run374: ConnectByIPAddress СТРЕЛЯЕТ МГНОВЕННО — ConnectOK
+             *     валидируется против ЕЩЁ ПУСТОГО CA-списка steamclient-GNS
+             *     => 'Bad cert: CA key ... is not known to us' (4003) =>
+             *     Failed crypto init => h1 умирает КАЖДЫЙ ран.
+             * (2) run375 (v37-урок): only-if-cached fetch СТАРТУЕТ САМИМ
+             *     ConnectByIPAddress (НЕ фабрикой!) — wait ДО коннекта =
+             *     dead-wait 90s + коннект в 504-starvation = нет config в
+             *     ране вообще = нет ConnectRequest = пустая сессия.
+             * ФИКС: ПЕРВЫЙ connect = PRIME (h_pr) — кикает fetch+cert —
+             * затем СРАЗУ Close (fetch/cert = instance-global, живут);
+             * дальше v37-гейт (ждём g_sdr_cfg_ok ≤90s — флаг ставит ТОЛЬКО
+             * GNSLIB-spew хук steamclient-строки 'Got SDR network config',
+             * движковая линия идёт мимо хука); затем РЕАЛЬНЫЙ connect с
+             * загруженным CA-списком. Если config уже есть (warm cache /
+             * второй vi) — prime скипается. Timeout 90s = legacy-fallback
+             * (g75 close+retry всё равно спасает). C2B_SDRWAIT2=0 = off. */
             if (!g_c2b_nog32) {
                 const char *e37 = getenv("C2B_SDRWAIT2");
-                static u32 cfg37_off, cfg37_once;
+                static u32 cfg37_off;
                 u32 w37;
                 if (e37 && e37[0] == '0') cfg37_off = 1;
-                if (!cfg37_off) {
+                if (!cfg37_off && !g_sdr_cfg_ok) {
+                    uptr hpr = 0;
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        hpr = ((uptr (*)(void *, void *, i32, void *))vt[1])(
+                            iface, addr, 0, (void *)0);
+                    }
+                    g_probe_active = 0;
+                    if (hpr) {
+                        C2B_LOGS("[c2b] v37b: prime-connect h=0x");
+                        C2B_LOGH((u32)hpr);
+                        C2B_LOGS(" (config-fetch kick) -> close\n");
+                        g_probe_active = 1;
+                        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                            ((i32 (*)(void *, uptr, i32, const char *, i32))vt[4])(
+                                iface, hpr, 0, (const char *)0, 0);
+                        }
+                        g_probe_active = 0;
+                    }
                     for (w37 = 0; w37 < 180; w37++) {
                         if (g_sdr_cfg_ok) break;
                         usleep(500000);
                     }
-                    if (!cfg37_once || !g_sdr_cfg_ok) {
-                        cfg37_once = 1;
-                        C2B_LOGS("[c2b] v37: steamclient-GNS config-wait cfg_ok=");
-                        C2B_LOGN(g_sdr_cfg_ok);
-                        C2B_LOGS(" w500ms="); C2B_LOGN(w37);
-                        C2B_LOGS("\n");
-                    }
+                    C2B_LOGS("[c2b] v37b: config-gate cfg_ok=");
+                    C2B_LOGN(g_sdr_cfg_ok);
+                    C2B_LOGS(" w500ms="); C2B_LOGN(w37);
+                    C2B_LOGS("\n");
                 }
             }
             if (g_c2b_nog32) {

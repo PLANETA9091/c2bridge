@@ -1732,6 +1732,11 @@ static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len)
  * мост отвечает 'k' in-channel с ЭТИМ chal (k27). 'B' = accept = WIN-сигнал.
  * Сессия-источник (мост vs движок) = пост-фактум по gcm + in=<8B> ↔ pcap.
  * Rate: лог первые 16; нота мосту = дедап по (gcm,chal,proto,val). */
+/* v45: полная 'B'-нота мосту (та же форма, что 'A'-нота; консюмер =
+ * c2b_a2eb_maybe в c2bridge.c — даунлинк серверского accept движку).
+ * НЕ static: мост достаёт dlsym(0,"g_c2b_k27_B") — как g_c2b_k27_A. */
+c2b_k27_A_t g_c2b_k27_B;
+
 static void c2b_g126_k27_sniff(const void *gcm, const void *in,
                                const void *out, sz_t len)
 {
@@ -1746,6 +1751,9 @@ static void c2b_g126_k27_sniff(const void *gcm, const void *in,
                            &cls, &chal, &proto, &val, &mo))
         return;
     if (cls == (unsigned char)'B') {
+        static u32 sn_bn;
+        static unsigned char sn_braw[C2B_K27_RAWMAX];
+        static u32 sn_brl;
         if (sn_n < 16) {
             sn_n++;
             klog_s("[c2b] g126: DEC-B!!! n=");
@@ -1755,6 +1763,44 @@ static void c2b_g126_k27_sniff(const void *gcm, const void *in,
             klog_s(" gcm=");
             klog_p((uptr)gcm);
             klog_s("\n");
+        }
+        /* v45: ПОЛНЫЙ 'B'-капчер для моста (a2e-B даунлинк = серверский
+         * accept -> движковый loopback, g48/g49-проверенный 'B'-case) +
+         * raw-hexdump (первые 48B) = вход для v46 ('B'-парсер 0x25a8b0,
+         * фаза B(в) таск-текста). Дедап по сырым байтам (как у 'A'): тот
+         * же 'B' перекриптуется повторно — не бампаем. rl = len-mo (сканер
+         * гарантирует mo+14 <= len); единственный кламп = RAWMAX. */
+        {
+            u32 brl = (u32)len - mo;
+            if (brl > C2B_K27_RAWMAX) brl = C2B_K27_RAWMAX;
+            if (brl >= 14 &&
+                !(sn_brl == brl &&
+                  memcmp(sn_braw, (const unsigned char *)out + mo, brl) == 0)) {
+                memcpy(sn_braw, (const unsigned char *)out + mo, brl);
+                sn_brl = brl;
+                g_c2b_k27_B.chal = chal;
+                g_c2b_k27_B.proto = proto;
+                g_c2b_k27_B.val = val;
+                g_c2b_k27_B.gcm = (unsigned long long)(uptr)gcm;
+                g_c2b_k27_B.rawlen = brl;   /* ДО seq-bump (контракт) */
+                memcpy((void *)g_c2b_k27_B.raw, sn_braw, brl);
+                __atomic_store_n(&g_c2b_k27_B.seq, g_c2b_k27_B.seq + 1,
+                                 __ATOMIC_RELEASE);
+                if (sn_bn < 4) {
+                    sn_bn++;
+                    klog_s("[c2b] g126: DEC-B raw n=");
+                    klog_h(sn_bn);
+                    klog_s(" len=");
+                    klog_h(brl);
+                    klog_s(" chal=");
+                    klog_h(chal);
+                    klog_s(" val=");
+                    klog_h(val);
+                    klog_s(" raw=");
+                    klog_x(sn_braw, brl < 48 ? brl : 48);
+                    klog_s("\n");
+                }
+            }
         }
         return;
     }

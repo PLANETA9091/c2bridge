@@ -15261,6 +15261,7 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 /* v27: A-driven 'k'-fire — объявление (тело = после c2b_k24_brlive) */
 static void c2b_k27_maybe_fire(void);
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
+static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 
 /* v28 (run365-декод SNP_WIRE_FORMAT.md): серверный in-channel 'A' = UNRELIABLE
  * message (0x37-сегмент, msg_num 1, payload = raw ff×4 'A'). Надёжный поток =
@@ -15460,6 +15461,7 @@ static void *c2b_g97_thread(void *arg)
          * Тот же тред = проверенный контекст отправки. См. блок у brlive. */
         c2b_k27_maybe_fire();
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
+        c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -15906,6 +15908,23 @@ static void c2b_k27_maybe_fire(void)
         C2B_LOGS(" slot=11 rc=");
         C2B_LOGN((u32)(i32)rc27);
         C2B_LOGS("\n");
+        /* v45: фаза B(а) таск-текста — дамп состояния тикета на каждый
+         * выстрел (тикет = g_ticket_* из FUv-интерцептора SteamUser,
+         * run99: slot 13, 252B, наш steamid внутри; здесь = свежий слепок
+         * для v46 — дизайна in-channel auth-аплинка). Первые 8B = u32-халы. */
+        if (g_ticket_ok && g_ticket_len) {
+            u32 t8a = 0, t8b = 0;
+            memcpy(&t8a, g_ticket_buf, 4);
+            memcpy(&t8b, g_ticket_buf + 4, 4);
+            C2B_LOGS("[c2b] k27: tk ok=1 len=");
+            C2B_LOGN(g_ticket_len);
+            C2B_LOGS(" t8=");
+            C2B_LOGH(t8a);
+            C2B_LOGH(t8b);
+            C2B_LOGS("\n");
+        } else {
+            C2B_LOGS("[c2b] k27: tk ok=0 (FUv-тикет ещё не захвачен)\n");
+        }
         if (rc27 != 1) {
             g_krel_dead = 1;
             C2B_LOGS("[c2b] k27: ascii rc!=1 — общий death-stop\n");
@@ -16089,6 +16108,80 @@ static void c2b_a2e_maybe(void)
     C2B_LOGH(g_a2e_Ap->chal);
     C2B_LOGS(" val=");
     C2B_LOGH(g_a2e_Ap->val);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)g_clv2_fd);
+    C2B_LOGS("\n");
+}
+
+/* v45: a2e-B — ДАУНЛИНК серверского 'B' (accept) в движок. Продюсер =
+ * g126-dec-tap хука (g_c2b_k27_B: полный raw от ff×4, дедап по байтам).
+ * Пуш = ВЕРБАТИМ (raw уже ff×4-префиксован) на движковый loopback
+ * 127.0.0.1:27005 (g_clv2_fd) = ТОТ ЖЕ g63-проверенный канал, что у a2e
+ * ('A'); 'B'-case диспетчера = g48/g49-проверенный путь парса. До v45
+ * серверный 'B' только ЛОГИЛСЯ (DEC-B!!!, первые 16) — движок его не
+ * видел. Кап 4; дедап по seq; киллисвитч C2B_A2EB=0; на провод к серверу
+ * НЕ попадает (loopback) — риск wire-смертей нулевой по построению. */
+static u32 g_a2eb_init, g_a2eb_on = 1, g_a2eb_seen, g_a2eb_fires;
+static c2b_k27_A_t *g_a2eb_Bp;
+#define C2B_A2EB_CAP 4
+
+static void c2b_a2eb_maybe(void)
+{
+    u32 s1, s2, rl;
+    u8 la[16];
+    ssize_t sr;
+    if (!g_a2eb_init) {
+        const char *e = getenv("C2B_A2EB");
+        if (e && e[0] == '0') g_a2eb_on = 0;
+        g_a2eb_init = 1;
+        if (g_a2eb_on)
+            C2B_LOGS("[c2b] a2e-B: ARMED (v45 relay server-'B'->engine, cap 4)\n");
+    }
+    if (!g_a2eb_on) return;
+    if (!g_a2eb_Bp) {
+        g_a2eb_Bp = (c2b_k27_A_t *)dlsym((void *)0, "g_c2b_k27_B");
+        if (!g_a2eb_Bp) return;        /* хук без v45-сниффа — молча ждём */
+    }
+    s1 = __atomic_load_n(&g_a2eb_Bp->seq, __ATOMIC_ACQUIRE);
+    if (!s1 || s1 == g_a2eb_seen) return;
+    rl = g_a2eb_Bp->rawlen;
+    s2 = __atomic_load_n(&g_a2eb_Bp->seq, __ATOMIC_ACQUIRE);
+    if (s1 != s2) return;              /* гонка — возьмём на следующем тике */
+    g_a2eb_seen = s1;                  /* consume независимо от исхода */
+    if (g_a2eb_fires >= C2B_A2EB_CAP) return;
+    if (rl < 14) {
+        C2B_LOGS("[c2b] a2e-B: seq bump но rawlen=");
+        C2B_LOGN(rl);
+        C2B_LOGS(" <14 — скип\n");
+        return;
+    }
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1) {
+        g_a2eb_seen = s1 - 1;          /* НЕ consume: ретрай след. тиком */
+        return;
+    }
+    {
+        u32 i;
+        for (i = 0; i < sizeof(la); i++) la[i] = 0;
+    }
+    la[0] = 2;                     /* AF_INET (LE) */
+    la[2] = 0x69; la[3] = 0x7D;    /* порт 27005 BE */
+    la[4] = 127; la[5] = 0; la[6] = 0; la[7] = 1;
+    c2b_g50_force_cstate();        /* ворота cstate=1 ДО парса (=a2e) */
+    sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)g_a2eb_Bp->raw,
+                                       rl, 0,
+                                       (const struct sockaddr *)la, 16);
+    g_a2eb_fires++;
+    C2B_LOGS("[c2b] a2e-B: relay #");
+    C2B_LOGN(g_a2eb_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(rl);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(g_a2eb_Bp->chal);
+    C2B_LOGS(" val=");
+    C2B_LOGH(g_a2eb_Bp->val);
     C2B_LOGS(" rc=");
     C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
     C2B_LOGS(" fd=");

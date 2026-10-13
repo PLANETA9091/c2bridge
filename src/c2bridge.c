@@ -15737,6 +15737,7 @@ static void c2b_k27_maybe_fire(void)
             if (ef && ef[0] == '1') g_k27_form = 1;
             else if (ef && ef[0] == '2') g_k27_form = 2;
             else if (ef && ef[0] == '3') g_k27_form = 3;
+            else if (ef && ef[0] == '4') g_k27_form = 4;   /* v44: вербатим-эхо */
         }
         g_k27_init = 1;
     }
@@ -15806,6 +15807,42 @@ static void c2b_k27_maybe_fire(void)
                 kcopy27[14 + z27] = hx39[(val >> (28 - z27 * 4)) & 0xf];
             kcopy27[22] = 0;
             kn27 = 23;
+        } else if (form27 == 4) {
+            /* v44 (run383-вердикт): ВЕРБАТИМ-ЭХО — сервер РОЛЛИРУЕТ токен
+             * (run381 echo 'connect0x00000ee0a07' -> run383 'A'#2 'connect0x
+             * 00700ee0a07'), а FORM=2/3 отвечают ПЕРЕФОРМАТИРОВАННЫМ
+             * ПОСТОЯННЫМ val => ответ НИКОГДА не совпадает с последним
+             * view сервера => погоня бесконечна ПО КОНСТРУКЦИИ. FORM=4 =
+             * 'q' + СТРОКА ЭХО ИЗ RAW-'A' БЕЗ ИЗМЕНЕНИЙ (v43-капчер несёт
+             * raw[24..NUL] = 'connect0x<11 hex сервера>') = ответ ТОЧНО
+             * в view сервера на момент 'A'. ff×4+'q'+echo+NUL = 26B. */
+            u32 rle44 = g_k27_Ap->rawlen;
+            const volatile unsigned char *rw44;
+            u32 e44, nul44 = 0;
+            kcopy27[0] = 0xff; kcopy27[1] = 0xff;
+            kcopy27[2] = 0xff; kcopy27[3] = 0xff;
+            kcopy27[4] = 'q';
+            kn27 = 5;
+            rw44 = g_k27_Ap->raw;
+            if (rle44 >= 25 && rle44 <= 639 &&
+                rw44[24] == 'c' && rw44[25] == 'o' && rw44[26] == 'n' &&
+                rw44[27] == 'n' && rw44[28] == 'e' && rw44[29] == 'c' &&
+                rw44[30] == 't') {
+                for (e44 = 24; e44 < rle44 && e44 < 63; e44++) {
+                    kcopy27[kn27++] = rw44[e44];
+                    if (rw44[e44] == 0) { nul44 = 1; break; }
+                }
+            }
+            if (!nul44) {
+                /* raw без "connect"-эха = фолбэк на FORM=3 (11-значный val) */
+                kn27 = 5;
+                memcpy(kcopy27 + 5, "connect0x", 9);
+                for (z27 = 0; z27 < 11; z27++)
+                    kcopy27[14 + z27] = hx39[(val >> (40 - z27 * 4)) & 0xf];
+                kcopy27[25] = 0;
+                kn27 = 26;
+                C2B_LOGS("[c2b] k27: form4 фолбэк на 11-значный (raw-эхо не 'connect')\n");
+            }
         } else if (form27 == 3) {
             /* v42 (run381-вердикт): ЭХО-МИМИКРИЯ — сервер сам показал форму:
              * 'A' #2 echo = "connect0x00000ee0a07" = "connect0x" + %011x(val).
@@ -15847,15 +15884,22 @@ static void c2b_k27_maybe_fire(void)
         }
         C2B_LOGS(form27 == 2 ? "[c2b] k27: A-fire form=qconnect-val #"
                              : (form27 == 3 ? "[c2b] k27: A-fire form=qconnect-val11 #"
-                                            : "[c2b] k27: A-fire form=ascii #"));
+                             : (form27 == 4 ? "[c2b] k27: A-fire form=verbatim-echo #"
+                                            : "[c2b] k27: A-fire form=ascii #")));
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
         C2B_LOGS(" val=");
         C2B_LOGH(val);
-        C2B_LOGS(form27 == 2 ? " len=23 fl=1 live="
-                             : (form27 == 3 ? " len=26 fl=1 live="
-                                            : " len=22 fl=1 live="));
+        if (form27 == 4) {
+            C2B_LOGS(" len=");
+            C2B_LOGN(kn27);
+            C2B_LOGS(" fl=1 live=");
+        } else {
+            C2B_LOGS(form27 == 2 ? " len=23 fl=1 live="
+                                 : (form27 == 3 ? " len=26 fl=1 live="
+                                                : " len=22 fl=1 live="));
+        }
         C2B_LOGN(live27);
         C2B_LOGS(" tgt=");
         C2B_LOGN((u32)g_gns_conn_h);

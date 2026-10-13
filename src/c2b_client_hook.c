@@ -1883,6 +1883,102 @@ static i32 c2b_g126_decc32_detour(void *gcm, const void *in, void *out,
     return rc;
 }
 
+/* ---- v31: THE ENCRYPT TAPS (SITE E = encrypt, F = encrypt_ctr32).
+ * THE RE (this round, the steamclient.so__d975c5 objdump, the twins of the
+ * verified dec sites): the dispatcher's enc!=0 twins = 0x212dc60 encrypt /
+ * 0x212e950 encrypt_ctr32. THE PRIZE: the in-buffer = THE ENGINES'S OWN
+ * APP MESSAGES IN THE CLEAR (the S2 'hello' = the in-channel 'k'-equi-
+ * valent — run258 '51B tolerated hello'; run368: raw 'k' = 0x24 PARSE_
+ * ERROR on BOTH lanes => the netmessage = the only language left). The
+ * enc ABI = the same family as the dec (rdi=gcm rsi=in rdx=out rcx=len
+ * r8=ctr). Sig E = the exact 26B twin of the DEC sig (the tail = sub
+ * $0x68 vs $0x58 — byte-verified). Sig F = the 15B head (push r15; mov
+ * %rsi,%r15; movabs $0xfffffffe0,%rsi — the boundary-safe edge; the dec
+ * twin lacks the movabs = a distinct sig). Rate = the first 8 + every
+ * 8th per fn (the self-sends = our krel/g98 = the same lib = the same
+ * tap — the rate + the gcm tag keep the noise bounded). C2B_G126=0 off. */
+#define G126_ENC_OFF    0x212dc60u   /* CRYPTO_gcm128_encrypt      */
+#define G126_ENCC32_OFF 0x212e950u   /* CRYPTO_gcm128_encrypt_ctr32 */
+static const u8 G126_ENC_SIG[26] = {
+    0x41, 0x57,                          /* push %r15 */
+    0x48, 0x89, 0xc8,                    /* mov %rcx,%rax (len) */
+    0x49, 0x89, 0xd7,                    /* mov %rdx,%r15 (out) */
+    0x41, 0x56,                          /* push %r14 */
+    0x48, 0x89, 0xc2,                    /* mov %rax,%rdx */
+    0x49, 0x89, 0xfe,                    /* mov %rdi,%r14 (gcm) */
+    0x41, 0x55,                          /* push %r13 */
+    0x41, 0x54,                          /* push %r12 */
+    0x55,                                /* push %rbp */
+    0x53,                                /* push %rbx */
+    0x48, 0x83, 0xec, 0x68               /* sub $0x68,%rsp (the enc twin) */
+};
+static const u8 G126_ENCC32_SIG[15] = {
+    0x41, 0x57,                          /* push %r15 */
+    0x49, 0x89, 0xf7,                    /* mov %rsi,%r15 (in) */
+    0x48, 0xbe, 0xe0, 0xff, 0xff, 0xff, 0x0f,
+    0x00, 0x00, 0x00                     /* movabs $0xfffffffe0,%rsi */
+};
+static u8 g126_tramp_e[64] __attribute__((aligned(4096)));
+static u8 g126_tramp_f[64] __attribute__((aligned(4096)));
+static u32 g126_nenc;         /* the encrypt calls seen */
+static u32 g126_nencc32;      /* the encrypt_ctr32 calls seen */
+static u32 g126_prof_ec;      /* the enc-profile lines logged (cap 8) */
+static u32 g126_prof_ecl;     /* the encc32-profile lines logged (cap 8) */
+
+static void c2b_g126_enc_capture(void *gcm, const void *in, const void *out,
+                                 sz_t len, i32 rc, u32 c32)
+{
+    u32 z;
+    u8 bo[8];
+    u32 n = c32 ? ++g126_nencc32 : ++g126_nenc;
+    u32 *prof = c32 ? &g126_prof_ecl : &g126_prof_ec;
+    if ((n & 0x07) != 1 && n > 8) return;
+    if (len > 0x10000) return;    /* the junk guard */
+    memcpy(bo, out, sizeof bo);
+    if (*prof < 8) {
+        (*prof)++;
+        klog_s("[c2b] g126: ENC"); if (c32) klog_s("C32");
+        klog_s("# prof n="); klog_h(n); klog_s("\n");
+    }
+    klog_s("[c2b] g126: ENC"); if (c32) klog_s("C32");
+    klog_s(" n="); klog_h(n);
+    klog_s(" len="); klog_h((u32)len);
+    klog_s(" rc="); klog_h((u32)rc);
+    klog_s(" gcm="); klog_p((uptr)gcm);
+    if (in) {
+        u32 hl = (u32)len < 96 ? (u32)len : 96;
+        klog_s(" pt=");  /* THE PLAINTEXT (the app msgs in the clear) */
+        for (z = 0; z < hl; z++) klog_h(((const u8 *)in)[z]);
+    }
+    klog_s(" ct="); klog_x(bo, 8);
+    klog_s("\n");
+}
+
+/* SITE E = CRYPTO_gcm128_encrypt (the 4-arg non-stream path) */
+static i32 c2b_g126_enc_detour(void *gcm, const void *in, void *out, sz_t len);
+static i32 c2b_g126_enc_detour(void *gcm, const void *in, void *out, sz_t len)
+{
+    i32 (*tramp)(void *, const void *, void *, sz_t) =
+        (i32 (*)(void *, const void *, void *, sz_t))g126_tramp_e;
+    i32 rc = tramp(gcm, in, out, len);
+    c2b_g126_enc_capture(gcm, in, out, len, rc, 0);
+    return rc;
+}
+/* SITE F = CRYPTO_gcm128_encrypt_ctr32 (the 5-arg stream path = the SNP
+ * fast path — the dispatcher's enc!=0 + stream!=0 = OUR outbound) */
+static i32 c2b_g126_encc32_detour(void *gcm, const void *in, void *out,
+                                  sz_t len, const void *ctrfn);
+static i32 c2b_g126_encc32_detour(void *gcm, const void *in, void *out,
+                                  sz_t len, const void *ctrfn)
+{
+    i32 (*tramp)(void *, const void *, void *, sz_t, const void *) =
+        (i32 (*)(void *, const void *, void *, sz_t, const void *))
+            g126_tramp_f;
+    i32 rc = tramp(gcm, in, out, len, ctrfn);
+    c2b_g126_enc_capture(gcm, in, out, len, rc, 1);
+    return rc;
+}
+
 static void c2b_g126_patch(u8 *tgt, const u8 *sig, u32 siglen, u8 *tramp,
                            uptr detour, const char *name, u32 bit, uptr base)
 {
@@ -2047,6 +2143,19 @@ static void *c2b_g126_watch(void *arg)
             c2b_g126_patch((u8 *)(liblo + G126_DEC_OFF), G126_DEC_SIG,
                            sizeof(G126_DEC_SIG), g126_tramp_c,
                            (uptr)&c2b_g126_dec_detour, "dec", 4,
+                           liblo);
+        /* v31: the encrypt taps (bits 16/32) — the engine's own app msgs
+         * in the clear (the S2 'hello' hunt; run368 verdict: the raw 'k'
+         * = dead on both lanes => the netmessage = the only language). */
+        if (!(g126_patched & 16))
+            c2b_g126_patch((u8 *)(liblo + G126_ENC_OFF), G126_ENC_SIG,
+                           sizeof(G126_ENC_SIG), g126_tramp_e,
+                           (uptr)&c2b_g126_enc_detour, "enc", 16,
+                           liblo);
+        if (!(g126_patched & 32))
+            c2b_g126_patch((u8 *)(liblo + G126_ENCC32_OFF), G126_ENCC32_SIG,
+                           sizeof(G126_ENCC32_SIG), g126_tramp_f,
+                           (uptr)&c2b_g126_encc32_detour, "encc32", 32,
                            liblo);
         if ((g126_patched & 3) == 3) return (void *)0;
         if (g126_patched) return (void *)0;

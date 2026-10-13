@@ -48,8 +48,8 @@ on:
         type: choice
         options: ["1", "0"]
       dsites:
-        description: "v60: C2B_DSITES site-filter: 'all' = v59b (8 sites); 'none' = sites-OFF (flake-vs-v59 bisect); 'wr1,wr2' = subset"
-        default: "all"
+        description: "v60: C2B_DSITES site-filter: 'all' = v59b (8 sites); 'none' = sites-OFF; 'wr1,wr2' = subset. DEFAULT = 'none' — the run419-422 bisect: wr2 (libc write-inner site) = the menu=0 killer when FIRED; sites stay OFF until the v61 tramp fix"
+        default: "none"
         required: false
         type: string
   schedule:

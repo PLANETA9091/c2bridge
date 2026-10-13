@@ -15722,10 +15722,13 @@ static c2b_k27_A_t *g_k27_Ap;
  * форма доставки тикета после 5x2047 (ff×4 = варинт-взрыв NET-фреймера:
  * 0xffffffff -> кламп 2047 -> PARSE_ERROR) и тишины стрипнутого (run366:
  * без опкода 'k' обработчик не вызывается). Форма = ['k'][96\0][proto]
- * [chal-from-'A'][тикет] = 509B, UNRELIABLE (flags=0, run366-урок).
+ * [chal = 'A'-VAL v49 (было chal-поле=0)][тикет] = 509B, UNRELIABLE
+ * (flags=0, run366-урок).
  * Огонь = ПОСЛЕ успешного (rc==1) FORM-ответа на тот же 'A' — танец-
  * первым, 'k'-следом. Cap 2/ран, общий death-stop, C2B_K27K=1 = арм. */
 static u32 g_k27k_init, g_k27k_on, g_k27k_fires, g_k27k_pend, g_k27k_chal;
+/* v49: g_k27k_chal = 'A'-VAL (серверный challenge value), не chal-поле;
+ * имя историческое — см. c2b_k27k_try(chal=val). */
 static i64 g_k27k_out47;   /* vt[11] out-параметр (queued-status) */
 #define C2B_K27K_CAP 2
 #define C2B_K27K_MAX 660   /* синтез-хвост: 513B + запас */
@@ -15802,6 +15805,7 @@ static i32 c2b_k27k_try(u32 chal, i32 *rc_out)
     C2B_LOGN(kout_len47);
     C2B_LOGS(" chal=");
     C2B_LOGH(chal);
+    C2B_LOGS(" chal-src=val-v49");
     C2B_LOGS(" live=");
     C2B_LOGN(live27);
     C2B_LOGS(" tgt=");
@@ -16046,10 +16050,15 @@ static void c2b_k27_maybe_fire(void)
         if (g_k27k_on && rc27 == 1 && !g_krel_dead &&
             g_k27k_fires < C2B_K27K_CAP) {
             i32 rk47 = -999;
-            i32 v47 = c2b_k27k_try(chal, &rk47);
+            /* v49 (run389-вердикт): chal := VAL — поле chal в 'A' = 0 = НЕ
+             * используется (ledgi 1438: 'real challenge = the val field');
+             * эхо 'connect0x<val>' = серверный challenge VALUE; run384
+             * roll-stop = сервер распарсил 'qconnect0x<val>'. Единственный
+             * непроверенный гель = 'k' с chal=VAL (0x00ee0a07), не 0. */
+            i32 v47 = c2b_k27k_try(val, &rk47);
             if (v47 == -1) {
                 g_k27k_pend = 1;
-                g_k27k_chal = chal;
+                g_k27k_chal = val;
                 C2B_LOGS("[c2b] k27k: источник пуст — PEND (ретрай по тикам)\n");
             }
             /* v47==1/0: лог уже внутри try (включая death-stop) */

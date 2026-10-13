@@ -15566,8 +15566,12 @@ static void c2b_k27_maybe_fire(void)
             C2B_LOGS("\n");
         }
     }
-    /* полная форма (ff×4-хедер на месте, RAW=1) + chal = chal из 'A' */
-    (void)c2b_krel_patchchal(kcopy27, kn27, chal);
+    /* v32 (run369-урок + единая теория): chal-поле 'k' = VAL из 'A'
+     * (0x00ee0a07 = relay-session challenge), НЕ chal-поле (0 = unused).
+     * ВСЕ 3 parse-error (365: chal=0 reliable; 368: chal=connless unreli-
+     * able; 369: chal=0 unreliable) = консистентны с валидацией chal-полЯ
+     * 'k' против серверного val; lane = нейтральна. Полная форма RAW=1. */
+    (void)c2b_krel_patchchal(kcopy27, kn27, val);
     live27 = c2b_k24_brlive();         /* тот же тред — вложений нет */
     vt27 = *(void ***)g_gns_conn_iface;
     rc27 = -999;

@@ -7097,7 +7097,7 @@ static u32 g_k21_eng_h;
  * надёжном SNP-канале = яд для сервера) — ждать живой канал движка; сервер
  * ретраит 'A' => scp => новый krel-шанс. C2B_K21WAIT=0 = старый фолбэк. */
 static u32 g_k21_wait = 1, g_k21_scan_cnt, g_k21_rearm;
-static u32 g_krel_raw;                   /* v24: 0 = стрип 17B хедера (A/B) */
+static u32 g_krel_raw = 1;               /* v29: 1 = FULL 513B ff×4-форма (run366: стрипнутый 496B = сервер ИГНОРИРУЕТ молча; симметрия к серверному raw ff×4 'A' = unreliable-сегмент). C2B_KREL_RAW=0 = легаси-стрип A/B */
 static u32 g_krel_sync;                  /* v25: 1 = инлайн (легаси), 0 = тред */
 /* v25: очередь поток-отправки — SendMessageToConnection из КОНТЕКСТА ДВИЖКА
  * (g130/scp) = rc=1 (queued) НО НА ПРОВОД НЕ УХОДИТ (run362: 5x rc=1,
@@ -15570,7 +15570,7 @@ static void c2b_k19_relay(void)
         e = getenv("C2B_K21WAIT");
         if (e && e[0] == '0') g_k21_wait = 0;
         e = getenv("C2B_KREL_RAW");
-        if (e && e[0] == '1') g_krel_raw = 1;
+        if (e && e[0] == '0') g_krel_raw = 0;   /* v29: default RAW=1 (full форма) */
         e = getenv("C2B_KRELSYNC");
         if (e && e[0] == '1') g_krel_sync = 1;
         g_krel_init = 1;
@@ -15637,11 +15637,14 @@ static void c2b_k19_relay(void)
     if (!g_krel_keep && g_g90_A_seq) {
         (void)c2b_krel_patchchal(kcopy, kn, g_g90_A_chal);
     }
-    /* v24: RAW A/B — C2B_KREL_RAW=0 (default): в канал уходит
-     * ticket-protobuf БЕЗ 17B connless-хедера (ff×4+'k'+ver u16+6B+chal
-     * u32@13; run355-декод) — гипотеза: 513B С хедером = коррелят смерти
-     * сессии ~15с (run256/357). RAW=1 = полный 513B (форма run357).
-     * Chal-патч смыслён только при RAW=1 (в стрипнутой форме нет chal-поля). */
+    /* v29: RAW default = 1 — в канал уходит ПОЛНЫЙ 513B (ff×4+'k'+ver u16+6B+chal
+     * u32@13; run355-декод). ОСНОВАНИЕ: run366 (v28 unreliable-фикс) — стрипнутый
+     * 496B без ff×4 = сервер ИГНОРИРУЕТ молча (сессия жива, но ноль реакции:
+     * нет 'B', нет 0x24, только stats/acks) — connless-хендлер требует ff×4-маршру-
+     * тизацию (серверный 'A' = raw ff×4 в unreliable-сегменте, SNP-декод run365).
+     * Смерть-корреляция 513B (run256/357) = ОПРОВЕРГНУТА: та смерть = RELIABLE-
+     * lane parse error (v28), не форма. C2B_KREL_RAW=0 = легаси-стрип (A/B).
+     * Chal-патч осмыслен только при RAW=1 (в стрипнутой форме нет chal-поля). */
     if (!g_krel_raw && kn > 17) {
         koff24 = 17;
         kn -= 17;
@@ -15684,7 +15687,8 @@ static void c2b_k19_relay(void)
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
         rc19 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt19[slot19])(
-            g_gns_conn_iface, hsend, kcopy + koff24, kn, 1, &out19);
+            g_gns_conn_iface, hsend, kcopy + koff24, kn,
+            c2b_krel_send_flags(), &out19);
         g_probe_active = 0;
     } else {
         g_probe_active = 0;

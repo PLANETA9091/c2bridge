@@ -15662,6 +15662,7 @@ static void c2b_k27_maybe_fire(void)
 {
     u32 s1, s2, chal, proto, val, kn27, z27, live27;
     u8 kcopy27[640];
+    u32 form27 = g_k27_form;   /* v40: снепшот формы на весь выстрел */
     void **vt27;
     i32 rc27;
     i64 out27;
@@ -15669,9 +15670,10 @@ static void c2b_k27_maybe_fire(void)
         const char *e = getenv("C2B_K27A");
         if (e && e[0] == '0') g_k27_on = 0;
         else if (e && e[0] == '1') g_k27_on = 1;   /* v35: A/B реарм вручную */
-        {   /* v39: форма ответа на 'A' */
+        {   /* v39: форма ответа на 'A'; v40: 2 = 'q'-твиновый qconnect0x<chal> */
             const char *ef = getenv("C2B_K27FORM");
             if (ef && ef[0] == '1') g_k27_form = 1;
+            else if (ef && ef[0] == '2') g_k27_form = 2;
         }
         g_k27_init = 1;
     }
@@ -15711,15 +15713,38 @@ static void c2b_k27_maybe_fire(void)
      * 'A' (run376: 0). reliable=1 = как у g76. Слот 11 (v26).
      * C2B_K27A=1 + C2B_K27FORM=1 = арм. Тикет не нужен: SDR-auth УЖЕ
      * доставлен на слое ConnectRequest (cert+crypt = 0x23 ConnectOK). */
-    if (g_k27_form) {
+    /* v40 (run378-вердикт): FORM=1 (ascii без 'q') = ПОДТВЕРЖДЁННО-ТЕРПИМЫЙ
+     * но НЕОТВЕЧЕННЫЙ (run378: rc=1, ноль 2047, сессия жива 90s, НО сервер
+     * ответил только 7B ack-keepalives — 'B'-accept/0x24/тишина-иначе).
+     * ЕДИНСТВЕННАЯ ОТВЕЧЕННАЯ форма за всю историю = 'q'-префиксный твин
+     * "qconnect0x%08x\0" (23B, reliable, слот 11): run230 = 77B-реплай
+     * +172ms; run376/run378 = 'A'-реплай. В run378 g76 выстрелил СВОЙ
+     * qconnect (qc=0) ДО 'A' -> 'A'-реплай; ответ ПОСЛЕ 'A' 'q'-формой
+     * НИКОГДА не посылался (k27 FORM=1 = без 'q'!). Танцевальная теория:
+     * сервер = 'q'(запрос) -> 'A'(челлендж) -> 'qconnect0x<chal>'(ответ
+     * С челленджем) -> коннект. FORM=2 = ТОЧНЫЙ g76-твин, но fired НА
+     * DEC-A (A-driven dedup k27) с chal ПОСЛЕДНЕГО 'A'. Разница с g76:
+     * момент (после 'A') + значение chal от сервера. 1-токен-фикс. */
+    if (form27) {
         static const char hx39[] = "0123456789abcdef";
         kcopy27[0] = 0xff; kcopy27[1] = 0xff;
         kcopy27[2] = 0xff; kcopy27[3] = 0xff;
-        memcpy(kcopy27 + 4, "connect0x", 9);
-        for (z27 = 0; z27 < 8; z27++)
-            kcopy27[13 + z27] = hx39[(chal >> (28 - z27 * 4)) & 0xf];
-        kcopy27[21] = 0;
-        kn27 = 22;
+        if (form27 == 2) {
+            /* v40: 'q'-твин = ff×4 + "qconnect0x%08x\0" = 23B (г76-форма) */
+            kcopy27[4] = 'q';
+            memcpy(kcopy27 + 5, "connect0x", 9);
+            for (z27 = 0; z27 < 8; z27++)
+                kcopy27[14 + z27] = hx39[(chal >> (28 - z27 * 4)) & 0xf];
+            kcopy27[22] = 0;
+            kn27 = 23;
+        } else {
+            /* v39: ascii = ff×4 + "connect0x%08x\0" = 22B */
+            memcpy(kcopy27 + 4, "connect0x", 9);
+            for (z27 = 0; z27 < 8; z27++)
+                kcopy27[13 + z27] = hx39[(chal >> (28 - z27 * 4)) & 0xf];
+            kcopy27[21] = 0;
+            kn27 = 22;
+        }
         g_k27_seen = s1;               /* consume 'A' при состоявшемся выстреле */
         g_k27_wait = 0;
         g_k27_fires++;
@@ -15738,11 +15763,12 @@ static void c2b_k27_maybe_fire(void)
             C2B_LOGS("[c2b] k27: ascii send SEGV\n");
             return;
         }
-        C2B_LOGS("[c2b] k27: A-fire form=ascii #");
+        C2B_LOGS(form27 == 2 ? "[c2b] k27: A-fire form=qconnect #"
+                             : "[c2b] k27: A-fire form=ascii #");
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
-        C2B_LOGS(" len=22 fl=1 live=");
+        C2B_LOGS(form27 == 2 ? " len=23 fl=1 live=" : " len=22 fl=1 live=");
         C2B_LOGN(live27);
         C2B_LOGS(" tgt=");
         C2B_LOGN((u32)g_gns_conn_h);

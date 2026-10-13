@@ -947,6 +947,34 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       > "$FARM_DIR/engine_ports.txt" 2>/dev/null || true
     log "attempt $ATTEMPT: engine UDP ports: $(tr '\n' ' ' < "$FARM_DIR/engine_ports.txt" 2>/dev/null)"
   fi
+  # ---- v34: WAIT for the SDR network config BEFORE firing the connect ----
+  # run371 lesson: the engine's native SDR connect happens AT connect-time
+  # and silently falls back to the connless path (dead end at the relay,
+  # 0x20/0x21/0x22 retransmit loop) when the SDR network config fetch
+  # (https://api.steampowered.com GetSDRConfig, flaky HTTP 504s) has not
+  # completed yet. run370 (config arrived during the bridge phase): engine
+  # did native SDR (0x22 with cert/ticket -> ConnectOK). run371 (v33, no
+  # bridge session, fetch never completed within the window): NO native SDR
+  # session at all. The fetch starts at client boot; give it up to
+  # C2B_SDR_WAIT seconds, then fire connect anyway (legacy behavior).
+  SDR_WAIT=${C2B_SDR_WAIT:-90}
+  if (( SDR_WAIT > 0 )); then
+    log "attempt $ATTEMPT: waiting up to ${SDR_WAIT}s for SDR network config"
+    SDW=0
+    while (( SDW < SDR_WAIT )); do
+      if grep -aq "Got SDR network config" "$OUT" 2>/dev/null \
+         || sudo -n grep -aq "Got SDR network config" "$CONLOG" 2>/dev/null; then
+        log "attempt $ATTEMPT: SDR network config READY after ${SDW}s"
+        break
+      fi
+      engine_alive || { log "attempt $ATTEMPT: client gone during SDR wait"; break; }
+      sleep 5
+      SDW=$((SDW + 5))
+    done
+    if (( SDW >= SDR_WAIT )); then
+      log "attempt $ATTEMPT: SDR config NOT confirmed in ${SDR_WAIT}s — firing connect anyway (legacy fallback)"
+    fi
+  fi
   log "attempt $ATTEMPT: firing steam://connect/$TARGET"
   rm -f "$RUNDIR/g113.go" 2>/dev/null
   sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \

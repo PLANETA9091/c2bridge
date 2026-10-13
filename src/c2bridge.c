@@ -20097,7 +20097,14 @@ static void c2b_g_authdiag(const char *tag)
 
 static void *c2b_g98_thread(void *arg)
 {
-    u32 it, frm = 0, msg = 0;
+    /* v48 (run386/388-вердикт): FRM=2 = FLAT [type-varint][proto-body] =
+     * РЕАЛЬНАЯ S2-обмотка netmessages. РАНЬШЕ: дефолт frm=0 = [type]
+     * [len-u32-LE][body] = S1-легаси — сервер (Source-2) парсит тело как
+     * proto: первый байт 0x02 = тег поля-0 = INVALID = тихий дроп на app-
+     * уровне (транспорт acked = «the SNM ignored»-загадка РЕШЕНА). Alias
+     * frm=2->1 (58f-эра) УДАЛЁН — плоская форма никогда не тестировалась.
+     * C2B_G98_FRM=0/1 = старые формы для A/B. */
+    u32 it, frm = 2, msg = 0;
     (void)arg;
     {
         const char *e = getenv("C2B_G98");
@@ -20109,8 +20116,7 @@ static void *c2b_g98_thread(void *arg)
     {
         const char *e = getenv("C2B_G98_FRM");
         if (e && e[0] >= '0' && e[0] <= '9') frm = (u32)(e[0] - '0');
-        if (frm == 2) frm = 1;                  /* the alias */
-        if (frm > 3) frm = 0;
+        if (frm > 3) frm = 2;
     }
     {
         const char *e = getenv("C2B_G98_MSG");
@@ -20135,6 +20141,21 @@ static void *c2b_g98_thread(void *arg)
      * GetCertAsync APICall handle, the identity type, the live AuthStatus). */
     c2b_g_authdiag("t0 ");
     usleep(3000000);      /* 3s: the engine finishes the 0x20-0x23 handshake */
+    /* v48: сигнон ПОСЛЕ начала CLV2-танца — сервер в состоянии до 'A'-
+     * ответа сигнон-поток НЕ потребляет (порядок: 'A'->ответ->signon).
+     * Ждём первый k27 A-fire (гейт = g_k27_fires>0), потолок 20s. */
+    {
+        u32 w48;
+        for (w48 = 0; w48 < 40; w48++) {
+            if (__atomic_load_n(&g_k27_fires, __ATOMIC_ACQUIRE) > 0) break;
+            usleep(500000);
+        }
+        C2B_LOGS("[c2b] g98: probe-gate A-fires=");
+        C2B_LOGN(__atomic_load_n(&g_k27_fires, __ATOMIC_ACQUIRE));
+        C2B_LOGS(" waited=");
+        C2B_LOGN(w48);
+        C2B_LOGS("\n");
+    }
     /* 59f-g100v6: скан СРАЗУ после хэндшейка (t+6): ключи валидны; обратный
      * порядок регионов (арены = высокие адреса), pread, потолок 15с ->
      * done к t+21 < минимального death t+25 (run270-урок: смерть переменна). */
@@ -20186,9 +20207,10 @@ static void *c2b_g98_thread(void *arg)
                 /* 58f-g99v3: fallback-синтетика SetConVar только если тапнутый
                  * t=6 ещё НЕ ушёл в релей (иначе = дубль = новая переменная
                  * бисекта). run263: синтетика rc=3 = сессия уже мертва к t+9s
-                 * — тело так и не проверено на ЖИВОЙ сессии. */
+                 * — тело так и не проверено на ЖИВОЙ сессии. v48: frm=2. */
                 if (w8 == 9 && !t6_relayed) {
-                    (void)c2b_g98_send_msg(6, sc99, (u32)sizeof(sc99), 0, 99);
+                    (void)c2b_g98_send_msg(6, sc99,
+                                           (u32)sizeof(sc99), frm, 99);
                 }
                 if (!g99_on) continue;
                 {
@@ -20221,7 +20243,7 @@ static void *c2b_g98_thread(void *arg)
                             C2B_LOGN(ml);
                             C2B_LOGS(" -> S2 CConVar synthetic\n");
                             r99 = c2b_g98_send_msg(6, sc99,
-                                                   (u32)sizeof(sc99), 0,
+                                                   (u32)sizeof(sc99), frm,
                                                    ri99 + 1);
                             __atomic_store_n(&g_g99_ri, ri99 + 1,
                                              __ATOMIC_RELEASE);
@@ -20234,7 +20256,7 @@ static void *c2b_g98_thread(void *arg)
                             continue;
                         }
                         r99 = c2b_g98_send_msg(mt, g_g99_body[s99], ml,
-                                               0, ri99 + 1);
+                                               frm, ri99 + 1);
                         __atomic_store_n(&g_g99_ri, ri99 + 1,
                                          __ATOMIC_RELEASE);
                         if (mt == 6) t6_relayed = 1;

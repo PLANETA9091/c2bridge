@@ -68,6 +68,11 @@ jobs:
       # map = added to the artifact (the ci-collect) = any future crash
       # rip-offset resolves to the fn name.
       C2B_G109: "0"
+      # v53b: ядерная правда о send-классе (elimination-финал v51/v52/v53
+      # = не-GOT/PLT, не-libc-прологи 4/4 zero-HIT, не-анон-r-x) —
+      # strace -f -e sendto,sendmsg,send = tid+fd+буфер+таймстемп,
+      # кросс-реф с pcap. Диагностика читается из strace_send.a*.log.
+      STRACE_GAME: "1"
       C2B_GAME_DIR: ${{ github.workspace }}/csgo-lite
       STEAM_USER: ${{ secrets.STEAM_USER }}
       STEAM_PASS: ${{ secrets.STEAM_PASS }}

@@ -840,6 +840,18 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       --args ./csgo_linux64"
   elif (( ATTEMPT == DBG_ATTEMPT )) && command -v strace >/dev/null 2>&1; then
     DBG_INNER="exec strace -f -qq -e trace=execve,execveat,kill,tgkill,mprotect,prctl -o $RUNDIR/strace_game.a${DBG_ATTEMPT}.log ./csgo_linux64"
+  elif [[ "${STRACE_GAME:-0}" = "1" ]] && command -v strace >/dev/null 2>&1; then
+    # v53b: ЯДЕРНАЯ правда о send-классе (elimination-финал v51/v52/v53:
+    # не-GOT/PLT, не-libc sendto/sendmsg/send/write прологи (ARMED 4/4 =
+    # zero HITs), не-анон-r-x стабы (chunks=0) => остаток = сырой syscall
+    # в файл-бэкед модуле (не в аудит-списке) / io_uring / вне-процессный
+    # отправитель. strace = ptrace-земля: каждый sendto/sendmsg/send всех
+    # тидов = tid + fd + буфер (64B hex) + таймстемп = кросс-реф с pcap.
+    # Только send-класс = объём ~1500 строк/ран (write = НЕ трейсится:
+    # слишком горячо, и write-класс = закрыт детуром run400). Оверхед
+    # ptrace = приёмлем для одного диагностического рана (прецедент
+    # DBG_ATTEMPT). Лог = в RUNDIR = артефакт автоматически.
+    DBG_INNER="exec strace -f -qq -e trace=sendto,sendmsg,send -s 64 -x -o $RUNDIR/strace_send.a${ATTEMPT}.log ./csgo_linux64"
   fi
 
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \

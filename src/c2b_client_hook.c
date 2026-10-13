@@ -1737,6 +1737,50 @@ static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len)
  * НЕ static: мост достаёт dlsym(0,"g_c2b_k27_B") — как g_c2b_k27_A. */
 c2b_k27_A_t g_c2b_k27_B;
 
+/* v46 DEC-X: наблюдатель S>C-верdictов/relay-классов — СМ. c2b_k27.h
+ * (c2b_decx_want) для обоснования. Снифф = pre-rate-gate => 100%-захват
+ * редких событий (верdict 45/46B = 2/90s — оба были ПОТЕРЯНЫ DEC32-гейтом).
+ * Dedup по первым 16B (кольцо 8): повторный расшифр того же пакета/keepalive-
+ * серию не бампаем. Rate: первые 8 + каждый 32-й. Killswitch C2B_DECX=0. */
+static void c2b_g126_decx(const void *gcm, const void *out, sz_t len)
+{
+    static unsigned char dseen[8][16];
+    static u32 dseenn[8], dseeni, dx_n, dx_logn;
+    static u32 dx_en;
+    const unsigned char *p = (const unsigned char *)out;
+    unsigned char h[16];
+    u32 n16, i;
+    if (!p || !len) return;
+    if (!dx_en) {
+        const char *e = (const char *)getenv("C2B_DECX");
+        dx_en = (e && e[0] == '0') ? 2u : 1u;
+    }
+    if (dx_en == 2u) return;
+    if (!c2b_decx_want((u32)len, p[0])) return;
+    dx_n++;
+    n16 = len < 16 ? (u32)len : 16;
+    for (i = 0; i < 16; i++) h[i] = 0;
+    for (i = 0; i < n16; i++) h[i] = p[i];
+    for (i = 0; i < 8; i++)
+        if (dseenn[i] == n16 && memcmp(dseen[i], h, n16) == 0) return;
+    i = dseeni % 8;
+    memcpy(dseen[i], h, 16);
+    dseenn[i] = n16;
+    dseeni++;
+    if (dx_logn < 8 || (dx_n & 31u) == 0) {
+        dx_logn++;
+        klog_s("[c2b] g126: DEC-X n=");
+        klog_h(dx_n);
+        klog_s(" len=");
+        klog_h((u32)len);
+        klog_s(" gcm=");
+        klog_p((uptr)gcm);
+        klog_s(" raw=");
+        klog_x(p, len < 48 ? (u32)len : 48);
+        klog_s("\n");
+    }
+}
+
 static void c2b_g126_k27_sniff(const void *gcm, const void *in,
                                const void *out, sz_t len)
 {
@@ -1748,8 +1792,11 @@ static void c2b_g126_k27_sniff(const void *gcm, const void *in,
     unsigned char cls;
     if (!out || len < 14) return;
     if (!c2b_k27_scan_clv2((const unsigned char *)out, (unsigned)len, off,
-                           &cls, &chal, &proto, &val, &mo))
+                           &cls, &chal, &proto, &val, &mo)) {
+        /* v46: не-'A'/'B' расшифровка = наблюдение верdict/relay-классов */
+        c2b_g126_decx(gcm, out, len);
         return;
+    }
     if (cls == (unsigned char)'B') {
         static u32 sn_bn;
         static unsigned char sn_braw[C2B_K27_RAWMAX];

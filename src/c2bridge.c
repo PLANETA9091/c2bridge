@@ -26351,6 +26351,26 @@ static void test_k27scan(void)
                             &val, 0) == 0, "k27: off=13 (за ff) = 0");
 }
 
+/* v46: DEC-X гейт (c2b_k27.h) — класс вердиктов/relay-голов. */
+static void test_decx(void)
+{
+    CHECK(c2b_decx_want(28, 0x0f) == 1, "decx: 28B = верdict-класс (1)");
+    CHECK(c2b_decx_want(45, 0x81) == 1, "decx: 45B = верdict-класс (2)");
+    CHECK(c2b_decx_want(24, 0x80) == 1, "decx: 24B нижняя граница");
+    CHECK(c2b_decx_want(72, 0x00) == 1, "decx: 72B верхняя граница");
+    CHECK(c2b_decx_want(23, 0x80) == 0, "decx: 23B ниже класса = 0");
+    CHECK(c2b_decx_want(73, 0x80) == 0, "decx: 73B выше класса = 0");
+    CHECK(c2b_decx_want(7, 0x81) == 0, "decx: 7B keepalive = мимо");
+    CHECK(c2b_decx_want(100, 0x80) == 0, "decx: 100B = мимо");
+    CHECK(c2b_decx_want(9, 0x22) == 1, "decx: head 0x22 = relay-класс");
+    CHECK(c2b_decx_want(5, 0x23) == 1, "decx: head 0x23 = relay-класс");
+    CHECK(c2b_decx_want(3, 0x24) == 1, "decx: head 0x24 = relay-класс");
+    CHECK(c2b_decx_want(2, 0x25) == 1, "decx: head 0x25 = relay-класс");
+    CHECK(c2b_decx_want(9, 0x21) == 0, "decx: head 0x21 вне окна = 0");
+    CHECK(c2b_decx_want(9, 0x26) == 0, "decx: head 0x26 вне окна = 0");
+    CHECK(c2b_decx_want(0, 0x23) == 0, "decx: len=0 = мимо");
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -26457,6 +26477,7 @@ int main(void)
     test_g77fd();       /* v18: g77fd-форматтер sockaddr_in */
     test_krelpatch();   /* v19: krel-patchchal (chal в копии 'k') */
     test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
+    test_decx();        /* v46: DEC-X гейт верdict/relay-классов */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

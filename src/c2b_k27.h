@@ -85,4 +85,21 @@ static inline int c2b_k27_scan_clv2(const unsigned char *p, unsigned n,
     return 0;
 }
 
+/* v46 DEC-X: чистый гейт наблюдателя S>C-верdictов (c2b_g126_decx в хуке,
+ * pre-rate-gate). ОБОСНОВАНИЕ (run385-pcap + логи, 17:38-раунд): reliable
+ * 0x81-кадры 45/46B = сессионные верdict-протобуфы ({inner{4x0,code}}:
+ * run383 code=0x9f01=159 (reject), run385 code=0x72=114 x2 @+22s) — на
+ * проводе есть, в DEC32-логах НЕТ (rate-гейт first-64+every-8th пропустил
+ * оба события; grep len=00000039/0000002d = только 'A'-кадры). Снифф =
+ * pre-gate = точка 100%-захвата. Класс гейта: расшифрованный 24..72B
+ * (wire 45B -> расшифрованный ~28B) ИЛИ голова 0x22..0x25 (relay-управле-
+ * ние, in-session форма неизвестна = само наблюдение и есть цель). */
+static inline int c2b_decx_want(unsigned int len, unsigned char c0)
+{
+    if (len == 0u) return 0;
+    if (len >= 24u && len <= 72u) return 1;
+    if (c0 >= 0x22u && c0 <= 0x25u) return 1;
+    return 0;
+}
+
 #endif /* C2B_K27_H */

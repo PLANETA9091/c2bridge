@@ -7076,7 +7076,11 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
  * (ретраи движка = тот же chal), cap 12/сессия, SEGV-гард на send,
  * killswitch C2B_KREL=0. */
 #ifndef C2B_SELFTEST
-static u32 g_krel_on = 1, g_krel_keep, g_krel_init;
+/* v36: DEFAULT OFF (дополнение v35: там выключили только k27, krel остался
+ * вооружён и УБИЛ сессию в run373 — 548B-кадр @t+2.6s после ConnectOK ->
+ * 0x24 2047 за 160ms; пятая смерть от raw-'k': 365/368/369/370/373).
+ * C2B_KREL=1 = реарм для A/B. */
+static u32 g_krel_on = 0, g_krel_keep, g_krel_init;
 static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal, g_krel_chalv;
 #define C2B_KREL_CAP 12
 /* v21: цель krel = ЖИВАЯ сессия ДВИЖКА (run357-урок: krel#1 rc=1 улетел в
@@ -8201,6 +8205,8 @@ static socklen_t g_gns_dstlen;          /* 0 = не собран */
 /* 41f-g32a: fwd decl — драйвер определяется ниже, зовётся из auth-потока */
 static void c2b_g32_drive(void);
 static void *c2b_g32_thread(void *arg);
+/* v36: fwd decl — g75-wait зовёт buffer-oracle (определение ниже, ~15490) */
+static u32 c2b_k24_brlive(void);
 /* 58f-g71: fwd decl (дамп принятого GNS-сообщения; определение ниже драйвера) */
 static u32 g_gns_rx_n;
 static i32 c2b_g71_dumpmsg(void *mp);
@@ -13034,11 +13040,18 @@ static void c2b_g32_drive(void)
             {
                 u32 w;
                 i32 ok75 = 0;
+                /* v36: cfg_ok-2s-early-break УДАЛЁН (run373-автопсия: v34
+                 * гарантирует cfg_ok ДО firing connect => early-break СТАНОВИЛСЯ
+                 * БЕЗУСЛОВНЫМ 2s-таймаутом => CloseConnection(h1) ПРЯМО ПЕРЕД
+                 * его 'connected'-spew (line 6589 после create h2 6579) =>
+                 * двойная сессия-churn каждый ран). Теперь: полные 12s, ДВА
+                 * оракула = GNSLIB-spew '] connected' (sticky) ИЛИ slot-17
+                 * detail-ascii br-live (v24b buffer-oracle). */
                 for (w = 0; w < 24; w++) {
                     usleep(500000);
                     if (g_sdr_conn_ok) { ok75 = 1; break; }
                     if (g_sdr_conn_dead) break;
-                    if (g_sdr_cfg_ok && w >= 3) break;
+                    if (c2b_k24_brlive()) { ok75 = 1; break; }
                 }
                 if (ok75) {
                     C2B_LOGS("[c2b] g75: session connected att=");
@@ -15697,7 +15710,7 @@ static void c2b_k19_relay(void)
     u32 he21;
     if (!g_krel_init) {
         const char *e = getenv("C2B_KREL");
-        if (e && e[0] == '0') g_krel_on = 0;
+        if (e && e[0] == '1') g_krel_on = 1;   /* v36: default OFF, C2B_KREL=1 = реарм */
         e = getenv("C2B_KREL_KEEP");
         if (e && e[0] == '1') g_krel_keep = 1;
         e = getenv("C2B_K21ENG");

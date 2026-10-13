@@ -76,7 +76,9 @@ extern void *memcpy(void *d, const void *s, u32 n);
 extern i32   memcmp(const void *a, const void *b, u32 n);
 extern void *memset(void *d, i32 c, u32 n);
 extern u32   strlen(const char *s);
-extern i32   write(i32 fd, const void *buf, u32 n);
+/* 50e-v50: РЕАЛЬНАЯ сигнатура (была i32/u32 — конфликтовала с write-ху- ком); единственный call-site = лог-флеш @105, конверсии беззнаковы */
+/* 50e-v50: ABI-сигнатура x86-64 (ssize_t/size_t = недоступны в секции объявлений; long/unsigned long = ABI-эквивалент) */
+extern long write(int fd, const void *buf, unsigned long n);
 extern i32   dl_iterate_phdr(i32 (*cb)(void *info, void *size, void *data), void *data);
 extern i32   usleep(u32 usec);
 extern i32   pthread_create(void *t, const void *a, void *(*fn)(void *), void *arg);
@@ -6080,6 +6082,8 @@ struct c2b_msghdr {
 typedef ssize_t (*c2b_sendmsg_fn)(int, const struct c2b_msghdr *, int);
 /* 50b-v50: третий член send-семейства (compat-GNS шлёт 0x20/0x22 через send) */
 typedef ssize_t (*c2b_send_fn)(int, const void *, size_t, int);
+/* 50e-v50: write() — последний неперехваченный (соединённый UDP-сокет) */
+typedef ssize_t (*c2b_write_fn)(int, const void *, size_t);
 
 /* ленивый резолв реальных функций: 0=ещё не пробовали, 1=не нашли (dlsym
  * вернул NULL), иначе адрес. Гонка первого вызова безвредна: оба потока
@@ -15255,6 +15259,54 @@ static void c2b_g98_sendmsg_dump(int fd98, const struct c2b_msghdr *msg, ssize_t
     for (k98 = 0; k98 < h98; k98++)
         C2B_LOGH(p98[k98]);
     C2B_LOGS("\n");
+}
+
+/* 50e-v50: write-хук — ПОСЛЕДНИЙ неперехваченный член send-семейства.
+ * Матрица run392/394 (обе = на проводе 0x22 [4c 00], ноль в хуках):
+ * sendto (AF_INET) ✓ отсеян, sendmsg (любой iovlen) ✓ отсеян (v50d),
+ * send() ✓ отсеян (44f-g43 делегация в sendto), syscall() = getrandom
+ * (objdump), AF_PACKET = нет (raw_packet_sockets: только systemd+tcpdump),
+ * writev/sendmmsg = не импортированы. Остаются write() (импорт BOTH
+ * libsteamnetworkingsockets + engine_client) на СОЕДИНЁННОМ UDP-сокете
+ * (fd 47 = 27005; run188: путь движка = connect()+send()/recv()).
+ * ГВАРДЫ: __thread re-entrancy (лог переписывания = printf -> write ->
+ * хук), быстрый passthrough = 2 байта-сравнения до всего. */
+__thread int g_crt_inwl;
+static void *g_clp_write;
+__attribute__((visibility("default")))
+ssize_t write(int fd, const void *buf, size_t len)
+{
+    if (!g_clp_write) {
+        void *f = dlsym(C2B_CL_RTLD_NEXT, "write");
+        if (!f) f = (void *)1;
+        g_clp_write = f;
+    }
+    if ((uptr)g_clp_write == 1) {
+        *__errno_location() = 2;            /* ENOENT */
+        return -1;
+    }
+    if (!g_crt_inwl && buf && len >= 40u && len <= 640u &&
+        ((const u8 *)buf)[0] == 0x22) {
+        const u8 *sp = (const u8 *)buf;
+        u8 crtbuf[600];
+        u32 on;
+        if (!g_crt_init) {
+            const char *ec = getenv("C2B_CRTFIX");
+            if (ec && ec[0] == '1') g_crt_fix = 1;
+            g_crt_init = 1;
+        }
+        c2b_crt_maybe_capture(sp, (u32)len);
+        on = c2b_crt_maybe_rewrite(sp, (u32)len, crtbuf,
+                                   (u32)sizeof crtbuf);
+        if (on) {
+            ssize_t r2;
+            g_crt_inwl = 1;
+            r2 = ((c2b_write_fn)g_clp_write)(fd, crtbuf, on);
+            g_crt_inwl = 0;
+            return r2;
+        }
+    }
+    return ((c2b_write_fn)g_clp_write)(fd, buf, len);
 }
 
 /* 43f-g40: sendmsg-хук — passthrough + тот же diag (путь nChunks!=1 GNS).

@@ -27763,21 +27763,28 @@ static void test_lddet(void)
               "ldd: RWX-страницы (код+трамп)");
         if (pg == (u8 *)-1 || trx == (u8 *)-1) return;
         memset(pg, 0x90, 4096);
-        /* пролог формы 2.39-sendmsg (je В ОКНЕ) + тело sendto-синтетики:
-         * st-байт @0x40 (disp = 0x40-11 = 0x35), je -> slow @0x28
-         * (rip-after = 13, disp8 = 0x28-13 = 0x1b) */
+        /* пролог формы 2.39-SENDTO (endbr+cmpb-riprel+mov-ecx->r10d;
+         * je @14 = ВНЕ окна 14B) + тело sendto-синтетики:
+         *   st-байт @0x40 (disp = 0x40-11 = 0x35), je -> slow @0x28
+         *   (rip-after = 16, disp8 = 0x28-16 = 0x12).
+         * ВАЖНО (CI-урок): mov ecx,r10d ОБЯЗАТЕЛЕН до syscall — иначе r10
+         * = мусор вызывающего = мусорные flags = syscall-фейл = ja -> ud2
+         * = SIGILL (локально r10 = 0 по везению, на раннере = нет).
+         * Слоу-ветка получает r10 из трампа (mov = в окне, исполняется
+         * трампом ДО jmp-back) => стаб @0x28 = чистое тело. */
         pg[0] = 0xf3; pg[1] = 0x0f; pg[2] = 0x1e; pg[3] = 0xfa;
         pg[4] = 0x80; pg[5] = 0x3d;
         pg[6] = 0x35; pg[7] = 0; pg[8] = 0; pg[9] = 0; pg[10] = 0x00;
-        pg[11] = 0x74; pg[12] = 0x1b;
-        pg[13] = 0xb8; pg[14] = 0x2c; pg[15] = 0; pg[16] = 0;
-        pg[17] = 0;
-        pg[18] = 0x0f; pg[19] = 0x05;
-        pg[20] = 0x48; pg[21] = 0x3d; pg[22] = 0x00; pg[23] = 0xf0;
-        pg[24] = 0xff; pg[25] = 0xff;
-        pg[26] = 0x77; pg[27] = 0x01;
-        pg[28] = 0xc3;
-        pg[29] = 0x0f; pg[30] = 0x0b;
+        pg[11] = 0x41; pg[12] = 0x89; pg[13] = 0xca;
+        pg[14] = 0x74; pg[15] = 0x12;
+        pg[16] = 0xb8; pg[17] = 0x2c; pg[18] = 0; pg[19] = 0;
+        pg[20] = 0;
+        pg[21] = 0x0f; pg[22] = 0x05;
+        pg[23] = 0x48; pg[24] = 0x3d; pg[25] = 0x00; pg[26] = 0xf0;
+        pg[27] = 0xff; pg[28] = 0xff;
+        pg[29] = 0x77; pg[30] = 0x01;
+        pg[31] = 0xc3;
+        pg[32] = 0x0f; pg[33] = 0x0b;
         pg[0x28] = 0xb8; pg[0x29] = 0x2c; pg[0x2a] = 0; pg[0x2b] = 0;
         pg[0x2c] = 0;
         pg[0x2d] = 0x0f; pg[0x2e] = 0x05;
@@ -27789,9 +27796,9 @@ static void test_lddet(void)
         pg[0x40] = 1;                                    /* st = fast */
         CHECK(c2b_ldd_build(pg, 64u, (unsigned long long)(uptr)pg,
                             trx, (unsigned long long)(uptr)trx, 44u,
-                            &olen, &tlen) == 18u,
-              "ldd: синтетика build=18");
-        if (olen != 18u) { munmap(pg, 4096); munmap(trx, 4096); return; }
+                            &olen, &tlen) == 14u,
+              "ldd: синтетика build=14");
+        if (olen != 14u) { munmap(pg, 4096); munmap(trx, 4096); return; }
         memcpy(saved, pg, 24);
         site[0] = 0xff; site[1] = 0x25;
         site[2] = 0; site[3] = 0; site[4] = 0; site[5] = 0;
@@ -27799,8 +27806,7 @@ static void test_lddet(void)
         for (q = 0; q < 8u; q++)
             site[6u + q] = (u8)((det >> (8 * q)) & 0xffu);
         g_tldd_tramp = (void *)trx;
-        memcpy(pg, site, 14);
-        for (q = 14; q < 18u; q++) pg[q] = 0x90;
+        memcpy(pg, site, 14);   /* olen = 14 = патч точно до края окна */
         /* сокет-пара loopback (адрес = 16B: family=2, порт BE, ip, пад) */
         sfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
         rfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);

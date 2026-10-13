@@ -425,17 +425,22 @@ static inline unsigned int c2b_ldd_build(const unsigned char *tgt,
  *   48 8b 4c 24 30   mov 0x30(%rsp),%rcx        (a3 -> arg4)
  *   4c 8b 44 24 38   mov 0x38(%rsp),%r8         (arg5 = orig rcx)
  *   49 8d 4c 24 48   lea 0x48(%rsp),%r9         (orig rsp -> arg6)
+ *   50                                           (push rax = ВЫРАВНИВАНИЕ:
+ *     13 push = 104B; site-rsp%16==8 (стандартный кадр) => call при
+ *     rsp%16==0 = ABI-контракт; run417-урок: 12 push = misaligned
+ *     call => gcc-логгер movaps-класс = SIGSEGV = menu=0)
  *   41 52 41 51 41 50                            (push r10 r9 r8 = args 9-7)
  *   e8 <rel32>                                   call logger
  *   41 58 41 59 41 5a                            (pop r8 r9 r10)
+ *   58                                           (pop rax = выравнивание)
  *   41 5b 41 5a 41 59 41 58 5f 5e 5a 59 58      (9 pop, реверс)
  * Возврат: olen (>= 14) или 0 = отказ (окно/дистанция/неизвестный опкод). */
-#define C2B_LDD_SITE_PRE  73u
+#define C2B_LDD_SITE_PRE  75u
 static inline unsigned int c2b_ldd_site_prefix(
     unsigned char *tramp, unsigned long long tramp_addr,
     unsigned long long logger_addr)
 {
-    static const unsigned char pre[68] = {
+    static const unsigned char pre[70] = {
         0x50u, 0x51u, 0x52u, 0x56u, 0x57u,
         0x41u, 0x50u, 0x41u, 0x51u, 0x41u, 0x52u, 0x41u, 0x53u,
         0x48u, 0x8bu, 0x7cu, 0x24u, 0x40u,
@@ -444,11 +449,13 @@ static inline unsigned int c2b_ldd_site_prefix(
         0x48u, 0x8bu, 0x4cu, 0x24u, 0x30u,
         0x4cu, 0x8bu, 0x44u, 0x24u, 0x38u,
         0x49u, 0x8du, 0x4cu, 0x24u, 0x48u,
-        /* call rel32 = пишется отдельно ниже; далее 25 байтов:
-         * push r10 r9 r8 | pop r8 r9 r10 | pop r11 r10 r9 r8 rdi rsi
-         * rdx rcx rax */
+        /* call rel32 = пишется отдельно ниже; далее 27 байтов:
+         * push rax (выравнивание) | push r10 r9 r8 | pop r8 r9 r10 |
+         * pop rax | pop r11 r10 r9 r8 rdi rsi rdx rcx rax */
+        0x50u,
         0x41u, 0x52u, 0x41u, 0x51u, 0x41u, 0x50u,
         0x41u, 0x58u, 0x41u, 0x59u, 0x41u, 0x5au,
+        0x58u,
         0x41u, 0x5bu, 0x41u, 0x5au, 0x41u, 0x59u, 0x41u, 0x58u,
         0x5fu, 0x5eu, 0x5au, 0x59u, 0x58u
     };
@@ -464,8 +471,8 @@ static inline unsigned int c2b_ldd_site_prefix(
                                                 (8 * q)) & 0xffu);
     }
     t += 5u;
-    for (q = 43u; q < 68u; q++) tramp[t++] = pre[q];  /* стек-args + pop'ы */
-    return t;                   /* 73 байта: 43 + 5 call + 25 хвост */
+    for (q = 43u; q < 70u; q++) tramp[t++] = pre[q];  /* стек-args + pop'ы */
+    return t;                   /* 75 байта: 43 + 5 call + 27 хвост */
 }
 
 static inline unsigned int c2b_ldd_site_build(const unsigned char *tgt,

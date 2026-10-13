@@ -15337,9 +15337,11 @@ static long c2b_ldd_dsyscall(long nr, long a1, long a2, long a3,
  * 6 ожидаемых байтов; несовпадение = drift-лог + скип (протокол g124). */
 struct c2b_dsite_ent { u32 va; const char *tag; u8 exp[6]; };
 static const struct c2b_dsite_ent g_dsite_tab[8] = {
-    { 0x2a1ecu,  "csp1", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u } },
-    { 0x9cb14u,  "csp2", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u } },
-    { 0xee31bu,  "csp3", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0x48u, 0x3du } },
+    /* csp-офсеты = -2 от run414-census (репортил 0f 05-позицию,
+     * не mov-голову; run417 drift-have = байт-доказательство) */
+    { 0x2a1eau,  "csp1", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u } },
+    { 0x9cb12u,  "csp2", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u } },
+    { 0xee319u,  "csp3", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0x48u, 0x3du } },
     { 0x12c136u, "snd",  { 0xb8u, 0x2cu, 0x00u, 0x00u, 0x00u, 0x0fu } },
     { 0x12c183u, "smg",  { 0xb8u, 0x2cu, 0x00u, 0x00u, 0x00u, 0x0fu } },
     { 0x12c2c4u, "smsg", { 0xb8u, 0x2eu, 0x00u, 0x00u, 0x00u, 0x0fu } },
@@ -28864,8 +28866,8 @@ static void test_lddet(void)
                                  &olen, &tlen) == 21u,
               "v59: csp1 build=21 (SIB-фикс 11B-nop)");
         if (olen == 21u) {
-            CHECK(tlen == 73u + 27u + 14u,
-                  "v59: csp1 tlen=114 (73 префикс + 27 окно + ff25)");
+            CHECK(tlen == 75u + 27u + 14u,
+                  "v59: csp1 tlen=116 (75 префикс + 27 окно + ff25)");
             /* префикс байт-точно: 9 push + 6 arg-load + call */
             CHECK(str[0] == 0x50 && str[1] == 0x51 && str[2] == 0x52 &&
                   str[3] == 0x56 && str[4] == 0x57 &&
@@ -28900,33 +28902,35 @@ static void test_lddet(void)
                 v32 |= ((unsigned int)str[44u + q]) << (8 * q);
             CHECK((long long)(int)v32 == rel,
                   "v59: call rel32 пересчитан");
-            /* стек-args pop + restore 9 pop (все 25 хвостовых байтов) */
-            CHECK(str[48] == 0x41 && str[49] == 0x52 &&
-                  str[50] == 0x41 && str[51] == 0x51 &&
-                  str[52] == 0x41 && str[53] == 0x50 &&
-                  str[54] == 0x41 && str[55] == 0x58 &&
-                  str[56] == 0x41 && str[57] == 0x59 &&
-                  str[58] == 0x41 && str[59] == 0x5a &&
-                  str[60] == 0x41 && str[61] == 0x5b &&
-                  str[62] == 0x41 && str[63] == 0x5a &&
-                  str[64] == 0x41 && str[65] == 0x59 &&
-                  str[66] == 0x41 && str[67] == 0x58 &&
-                  str[68] == 0x5f && str[69] == 0x5e &&
-                  str[70] == 0x5a && str[71] == 0x59 &&
-                  str[72] == 0x58,
-                  "v59: push r10 r9 r8 (пост-call) + pop r8 r9 r10 + "
-                  "restore 9 pop (реверс)");
-            /* окно @73: 89 d0 | 0f 05 | eb f8 -> e9 (цель = site-2) */
-            CHECK(str[73] == 0x89 && str[74] == 0xd0 &&
-                  str[75] == 0x0f && str[76] == 0x05,
-                  "v59: stolen = mov eax,edx; syscall @73");
-            CHECK(str[77] == 0xe9,
-                  "v59: eb f8 развёрнут в e9 @77");
+            /* выравнивание + стек-args pop + restore 9 pop (27 хвост) */
+            CHECK(str[48] == 0x50 &&
+                  str[49] == 0x41 && str[50] == 0x52 &&
+                  str[51] == 0x41 && str[52] == 0x51 &&
+                  str[53] == 0x41 && str[54] == 0x50 &&
+                  str[55] == 0x41 && str[56] == 0x58 &&
+                  str[57] == 0x41 && str[58] == 0x59 &&
+                  str[59] == 0x41 && str[60] == 0x5a &&
+                  str[61] == 0x58 &&
+                  str[62] == 0x41 && str[63] == 0x5b &&
+                  str[64] == 0x41 && str[65] == 0x5a &&
+                  str[66] == 0x41 && str[67] == 0x59 &&
+                  str[68] == 0x41 && str[69] == 0x58 &&
+                  str[70] == 0x5f && str[71] == 0x5e &&
+                  str[72] == 0x5a && str[73] == 0x59 &&
+                  str[74] == 0x58,
+                  "v59: push rax (align) + push r10 r9 r8 + pop r8 r9 r10 "
+                  "+ pop rax + restore 9 pop");
+            /* окно @75: 89 d0 | 0f 05 | eb f8 -> e9 (цель = site-2) */
+            CHECK(str[75] == 0x89 && str[76] == 0xd0 &&
+                  str[77] == 0x0f && str[78] == 0x05,
+                  "v59: stolen = mov eax,edx; syscall @75");
+            CHECK(str[79] == 0xe9,
+                  "v59: eb f8 развёрнут в e9 @79");
             rel = (0x7f0000001002ll + 4ll + 2ll - 8ll) -
-                  (0x7f0000200000ll + 77ll + 5ll);
+                  (0x7f0000200000ll + 79ll + 5ll);
             v32 = 0;
             for (q = 0; q < 4u; q++)
-                v32 |= ((unsigned int)str[78u + q]) << (8 * q);
+                v32 |= ((unsigned int)str[80u + q]) << (8 * q);
             CHECK((long long)(int)v32 == rel,
                   "v59: eb f8 rel32 = спин-голова site-2");
             /* ff25-jmp-back -> site+21 (abs8 = 64-бит) */

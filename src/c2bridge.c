@@ -14984,20 +14984,23 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
         *__errno_location() = 2;            /* ENOENT */
         return -1;
     }
-    if (addr && (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
-        g_cl_s_total++;
-        c2b_g109_census(fd, (u32)len, addr, (const u8 *)buf);
-        const u8 *p = (const u8 *)buf;
-        /* v50: crt-класс до connless-обработки (0x22 = не-connless, но
-         * гвард раньше = дешевле и не зависит от порядка). */
-        if (!g_crt_init) {
-            const char *ec = getenv("C2B_CRTFIX");
-            if (ec && ec[0] == '1') g_crt_fix = 1;
-            g_crt_init = 1;
-        }
-        if (len >= 40u && len <= 640u && p[0] == 0x22) {
+    {
+        /* 50f-v50: crt-класс ДО ветки addr — run395-урок: compat шлёт 0x22
+         * через sendto(fd, buf, 512, 0, NULL, 0) на СОЕДИНЁННОМ сокете —
+         * гвард 'addr && family' (v50a) пропускал NULL-addr класс. Проверка
+         * = по БУФЕРУ (2 байта), addr пробрасывается как есть (NULL лега-
+         * лен для connected). 0x22 = не-connless/не-A2S = в остальные ветки
+         * не попадает (ранний return ниже = корректен). */
+        if (buf && len >= 40u && len <= 640u &&
+            ((const u8 *)buf)[0] == 0x22) {
+            const u8 *p = (const u8 *)buf;
             u8 crtbuf[600];
             u32 on;
+            if (!g_crt_init) {
+                const char *ec = getenv("C2B_CRTFIX");
+                if (ec && ec[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
             c2b_crt_maybe_capture(p, (u32)len);
             on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
                                        (u32)sizeof crtbuf);
@@ -15008,6 +15011,11 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 return rc;      /* переписанный кадр ушёл вместо исходного */
             }
         }
+    }
+    if (addr && (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
+        g_cl_s_total++;
+        c2b_g109_census(fd, (u32)len, addr, (const u8 *)buf);
+        const u8 *p = (const u8 *)buf;
         if (c2b_cl_is_connless(p, (u32)len)) {
             g_cl_s_cl++;
             i32 cls = c2b_cl_class_up(p, (u32)len);

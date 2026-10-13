@@ -847,11 +847,15 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     # в файл-бэкед модуле (не в аудит-списке) / io_uring / вне-процессный
     # отправитель. strace = ptrace-земля: каждый sendto/sendmsg/send всех
     # тидов = tid + fd + буфер (64B hex) + таймстемп = кросс-реф с pcap.
-    # Только send-класс = объём ~1500 строк/ран (write = НЕ трейсится:
-    # слишком горячо, и write-класс = закрыт детуром run400). Оверхед
-    # ptrace = приёмлем для одного диагностического рана (прецедент
-    # DBG_ATTEMPT). Лог = в RUNDIR = артефакт автоматически.
-    DBG_INNER="exec strace -f -qq -e trace=sendto,sendmsg,send -s 64 -x -o $RUNDIR/strace_send.a${ATTEMPT}.log ./csgo_linux64"
+    # Only the send class = the volume ~1500 lines/run (write = NOT traced:
+    # too hot, and the write class = closed by the run400 detour). v53c:
+    # --seccomp-bpf = the kernel-side filter = the ptrace-stop ONLY on the
+    # traced calls (the rest = native speed) — the run401 lesson: the full
+    # ptrace-stop-per-syscall = the observer effect = the engine's 0x22
+    # sender NEVER FIRED under the plain strace (0 on the wire too!) while
+    # the engine state = alive (the cert fetch = the same 17). -tt/-T =
+    # the absolute timestamps + the per-call duration = the pcap cross-ref.
+    DBG_INNER="exec strace -f -qq --seccomp-bpf -tt -T -e trace=sendto,sendmsg,send -s 64 -x -o $RUNDIR/strace_send.a${ATTEMPT}.log ./csgo_linux64"
   fi
 
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \

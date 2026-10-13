@@ -15624,7 +15624,7 @@ static void c2b_ss_scan_maps(void)
     /* v55c: диагностика — почему chunks=0 в runs 400-405? Счётчики
      * по классам регионов + сбой преада + сырая строка первого r-x. */
     u32 nrx = 0, nexe = 0, neng = 0, nanon = 0, nfull = 0, npf = 0;
-    u32 nmemfd = 0, nskip = 0;
+    u32 nmemfd = 0, nskip = 0, nsteam = 0, nsys = 0;
     extern i32 open(const char *, i32, ...);
     extern i64 read(i32, void *, u64);
     extern i32 close(i32);
@@ -15663,7 +15663,12 @@ static void c2b_ss_scan_maps(void)
                 for (k = 0; k < (u32)llen; k++)
                     if (line[k] == '/') { hasslash = 1; break; }
                 /* v55: kind = 0 anon, 1 = гл. бинарь, 2 = engine_client;
-                 * v57: 3 = memfd/"(deleted)" (DRM-класс, раньше = скип) */
+                 * v57: 3 = memfd/"(deleted)" (DRM-класс, раньше = скип);
+                 * v57c: 4 = steam-модули (steamclient/GNS/vstdlib/
+                 * matchmaking/steam_api), 5 = прочие файл-бэкед (libc,
+                 * ld, X-библ.) — СКАН = ВСЕ r-x (run413-урок: диск ≠
+                 * память для упакованных модулей; '?'-цензус = нуль на
+                 * диске => отправитель = РАНТАЙМ-байты файл-бэкед) */
                 if (isrx && hasslash) {
                     if (c2b_ss_sub(line, (u32)llen, "csgo_linux64"))
                         kind = 1;
@@ -15674,6 +15679,19 @@ static void c2b_ss_scan_maps(void)
                              c2b_ss_sub(line, (u32)llen,
                                         "(deleted)"))
                         kind = 3;
+                    else if (c2b_ss_sub(line, (u32)llen,
+                                        "steamclient") ||
+                             c2b_ss_sub(line, (u32)llen,
+                                        "steamnetworkingsockets") ||
+                             c2b_ss_sub(line, (u32)llen,
+                                        "vstdlib") ||
+                             c2b_ss_sub(line, (u32)llen,
+                                        "matchmaking") ||
+                             c2b_ss_sub(line, (u32)llen,
+                                        "steam_api"))
+                        kind = 4;
+                    else
+                        kind = 5;
                 }
                 if (isrx && nrx <= 2u && g_ss_scans == 0u) {
                     /* сырая голова первых двух r-x строк = парс-пруф */
@@ -15684,14 +15702,16 @@ static void c2b_ss_scan_maps(void)
                     C2B_LOGS(head);
                     C2B_LOGS("\n");
                 }
-                if (isrx && (!hasslash || kind) && budget &&
+                /* v57c: СКАН = КАЖДЫЙ r-x (файл-бэкед тоже); большие =
+                 * счётный скип; дедуп/бюджет = как раньше */
+                if (isrx && budget &&
                     c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
                     (hi - lo) > C2B_SS_REGIONMAX) {
                     /* v57b: слишком большие = СЧЁТНО пропускаем (не
                      * continue: llen=0 ниже обязателен для парсера) */
                     nskip++;
                 }
-                if (isrx && (!hasslash || kind) && budget &&
+                if (isrx && budget &&
                     c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
                     (hi - lo) <= C2B_SS_REGIONMAX) {
                     u32 dupe = 0;
@@ -15702,6 +15722,8 @@ static void c2b_ss_scan_maps(void)
                         if (kind == 1) nexe++;
                         else if (kind == 2) neng++;
                         else if (kind == 3) nmemfd++;
+                        else if (kind == 4) nsteam++;
+                        else if (kind == 5) nsys++;
                         else nanon++;
                         g_ss_seen[g_ss_seen_n++] = (u64)lo;
                         for (off = 0; off < (u64)(hi - lo) &&
@@ -15732,6 +15754,8 @@ static void c2b_ss_scan_maps(void)
                                 C2B_LOGS(kind == 1 ? " mod=exe ctx=" :
                                          kind == 2 ? " mod=eng ctx=" :
                                          kind == 3 ? " mod=memfd ctx=" :
+                                         kind == 4 ? " mod=steam ctx=" :
+                                         kind == 5 ? " mod=sys ctx=" :
                                                      " ctx=");
                                 {
                                     u32 cs = hits[h].off >= 8u ?
@@ -15775,6 +15799,10 @@ static void c2b_ss_scan_maps(void)
     C2B_LOGN(nanon);
     C2B_LOGS(" memfd=");
     C2B_LOGN(nmemfd);
+    C2B_LOGS(" steam=");
+    C2B_LOGN(nsteam);
+    C2B_LOGS(" sys=");
+    C2B_LOGN(nsys);
     C2B_LOGS(" seen32=");
     C2B_LOGN(nfull);
     C2B_LOGS(" pf=");

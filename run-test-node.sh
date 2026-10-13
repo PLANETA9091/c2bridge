@@ -86,7 +86,9 @@ finish() { # $1 exit code, $2 verdict
   pkill -x csgo_linux64 2>/dev/null; sleep 2; pkill -9 -x csgo_linux64 2>/dev/null
   [[ -n "$FARM_PID" ]] && kill "$FARM_PID" 2>/dev/null
   # 41e-l teardown: A2S-релей + DNAT (best-effort)
-  if [[ -n "$A2S_DNAT_SET" ]]; then
+  # v58c: ${VAR:-} = set -u safe (A2S_DNAT_SET никогда не присваивался =
+  # unbound-variable exit-1 ПОСЛЕ VERDICT = класс 'failure'-лейбла 411-415)
+  if [[ -n "${A2S_DNAT_SET:-}" ]]; then
     sudo -n iptables -t nat -D OUTPUT -p udp -d "${TARGET%%:*}" --dport "${TARGET##*:}" \
       -m owner ! --uid-owner 0 -j DNAT --to-destination "$A2S_DNAT_DST" 2>/dev/null || true
     sudo -n pkill -f a2s_relay.py 2>/dev/null || true
@@ -936,11 +938,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # (если пакет шлёт kernel-thread/kernel_sendmsg — имя названо;
       # если userspace-syscall — стек = do_syscall_64-класс = бесполезен,
       # но тогда ловит kprobe-rip). Дуал = замена умершего perf.
-      sudo -n sh -c 'cd /sys/kernel/tracing && if [ -d events/net/net_dev_queue ]; then echo "stacktrace if len == 512" > events/net/net_dev_queue/trigger 2>/dev/null; echo 1 > events/net/net_dev_queue/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
+      # v58c-УРОК run415: ndq len = L2-ВКЛЮЧАЮЩИЙ (512+42 = 554/555; GNS
+      # класс = 583/589; run415-цензус) — триггер len == 512 = НИКОГДА
+      # не сработал (0 stack traces при 28102 ndq) => диапазон 540-600.
+      sudo -n sh -c 'cd /sys/kernel/tracing && if [ -d events/net/net_dev_queue ]; then echo "stacktrace if len > 540 && len < 600" > events/net/net_dev_queue/trigger 2>/dev/null; echo 1 > events/net/net_dev_queue/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
       # v58: ndq-триггер = СЛЕПАЯ ОТКАЗ-КЛАССА (v55g-урок kprobe_err: тиши-
       # на регистрации = невидимое отклонение). STDERR капчурится + триггер
       # читается обратно (пусто = echo не зарегистрировал = причина в ERR).
-      NDQ_ERR=$(sudo -n sh -c 'cd /sys/kernel/tracing && echo "stacktrace if len == 512" > events/net/net_dev_queue/trigger' 2>&1 | head -1)
+      NDQ_ERR=$(sudo -n sh -c 'cd /sys/kernel/tracing && echo "stacktrace if len > 540 && len < 600" > events/net/net_dev_queue/trigger' 2>&1 | head -1)
       NDQ_TRG=$(sudo -n cat /sys/kernel/tracing/events/net/net_dev_queue/trigger 2>/dev/null | head -1)
       KPROBE_OK=$(sudo -n test -e /sys/kernel/tracing/events/kprobes/c2b_rip/enable && echo yes || echo NO)
       KPROBE_ERR=$(sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip3 __x64_sys_sendto rip=+128(+0(%rdi)):u64" >> kprobe_events' 2>&1 | head -1)

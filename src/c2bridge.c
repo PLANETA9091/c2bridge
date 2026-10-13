@@ -15014,6 +15014,23 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 /* v27: A-driven 'k'-fire — объявление (тело = после c2b_k24_brlive) */
 static void c2b_k27_maybe_fire(void);
 
+/* v28 (run365-декод SNP_WIRE_FORMAT.md): серверный in-channel 'A' = UNRELIABLE
+ * message (0x37-сегмент, msg_num 1, payload = raw ff×4 'A'). Надёжный поток =
+ * поток NET-сообщений (сигнон CCLC-протобуфов парсится БЕЗ ошибки), а наш
+ * 'k' 513B ушёл RELIABLE (flags=1) => сервер спарсил его как netmessage =>
+ * 0x24 ConnectionClosed "NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR" через 130мс.
+ * ФИКС: 'k' (и любой raw-S1 connless) = flags=0 (k_nSteamNetworkingSend_
+ * Unreliable). C2B_KREL_FLAGS=1 = легаси-reliable для A/B. */
+static i32 c2b_krel_send_flags(void)
+{
+    static i32 f = -1;
+    if (f < 0) {
+        const char *e = getenv("C2B_KREL_FLAGS");
+        f = (e && e[0] == '1') ? 1 : 0;   /* default = UNRELIABLE */
+    }
+    return f;
+}
+
 static void *c2b_g97_thread(void *arg)
 {
     u32 t, prev = 0xFFFFFFFFu, dead_run = 0, done = 0, h_seen = 0;
@@ -15141,7 +15158,8 @@ static void *c2b_g97_thread(void *arg)
             if (__sigsetjmp(g_probe_jb, 1) == 0) {
                 rc25 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))
                         vt25[slot25])(g_gns_conn_iface, g_gns_conn_h,
-                                      g_krel_pbuf, g_krel_plen, 1, &out25);
+                                      g_krel_pbuf, g_krel_plen,
+                                      c2b_krel_send_flags(), &out25);
                 g_probe_active = 0;
             } else {
                 g_probe_active = 0;
@@ -15149,6 +15167,8 @@ static void *c2b_g97_thread(void *arg)
             }
             C2B_LOGS("[c2b] krel-ts: 'k' thread-send len=");
             C2B_LOGN(g_krel_plen);
+            C2B_LOGS(" fl=");
+            C2B_LOGN((u32)c2b_krel_send_flags());
             C2B_LOGS(" tgt=");
             C2B_LOGN((u32)g_gns_conn_h);
             C2B_LOGS(" slot=");
@@ -15497,7 +15517,8 @@ static void c2b_k27_maybe_fire(void)
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
         rc27 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt27[11])(
-            g_gns_conn_iface, g_gns_conn_h, kcopy27, kn27, 1, &out27);
+            g_gns_conn_iface, g_gns_conn_h, kcopy27, kn27,
+            c2b_krel_send_flags(), &out27);
         g_probe_active = 0;
     } else {
         g_probe_active = 0;
@@ -15514,7 +15535,9 @@ static void c2b_k27_maybe_fire(void)
     C2B_LOGH(val);
     C2B_LOGS(" len=");
     C2B_LOGN(kn27);
-    C2B_LOGS(" raw=1 live=");
+    C2B_LOGS(" raw=1 fl=");
+    C2B_LOGN((u32)c2b_krel_send_flags());
+    C2B_LOGS(" live=");
     C2B_LOGN(live27);
     C2B_LOGS(" tgt=");
     C2B_LOGN((u32)g_gns_conn_h);
@@ -15981,7 +16004,8 @@ static void *c2b_g90_thread(void *arg)
         g_probe_active = 1;
         if (__sigsetjmp(g_probe_jb, 1) == 0) {
             rc9 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt9[send_slot])(
-                g_gns_conn_iface, g_gns_conn_h, g_kfull, g_kfull_len, 1, &out9);
+                g_gns_conn_iface, g_gns_conn_h, g_kfull, g_kfull_len,
+                c2b_krel_send_flags(), &out9);
             g_probe_active = 0;
         } else {
             g_probe_active = 0;
@@ -15989,6 +16013,8 @@ static void *c2b_g90_thread(void *arg)
         }
         C2B_LOGS("[c2b] g90: 'k' relay in-channel len=");
         C2B_LOGN(g_kfull_len);
+        C2B_LOGS(" fl=");
+        C2B_LOGN((u32)c2b_krel_send_flags());
         C2B_LOGS(" slot=");
         C2B_LOGN(send_slot);
         C2B_LOGS(" rc=");

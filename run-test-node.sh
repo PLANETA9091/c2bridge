@@ -659,7 +659,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # отравлял счётчик инициализации BSteamNetworkingSocketsLowLevelAddRef
   # (скип init -> s_hEpoll=-1 -> epoll_ctl EBADF -> ConnectByIPAddress h=0,
   # RE run181); больше не выставлять ни в каких MODES.
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27FORM=4 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1"
+  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27FORM=4 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"
@@ -937,11 +937,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # если userspace-syscall — стек = do_syscall_64-класс = бесполезен,
       # но тогда ловит kprobe-rip). Дуал = замена умершего perf.
       sudo -n sh -c 'cd /sys/kernel/tracing && if [ -d events/net/net_dev_queue ]; then echo "stacktrace if len == 512" > events/net/net_dev_queue/trigger 2>/dev/null; echo 1 > events/net/net_dev_queue/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
+      # v58: ndq-триггер = СЛЕПАЯ ОТКАЗ-КЛАССА (v55g-урок kprobe_err: тиши-
+      # на регистрации = невидимое отклонение). STDERR капчурится + триггер
+      # читается обратно (пусто = echo не зарегистрировал = причина в ERR).
+      NDQ_ERR=$(sudo -n sh -c 'cd /sys/kernel/tracing && echo "stacktrace if len == 512" > events/net/net_dev_queue/trigger' 2>&1 | head -1)
+      NDQ_TRG=$(sudo -n cat /sys/kernel/tracing/events/net/net_dev_queue/trigger 2>/dev/null | head -1)
       KPROBE_OK=$(sudo -n test -e /sys/kernel/tracing/events/kprobes/c2b_rip/enable && echo yes || echo NO)
       KPROBE_ERR=$(sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip3 __x64_sys_sendto rip=+128(+0(%rdi)):u64" >> kprobe_events' 2>&1 | head -1)
       NDQ_OK=$(sudo -n test -e /sys/kernel/tracing/events/net/net_dev_queue/enable && echo yes || echo NO)
       WFL=$(sudo -n cat /sys/kernel/tracing/events/syscalls/sys_enter_write/filter 2>/dev/null || echo unset)
-      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip + NET_DEV_QUEUE stacktrace); kprobe=$KPROBE_OK ndq=$NDQ_OK write_filter=$WFL kprobe_err=$KPROBE_ERR"
+      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip + NET_DEV_QUEUE stacktrace); kprobe=$KPROBE_OK ndq=$NDQ_OK write_filter=$WFL kprobe_err=$KPROBE_ERR ndq_err=$NDQ_ERR ndq_trg=$NDQ_TRG"
     else
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi

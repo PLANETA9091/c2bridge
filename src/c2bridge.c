@@ -15605,6 +15605,7 @@ static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
 
 #if !defined(C2B_SELFTEST) && defined(__x86_64__)
 static u32 g_ss_scans, g_ss_last, g_ss_logn, g_ss_done;
+static u32 g_ss_rescans;   /* v58b: лэйзи-ресканы (seen-очистки) */
 /* v57b-ФИКС (run411-урок): seen[32] = ПЕРЕПОЛНЯЛСЯ после первых сканов
  * (seen32=0x6d = 109 регионов из ~165 r-x ПРОПУЩЕНЫ НАВСЕГДА через
  * nfull++ — включая steamclient/анон/memfd!) => v55-элиминация
@@ -15636,6 +15637,19 @@ static void c2b_ss_scan_maps(void)
         if (fdm >= 0) close(fdm);
         if (fdmem >= 0) close(fdmem);
         return;
+    }
+    /* v58b: ЛЭЙЗИ-РЕСКАН — каждые 6 сканов seen-дедуп ОЧИЩАЕТСЯ: регионы,
+     * самомодифицировавшиеся после скана #1 (упакованный steamclient x6
+     * распаковывается В r-x in-place ПОСЛЕ первого прохода = класс (a)
+     * паралога v58), пересканируются тем же раном. Темп: скан = раз в
+     * 5с (свиньячок), кап 24 => ресканы на #6/#12/#18 = t~30/60/90с —
+     * 0x22-отправитель жив с t~11.5 => его байты УЖЕ на месте. */
+    if (g_ss_scans && (g_ss_scans % 6u) == 0u && g_ss_seen_n) {
+        g_ss_seen_n = 0;
+        g_ss_rescans++;
+        C2B_LOGS("[c2b] v58: ss rescan #");
+        C2B_LOGN(g_ss_rescans);
+        C2B_LOGS(" (seen cleared)\n");
     }
     while ((r = read(fdm, chunk, (uptr)sizeof chunk)) > 0) {
         u32 i = 0;
@@ -15811,6 +15825,8 @@ static void c2b_ss_scan_maps(void)
     C2B_LOGN(nskip);
     C2B_LOGS(" seen_n=");
     C2B_LOGN(g_ss_seen_n);
+    C2B_LOGS(" rescan=");
+    C2B_LOGN(g_ss_rescans);
     C2B_LOGS("\n");
 }
 
@@ -15826,6 +15842,243 @@ static void c2b_ss_maybe(void)
 #else   /* selftest / i386: no-op */
 static void c2b_ss_maybe(void) { }
 #endif  /* v53 */
+
+/* ---------- v58: SECCOMP-USER-NOTIF СУПЕРВАЙЗЕР (capture-without-RIP) ----
+ * ПАРАДОКС (ledger 03:09, runs 411-414): tracefs = 79 реальных sys_sendto
+ * (len 512/513, движковые tid, ~0.24s cadence, sendto->ndq 32us-корреляция)
+ * при НУЛЕ reachable syscall-путей: v52 прологи (ARMED 5 = zero HITs), v51
+ * GOT/PLT, v55/v57b/v57c полные цензусы (fixed + '?'-формы, весь r-x про-
+ * цесса) + офлайн-диск (все 14 модулей) = ZERO. Оставшиеся объяснения:
+ * (a) лэйзи-распаковка упакованных модулей (steamclient x6 = 46-54MB рас-
+ * паковывается В r-x in-place ПОСЛЕ seen-дедупа скана #1), (b) форма ста-
+ * ба вне всех известных энкодингов, (c) __syscall_cancel_arch-путь.
+ * V58 = capture БЕЗ RIP: seccomp SECCOMP_RET_USER_NOTIF на nr==44 (sendto)
+ * && len>=0x28 => каждое raw sys_sendto ПРОЦЕССА = уведомление => суперви-
+ * зор-поток читает args (fd/buf/len/flags/addr/addrlen) + PAYLOAD через
+ * pread(/proc/self/mem) (v4.3-дисциплина: ноль прямых разыменований) =>
+ * hex в лог (ПЕРВАЯ в кампании поимка байтов 0x22 из syscall-слоя) =>
+ * SECCOMP_USER_NOTIF_FLAG_CONTINUE = syscall продолжается штатно (pass-
+ * through-first; rewrite = следующая итерация, тем же NOTIF_SEND).
+ *
+ * ПОТОКИ/НАСЛЕДОВАНИЕ: seccomp-фильтр = per-thread; инсталл = В КТОРЕ
+ * (constructor(101), главный поток, ДО всех pthread_create дома и ДО ВСЕХ
+ * потоков движка) => наследуют ВСЕ последующие. Супервизор-поток создается
+ * ДО инсталла (крутится на volatile g_sn_lfd) => фильтр НЕ наследует = его
+ * ioctl/pread/write-логи не перехватываются. Дедлок-анализ: фильтр = ТОЛЬ-
+ * КО nr==44 && len>=40 => write(1)/pread(17)/ioctl(16)/nanosleep(35) дома
+ * и супервизора мимо; супервизор НЕ зовет sendto никогда. Объем: движковые
+ * 0x20/0x22 (~80/ран) + мостовые hello + GNS-класс = сотни/ран; окно RECV->
+ * SEND = микросекунды. Арх-гвард = AUDIT_ARCH_X86_64 в BPF.
+ *
+ * ОТКАЗЫ (пассивные, лог, нулевая регрессия): NNP fail / seccomp rc<0 (err-
+ * no: EACCES-класс песочницы / EINVAL ядро < 5.9) / pthread fail => фильтра
+ * нет = мир v57c как был. SEND-CONTINUE fail (ядро < 5.14) => фолбэк-ответ
+ * val=0 (вызов "успешен", кадр НЕ на проводе — семантика capture-рана),
+ * лог 3 шт. Форк движка: дети наследуют фильтр + листенер; pread их памяти
+ * = rn<=0 => pf-счетчик (graceful).
+ *
+ * Гейт C2B_SECCOMP=1. Лог: '[c2b] v58: sn armed lfd=', '[c2b] v58: CAP
+ * len=.. fd=.. pid=.. buf=<hex64> sa=<hex16>' (кап 24), '[c2b] v58: recv=..
+ * 22=.. 20=.. small=.. pf=.. sf=..' (каждый 64-й), '[c2b] v58: send-conti-
+ * nue fail'. Пид из NOTIF = tid триггера = кросс-реф с tracefs-tid (6106/
+ * 11568/11863/11593/11253/11285 класс). */
+struct c2b_sn_bpf { u16 code; u8 jt; u8 jf; u32 k; };    /* sock_filter  */
+struct c2b_sn_fprog { u16 len; struct c2b_sn_bpf *f; };  /* sock_fprog   */
+struct c2b_sn_notif { u64 id; u32 pid; u32 flags; u64 args[6]; };
+struct c2b_sn_resp  { u64 id; i64 val; i64 error; u32 flags; u32 pad; };
+/* ioctl-числа = _IOWR('!', nr, struct) по формуле _IOC (без linux-хедеров):
+ * dir<<30 | size<<16 | '!'<<8 | nr; RECV = 0xc0402100, SEND = 0xc0202101 */
+#define C2B_SN_IOC(dir, sz, nr) (((u32)(dir) << 30) | ((u32)(sz) << 16) | \
+                                 ((u32)0x21 << 8) | (u32)(nr))
+#define C2B_SN_IOCTL_RECV C2B_SN_IOC(3u, 64u, 0u)
+#define C2B_SN_IOCTL_SEND C2B_SN_IOC(3u, 32u, 1u)
+#define C2B_SN_UNOTIF  0x7ffc0000u   /* SECCOMP_RET_USER_NOTIF */
+#define C2B_SN_ALLOW   0x7fff0000u   /* SECCOMP_RET_ALLOW      */
+#define C2B_SN_CONT    1u            /* USER_NOTIF_FLAG_CONTINUE */
+
+/* pure: BPF-программа фильтра v58. Все ложные ветки -> ALLOW (последняя
+ * инструкция), истинные -> цепочка сравнений. Возврат 8 или 0 (cap<8).
+ * i0 LD arch | i1 JEQ x86_64 (jf->i7) | i2 LD nr | i3 JEQ 44 (jf->i7)
+ * i4 LD args[2] lo | i5 JGE 0x28 (jf->i7) | i6 RET USER_NOTIF | i7 RET */
+static u32 c2b_sn_build(struct c2b_sn_bpf *p, u32 cap)
+{
+    if (!p || cap < 8u) return 0u;
+    p[0].code = 0x20u; p[0].jt = 0u; p[0].jf = 0u; p[0].k = 4u;
+    p[1].code = 0x15u; p[1].jt = 0u; p[1].jf = 5u; p[1].k = 0xc000003eu;
+    p[2].code = 0x20u; p[2].jt = 0u; p[2].jf = 0u; p[2].k = 0u;
+    p[3].code = 0x15u; p[3].jt = 0u; p[3].jf = 3u; p[3].k = 44u;
+    p[4].code = 0x20u; p[4].jt = 0u; p[4].jf = 0u; p[4].k = 0x20u;
+    p[5].code = 0x35u; p[5].jt = 0u; p[5].jf = 1u; p[5].k = 0x28u;
+    p[6].code = 0x06u; p[6].jt = 0u; p[6].jf = 0u; p[6].k = C2B_SN_UNOTIF;
+    p[7].code = 0x06u; p[7].jt = 0u; p[7].jf = 0u; p[7].k = C2B_SN_ALLOW;
+    return 8u;
+}
+
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+static volatile u32 g_sn_lfd;           /* листенер (0 = ещё не инсталл) */
+static volatile u32 g_sn_on;            /* one-shot гейт арма */
+static volatile u32 g_sn_stop;          /* инсталл-фейл => поток выходит */
+static u32 g_sn_recv, g_sn_22, g_sn_20, g_sn_small, g_sn_pf, g_sn_sf;
+static i32 g_sn_fdmem = -1;
+
+static void *c2b_sn_thread(void *arg)
+{
+    extern i32 ioctl(i32, unsigned long, ...);
+    extern i32 open(const char *, i32, ...);
+    extern i64 syscall(i64, ...);
+    (void)arg;
+    while (!g_sn_lfd) {
+        if (g_sn_stop) return (void *)0;   /* инсталл не удался */
+        usleep(500u);
+    }
+    g_sn_fdmem = open("/proc/self/mem", 0 /*O_RDONLY*/);
+    for (;;) {
+        struct c2b_sn_notif req;
+        struct c2b_sn_resp rsp;
+        i64 rc;
+        memset(&req, 0, sizeof req);
+        rc = ioctl((i32)g_sn_lfd, (unsigned long)C2B_SN_IOCTL_RECV, &req);
+        if (rc != 0) { usleep(20000u); continue; }
+        g_sn_recv++;
+        {
+            u64 fd = req.args[0], buf = req.args[1], len = req.args[2];
+            u64 addr = req.args[4], alen = req.args[5];
+            if (len < 40u) {
+                g_sn_small++;
+            } else {
+                u8 pay[640], sa[16];
+                i64 rn = -1, rs = -1;
+                if (g_sn_fdmem >= 0 && buf)
+                    rn = pread(g_sn_fdmem, pay,
+                               (uptr)(len <= 640u ? len : 640u),
+                               (i64)buf);
+                if (g_sn_fdmem >= 0 && addr && alen && alen <= 16u)
+                    rs = pread(g_sn_fdmem, sa, (uptr)alen, (i64)addr);
+                if (rn <= 0) g_sn_pf++;
+                if (rn > 0) {
+                    if (pay[0] == 0x22) g_sn_22++;
+                    else if (pay[0] == 0x20) g_sn_20++;
+                    if (pay[0] == 0x22 && g_sn_22 <= 24u) {
+                        u32 q;
+                        C2B_LOGS("[c2b] v58: CAP len=");
+                        C2B_LOGN((u32)len);
+                        C2B_LOGS("fd=");
+                        C2B_LOGN((u32)fd);
+                        C2B_LOGS("pid=");
+                        C2B_LOGN(req.pid);
+                        C2B_LOGS("buf=");
+                        for (q = 0; q < 64u && (u32)q < (u32)rn; q++)
+                            C2B_LOGH(pay[q]);
+                        C2B_LOGS("sa=");
+                        for (q = 0; q < 16u && (i32)q < (i32)rs; q++)
+                            C2B_LOGH(sa[q]);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
+        }
+        if ((g_sn_recv & 63u) == 0u) {
+            C2B_LOGS("[c2b] v58: recv=");
+            C2B_LOGN(g_sn_recv);
+            C2B_LOGS("22=");
+            C2B_LOGN(g_sn_22);
+            C2B_LOGS("20=");
+            C2B_LOGN(g_sn_20);
+            C2B_LOGS("small=");
+            C2B_LOGN(g_sn_small);
+            C2B_LOGS("pf=");
+            C2B_LOGN(g_sn_pf);
+            C2B_LOGS("sf=");
+            C2B_LOGN(g_sn_sf);
+            C2B_LOGS("\n");
+        }
+        memset(&rsp, 0, sizeof rsp);
+        rsp.id = req.id;
+        rsp.flags = C2B_SN_CONT;              /* passthrough-first */
+        rc = ioctl((i32)g_sn_lfd, (unsigned long)C2B_SN_IOCTL_SEND, &rsp);
+        if (rc != 0) {
+            /* ядро < 5.14 = CONTINUE нет (EINVAL). ФОЛБЭК = супервизор
+             * (НЕ фильтрован: создан до инсталла) выполняет sendto сам
+             * по fd/буферу вызывающего (та же память, та же fd-табли-
+             * ца) и возвращает rv => базовая линия НЕ рвется ни на од-
+             * ном ядре раннера. */
+            g_sn_sf++;
+            if (g_sn_sf <= 3u)
+                C2B_LOGS("[c2b] v58: CONTINUE fail -> фолбэк raw send "
+                         "супервизором\n");
+            {
+                i64 rv = syscall(44, (i64)req.args[0], (i64)req.args[1],
+                                 (i64)req.args[2], (i64)req.args[3],
+                                 (i64)req.args[4], (i64)req.args[5]);
+                memset(&rsp, 0, sizeof rsp);
+                rsp.id = req.id;
+                rsp.val = rv;                 /* error=0 flags=0 */
+                ioctl((i32)g_sn_lfd, (unsigned long)C2B_SN_IOCTL_SEND,
+                      &rsp);
+            }
+        }
+    }
+    return (void *)0;
+}
+
+static void c2b_sn_maybe(void)
+{
+    const char *ec;
+    struct c2b_sn_bpf prog[8];
+    struct c2b_sn_fprog fp;
+    void *tid = 0;
+    long rc;
+    extern i32 *__errno_location(void);
+    extern i32 prctl(i32, unsigned long, unsigned long, unsigned long,
+                     unsigned long);
+    extern i64 syscall(i64, ...);
+    extern i32 ioctl(i32, unsigned long, ...);
+    if (g_sn_on) return;
+    g_sn_on = 1;
+    ec = getenv("C2B_SECCOMP");
+    if (!ec || ec[0] != '1') return;
+    if (c2b_sn_build(prog, 8u) != 8u) {
+        C2B_LOGS("[c2b] v58: build=0\n");
+        return;
+    }
+    /* супервизор = ДО инсталла: фильтр не наследует (дедлок-фри), крутит-
+     * ся на volatile g_sn_lfd (окно seccomp()->стор = нс) */
+    if (pthread_create(&tid, 0, c2b_sn_thread, 0) != 0) {
+        C2B_LOGS("[c2b] v58: pthread fail\n");
+        return;
+    }
+    rc = prctl(38 /*PR_SET_NO_NEW_PRIVS*/, 1ul, 0ul, 0ul, 0ul);
+    if (rc != 0) {
+        C2B_LOGS("[c2b] v58: nnp fail err=");
+        C2B_LOGN((u32)*__errno_location());
+        C2B_LOGS("\n");
+        return;
+    }
+    fp.len = 8u;
+    fp.f = prog;
+    rc = syscall(317 /*seccomp*/, 1 /*SET_MODE_FILTER*/,
+                 1 /*FLAG_NEW_LISTENER*/, (i64)(uptr)&fp);
+    if (rc < 1) {
+        /* rc<0 = errno-путь (EACCES/EINVAL ядро<5.9); rc==0 = ПОДДЕЛКА
+         * песочницы (fd0 = stdin — листенер НИКОГДА не 0 при живых std
+         * стримах; настоящий kernel = fd>=3; sanbox-эмуляция возвращает
+         * 0 без эффекта — sn_dbg-урок). В обоих случаях = мир v57c. */
+        C2B_LOGS("[c2b] v58: seccomp fail rc=");
+        C2B_LOGN((u32)rc);
+        C2B_LOGS("err=");
+        C2B_LOGN((u32)*__errno_location());
+        C2B_LOGS("\n");
+        g_sn_stop = 1;                        /* супервизор-поток выходит */
+        return;
+    }
+    g_sn_lfd = (u32)rc;   /* ПОСЛЕДНИЙ стор = супервизор входит в RECV-цикл */
+    C2B_LOGS("[c2b] v58: sn armed lfd=");
+    C2B_LOGN((u32)rc);
+    C2B_LOGS("\n");
+}
+#else   /* selftest / i386: no-op */
+static void c2b_sn_maybe(void) { }
+#endif  /* v58 */
 
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
@@ -23002,6 +23255,13 @@ i32 c2b_main(void)
             g_vlevel = (u32)(e[0] - '0');
         C2B_LOGS("[c2b] verbose level="); C2B_LOGN(g_vlevel); C2B_LOGS("\n");
     }
+    {   /* v58: seccomp-user-notif супервизор (capture-without-RIP). Инсталл
+         * = ЗДЕСЬ, в ctor-потоке, ДО auth/g24/.../poll и ДО ВСЕХ потоков
+         * движка — фильтр = per-thread, наследуют все последующие clone.
+         * Супервизор-поток создается внутри ДО инсталла = сам не фильтро-
+         * ван (дедлок-фри). Гейт C2B_SECCOMP=1; отказы = пассивные. */
+        c2b_sn_maybe();
+    }
     {   /* аплинк v1: 0=observe (по умолчанию), 1=translate */
         const char *e = getenv("C2B_UPLINK");
         if (e && e[0] == '1') {
@@ -28623,6 +28883,168 @@ static void test_stubscan(void)
           "ss57: 0x90-фон без mov = 0");
 }
 
+/* v58: seccomp-user-notif супервизор — pure-сборка BPF (байт-точные
+ * инструкции + граф прыжков) + ЖИВОЙ e2e: фильтр nr==44 на САМ процесс,
+ * супервизор-поток (создан ДО инсталла = не фильтрован), raw
+ * syscall(44, ...) 512B 0x22 через loopback = RECV -> pread-CAP ->
+ * SEND CONTINUE -> дейтаграмма у приемника (passthrough-семантика
+ * целиком). seccomp недоступен (ядро < 5.9 / песочница) = skip. */
+static volatile u32 g_tsn_lfd, g_tsn_stop;
+static u32 g_tsn_recv, g_tsn_22, g_tsn_sendok, g_tsn_fbk;
+
+static void *tsn_thread(void *a)
+{
+    extern int ioctl(int, unsigned long, ...);
+    extern i64 syscall(i64, ...);
+    struct c2b_sn_notif req;
+    struct c2b_sn_resp rsp;
+    i32 lfd, fdm;
+    (void)a;
+    while (!g_tsn_lfd && !g_tsn_stop) usleep(500);
+    lfd = (i32)g_tsn_lfd;
+    if (!lfd) return 0;
+    fdm = open("/proc/self/mem", O_RDONLY);
+    while (!g_tsn_stop) {
+        memset(&req, 0, sizeof req);
+        if (ioctl(lfd, (unsigned long)C2B_SN_IOCTL_RECV, &req) != 0) {
+            usleep(1000);
+            continue;
+        }
+        g_tsn_recv++;
+        if (req.args[1] && req.args[2] >= 40u && req.args[2] <= 640u) {
+            u8 pay[640];
+            i64 rn = pread(fdm, pay, (uptr)req.args[2],
+                           (i64)req.args[1]);
+            if (rn > 0 && pay[0] == 0x22) g_tsn_22++;
+        }
+        memset(&rsp, 0, sizeof rsp);
+        rsp.id = req.id;
+        rsp.flags = C2B_SN_CONT;
+        if (ioctl(lfd, (unsigned long)C2B_SN_IOCTL_SEND, &rsp) == 0)
+            g_tsn_sendok++;
+        else {
+            /* фолбэк <5.14: супервизор шлет сам (не фильтрован) */
+            i64 rv = syscall(44, (i64)req.args[0], (i64)req.args[1],
+                             (i64)req.args[2], (i64)req.args[3],
+                             (i64)req.args[4], (i64)req.args[5]);
+            memset(&rsp, 0, sizeof rsp);
+            rsp.id = req.id;
+            rsp.val = rv;
+            if (ioctl(lfd, (unsigned long)C2B_SN_IOCTL_SEND, &rsp) == 0)
+                g_tsn_fbk++;
+        }
+    }
+    return 0;
+}
+
+static void test_seccomp(void)
+{
+    struct c2b_sn_bpf p[16];
+    printf("[t] seccomp v58 (user-notif)\n");
+    CHECK(c2b_sn_build(p, 16u) == 8u, "sn: build = 8 insns");
+    CHECK(sizeof(struct c2b_sn_bpf) == 8, "sn: bpf-insn = 8B");
+    CHECK(sizeof(struct c2b_sn_notif) == 64, "sn: notif = 64B (ABI)");
+    CHECK(sizeof(struct c2b_sn_resp) == 32, "sn: resp = 32B (ABI)");
+    CHECK(C2B_SN_IOCTL_RECV == 0xc0402100u, "sn: ioctl RECV = 0xc0402100");
+    CHECK(C2B_SN_IOCTL_SEND == 0xc0202101u, "sn: ioctl SEND = 0xc0202101");
+    CHECK(p[0].code == 0x20 && p[0].k == 4u, "sn: i0 ld arch");
+    CHECK(p[1].code == 0x15 && p[1].k == 0xc000003eu && p[1].jf == 5u,
+          "sn: i1 jeq x86_64 (false->i7=allow)");
+    CHECK(p[2].code == 0x20 && p[2].k == 0u, "sn: i2 ld nr");
+    CHECK(p[3].code == 0x15 && p[3].k == 44u && p[3].jf == 3u,
+          "sn: i3 jeq sendto (false->i7=allow)");
+    CHECK(p[4].code == 0x20 && p[4].k == 0x20u, "sn: i4 ld args[2] lo");
+    CHECK(p[5].code == 0x35 && p[5].k == 0x28u && p[5].jf == 1u,
+          "sn: i5 jge 0x28 (false->i7=allow)");
+    CHECK(p[6].code == 0x06 && p[6].k == C2B_SN_UNOTIF,
+          "sn: i6 ret USER_NOTIF");
+    CHECK(p[7].code == 0x06 && p[7].k == C2B_SN_ALLOW,
+          "sn: i7 ret ALLOW");
+    CHECK(c2b_sn_build(p, 4u) == 0u, "sn: cap<8 = 0");
+    /* ---- живой e2e ---- */
+    {
+        extern int ioctl(int, unsigned long, ...);
+        extern int pthread_create(void *, const void *,
+                                  void *(*)(void *), void *);
+        extern i64 syscall(i64, ...);
+        extern int prctl(int, unsigned long, unsigned long,
+                         unsigned long, unsigned long);
+        extern int socket(int, int, int);
+        extern int bind(int, const struct sockaddr *, socklen_t);
+        extern int connect(int, const struct sockaddr *, socklen_t);
+        extern int getsockname(int, struct sockaddr *, socklen_t *);
+        extern int close(int);
+        extern int *__errno_location(void);
+        struct c2b_sn_fprog fp;
+        struct sockaddr sa, ra;
+        socklen_t slen;
+        int sfd, rfd, r;
+        u32 q;
+        long rc;
+        void *tid = 0;
+        u8 snd[512], rcv[600];
+        g_tsn_lfd = 0; g_tsn_stop = 0;
+        g_tsn_recv = 0; g_tsn_22 = 0; g_tsn_sendok = 0; g_tsn_fbk = 0;
+        r = pthread_create(&tid, 0, tsn_thread, 0);
+        CHECK(r == 0, "v58e2e: pthread_create (супервизор ДО инсталла)");
+        if (r != 0) { g_tsn_stop = 1; return; }
+        rc = prctl(38 /*PR_SET_NO_NEW_PRIVS*/, 1ul, 0ul, 0ul, 0ul);
+        CHECK(rc == 0, "v58e2e: NNP");
+        if (rc != 0) { g_tsn_stop = 1; return; }
+        if (c2b_sn_build(p, 16u) != 8u) { g_tsn_stop = 1; return; }
+        fp.len = 8u;
+        fp.f = p;
+        rc = syscall(317 /*seccomp*/, 1 /*SET_MODE_FILTER*/,
+                     1 /*FLAG_NEW_LISTENER*/, (i64)(uptr)&fp);
+        if (rc < 1) {
+            /* rc==0 = подделка песочницы (fd0 = stdin — не листенер;
+             * sn_dbg-урок), rc<0 = errno-путь. Оба = skip, не fail. */
+            printf("[i] v58 e2e skipped: seccomp rc=%ld err=%d "
+                   "(песочница-эмуляция/ядро)\n", rc, *__errno_location());
+            g_tsn_stop = 1;
+            return;
+        }
+        g_tsn_lfd = (u32)rc;
+        sfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+        rfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+        CHECK(sfd >= 0 && rfd >= 0, "v58e2e: udp-сокеты");
+        memset(&ra, 0, sizeof ra);
+        ra.sa_family = C2B_AF_INET;
+        ra.sa_data[0] = (char)0; ra.sa_data[1] = (char)0;  /* порт = 0 */
+        ra.sa_data[2] = (char)127; ra.sa_data[3] = (char)0;
+        ra.sa_data[4] = (char)0; ra.sa_data[5] = (char)1;
+        r = bind(rfd, &ra, (socklen_t)sizeof ra);
+        CHECK(r == 0, "v58e2e: bind rx");
+        slen = (socklen_t)sizeof ra;
+        r = getsockname(rfd, &ra, &slen);
+        CHECK(r == 0, "v58e2e: getsockname rx");
+        r = connect(sfd, &ra, (socklen_t)sizeof ra);
+        CHECK(r == 0, "v58e2e: connect tx");
+        memset(snd, 0, sizeof snd);
+        snd[0] = 0x22;                       /* CAP-класс */
+        for (q = 1; q < sizeof snd; q++) snd[q] = (u8)(q & 0xffu);
+        /* RAW syscall(44=sendto) = ТОЧНАЯ симуляция механизма движка
+         * (tracefs-класс raw sys_sendto len=0x200) */
+        rc = syscall(44, (i64)sfd, (i64)(uptr)snd,
+                     (i64)sizeof snd, 0, (i64)(uptr)&ra, 16);
+        CHECK(rc == (long)sizeof snd,
+              "v58e2e: sendto вернул len (CONTINUE = штатный вызов)");
+        CHECK(g_tsn_recv == 1, "v58e2e: супервизор получил RECV");
+        CHECK(g_tsn_22 == 1,
+              "v58e2e: CAP прочитал payload 0x22 через pread");
+        CHECK(g_tsn_sendok + g_tsn_fbk == 1,
+              "v58e2e: NOTIF отвечен (CONTINUE или фолбэк-send)");
+        memset(rcv, 0, sizeof rcv);
+        slen = (socklen_t)sizeof sa;
+        r = (int)recvfrom(rfd, rcv, sizeof rcv, 0, &sa, &slen);
+        CHECK(r == (int)sizeof snd && rcv[0] == 0x22 && rcv[1] == 1,
+              "v58e2e: дейтаграмма дошла (passthrough целиком)");
+        close(sfd);
+        close(rfd);
+        g_tsn_stop = 1;
+    }
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -28735,6 +29157,7 @@ int main(void)
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */
     test_stubscan();    /* v53: anon-r-x syscall-stub matcher */
+    test_seccomp();     /* v58: seccomp-user-notif (BPF + живой e2e) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

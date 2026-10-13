@@ -920,10 +920,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # и для ВСЕГО что не поймали отдельные трейспойнты); фильтр =
       # только send-класс nr — поток копеечный. Это замена умершего
       # perf (run406: probe failed all variants, stderr пуст).
-      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo "count == 512" > events/syscalls/sys_enter_write/filter; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable' 2>/dev/null || true
-      # kprobe: pt_regs = arg1 (%di) do_syscall_64; ip @ +128, orig_ax @ +120
-      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip do_syscall_64 rip=+128(+0(%di)):u64 nr=+120(+0(%di)):u64" >> kprobe_events 2>/dev/null; echo "nr==1||nr==41||nr==44||nr==46||nr==307||nr==425" > events/kprobes/c2b_rip/filter 2>/dev/null; echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null' 2>/dev/null || true
-      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512-filtered] + io_uring + KPROBE rip/nr)"
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo "count == 512" > events/syscalls/sys_enter_write/filter; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable; echo 1 > tracing_on' 2>/dev/null || true
+      # kprobe: pt_regs = arg1 (%di) do_syscall_64; ip @ +128, orig_ax @ +120.
+      # v55e: сам факт регистрации = В ЛОГ (run407-урок: kprobe/filter
+      # могут молча не создаться — 2>/dev/null глотал всё).
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip do_syscall_64 rip=+128(+0(%di)):u64 nr=+120(+0(%di)):u64" >> kprobe_events 2>/dev/null; if [ -e events/kprobes/c2b_rip/enable ]; then echo "nr==1||nr==41||nr==44||nr==46||nr==307||nr==425" > events/kprobes/c2b_rip/filter 2>/dev/null; echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
+      KPROBE_OK=$(sudo -n test -e /sys/kernel/tracing/events/kprobes/c2b_rip/enable && echo yes || echo NO)
+      WFL=$(sudo -n cat /sys/kernel/tracing/events/syscalls/sys_enter_write/filter 2>/dev/null || echo unset)
+      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip/nr); kprobe=$KPROBE_OK write_filter=$WFL"
     else
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi

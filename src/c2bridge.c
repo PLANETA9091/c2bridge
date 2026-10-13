@@ -15012,6 +15012,7 @@ extern i32 munmap(void *, u32);
 static void *volatile g_ldd_tr_st;      /* tramp sendto */
 static void *volatile g_ldd_tr_sm;      /* tramp sendmsg */
 static void *volatile g_ldd_tr_sd;      /* tramp send   */
+static void *volatile g_ldd_tr_wr;      /* tramp write (v53) */
 static u32 g_ldd_init, g_ldd_arm, g_ldd_hits, g_ldd_armed;
 static uptr g_ldd_lo, g_ldd_hi;         /* текст моста (ra-гвард) */
 typedef ssize_t (*c2b_ldd_sd_fn)(int, const void *, size_t, int);
@@ -15087,6 +15088,46 @@ static ssize_t c2b_ldd_dsend(int fd, const void *buf, size_t len,
         }
     }
     return tr(fd, buf, len, flags);
+}
+
+static ssize_t c2b_ldd_dwrite(int fd, const void *buf, size_t len)
+{
+    c2b_write_fn tr = (c2b_write_fn)g_ldd_tr_wr;
+    if (!tr) { *__errno_location() = 2; return -1; }
+    /* v53: ПРЯМОЙ-укатель write на connected UDP = последний невидимый
+     * libc-класс (v52 = пропускал write по плану "горячий путь"). Цена
+     * детура = 2-байтовая проверка на вызов — симметрично v50e-хуку.
+     * Ре-входа нет: логи = [0]=='[' != 0x22 => passthrough; трамп зовётся
+     * НАПРЯМУЮ. Порядок проверки: buf-форма ДО ra-гварда (как v50e). */
+    if (buf && len >= 40u && len <= 640u &&
+        ((const u8 *)buf)[0] == 0x22) {
+        uptr ra = (uptr)__builtin_return_address(0);
+        if (!g_ldd_lo || ra < g_ldd_lo || ra >= g_ldd_hi) {
+            const u8 *p = (const u8 *)buf;
+            u8 crtbuf[600];
+            u32 on;
+            if (g_ldd_hits < 12u) {
+                g_ldd_hits++;
+                C2B_LOGS("[c2b] v53: HIT write len=");
+                C2B_LOGN((u32)len);
+                C2B_LOGS("fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS("ra=");
+                c2b_gp_lh64((unsigned long long)ra);
+                C2B_LOGS("\n");
+            }
+            if (!g_crt_init) {
+                const char *ec = getenv("C2B_CRTFIX");
+                if (ec && ec[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
+            c2b_crt_maybe_capture(p, (u32)len);
+            on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
+                                       (u32)sizeof crtbuf);
+            if (on) return tr(fd, crtbuf, on);
+        }
+    }
+    return tr(fd, buf, len);
 }
 
 static ssize_t c2b_ldd_dsendmsg(int fd, const struct c2b_msghdr *msg,
@@ -15316,6 +15357,8 @@ static void c2b_ldd_maybe(void)
                      (void *)&c2b_ldd_dsendmsg);
     c2b_ldd_install1("send", 44u, &g_ldd_tr_sd,
                      (void *)&c2b_ldd_dsend);
+    c2b_ldd_install1("write", 1u, &g_ldd_tr_wr,
+                     (void *)&c2b_ldd_dwrite);
     C2B_LOGS("[c2b] v52: install done armed=");
     C2B_LOGN(g_ldd_armed);
     C2B_LOGS("\n");
@@ -15324,12 +15367,188 @@ static void c2b_ldd_maybe(void)
 static void c2b_ldd_maybe(void) { }
 #endif  /* v52 */
 
+/* ---------- v53: СКАН АНОН-r-x SYSCALL-СТАБОВ ----------
+ * ФИНАЛ elimination-матрицы (v51 = не-GOT/PLT, v52 = не-libc-send-
+ * прологи, run399: ARMED 3/3 + ZERO HITs при 40 живых 0x22 на проводе)
+ * => отправитель = СВОЙ syscall-инструктаж в АНОНИМНОЙ r-x памяти
+ * (run392 '?'-ra) и/или прямой-укатель write (v53 закрыл write-детуром
+ * выше). СКАН = диагностика-локатор: /proc/self/maps -> КАЖДЫЙ r-xp
+ * регион БЕЗ пути (файл-бэкед движок/либы = отсечены; аноним r-x =
+ * JIT/трамплины/самодельные стабы = ровно класс подозреваемого) ->
+ * pread-прогулка 64KB-чанками (v4.3-дисциплина, ноль прямых
+ * разыменований) -> подписи стабов:
+ *   b8 2c 00 00 00 0f 05   mov eax,44; syscall  (sendto)
+ *   b8 2e 00 00 00 0f 05   (sendmsg)
+ *   b8 01 00 00 00 0f 05   (write!)
+ *   48 c7 c0 <nr> 00 00 00 0f 05   (mov rax,imm32-форма)
+ * Локатор: '[c2b] v53: stub region=<lo>-<hi> off=<o> nr=<n> ctx=<hex>'
+ * = цель ДЛЯ СЛЕДУЮЩЕГО шага (тот же c2b_ldd_build принимает ЛЮБЫЕ
+ * байты цели = детур ПРЯМО стаба). Гейт = C2B_LIBCDET=1 (тот же рычаг
+ * кампании), триггер = свиньячки sendto/recvfrom хуков, rate 5s, кап
+ * 24 скана/ран (~120s покрытия от первого sendto = окно 0x22 t≈36s+),
+ * дедуп по базе региона (новые регионы = сканируются по мере мапа),
+ * бюджет 32МБ преада/скан, регион > 64МБ = скип. Ядро = pure
+ * (selftest-ируемое). */
+#define C2B_SS_RATE_MS  5000u
+#define C2B_SS_CAP      24u
+#define C2B_SS_BUDGET   (32u << 20)
+#define C2B_SS_REGIONMAX (64u << 20)
+#define C2B_SS_LOGCAP   24u
+struct c2b_ss_hit { u32 off; u32 nr; };
+
+/* pure-ядро: стабы в чанке. Возврат = число находок (<= cap). */
+static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
+                             u32 cap)
+{
+    u32 i, k = 0;
+    if (!p || !out || n < 7u) return 0u;
+    for (i = 0u; i + 7u <= n && k < cap; i++) {
+        if (p[i] == 0xb8u && p[i + 2u] == 0u && p[i + 3u] == 0u &&
+            p[i + 4u] == 0u && p[i + 5u] == 0x0fu &&
+            p[i + 6u] == 0x05u &&
+            (p[i + 1u] == 44u || p[i + 1u] == 46u || p[i + 1u] == 1u)) {
+            out[k].off = i; out[k].nr = (u32)p[i + 1u]; k++;
+        }
+    }
+    for (i = 0u; i + 9u <= n && k < cap; i++) {
+        if (p[i] == 0x48u && p[i + 1u] == 0xc7u && p[i + 2u] == 0xc0u &&
+            p[i + 4u] == 0u && p[i + 5u] == 0u &&
+            p[i + 7u] == 0x0fu && p[i + 8u] == 0x05u &&
+            (p[i + 3u] == 44u || p[i + 3u] == 46u || p[i + 3u] == 1u)) {
+            out[k].off = i; out[k].nr = (u32)p[i + 3u]; k++;
+        }
+    }
+    return k;
+}
+
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+static u32 g_ss_scans, g_ss_last, g_ss_logn, g_ss_done;
+static u64 g_ss_seen[32];
+static u32 g_ss_seen_n;
+
+static void c2b_ss_scan_maps(void)
+{
+    i32 fdm;
+    char chunk[65536], line[4096];
+    i32 llen = 0;
+    i64 r;
+    u32 budget = C2B_SS_BUDGET, nsc = 0;
+    extern i32 open(const char *, i32, ...);
+    extern i64 read(i32, void *, u64);
+    extern i32 close(i32);
+    fdm = open("/proc/self/maps", 0 /*O_RDONLY*/);
+    if (fdm < 0) return;
+    while ((r = read(fdm, chunk, (uptr)sizeof chunk)) > 0) {
+        u32 i = 0;
+        while (i < (u32)r) {
+            u32 j = i, seg, k;
+            while (j < (u32)r && chunk[j] != '\n') j++;
+            seg = j - i;
+            if (llen + (i32)seg > (i32)sizeof line - 1)
+                seg = (u32)(sizeof line - 1u - (u32)llen);
+            if (seg) {
+                memcpy(line + llen, chunk + i, seg);
+                llen += (i32)seg;
+            }
+            if (j == (u32)r) break;
+            i = j + 1;
+            /* полная строка: r-xp, БЕЗ '/', бюджет, дедуп */
+            {
+                unsigned long lo = 0, hi = 0;
+                i32 isrx = 0, hasslash = 0;
+                for (k = 0; k + 4u <= (u32)llen; k++)
+                    if (line[k] == 'r' && line[k + 1u] == '-' &&
+                        line[k + 2u] == 'x' && line[k + 3u] == 'p')
+                        isrx = 1;
+                for (k = 0; k < (u32)llen; k++)
+                    if (line[k] == '/') { hasslash = 1; break; }
+                if (isrx && !hasslash && budget &&
+                    c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
+                    (hi - lo) <= C2B_SS_REGIONMAX) {
+                    u32 dupe = 0;
+                    for (k = 0; k < g_ss_seen_n; k++)
+                        if (g_ss_seen[k] == (u64)lo) { dupe = 1; break; }
+                    if (!dupe && g_ss_seen_n < 32u) {
+                        u64 off;
+                        g_ss_seen[g_ss_seen_n++] = (u64)lo;
+                        for (off = 0; off < (u64)(hi - lo) &&
+                                      budget > 0u; ) {
+                            u8 buf[65536];
+                            i64 rn = pread(fdm, buf,
+                                           (uptr)sizeof buf,
+                                           (i64)(lo + off));
+                            struct c2b_ss_hit hits[16];
+                            u32 nh, h;
+                            if (rn <= 0) break;
+                            if ((u64)rn > (u64)budget)
+                                rn = (i64)budget;
+                            budget -= (u32)rn;
+                            nh = c2b_ss_scan_chunk(buf, (u32)rn,
+                                                   hits, 16u);
+                            for (h = 0; h < nh; h++) {
+                                u32 q;
+                                if (g_ss_logn >= C2B_SS_LOGCAP) break;
+                                g_ss_logn++;
+                                C2B_LOGS("[c2b] v53: stub region=");
+                                c2b_gp_lh64((unsigned long long)lo);
+                                C2B_LOGS("off=");
+                                c2b_gp_lh64((unsigned long long)
+                                                (off + hits[h].off));
+                                C2B_LOGS("nr=");
+                                C2B_LOGN(hits[h].nr);
+                                C2B_LOGS("ctx=");
+                                {
+                                    u32 cs = hits[h].off >= 8u ?
+                                             hits[h].off - 8u : 0u;
+                                    u32 ce = (u32)hits[h].off + 24u;
+                                    if (ce > (u32)rn) ce = (u32)rn;
+                                    for (q = cs; q < ce; q++)
+                                        C2B_LOGH((u32)buf[q]);
+                                }
+                                C2B_LOGS("\n");
+                            }
+                            off += (u64)rn;
+                            nsc++;
+                        }
+                    }
+                }
+            }
+            llen = 0;
+        }
+    }
+    close(fdm);
+    g_ss_scans++;
+    C2B_LOGS("[c2b] v53: scan #");
+    C2B_LOGN(g_ss_scans);
+    C2B_LOGS("chunks=");
+    C2B_LOGN(nsc);
+    C2B_LOGS("budget=");
+    C2B_LOGN(budget);
+    C2B_LOGS("stubs=");
+    C2B_LOGN(g_ss_logn);
+    C2B_LOGS("\n");
+}
+
+static void c2b_ss_maybe(void)
+{
+    u64 now;
+    if (g_ss_scans >= C2B_SS_CAP || !g_ldd_arm) return;
+    now = c2b_mono_ms();
+    if (g_ss_last && (u32)now - g_ss_last < C2B_SS_RATE_MS) return;
+    g_ss_last = (u32)now;
+    c2b_ss_scan_maps();
+}
+#else   /* selftest / i386: no-op */
+static void c2b_ss_maybe(void) { }
+#endif  /* v53 */
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
     c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
     c2b_ldd_maybe();    /* v52: свиньячок — детур прологов libc */
+    c2b_ss_maybe();     /* v53: свиньячок — скан анон-r-x стабов */
     c2b_g15_note((uptr)__builtin_return_address(0), "s");
     if (!g_clp_sendto) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "sendto");
@@ -21082,6 +21301,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 {
     c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
     c2b_ldd_maybe();    /* v52: свиньячок — детур прологов libc */
+    c2b_ss_maybe();     /* v53: свиньячок — скан анон-r-x стабов */
     c2b_g15_note((uptr)__builtin_return_address(0), "r");
     if (!g_clp_recvfrom) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "recvfrom");
@@ -27877,6 +28097,69 @@ static void test_lddet(void)
 #endif
 }
 
+/* v53: anon-r-x syscall-stub сканер — pure-ядро c2b_ss_scan_chunk на
+ * синтетике (все 4 формы + негативы + кап + граница чанка). */
+static void test_stubscan(void)
+{
+    u8 buf[128];
+    struct c2b_ss_hit hits[16];
+    u32 n, i;
+    printf("[t] stubscan v53 (anon-r-x syscall-stub matcher)\n");
+    memset(buf, 0x90, sizeof buf);
+    /* форма 1 @5: b8 2c 00 00 00 0f 05 (sendto) */
+    buf[5] = 0xb8; buf[6] = 44; buf[7] = 0; buf[8] = 0; buf[9] = 0;
+    buf[10] = 0x0f; buf[11] = 0x05;
+    /* форма 1 @20: b8 2e ... (sendmsg) */
+    buf[20] = 0xb8; buf[21] = 46; buf[22] = 0; buf[23] = 0; buf[24] = 0;
+    buf[25] = 0x0f; buf[26] = 0x05;
+    /* форма 1 @35: b8 01 ... (write!) */
+    buf[35] = 0xb8; buf[36] = 1; buf[37] = 0; buf[38] = 0; buf[39] = 0;
+    buf[40] = 0x0f; buf[41] = 0x05;
+    /* форма 2 @50: 48 c7 c0 2c 00 00 00 0f 05 */
+    buf[50] = 0x48; buf[51] = 0xc7; buf[52] = 0xc0; buf[53] = 44;
+    buf[54] = 0; buf[55] = 0; buf[56] = 0; buf[57] = 0x0f;
+    buf[58] = 0x05;
+    n = c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u);
+    CHECK(n == 4, "ss: 4 стаба найдены");
+    CHECK(n > 0 && hits[0].off == 5u && hits[0].nr == 44u,
+          "ss: sendto-стаб @5");
+    CHECK(n > 1 && hits[1].off == 20u && hits[1].nr == 46u,
+          "ss: sendmsg-стаб @20");
+    CHECK(n > 2 && hits[2].off == 35u && hits[2].nr == 1u,
+          "ss: write-стаб @35");
+    CHECK(n > 3 && hits[3].off == 50u && hits[3].nr == 44u,
+          "ss: 48c7-форма @50");
+    /* негативы: чужие nr / без syscall / усечённый хвост */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 45; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05;          /* recvfrom nr = не наш класс */
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
+          "ss: чужой nr = 0");
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 44; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x07;          /* не syscall */
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
+          "ss: без 0f 05 = 0");
+    memset(buf, 0x90, sizeof buf);
+    buf[10] = 0xb8; buf[11] = 44; buf[12] = 0; buf[13] = 0; buf[14] = 0;
+    buf[15] = 0x0f; buf[16] = 0x05;
+    CHECK(c2b_ss_scan_chunk(buf, 12u, hits, 16u) == 0u,
+          "ss: стаб за границей чанка = 0 (усечение)");
+    /* кап */
+    memset(buf, 0x90, sizeof buf);
+    for (i = 0; i < 8u; i++) {
+        buf[i * 8u] = 0xb8; buf[i * 8u + 1u] = 44;
+        buf[i * 8u + 2u] = 0; buf[i * 8u + 3u] = 0;
+        buf[i * 8u + 4u] = 0; buf[i * 8u + 5u] = 0x0f;
+        buf[i * 8u + 6u] = 0x05;
+    }
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 3u) == 3u,
+          "ss: кап = 3");
+    /* NULL/короткий */
+    CHECK(c2b_ss_scan_chunk(0, 100u, hits, 16u) == 0u, "ss: NULL = 0");
+    CHECK(c2b_ss_scan_chunk(buf, 3u, hits, 16u) == 0u, "ss: n=3 = 0");
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -27988,6 +28271,7 @@ int main(void)
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */
+    test_stubscan();    /* v53: anon-r-x syscall-stub matcher */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

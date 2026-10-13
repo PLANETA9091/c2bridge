@@ -15532,9 +15532,9 @@ static void c2b_ldd_maybe(void) { }
  * 0x20-hello = тоже 512B, cadence совпал). */
 #define C2B_SS_RATE_MS  5000u
 #define C2B_SS_CAP      24u
-#define C2B_SS_BUDGET   (256u << 20)
-#define C2B_SS_REGIONMAX (192u << 20)
-#define C2B_SS_LOGCAP   24u
+#define C2B_SS_BUDGET   (384u << 20)
+#define C2B_SS_REGIONMAX (256u << 20)
+#define C2B_SS_LOGCAP   64u
 struct c2b_ss_hit { u32 off; u32 nr; };
 
 /* v55 pure: substring в maps-строке (0 = miss). Возврат 1 = найдено. */
@@ -15605,7 +15605,13 @@ static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
 
 #if !defined(C2B_SELFTEST) && defined(__x86_64__)
 static u32 g_ss_scans, g_ss_last, g_ss_logn, g_ss_done;
-static u64 g_ss_seen[32];
+/* v57b-ФИКС (run411-урок): seen[32] = ПЕРЕПОЛНЯЛСЯ после первых сканов
+ * (seen32=0x6d = 109 регионов из ~165 r-x ПРОПУЩЕНЫ НАВСЕГДА через
+ * nfull++ — включая steamclient/анон/memfd!) => v55-элиминация
+ * "фикс-форм = zero" = считана по 10 из 165 регионов. 256 слотов =
+ * полный процесс; скан = самовосстанавливающийся (дедуп = пер-ран,
+ * бюджет = пер-скан). */
+static u64 g_ss_seen[256];
 static u32 g_ss_seen_n;
 
 static void c2b_ss_scan_maps(void)
@@ -15618,7 +15624,7 @@ static void c2b_ss_scan_maps(void)
     /* v55c: диагностика — почему chunks=0 в runs 400-405? Счётчики
      * по классам регионов + сбой преада + сырая строка первого r-x. */
     u32 nrx = 0, nexe = 0, neng = 0, nanon = 0, nfull = 0, npf = 0;
-    u32 nmemfd = 0;
+    u32 nmemfd = 0, nskip = 0;
     extern i32 open(const char *, i32, ...);
     extern i64 read(i32, void *, u64);
     extern i32 close(i32);
@@ -15680,11 +15686,18 @@ static void c2b_ss_scan_maps(void)
                 }
                 if (isrx && (!hasslash || kind) && budget &&
                     c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
+                    (hi - lo) > C2B_SS_REGIONMAX) {
+                    /* v57b: слишком большие = СЧЁТНО пропускаем (не
+                     * continue: llen=0 ниже обязателен для парсера) */
+                    nskip++;
+                }
+                if (isrx && (!hasslash || kind) && budget &&
+                    c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
                     (hi - lo) <= C2B_SS_REGIONMAX) {
                     u32 dupe = 0;
                     for (k = 0; k < g_ss_seen_n; k++)
                         if (g_ss_seen[k] == (u64)lo) { dupe = 1; break; }
-                    if (!dupe && g_ss_seen_n < 32u) {
+                    if (!dupe && g_ss_seen_n < 256u) {
                         u64 off;
                         if (kind == 1) nexe++;
                         else if (kind == 2) neng++;
@@ -15766,6 +15779,10 @@ static void c2b_ss_scan_maps(void)
     C2B_LOGN(nfull);
     C2B_LOGS(" pf=");
     C2B_LOGN(npf);
+    C2B_LOGS(" bigskip=");
+    C2B_LOGN(nskip);
+    C2B_LOGS(" seen_n=");
+    C2B_LOGN(g_ss_seen_n);
     C2B_LOGS("\n");
 }
 

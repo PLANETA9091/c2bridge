@@ -921,10 +921,15 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # только send-класс nr — поток копеечный. Это замена умершего
       # perf (run406: probe failed all variants, stderr пуст).
       sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo "count == 512" > events/syscalls/sys_enter_write/filter; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable; echo 1 > tracing_on' 2>/dev/null || true
-      # kprobe: pt_regs = arg1 (%rdi — 64-БИТНАЯ форма! run408: kprobe=NO
-      # с 16-битной %di = ядро молча отвергло) do_syscall_64;
-      # ip @ +128, orig_ax @ +120.
-      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip do_syscall_64 rip=+128(+0(%rdi)):u64 nr=+120(+0(%rdi)):u64" >> kprobe_events 2>/dev/null; if [ -e events/kprobes/c2b_rip/enable ]; then echo "nr==1||nr==41||nr==44||nr==46||nr==307||nr==425" > events/kprobes/c2b_rip/filter 2>/dev/null; echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
+      # kprobe v55g: __x64_sys_sendto = УЗКИЙ символ syscall-обёртки
+      # sendto (do_syscall_64 = отвергнут ядром дважды: %di И %rdi —
+      # run408/409 kprobe=NO; STDERR ТЕПЕРЬ ЛОЖИТСЯ В ЛОГ). args = тот
+      # же pt_regs (%rdi): ip=+128 = ПОЛЬЗОВАТЕЛЬСКИЙ RIP sendto = САЙТ
+      # (run409-вердикт: отправитель 0x22 = tid движка через ОБЫЧНЫЙ
+      # sys_sendto len=0x200/0x201 512/513B — формат трейса МЕНЯЕТСЯ
+      # между ядрами раннеров: 'len: 0x200' vs 'len: 200' = grep-ловушка
+      # run404-408!). Объём = sendto-only ~1.5k/ран = фильтр не нужен.
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip __x64_sys_sendto rip=+128(+0(%rdi)):u64 fd=+112(+0(%rdi)):u64" >> kprobe_events 2>/dev/null; if [ -e events/kprobes/c2b_rip/enable ]; then echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
       # v55f: net_dev_queue = ТОЧКА ОЧЕРЕДИ WIRE-ПАКЕТА (skb, len, dev):
       # каждый пакет НА ПРОВОДЕ проходит здесь = фильтр len==512 = класс
       # 0x22/0x20-512 = триггер stacktrace = ЯДЕРНАЯ цепочка отправителя
@@ -933,9 +938,10 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # но тогда ловит kprobe-rip). Дуал = замена умершего perf.
       sudo -n sh -c 'cd /sys/kernel/tracing && if [ -d events/net/net_dev_queue ]; then echo "stacktrace if len == 512" > events/net/net_dev_queue/trigger 2>/dev/null; echo 1 > events/net/net_dev_queue/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
       KPROBE_OK=$(sudo -n test -e /sys/kernel/tracing/events/kprobes/c2b_rip/enable && echo yes || echo NO)
+      KPROBE_ERR=$(sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip3 __x64_sys_sendto rip=+128(+0(%rdi)):u64" >> kprobe_events' 2>&1 | head -1)
       NDQ_OK=$(sudo -n test -e /sys/kernel/tracing/events/net/net_dev_queue/enable && echo yes || echo NO)
       WFL=$(sudo -n cat /sys/kernel/tracing/events/syscalls/sys_enter_write/filter 2>/dev/null || echo unset)
-      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip/nr + NET_DEV_QUEUE stacktrace); kprobe=$KPROBE_OK ndq=$NDQ_OK write_filter=$WFL"
+      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip + NET_DEV_QUEUE stacktrace); kprobe=$KPROBE_OK ndq=$NDQ_OK write_filter=$WFL kprobe_err=$KPROBE_ERR"
     else
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi

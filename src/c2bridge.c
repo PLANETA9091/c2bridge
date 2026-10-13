@@ -90,6 +90,7 @@ extern void  siglongjmp(void *buf, i32 val);
 extern i32   sigaction(i32 sig, const void *act, void *oldact);
 extern i32   sigemptyset(void *set);   /* маска sa_mask */
 extern i64   pread(i32 fd, void *buf, uptr n, uptr off);   /* g24 v4.2: ssize_t/size_t/off_t = 64-bit */
+extern i64   pwrite(i32 fd, const void *buf, uptr n, uptr off);   /* v51: GOT-патч (self-запись мимо прота) */
 extern i32   vsnprintf(char *s, uptr n, const char *fmt, void *va);   /* g34v2: GNS lib-spew hook */
 static int g_logfd = 2;
 
@@ -138,6 +139,14 @@ static void c2b_log_dec(u32 v)   /* R37 (t35): десятичная телеме
 #define C2B_LOGN(v) c2b_log_hex((u32)(v))
 #define C2B_LOGD(v) c2b_log_dec((u32)(v))
 #endif
+
+/* v51: GOT-PATCH приватных ns-копий GNS/steamclient (после макросов лога —
+ * хедер логирует сам); x86-64 only, на i386 = пусто */
+#include "c2b_gp.h"
+
+/* v51: триггер gp-скана (определение в блоке перед send(); свиньячки =
+ * первые строки sendto/recvfrom хуков) */
+static void c2b_gp_maybe(void);
 
 /* v4.3 (run165): ОБЩИЙ safe-reader — /proc/self/mem pread ЧАНКАМИ 64KB с
  * дозаполнением после дыр. Замена прямых разыменований ПОСЛЕ
@@ -14974,6 +14983,7 @@ __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
+    c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
     c2b_g15_note((uptr)__builtin_return_address(0), "s");
     if (!g_clp_sendto) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "sendto");
@@ -20724,6 +20734,7 @@ ssize_t recvmsg(int fd, struct c2b_msghdr *msg, int flags)
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen)
 {
+    c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
     c2b_g15_note((uptr)__builtin_return_address(0), "r");
     if (!g_clp_recvfrom) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "recvfrom");
@@ -21042,6 +21053,161 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
     }
     return r;
 }
+
+/* ---------- v51: gp-скан — maps -> модули GNS/steamclient -> GOT-патч ----
+ * Состояние + триггер + скан (патчер = c2b_gp_patch_module в c2b_gp.h).
+ * Триггер = свиньячки в sendto/recvfrom хуках: rate 2с, кап 256 сканов,
+ * busy-гвард __sync (рекурсия через C2B_LOGS->write-хук = гасится гвар-
+ * дом). Дизарм (нет C2B_GOTPATCH=1) = навсегда (один env-рид). Боевой
+ * скан = .so-only (блок-скоуп extern open/read/close = g24-паттерн). */
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+static void c2b_gp_scan(void);          /* fwd: maybe() зовёт ниже */
+ssize_t send(int fd, const void *buf, size_t len, int flags);   /* fwd: определение ниже (44f-g43) */
+static u32 g_gp_init, g_gp_scans, g_gp_busy;
+static u32 g_gp_patched, g_gp_alread, g_gp_skip;
+static u64 g_gp_last_ms;
+static u64 g_gp_seen[12];
+static u32 g_gp_seen_n;
+
+static void c2b_gp_maybe(void)
+{
+    u64 now;
+    if (g_gp_scans >= 256u) return;
+    if (!g_gp_init) {
+        const char *ec = getenv("C2B_GOTPATCH");
+        g_gp_init = 1;
+        if (!ec || ec[0] != '1') { g_gp_scans = 0xffffffffu; return; }
+    }
+    now = c2b_mono_ms();
+    if (now - g_gp_last_ms < 2000u) return;
+    g_gp_last_ms = now;
+    if (__sync_lock_test_and_set(&g_gp_busy, 1u)) return;
+    g_gp_scans++;
+    c2b_gp_scan();
+    __sync_lock_release(&g_gp_busy);
+    if (g_gp_scans == 256u) {
+        C2B_LOGS("[c2b] v51: gp exhausted scans=256 patched=");
+        C2B_LOGD(g_gp_patched);
+        C2B_LOGS("\n");
+    }
+}
+
+static void c2b_gp_scan(void)
+{
+    static const char *pmap = "/proc/self/maps";
+    extern i32 open(const char *, i32, ...);
+    extern i64 read(i32, void *, u64);
+    extern i32 close(i32);
+    static char mb[2 * 1024 * 1024];    /* v3.3-урок: читаем ДО EOF — модули
+                                         * стима = ВЫСОКИЕ адреса = хвост файла */
+    struct { const char *path; u32 plen; u32 kind; unsigned long base, end; }
+        mods[8];
+    u32 nmods = 0;
+    i32 fd, mfd;
+    i64 n = 0, r;
+    char *p, *endp;
+    unsigned long hooks[5];
+    u32 patched = 0, alread = 0, skipn = 0, mi;
+    hooks[1] = (unsigned long)&sendto;
+    hooks[2] = (unsigned long)&sendmsg;
+    hooks[3] = (unsigned long)&send;
+    hooks[4] = (unsigned long)&write;
+    fd = open(pmap, 0);
+    if (fd < 0) return;
+    for (;;) {
+        r = read(fd, mb + n, (u64)(sizeof(mb) - 1 - (unsigned long)n));
+        if (r <= 0) break;
+        n += r;
+        if (n >= (i64)sizeof(mb) - 1) break;
+    }
+    close(fd);
+    if (n <= 0) return;
+    mb[n] = 0;
+    p = mb;
+    endp = mb + n;
+    while (p < endp) {
+        unsigned long lo, hi, off;
+        unsigned int prot, plen, linelen;
+        const char *pa;
+        if (!c2b_gp_line(p, (u32)(endp - p), &lo, &hi, &prot, &off,
+                         &pa, &plen, &linelen)) break;
+        p += linelen;
+        if (pa && c2b_gp_path_want(pa, plen)) {
+            u32 kind = (u32)c2b_gp_path_want(pa, plen);
+            u32 f;
+            for (f = 0; f < nmods; f++)
+                if (mods[f].plen == plen && mods[f].kind == kind &&
+                    memcmp(mods[f].path, pa, plen) == 0) break;
+            if (f == nmods && nmods < 8u) {
+                mods[nmods].path = pa;
+                mods[nmods].plen = plen;
+                mods[nmods].kind = kind;
+                mods[nmods].base = 0;
+                mods[nmods].end = 0;
+                nmods++;
+            }
+            if (f < nmods) {
+                if (off == 0 && !mods[f].base) mods[f].base = lo;
+                if (hi > mods[f].end) mods[f].end = hi;
+            }
+        }
+    }
+    if (!nmods) return;
+    mfd = open("/proc/self/mem", 2 /*O_RDWR*/);
+    if (mfd < 0) return;
+    for (mi = 0; mi < nmods; mi++) {
+        unsigned long base = mods[mi].base, end = mods[mi].end;
+        i32 r;
+        u32 seen, quiet;
+        if (!base || end <= base) continue;
+        for (seen = 0; seen < g_gp_seen_n; seen++)
+            if (g_gp_seen[seen] == base) break;
+        quiet = (seen < g_gp_seen_n) ? 1u : 0u;
+        if (seen == g_gp_seen_n && g_gp_seen_n < 12u) {
+            u32 q;
+            g_gp_seen[g_gp_seen_n++] = base;
+            C2B_LOGS("[c2b] v51: mod kind=");
+            C2B_LOGD(mods[mi].kind);
+            C2B_LOGS("base="); c2b_gp_lh64(base);
+            C2B_LOGS("end="); c2b_gp_lh64(end);
+            for (q = 0; q < mods[mi].plen && q < 200u; q++) {
+                char cbuf[2];
+                cbuf[0] = mods[mi].path[q];
+                cbuf[1] = 0;
+                C2B_LOGS(cbuf);
+            }
+            C2B_LOGS("\n");
+        }
+        r = c2b_gp_patch_module(mfd, base, end, hooks, quiet,
+                                &patched, &alread, &skipn);
+        if (r < 0) {
+            C2B_LOGS("[c2b] v51: mod kind=");
+            C2B_LOGD(mods[mi].kind);
+            C2B_LOGS("base="); c2b_gp_lh64(base);
+            C2B_LOGS("walk-err=");
+            C2B_LOGD((u32)(-r));
+            C2B_LOGS("\n");
+        }
+    }
+    close(mfd);
+    g_gp_patched += patched;
+    g_gp_alread += alread;
+    g_gp_skip += skipn;
+    C2B_LOGS("[c2b] v51: scan #");
+    C2B_LOGD(g_gp_scans);
+    C2B_LOGS("mods=");
+    C2B_LOGD(nmods);
+    C2B_LOGS(" patched=");
+    C2B_LOGD(patched);
+    C2B_LOGS(" alread=");
+    C2B_LOGD(alread);
+    C2B_LOGS(" skip=");
+    C2B_LOGD(skipn);
+    C2B_LOGS("\n");
+}
+#else /* C2B_SELFTEST || !__x86_64__: боевой скан не живёт — пусто */
+static void c2b_gp_maybe(void) { }
+#endif
 
 /* ---------- 44f-g43: send/recv (СОЕДИНЁННЫЕ сокеты) — делегация в наши ----
  * sendto/recvfrom. Run188: движок меняет путь сокетов ПО ПРОБАМ — пять
@@ -26940,6 +27106,143 @@ static void test_crt(void)
     }
 }
 
+/* v51: gp — чистые хелперы + СИНТЕТИЧЕСКИЙ мини-ELF end-to-end (прогулка +
+ * GOT-патч через /proc/self/mem — тот же код-путь, что в бою) */
+static void test_gp(void)
+{
+#ifdef __x86_64__
+    CHECK(c2b_gp_sym_want("sendto") == 1, "gp: sendto = 1");
+    CHECK(c2b_gp_sym_want("sendmsg") == 2, "gp: sendmsg = 2");
+    CHECK(c2b_gp_sym_want("send") == 3, "gp: send = 3");
+    CHECK(c2b_gp_sym_want("write") == 4, "gp: write = 4");
+    CHECK(c2b_gp_sym_want("writev") == 0, "gp: writev = 0");
+    CHECK(c2b_gp_sym_want("sendmmsg") == 0, "gp: sendmmsg = 0");
+    CHECK(c2b_gp_sym_want("sendtox") == 0, "gp: sendtox = 0");
+    CHECK(c2b_gp_sym_want("") == 0, "gp: пустое = 0");
+    CHECK(c2b_gp_sym_want(0) == 0, "gp: NULL = 0");
+    CHECK(c2b_gp_path_want("/h/.local/share/Steam/linux64/"
+                           "libsteamnetworkingsockets.so", 58) == 1,
+          "gp: путь gns = 1");
+    CHECK(c2b_gp_path_want("/h/.local/share/Steam/linux64/steamclient.so",
+                           44) == 2, "gp: путь steamclient = 2");
+    CHECK(c2b_gp_path_want("/g/csgo/bin/engine_client.so", 28) == 0,
+          "gp: путь engine = 0");
+    CHECK(c2b_gp_path_want("/lib/x86_64-linux-gnu/libc.so.6", 31) == 0,
+          "gp: путь libc = 0");
+    CHECK(c2b_gp_path_want(0, 0) == 0, "gp: путь NULL = 0");
+    {   unsigned long lo = 0, hi = 0;
+        CHECK(c2b_gp_lohi("7f1234567000-7f1234578000 rw-p", &lo, &hi) != 0,
+              "gp: lohi парс");
+        CHECK(lo == 0x7f1234567000ul && hi == 0x7f1234578000ul,
+              "gp: lohi значения");
+        CHECK(c2b_gp_lohi("abc", &lo, &hi) == 0, "gp: lohi мусор = 0");
+    }
+    CHECK(c2b_gp_prot("rw-p", 4) == 3u, "gp: prot rw = 3");
+    CHECK(c2b_gp_prot("r-xp", 4) == 5u, "gp: prot r-x = 5");
+    CHECK(c2b_gp_prot("r--p", 4) == 1u, "gp: prot r-- = 1");
+    CHECK(c2b_gp_slot_ok(0x1800ul, 0x1000ul, 0x2000ul) == 1, "gp: слот ок");
+    CHECK(c2b_gp_slot_ok(0x1000ul, 0x1000ul, 0x2000ul) == 0, "gp: слот = base");
+    CHECK(c2b_gp_slot_ok(0x2000ul, 0x1000ul, 0x2000ul) == 0, "gp: слот = end");
+    CHECK(c2b_gp_slot_ok(0x1804ul, 0x1000ul, 0x2000ul) == 0, "gp: слот не-выровн");
+    {   const char *L = "7f0000001000-7f0000002000 r--p 00000000 08:01 42 "
+                        "/x/steamclient.so\n";
+        unsigned long lo = 0, hi = 0, off = 99;
+        unsigned int pr = 0, pl = 0, ll = 0;
+        const char *pa = 0;
+        CHECK(c2b_gp_line(L, 67u, &lo, &hi, &pr, &off, &pa, &pl, &ll) == 1,
+              "gp: строка maps парс");
+        CHECK(lo == 0x7f0000001000ul && hi == 0x7f0000002000ul,
+              "gp: строка lo/hi");
+        CHECK(pr == 1u && off == 0ul, "gp: строка prot/off");
+        CHECK(pa && pl == 17u && pa[0] == '/', "gp: строка path");
+        CHECK(ll == 67u, "gp: строка linelen через \\n");
+        CHECK(pa && c2b_gp_path_want(pa, pl) == 2, "gp: строка->path_want");
+    }
+    /* --- синтетический мини-ELF: ehdr+2 phdr+dyn+strtab+symtab+relas+GOT;
+     * strtab = АБСОЛЮТНЫЙ d_ptr, symtab = ОТНОСИТЕЛЬНЫЙ (< base — эвристик
+     * +base), jmprel = абсолютный => ОБЕ ветки эвристика покрыты --- */
+    {
+        static unsigned char img[8192];
+        const unsigned long base = (unsigned long)img;
+        const unsigned long O_DYN = 0x100, O_STR = 0x200, O_SYM = 0x240,
+                            O_REL = 0x300, O_GOT = 0x400;
+        unsigned long hooks[5];
+        unsigned int P = 0, A = 0, S = 0;
+        int mfd, rc;
+        memset(img, 0, sizeof img);
+        memcpy(img, "\177ELF", 4);
+        img[4] = 2; img[5] = 1;                 /* ELF64 / LSB */
+        *(unsigned short *)(img + 0x36) = 56;   /* e_phentsize */
+        *(unsigned short *)(img + 0x38) = 2;    /* e_phnum */
+        *(unsigned long  *)(img + 0x20) = 0x40; /* e_phoff */
+        *(u32 *)(img + 0x40 + 0) = 1;           /* ph0: PT_LOAD */
+        *(unsigned long *)(img + 0x40 + 0x10) = 0;
+        *(unsigned long *)(img + 0x40 + 0x28) = sizeof img;
+        *(u32 *)(img + 0x78 + 0) = 2;           /* ph1: PT_DYNAMIC */
+        *(unsigned long *)(img + 0x78 + 0x10) = O_DYN;
+        *(unsigned long *)(img + 0x78 + 0x28) = 5u * 16u;
+        memcpy(img + O_STR, "\0sendto\0zzz\0write\0", 18);   /* strtab[0]=NUL */
+        *(u32 *)(img + O_SYM + 0)  = 0;         /* sym0 = STN_UNDEF (нумерация
+                                                 * symtab = С ЕДИНИЦЫ! probe-
+                                                 * урок: symidx 0 = скип) */
+        *(u32 *)(img + O_SYM + 24) = 1;         /* sym1 -> "sendto" */
+        *(u32 *)(img + O_SYM + 48) = 8;         /* sym2 -> "zzz" */
+        *(u32 *)(img + O_SYM + 72) = 12;        /* sym3 -> "write" */
+        *(unsigned long *)(img + O_DYN + 0)  = 5;  /* DT_STRTAB = АБС */
+        *(unsigned long *)(img + O_DYN + 8)  = base + O_STR;
+        *(unsigned long *)(img + O_DYN + 16) = 6;  /* DT_SYMTAB = ОТН */
+        *(unsigned long *)(img + O_DYN + 24) = O_SYM;
+        *(unsigned long *)(img + O_DYN + 32) = 23; /* DT_JMPREL = АБС */
+        *(unsigned long *)(img + O_DYN + 40) = base + O_REL;
+        *(unsigned long *)(img + O_DYN + 48) = 2;  /* DT_PLTRELSZ */
+        *(unsigned long *)(img + O_DYN + 56) = 3u * 24u;
+        *(unsigned long *)(img + O_DYN + 64) = 0;  /* DT_NULL */
+        *(unsigned long *)(img + O_REL + 0)  = O_GOT;      /* r0: sendto */
+        *(unsigned long *)(img + O_REL + 8)  =
+            (1ul << 32) | 7ul;
+        *(unsigned long *)(img + O_REL + 24) = O_GOT + 8;  /* r1: zzz = скип */
+        *(unsigned long *)(img + O_REL + 32) =
+            (2ul << 32) | 7ul;
+        *(unsigned long *)(img + O_REL + 48) = O_GOT + 16; /* r2: write */
+        *(unsigned long *)(img + O_REL + 56) =
+            (3ul << 32) | 7ul;
+        *(unsigned long *)(img + O_GOT + 0)  = 0x1122334455667788ul;
+        *(unsigned long *)(img + O_GOT + 8)  = 0x99aabbccddeeff01ul;
+        *(unsigned long *)(img + O_GOT + 16) = 0x0011223344556677ul;
+        hooks[1] = (unsigned long)&sendto;
+        hooks[2] = (unsigned long)&sendmsg;
+        hooks[3] = (unsigned long)&send;
+        hooks[4] = (unsigned long)&write;
+        mfd = open("/proc/self/mem", 2 /*O_RDWR*/);
+        CHECK(mfd >= 0, "gp: /proc/self/mem открыт");
+        if (mfd >= 0) {
+            rc = c2b_gp_patch_module(mfd, base, base + sizeof img, hooks, 0,
+                                     &P, &A, &S);
+            CHECK(rc == 1, "gp: прогулка синт-ELF = 1");
+            CHECK(P == 2u && A == 0u && S == 0u, "gp: patched=2 alread=0");
+            CHECK(*(unsigned long *)(img + O_GOT + 0) ==
+                  (unsigned long)&sendto, "gp: слот sendto = хук");
+            CHECK(*(unsigned long *)(img + O_GOT + 8) ==
+                  0x99aabbccddeeff01ul, "gp: слот zzz НЕ тронут");
+            CHECK(*(unsigned long *)(img + O_GOT + 16) ==
+                  (unsigned long)&write, "gp: слот write = хук");
+            P = A = S = 0;
+            rc = c2b_gp_patch_module(mfd, base, base + sizeof img, hooks, 1,
+                                     &P, &A, &S);
+            CHECK(rc == 1 && P == 0u && A == 2u, "gp: рескан already=2");
+        }
+        rc = c2b_gp_patch_module(-1, 0x1000ul, 0x2000ul, hooks, 0,
+                                 &P, &A, &S);
+        CHECK(rc < 0, "gp: фейл-pread < 0");
+        memset(img, 0, 64);
+        rc = c2b_gp_patch_module(mfd >= 0 ? mfd : -1, base, base + 4096ul,
+                                 hooks, 0, &P, &A, &S);
+        CHECK(rc == -2, "gp: не-ELF = -2");
+        if (mfd >= 0) close(mfd);
+    }
+#endif
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -27049,6 +27352,7 @@ int main(void)
     test_decx();        /* v46/v47: DEC-X гейт верdict/relay-классов */
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
+    test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

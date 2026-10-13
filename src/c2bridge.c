@@ -15718,6 +15718,16 @@ static u32 g_k27_init, g_k27_on = 0, g_k27_seen, g_k27_fires;
 static u32 g_k27_wait;                /* v30: тики ожидания g_kfull/g_kcap на тек. 'A' */
 static u32 g_k27_form = 0;            /* v39: 0=blob 513B (легаси), 1=ascii connect0x%08x */
 static c2b_k27_A_t *g_k27_Ap;
+/* v47 K27K: 'k'-БЕЗ-ff×4 in-channel uplink — единственная непроверенная
+ * форма доставки тикета после 5x2047 (ff×4 = варинт-взрыв NET-фреймера:
+ * 0xffffffff -> кламп 2047 -> PARSE_ERROR) и тишины стрипнутого (run366:
+ * без опкода 'k' обработчик не вызывается). Форма = ['k'][96\0][proto]
+ * [chal-from-'A'][тикет] = 509B, UNRELIABLE (flags=0, run366-урок).
+ * Огонь = ПОСЛЕ успешного (rc==1) FORM-ответа на тот же 'A' — танец-
+ * первым, 'k'-следом. Cap 2/ран, общий death-stop, C2B_K27K=1 = арм. */
+static u32 g_k27k_init, g_k27k_on, g_k27k_fires;
+#define C2B_K27K_CAP 2
+#define C2B_K27K_MAX 660   /* синтез-хвост: 513B + запас */
 #define C2B_K27_CAP 6
 #define C2B_K27_WAIT_TICKS 600   /* v30: ~5 мин на 'A'; дальше — consumed+skip */
 
@@ -15733,6 +15743,10 @@ static void c2b_k27_maybe_fire(void)
         const char *e = getenv("C2B_K27A");
         if (e && e[0] == '0') g_k27_on = 0;
         else if (e && e[0] == '1') g_k27_on = 1;   /* v35: A/B реарм вручную */
+        {   /* v47: 'k'-без-ff×4 uplink (по умолчанию ВЫКЛ; C2B_K27K=1 = арм) */
+            const char *ek = getenv("C2B_K27K");
+            if (ek && ek[0] == '1') g_k27k_on = 1;
+        }
         {   /* v39: форма ответа на 'A'; v40: 2 = 'q'-твиновый qconnect0x<chal>;
              * v42: 3 = 11-цифровой val (echo-мимикрия run381) */
             const char *ef = getenv("C2B_K27FORM");
@@ -15924,6 +15938,85 @@ static void c2b_k27_maybe_fire(void)
             C2B_LOGS("\n");
         } else {
             C2B_LOGS("[c2b] k27: tk ok=0 (FUv-тикет ещё не захвачен)\n");
+        }
+        /* v47 K27K: 'k'-без-ff×4 ПОСЛЕ успешного FORM-ответа. Источник =
+         * свежий g_kfull (капчер движкового 'k' с РЕАЛЬНЫМ тикетом) либо
+         * синтез 17B-хедера + g_kcap-тикета (v30-механика). УНРЕЛАЙАБЛ
+         * (flags=0): reliable-lane = парсер-смерть (v28-урок), ff×4 =
+         * варинт-взрыв (2047), опкод 'k' сохранён = единственная непро-
+         * веренная середина. rc!=1 => общий death-stop (без исключений). */
+        if (g_k27k_on && rc27 == 1 && !g_krel_dead &&
+            g_k27k_fires < C2B_K27K_CAP) {
+            static u8 ksrc47[C2B_K27K_MAX];
+            static u8 kout47[C2B_K27K_MAX];
+            u32 ksrc_len47 = 0, kout_len47 = 0, n1_47, n2_47;
+            u32 use_full47 = 0;
+            i32 rck47 = -998;
+            n1_47 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+            if (n1_47 && g_kfull_len >= 17 && g_kfull_len <= 640) {
+                use_full47 = 1;
+            } else if (g_kcap_n && g_kcap_len >= 400 && g_kcap_len <= 640) {
+                static const u8 khdr47[13] = {
+                    0xff, 0xff, 0xff, 0xff, 'k',
+                    0x39, 0x36, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00
+                };
+                ksrc_len47 = 17u + g_kcap_len;
+                if (ksrc_len47 <= sizeof ksrc47) {
+                    for (z27 = 0; z27 < 13; z27++) ksrc47[z27] = khdr47[z27];
+                    for (z27 = 13; z27 < 17; z27++) ksrc47[z27] = 0;
+                    for (z27 = 0; z27 < g_kcap_len; z27++)
+                        ksrc47[17 + z27] = g_kcap[z27];
+                } else {
+                    ksrc_len47 = 0;
+                }
+            }
+            if (use_full47) {
+                u32 fl47 = g_kfull_len;
+                const volatile u8 *fp47 = g_kfull;
+                if (fl47 > sizeof ksrc47) fl47 = sizeof ksrc47;
+                for (z27 = 0; z27 < fl47; z27++) ksrc47[z27] = fp47[z27];
+                ksrc_len47 = fl47;
+                n2_47 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+                if (n2_47 != n1_47) ksrc_len47 = 0;   /* гонка — скип */
+            }
+            if (ksrc_len47 &&
+                c2b_k27k_build(ksrc47, ksrc_len47, chal,
+                               kout47, (u32)sizeof kout47, &kout_len47)) {
+                live27 = c2b_k24_brlive();
+                vt27 = *(void ***)g_gns_conn_iface;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    rck47 = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                                      i64 *))vt27[11])(
+                        g_gns_conn_iface, g_gns_conn_h, kout47, kout_len47,
+                        0 /* v47: UNRELIABLE = безопасный класс (run366) */,
+                        &out27);
+                    g_probe_active = 0;
+                } else {
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] k27k: send SEGV\n");
+                }
+                g_k27k_fires++;
+                C2B_LOGS("[c2b] k27k: noff4-send #");
+                C2B_LOGN(g_k27k_fires);
+                C2B_LOGS(" len=");
+                C2B_LOGN(kout_len47);
+                C2B_LOGS(" chal=");
+                C2B_LOGH(chal);
+                C2B_LOGS(" live=");
+                C2B_LOGN(live27);
+                C2B_LOGS(" tgt=");
+                C2B_LOGN((u32)g_gns_conn_h);
+                C2B_LOGS(" slot=11 fl=0 rc=");
+                C2B_LOGN((u32)(i32)rck47);
+                C2B_LOGS("\n");
+                if (rck47 != 1) {
+                    g_krel_dead = 1;
+                    C2B_LOGS("[c2b] k27k: rc!=1 — общий death-stop\n");
+                }
+            } else if (g_k27k_fires == 0) {
+                C2B_LOGS("[c2b] k27k: нет источника 'k' (g_kfull/g_kcap пусты) — скип\n");
+            }
         }
         if (rc27 != 1) {
             g_krel_dead = 1;
@@ -26351,14 +26444,18 @@ static void test_k27scan(void)
                             &val, 0) == 0, "k27: off=13 (за ff) = 0");
 }
 
-/* v46: DEC-X гейт (c2b_k27.h) — класс вердиктов/relay-голов. */
+/* v46/v47: DEC-X гейт (c2b_k27.h) — класс вердиктов/relay-голов. v47:
+ * пол 24->20 (49B-wire вердикт расшифровывается в ~23B; run386-поправка:
+ * класс = ПИНГ-СТАТУС, протобуф читается прямо на проводе). */
 static void test_decx(void)
 {
     CHECK(c2b_decx_want(28, 0x0f) == 1, "decx: 28B = верdict-класс (1)");
     CHECK(c2b_decx_want(45, 0x81) == 1, "decx: 45B = верdict-класс (2)");
-    CHECK(c2b_decx_want(24, 0x80) == 1, "decx: 24B нижняя граница");
+    CHECK(c2b_decx_want(24, 0x80) == 1, "decx: 24B внутри окна");
     CHECK(c2b_decx_want(72, 0x00) == 1, "decx: 72B верхняя граница");
-    CHECK(c2b_decx_want(23, 0x80) == 0, "decx: 23B ниже класса = 0");
+    CHECK(c2b_decx_want(23, 0x80) == 1, "decx: 23B = 49B-wire верdict (v47-пол)");
+    CHECK(c2b_decx_want(20, 0x0f) == 1, "decx: 20B нижняя граница (v47)");
+    CHECK(c2b_decx_want(19, 0x0f) == 0, "decx: 19B ниже окна = 0");
     CHECK(c2b_decx_want(73, 0x80) == 0, "decx: 73B выше класса = 0");
     CHECK(c2b_decx_want(7, 0x81) == 0, "decx: 7B keepalive = мимо");
     CHECK(c2b_decx_want(100, 0x80) == 0, "decx: 100B = мимо");
@@ -26369,6 +26466,48 @@ static void test_decx(void)
     CHECK(c2b_decx_want(9, 0x21) == 0, "decx: head 0x21 вне окна = 0");
     CHECK(c2b_decx_want(9, 0x26) == 0, "decx: head 0x26 вне окна = 0");
     CHECK(c2b_decx_want(0, 0x23) == 0, "decx: len=0 = мимо");
+}
+
+/* v47: k27k-сборщик — 'k' БЕЗ ff×4 (['k'][96\0][proto][chal][тикет]). */
+static void test_k27k(void)
+{
+    u8 kf[513], out[660];
+    u32 i, n = 0;
+    for (i = 0; i < sizeof kf; i++) kf[i] = 0;
+    kf[0] = 0xff; kf[1] = 0xff; kf[2] = 0xff; kf[3] = 0xff;
+    kf[4] = 'k';
+    kf[5] = 0x39; kf[6] = 0x36; kf[7] = 0x00;      /* '96\0' */
+    kf[8] = 0x00; kf[9] = 0x03;                     /* proto u16? = 03 */
+    kf[10] = 0x00; kf[11] = 0x00; kf[12] = 0x00;    /* пэд */
+    kf[13] = 0x22; kf[14] = 0x2e; kf[15] = 0xae; kf[16] = 0xf9; /* старый chal */
+    for (i = 17; i < sizeof kf; i++) kf[i] = (u8)(i & 0xff);  /* тикет-слот */
+    CHECK(c2b_k27k_build(kf, sizeof kf, 0x11223344, out,
+                         (u32)sizeof out, &n) == 1, "k27k: 513B строится");
+    CHECK(n == 509u, "k27k: 513B -> 509B");
+    CHECK(out[0] == 'k', "k27k: опкод 'k' первый (ff×4 снят)");
+    CHECK(out[1] == 0x39 && out[2] == 0x36 && out[3] == 0x00,
+          "k27k: ver '96\\0' сохранён");
+    CHECK(out[9] == 0x44 && out[10] == 0x33 && out[11] == 0x22 &&
+          out[12] == 0x11, "k27k: chal @9..12 = LE(0x11223344)");
+    CHECK(out[13] == (u8)(17 & 0xff) && out[507] == 0xff &&
+          out[508] == (u8)(512 & 0xff),
+          "k27k: тикет-слот скопирован 1:1 (голова+хвост)");
+    /* негативы */
+    CHECK(c2b_k27k_build(kf, 16, 0, out, sizeof out, &n) == 0,
+          "k27k: короткий 'k' = 0");
+    CHECK(c2b_k27k_build(kf, 1200, 0, out, sizeof out, &n) == 0,
+          "k27k: слишком большой = 0");
+    kf[4] = 'x';
+    CHECK(c2b_k27k_build(kf, sizeof kf, 0, out, sizeof out, &n) == 0,
+          "k27k: не-'k' опкод = 0");
+    kf[4] = 'k'; kf[0] = 0xfe;
+    CHECK(c2b_k27k_build(kf, sizeof kf, 0, out, sizeof out, &n) == 0,
+          "k27k: без ff×4-головы = 0");
+    kf[0] = 0xff;
+    CHECK(c2b_k27k_build(kf, sizeof kf, 0, out, 100, &n) == 0,
+          "k27k: узкий outcap = 0");
+    CHECK(c2b_k27k_build(0, sizeof kf, 0, out, sizeof out, &n) == 0,
+          "k27k: NULL-источник = 0");
 }
 
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
@@ -26477,7 +26616,8 @@ int main(void)
     test_g77fd();       /* v18: g77fd-форматтер sockaddr_in */
     test_krelpatch();   /* v19: krel-patchchal (chal в копии 'k') */
     test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
-    test_decx();        /* v46: DEC-X гейт верdict/relay-классов */
+    test_decx();        /* v46/v47: DEC-X гейт верdict/relay-классов */
+    test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR

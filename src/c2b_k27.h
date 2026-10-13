@@ -91,15 +91,57 @@ static inline int c2b_k27_scan_clv2(const unsigned char *p, unsigned n,
  * run383 code=0x9f01=159 (reject), run385 code=0x72=114 x2 @+22s) — на
  * проводе есть, в DEC32-логах НЕТ (rate-гейт first-64+every-8th пропустил
  * оба события; grep len=00000039/0000002d = только 'A'-кадры). Снифф =
- * pre-gate = точка 100%-захвата. Класс гейта: расшифрованный 24..72B
- * (wire 45B -> расшифрованный ~28B) ИЛИ голова 0x22..0x25 (relay-управле-
- * ние, in-session форма неизвестна = само наблюдение и есть цель). */
+ * pre-gate = точка 100%-захвата.
+ * v47-ПОПРАВКА (run386-pcap, 18:09-раунд): 49B-кадр = ТОТ ЖЕ класс, но
+ * ПРОТОБУФ ЧИТАЕТСЯ ПРЯМО НА ПРОВОДЕ (0a10 0a0e 080010001801200b 2872
+ * 3000 3800 = {inner{c=1,d=11},e=114,f=0,g=0} = ПИНГ-СТАТУС, НЕ reject;
+ * e=114/159 = RTT-оценка, 33B-кадры = {c=2} keepalive ~10.2s). Расшиф-
+ * рованная длина = wire - (заголовок+tag) ≈ 23B для 49B-wire => пол
+ * 24B ПРОПУСКАЛ класс. Окно: 20..72B (49-10-16=23; 46-10-16=20) ИЛИ
+ * голова 0x22..0x25. Эмпирика run386 DEC32: 'A' = 54B plaintext, 7B =
+ * SNP-keepalive (за полом = правильно, дедап-шум). */
 static inline int c2b_decx_want(unsigned int len, unsigned char c0)
 {
     if (len == 0u) return 0;
-    if (len >= 24u && len <= 72u) return 1;
+    if (len >= 20u && len <= 72u) return 1;
     if (c0 >= 0x22u && c0 <= 0x25u) return 1;
     return 0;
+}
+
+/* v47 K27K: чистый сборщик 'k'-БЕЗ-ff×4 (in-channel uplink, единственная
+ * непроверенная форма после 5 смертей 2047 + 1 тишины).
+ * РАЦИОНАЛ (run386, 18:09-раунд): (1) 0x24 PARSE_ERROR "2047" = варинт-
+ * взрыв: in-channel получатель = NET-фреймер, первый байт 0xff = варинт-
+ * размер -> кламп 2047 -> parse-error; ff×4-ASCII ('qconnect') терпим,
+ * ff×4-'k'-бинарный = смерть (365/368/369/370/373). (2) СТРИПНУТЫЙ 496B
+ * (run366, без ff×4 И без 'k'-заголовка) = тишина: нет опкода 'k' =
+ * подключечный обработчик не вызывается. (3) СЕРЕДИНА = НЕ ПРОВЕРЕНА:
+ * 'k'+ver+proto+chal+тикет БЕЗ ff×4 = опкод жив, варинт-взрыва нет.
+ * ФОРМА: g_kfull (513B: ff×4+'k'+'96\0'+00 03+00 00+chal@13+тикет)
+ * -> копия байтов [4..klen) = 509B, chal патчится на @9..12 (LE) в
+ * in-channel-'A'-chal. Отправка = unreliable (flags=0, run366-урок:
+ * reliable-lane = парсер; unreliable = безопасный класс). */
+static inline int c2b_k27k_build(const unsigned char *kfull, unsigned int klen,
+                                 unsigned int chal, unsigned char *out,
+                                 unsigned int outcap, unsigned int *outlen)
+{
+    unsigned int i;
+    if (!kfull || !out || !outlen) return 0;
+    if (klen < 32u || klen > 1100u) return 0;      /* разумный 'k' */
+    if (kfull[0] != 0xff || kfull[1] != 0xff ||
+        kfull[2] != 0xff || kfull[3] != 0xff) return 0;   /* нет connless */
+    if (kfull[4] != 'k') return 0;                 /* не 'k'-опкод */
+    if (outcap < klen - 4u) return 0;
+    for (i = 4u; i < klen; i++) out[i - 4u] = kfull[i];
+    *outlen = klen - 4u;
+    /* chal u32 LE @9 (= @13 в исходном минус 4) */
+    if (*outlen >= 13u) {
+        out[9] = (unsigned char)(chal & 0xff);
+        out[10] = (unsigned char)((chal >> 8) & 0xff);
+        out[11] = (unsigned char)((chal >> 16) & 0xff);
+        out[12] = (unsigned char)((chal >> 24) & 0xff);
+    }
+    return 1;
 }
 
 #endif /* C2B_K27_H */

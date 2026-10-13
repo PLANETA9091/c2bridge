@@ -921,13 +921,21 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # только send-класс nr — поток копеечный. Это замена умершего
       # perf (run406: probe failed all variants, stderr пуст).
       sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo "count == 512" > events/syscalls/sys_enter_write/filter; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable; echo 1 > tracing_on' 2>/dev/null || true
-      # kprobe: pt_regs = arg1 (%di) do_syscall_64; ip @ +128, orig_ax @ +120.
-      # v55e: сам факт регистрации = В ЛОГ (run407-урок: kprobe/filter
-      # могут молча не создаться — 2>/dev/null глотал всё).
-      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip do_syscall_64 rip=+128(+0(%di)):u64 nr=+120(+0(%di)):u64" >> kprobe_events 2>/dev/null; if [ -e events/kprobes/c2b_rip/enable ]; then echo "nr==1||nr==41||nr==44||nr==46||nr==307||nr==425" > events/kprobes/c2b_rip/filter 2>/dev/null; echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
+      # kprobe: pt_regs = arg1 (%rdi — 64-БИТНАЯ форма! run408: kprobe=NO
+      # с 16-битной %di = ядро молча отвергло) do_syscall_64;
+      # ip @ +128, orig_ax @ +120.
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo "p:c2b_rip do_syscall_64 rip=+128(+0(%rdi)):u64 nr=+120(+0(%rdi)):u64" >> kprobe_events 2>/dev/null; if [ -e events/kprobes/c2b_rip/enable ]; then echo "nr==1||nr==41||nr==44||nr==46||nr==307||nr==425" > events/kprobes/c2b_rip/filter 2>/dev/null; echo 1 > events/kprobes/c2b_rip/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
+      # v55f: net_dev_queue = ТОЧКА ОЧЕРЕДИ WIRE-ПАКЕТА (skb, len, dev):
+      # каждый пакет НА ПРОВОДЕ проходит здесь = фильтр len==512 = класс
+      # 0x22/0x20-512 = триггер stacktrace = ЯДЕРНАЯ цепочка отправителя
+      # (если пакет шлёт kernel-thread/kernel_sendmsg — имя названо;
+      # если userspace-syscall — стек = do_syscall_64-класс = бесполезен,
+      # но тогда ловит kprobe-rip). Дуал = замена умершего perf.
+      sudo -n sh -c 'cd /sys/kernel/tracing && if [ -d events/net/net_dev_queue ]; then echo "stacktrace if len == 512" > events/net/net_dev_queue/trigger 2>/dev/null; echo 1 > events/net/net_dev_queue/enable 2>/dev/null; echo 1 > tracing_on; fi' 2>/dev/null || true
       KPROBE_OK=$(sudo -n test -e /sys/kernel/tracing/events/kprobes/c2b_rip/enable && echo yes || echo NO)
+      NDQ_OK=$(sudo -n test -e /sys/kernel/tracing/events/net/net_dev_queue/enable && echo yes || echo NO)
       WFL=$(sudo -n cat /sys/kernel/tracing/events/syscalls/sys_enter_write/filter 2>/dev/null || echo unset)
-      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip/nr); kprobe=$KPROBE_OK write_filter=$WFL"
+      log "attempt $ATTEMPT: tracefs census ARMED (send-class + write[512] + io_uring + KPROBE rip/nr + NET_DEV_QUEUE stacktrace); kprobe=$KPROBE_OK ndq=$NDQ_OK write_filter=$WFL"
     else
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi
@@ -1238,7 +1246,7 @@ done
 if [[ "${TRACEFS_GAME:-0}" = "1" ]] && sudo -n test -d /sys/kernel/tracing/events/syscalls 2>/dev/null; then
   sudo -n sh -c 'echo 0 > /sys/kernel/tracing/tracing_on' 2>/dev/null || true
   sudo -n cat /sys/kernel/tracing/trace > "$RUNDIR/tracefs_send.log" 2>/dev/null || true
-  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_sendmmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable; echo 0 > events/syscalls/sys_enter_write/enable; echo 0 > events/syscalls/sys_enter_io_uring_enter/enable; echo 0 > events/syscalls/sys_enter_io_uring_setup/enable; echo 0 > events/kprobes/c2b_rip/enable; echo > events/syscalls/sys_enter_write/filter; echo -:c2b_rip >> kprobe_events' 2>/dev/null || true
+  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_sendmmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable; echo 0 > events/syscalls/sys_enter_write/enable; echo 0 > events/syscalls/sys_enter_io_uring_enter/enable; echo 0 > events/syscalls/sys_enter_io_uring_setup/enable; echo 0 > events/kprobes/c2b_rip/enable; echo > events/syscalls/sys_enter_write/filter; echo -:c2b_rip >> kprobe_events; echo > events/net/net_dev_queue/trigger 2>/dev/null; echo 0 > events/net/net_dev_queue/enable 2>/dev/null' 2>/dev/null || true
   log "tracefs send-census collected: $(wc -l < "$RUNDIR/tracefs_send.log" 2>/dev/null || echo 0) lines"
 fi
 

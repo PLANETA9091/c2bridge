@@ -905,8 +905,13 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # raw write() или io_uring; write = главный подозреваемый);
       # buffer 8192KB/CPU = write-класс горячий, дефолт-ринг выдавил
       # бы раннее окно 0x22 до коллекта.
-      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > tracing_on' 2>/dev/null || true
-      log "attempt $ATTEMPT: tracefs send+write census ARMED (ptrace-free, buf=8M)"
+      # v55c: + sendmmsg (НЕ ВКЛЮЧАЛСЯ НИ РАЗУ — гнс-батч-кандидат!)
+      # + io_uring_setup/enter (последний syscall-free send-путь).
+      # run405-урок: 0x22 = 40 фреймов на проводе при НУЛЕ sendto
+      # (0x200) / write (count 512 — формат ДЕСЯТИЧНЫЙ!) / send (0)
+      # / sendmsg (5 в окне) system-wide => sendmmsg или io_uring.
+      sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on; : > trace; echo nop > current_tracer; echo 8192 > buffer_size_kb; echo 1 > events/syscalls/sys_enter_sendto/enable; echo 1 > events/syscalls/sys_enter_sendmsg/enable; echo 1 > events/syscalls/sys_enter_sendmmsg/enable; echo 1 > events/syscalls/sys_enter_send/enable; echo 1 > events/syscalls/sys_enter_write/enable; echo 1 > events/syscalls/sys_enter_io_uring_enter/enable; echo 1 > events/syscalls/sys_enter_io_uring_setup/enable; echo 1 > tracing_on' 2>/dev/null || true
+      log "attempt $ATTEMPT: tracefs send+write+sendmmsg+io_uring census ARMED (ptrace-free, buf=8M)"
     else
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi
@@ -933,23 +938,39 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     fi
     if [[ -n "$PERF_BIN" ]]; then
       rm -f "$RUNDIR/perf_send.a${ATTEMPT}.data"
-      # v55b: + sys_enter_write (count == 512) — run404-урок: отправитель
-      # 0x22 = не sendto/sendmsg/send syscall вообще; write = главный
-      # класс-подозреваемый (raw write на коннектнутый :27005). RIP =
-      # адрес insn syscall/write = САЙТ; dwarf = цепочка вызывающих.
-      sudo -n "$PERF_BIN" record -q -o "$RUNDIR/perf_send.a${ATTEMPT}.data" \
-        -e syscalls:sys_enter_sendto -c 1 -g dwarf -I \
-        --filter 'len == 512' \
-        -e syscalls:sys_enter_write -c 1 -g dwarf -I \
-        --filter 'count == 512' -- sleep $((DURATION + 30)) >/dev/null 2>&1 &
-      PERF_PID=$!
-      # v55b-урок run404: перф молча умер = 0 сэмплов (заголовок 10KB).
-      # Через 2s проверяем живость — ранний выход = лог ПРЯМО В HARNESS.
-      sleep 2
-      if ! sudo -n kill -0 "$PERF_PID" 2>/dev/null; then
-        log "attempt $ATTEMPT: perf record EXITED early (flags/filter rejected by kernel — decode will be empty)"
+      PERF_OUT="$RUNDIR/perf_record.a${ATTEMPT}.err"
+      # v55c: КАСКАД ФЛАГОВ — run404/405: перф умирал молча (заголовок
+      # 10KB, 0 сэмплов); подозреваемый = -I/-g dwarf на трейспойнте.
+      # Проба 2s на вариант; первый живой = вооружаем; stderr пробы ->
+      # артефакт (perf_record.a*.err) = диагноз ВИДЕН.
+      PERF_FLAGS=""
+      for _pf in "-g dwarf -I" "-g dwarf" "-I" ""; do
+        rm -f "$RUNDIR/perf_send.a${ATTEMPT}.data"
+        if sudo -n "$PERF_BIN" record -q -o "$RUNDIR/perf_send.a${ATTEMPT}.data" \
+          -e syscalls:sys_enter_sendto -c 1 $_pf \
+          --filter 'len == 512' \
+          -e syscalls:sys_enter_sendmmsg -c 1 $_pf \
+          -e syscalls:sys_enter_write -c 1 $_pf \
+          --filter 'count == 512' -- sleep 2 >"$PERF_OUT" 2>&1; then
+          PERF_FLAGS="$_pf"; break
+        fi
+      done
+      if [[ -n "$PERF_FLAGS" ]]; then
+        sudo -n "$PERF_BIN" record -q -o "$RUNDIR/perf_send.a${ATTEMPT}.data" \
+          -e syscalls:sys_enter_sendto -c 1 $PERF_FLAGS \
+          --filter 'len == 512' \
+          -e syscalls:sys_enter_sendmmsg -c 1 $PERF_FLAGS \
+          -e syscalls:sys_enter_write -c 1 $PERF_FLAGS \
+          --filter 'count == 512' -- sleep $((DURATION + 30)) >/dev/null 2>&1 &
+        PERF_PID=$!
+        sleep 2
+        if ! sudo -n kill -0 "$PERF_PID" 2>/dev/null; then
+          log "attempt $ATTEMPT: perf record EXITED early (flags=[$PERF_FLAGS])"
+        fi
+        log "attempt $ATTEMPT: perf callchain ARMED (pid $PERF_PID, flags=[$PERF_FLAGS], sendto len=512 + sendmmsg + write count=512)"
+      else
+        log "attempt $ATTEMPT: perf PROBE FAILED all variants; err: $(tail -c 240 "$PERF_OUT" 2>/dev/null | tr '\n' ' ')"
       fi
-      log "attempt $ATTEMPT: perf callchain ARMED (pid $PERF_PID, sendto len=512 + write count=512, dwarf+regs, bin=$PERF_BIN)"
     else
       log "attempt $ATTEMPT: perf NOT available (callchain skipped)"
     fi
@@ -1198,7 +1219,7 @@ done
 if [[ "${TRACEFS_GAME:-0}" = "1" ]] && sudo -n test -d /sys/kernel/tracing/events/syscalls 2>/dev/null; then
   sudo -n sh -c 'echo 0 > /sys/kernel/tracing/tracing_on' 2>/dev/null || true
   sudo -n cat /sys/kernel/tracing/trace > "$RUNDIR/tracefs_send.log" 2>/dev/null || true
-  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable; echo 0 > events/syscalls/sys_enter_write/enable' 2>/dev/null || true
+  sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_sendmmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable; echo 0 > events/syscalls/sys_enter_write/enable; echo 0 > events/syscalls/sys_enter_io_uring_enter/enable; echo 0 > events/syscalls/sys_enter_io_uring_setup/enable' 2>/dev/null || true
   log "tracefs send-census collected: $(wc -l < "$RUNDIR/tracefs_send.log" 2>/dev/null || echo 0) lines"
 fi
 

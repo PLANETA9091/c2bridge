@@ -15470,6 +15470,9 @@ static void c2b_ss_scan_maps(void)
     i32 llen = 0;
     i64 r;
     u32 budget = C2B_SS_BUDGET, nsc = 0;
+    /* v55c: диагностика — почему chunks=0 в runs 400-405? Счётчики
+     * по классам регионов + сбой преада + сырая строка первого r-x. */
+    u32 nrx = 0, nexe = 0, neng = 0, nanon = 0, nfull = 0, npf = 0;
     extern i32 open(const char *, i32, ...);
     extern i64 read(i32, void *, u64);
     extern i32 close(i32);
@@ -15504,6 +15507,7 @@ static void c2b_ss_scan_maps(void)
                     if (line[k] == 'r' && line[k + 1u] == '-' &&
                         line[k + 2u] == 'x' && line[k + 3u] == 'p')
                         isrx = 1;
+                if (isrx) nrx++;
                 for (k = 0; k < (u32)llen; k++)
                     if (line[k] == '/') { hasslash = 1; break; }
                 /* v55: kind = 0 anon, 1 = гл. бинарь, 2 = engine_client */
@@ -15514,6 +15518,15 @@ static void c2b_ss_scan_maps(void)
                                         "engine_client"))
                         kind = 2;
                 }
+                if (isrx && nrx <= 2u && g_ss_scans == 0u) {
+                    /* сырая голова первых двух r-x строк = парс-пруф */
+                    char head[80];
+                    u32 hn = llen < 79u ? (u32)llen : 79u;
+                    memcpy(head, line, hn); head[hn] = 0;
+                    C2B_LOGS("[c2b] v55c: rx-line: ");
+                    C2B_LOGS(head);
+                    C2B_LOGS("\n");
+                }
                 if (isrx && (!hasslash || kind) && budget &&
                     c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
                     (hi - lo) <= C2B_SS_REGIONMAX) {
@@ -15522,6 +15535,9 @@ static void c2b_ss_scan_maps(void)
                         if (g_ss_seen[k] == (u64)lo) { dupe = 1; break; }
                     if (!dupe && g_ss_seen_n < 32u) {
                         u64 off;
+                        if (kind == 1) nexe++;
+                        else if (kind == 2) neng++;
+                        else nanon++;
                         g_ss_seen[g_ss_seen_n++] = (u64)lo;
                         for (off = 0; off < (u64)(hi - lo) &&
                                       budget > 0u; ) {
@@ -15531,7 +15547,7 @@ static void c2b_ss_scan_maps(void)
                                            (i64)(lo + off));
                             struct c2b_ss_hit hits[16];
                             u32 nh, h;
-                            if (rn <= 0) break;
+                            if (rn <= 0) { npf++; break; }
                             if ((u64)rn > (u64)budget)
                                 rn = (i64)budget;
                             budget -= (u32)rn;
@@ -15564,6 +15580,8 @@ static void c2b_ss_scan_maps(void)
                             off += (u64)rn;
                             nsc++;
                         }
+                    } else if (!dupe) {
+                        nfull++;
                     }
                 }
             }
@@ -15581,6 +15599,18 @@ static void c2b_ss_scan_maps(void)
     C2B_LOGN(budget);
     C2B_LOGS("stubs=");
     C2B_LOGN(g_ss_logn);
+    C2B_LOGS(" rx=");
+    C2B_LOGN(nrx);
+    C2B_LOGS(" exe=");
+    C2B_LOGN(nexe);
+    C2B_LOGS(" eng=");
+    C2B_LOGN(neng);
+    C2B_LOGS(" anon=");
+    C2B_LOGN(nanon);
+    C2B_LOGS(" seen32=");
+    C2B_LOGN(nfull);
+    C2B_LOGS(" pf=");
+    C2B_LOGN(npf);
     C2B_LOGS("\n");
 }
 

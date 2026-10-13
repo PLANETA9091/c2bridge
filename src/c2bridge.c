@@ -27745,8 +27745,19 @@ static void test_lddet(void)
                             &olen, &tlen) == 0u,
               "ldd: дальняя пара = 0");
     }
+/* v52: детур-exec гейт: gcc-asan/ubsan (__SANITIZE_*) + clang-asan/ubsan
+ * (__has_feature — только внутри clang-ветки; в gcc = не раскрывается) */
+#if defined(__clang__)
+#  if defined(__has_feature) && \
+      (__has_feature(address_sanitizer) || \
+       __has_feature(undefined_behavior_sanitizer))
+#    define C2B_LDD_NOEXEC 1
+#  endif
+#elif defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
+#  define C2B_LDD_NOEXEC 1
+#endif
 #if defined(__x86_64__) && !defined(C2B_ST_NO_DETOUR) && \
-    !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_UNDEFINED__)
+    !defined(C2B_LDD_NOEXEC)
     /* ---- СИНТЕТИЧЕСКИЙ end-to-end (реальный syscall через UDP) ----
      * pg+trx = ОДНА 8192-mmap (соседи ГАРАНТИРОВАННО: дистанция < 2ГБ =
      * контракт фиксапов; два отдельных mmap на раннере = разные арены =

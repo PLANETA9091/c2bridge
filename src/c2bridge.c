@@ -15003,7 +15003,15 @@ static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
  * have=<hex>' (дрифт-протокол g124), '[c2b] v52: install done armed=<n>'
  * (сводка). Установка = при ПЕРВОМ sendto-хуке (раньше = лучше: окно
  * гонки с живыми callers = минимально; house-прецедент живого патча =
- * g124-вотчер). Убийсвич = не задавать C2B_LIBCDET. */
+ * g124-вотчер). Убийсвич = не задавать C2B_LIBCDET.
+ *
+ * v56: ПЯТЫЙ детур = ОБЁРТКА syscall() (glibc, переменный nr) — послед-
+ * ний непокрытый libc-путь (v52 = 4 пролога = ZERO HITs при живых 0x22,
+ * v51 = не GOT/PLT, v55 = фиксированные стабы = zero). nr 44/1 = буфер-
+ * ная форма (зеркало dsendto/dwrite), 46 = gather (dsendmsg); прочие nr
+ * = 2 сравнения = чистый passthrough. Сигнатура детура = 7 long (арг7 =
+ * [rsp+8] — ff25 rsp НЕ двигает; трамп (mov 0x8(%rsp),%r9) читает тот
+ * же слот => addrlen проходит ОБА пути). Якорь = C2B_LDD_NR_VAR. */
 #if !defined(C2B_SELFTEST) && defined(__x86_64__)
 struct c2b_ldd_dlinfo { const char *dli_fname; void *dli_fbase;
                         const char *dli_sname; void *dli_saddr; };
@@ -15013,9 +15021,11 @@ static void *volatile g_ldd_tr_st;      /* tramp sendto */
 static void *volatile g_ldd_tr_sm;      /* tramp sendmsg */
 static void *volatile g_ldd_tr_sd;      /* tramp send   */
 static void *volatile g_ldd_tr_wr;      /* tramp write (v53) */
+static void *volatile g_ldd_tr_sc;      /* tramp syscall() (v56) */
 static u32 g_ldd_init, g_ldd_arm, g_ldd_hits, g_ldd_armed;
 static uptr g_ldd_lo, g_ldd_hi;         /* текст моста (ra-гвард) */
 typedef ssize_t (*c2b_ldd_sd_fn)(int, const void *, size_t, int);
+typedef long (*c2b_ldd_sc_fn)(long, long, long, long, long, long, long);
 
 static ssize_t c2b_ldd_dsendto(int fd, const void *buf, size_t len,
                                int flags, const struct sockaddr *addr,
@@ -15191,6 +15201,112 @@ static ssize_t c2b_ldd_dsendmsg(int fd, const struct c2b_msghdr *msg,
     return tr(fd, msg, flags);
 }
 
+/* v56: детур ОБЁРТКИ syscall() — raw syscall(__NR_sendto/sendmsg/write,
+ * ...) движка проходит ЗДЕСЬ, минуя 4 фиксированных пролога (v52 = zero
+ * HITs). nr переменный => 7-long сигнатура; a6 = [rsp+8] на входе (ff25
+ * rsp НЕ двигает) => трамп читает тот же слот. Capture = зеркальность
+ * dsendto/dwrite/dsendmsg (ra-гвард, HIT-лог, crt, подмена в вызов трам-
+ * па); прочие nr = passthrough. Ре-входа нет: трамп зовётся напрямую,
+ * логи = write-путь ('[' != 0x22 => passthrough dwrite). */
+static long c2b_ldd_dsyscall(long nr, long a1, long a2, long a3,
+                             long a4, long a5, long a6)
+{
+    c2b_ldd_sc_fn tr = (c2b_ldd_sc_fn)g_ldd_tr_sc;
+    if (!tr) { *__errno_location() = 2; return -1; }
+    if (nr == 44 || nr == 1) {
+        const u8 *p = (const u8 *)a2;
+        u64 len = (u64)a3;
+        if (p && len >= 40u && len <= 640u && p[0] == 0x22) {
+            uptr ra = (uptr)__builtin_return_address(0);
+            if (!g_ldd_lo || ra < g_ldd_lo || ra >= g_ldd_hi) {
+                u8 crtbuf[600];
+                u32 on;
+                if (g_ldd_hits < 12u) {
+                    g_ldd_hits++;
+                    C2B_LOGS("[c2b] v56: HIT syscall nr=");
+                    C2B_LOGN((u32)nr);
+                    C2B_LOGS(" len=");
+                    C2B_LOGN((u32)len);
+                    C2B_LOGS(" fd=");
+                    C2B_LOGN((u32)(a1 & 0xffffu));
+                    C2B_LOGS(" ra=");
+                    c2b_gp_lh64((unsigned long long)ra);
+                    C2B_LOGS("\n");
+                }
+                if (!g_crt_init) {
+                    const char *ec = getenv("C2B_CRTFIX");
+                    if (ec && ec[0] == '1') g_crt_fix = 1;
+                    g_crt_init = 1;
+                }
+                c2b_crt_maybe_capture(p, (u32)len);
+                on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
+                                           (u32)sizeof crtbuf);
+                if (on) return tr(nr, a1, (long)crtbuf, (long)on,
+                                  a4, a5, a6);
+            }
+        }
+    } else if (nr == 46) {
+        const struct c2b_msghdr *msg = (const struct c2b_msghdr *)a2;
+        if (msg && msg->msg_iov && msg->msg_iovlen >= 1 &&
+            msg->msg_iovlen <= 8 && msg->msg_iov[0].iov_base) {
+            /* gather-форма: конкат до 8 чанков, crt-класс на конкате,
+             * подмена iov -> tramp -> restore (v50d-паттерн) */
+            u8 cat[900];
+            u8 crtbuf[600];
+            u32 tot = 0, k, on;
+            uptr ra = (uptr)__builtin_return_address(0);
+            for (k = 0; k < (u32)msg->msg_iovlen; k++) {
+                u32 cl = (u32)msg->msg_iov[k].iov_len;
+                if (!msg->msg_iov[k].iov_base || cl > 640u) {
+                    tot = 0; break;
+                }
+                if (tot + cl > sizeof cat) { tot = 0; break; }
+                memcpy(cat + tot, msg->msg_iov[k].iov_base, cl);
+                tot += cl;
+            }
+            if (tot >= 40u && tot <= 640u && cat[0] == 0x22 &&
+                (!g_ldd_lo || ra < g_ldd_lo || ra >= g_ldd_hi)) {
+                if (g_ldd_hits < 12u) {
+                    g_ldd_hits++;
+                    C2B_LOGS("[c2b] v56: HIT syscall nr=46 tot=");
+                    C2B_LOGN(tot);
+                    C2B_LOGS(" fd=");
+                    C2B_LOGN((u32)(a1 & 0xffffu));
+                    C2B_LOGS(" ra=");
+                    c2b_gp_lh64((unsigned long long)ra);
+                    C2B_LOGS("\n");
+                }
+                if (!g_crt_init) {
+                    const char *ec = getenv("C2B_CRTFIX");
+                    if (ec && ec[0] == '1') g_crt_fix = 1;
+                    g_crt_init = 1;
+                }
+                c2b_crt_maybe_capture(cat, tot);
+                on = c2b_crt_maybe_rewrite(cat, tot, crtbuf,
+                                           (u32)sizeof crtbuf);
+                if (on) {
+                    struct c2b_iovec sv[8];
+                    u32 k2, n2 = (u32)msg->msg_iovlen;
+                    long r2;
+                    if (n2 > 8u) n2 = 8u;
+                    for (k2 = 0; k2 < n2; k2++)
+                        sv[k2] = msg->msg_iov[k2];
+                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_base =
+                        crtbuf;
+                    ((struct c2b_iovec *)msg->msg_iov)[0].iov_len = on;
+                    ((struct c2b_msghdr *)msg)->msg_iovlen = 1;
+                    r2 = tr(46, a1, a2, a3, 0, 0, 0);
+                    for (k2 = 0; k2 < n2; k2++)
+                        ((struct c2b_iovec *)msg->msg_iov)[k2] = sv[k2];
+                    ((struct c2b_msghdr *)msg)->msg_iovlen = n2;
+                    return r2;
+                }
+            }
+        }
+    }
+    return tr(nr, a1, a2, a3, a4, a5, a6);
+}
+
 /* установка одного детура: имя, nr якоря, tramp-глобал, детур-фн. */
 static void c2b_ldd_install1(const char *name, u32 nr,
                              void *volatile *trslot, void *detour)
@@ -15359,6 +15475,8 @@ static void c2b_ldd_maybe(void)
                      (void *)&c2b_ldd_dsend);
     c2b_ldd_install1("write", 1u, &g_ldd_tr_wr,
                      (void *)&c2b_ldd_dwrite);
+    c2b_ldd_install1("syscall", C2B_LDD_NR_VAR, &g_ldd_tr_sc,
+                     (void *)&c2b_ldd_dsyscall);
     C2B_LOGS("[c2b] v52: install done armed=");
     C2B_LOGN(g_ldd_armed);
     C2B_LOGS("\n");
@@ -27940,6 +28058,18 @@ static const u8 tldd_g241_sd[] = {
     0x48,0x83,0xec,0x10, 0x48,0x63,0xc9, 0x48,0x63,0xff,
     0x45,0x31,0xc9, 0x6a,0x2c, 0x45,0x31,0xc0,
     0xe8,0x49,0xd4,0xf7,0xff, 0x48,0x83,0xc4,0x18, 0xc3 };
+/* v56: ОБЁРТКА syscall() glibc 2.39 (дизасм @0x127510, байт-точно):
+ * окно 16B = endbr64 + mov rdi,rax + mov rsi,rdi + mov rdx,rsi + mov
+ * rcx,rdx (все copy-класс, riprel НЕТ); хвост = r8->r10 | r9->r8 | mov
+ * 0x8(%rsp),r9 | syscall | cmp -4095 | jae | ret | errno-путь (riprel
+ * ТОЛЬКО в хвосте — исполняется jmp-back'ом, в трамп не попадает). */
+static const u8 tldd_g239_sc[] = {
+    0xf3,0x0f,0x1e,0xfa, 0x48,0x89,0xf8, 0x48,0x89,0xf7,
+    0x48,0x89,0xd6, 0x48,0x89,0xca,
+    0x4d,0x89,0xc2, 0x4d,0x89,0xc8, 0x4c,0x8b,0x4c,0x24,0x08,
+    0x0f,0x05, 0x48,0x3d,0x01,0xf0,0xff,0xff, 0x73,0x01, 0xc3,
+    0x48,0x8b,0x0d,0xbb,0xc8,0x0d,0x00,
+    0xf7,0xd8, 0x64,0x89,0x01, 0x48,0x83,0xc8,0xff, 0xc3 };
 
 static void tldd_run(const char *nm, const u8 *c, u32 cl, u32 nr,
                      u32 want)
@@ -27969,6 +28099,22 @@ static long tldd_detour(int fd, const void *buf, unsigned long len,
     return tr(fd, buf, len, flags, addr, alen);
 }
 
+/* v56: 7-арговый детур для синтетики syscall()-формы: nr + a6 (стек-
+ * арг [rsp+8]) фиксируются = доказательство прохождения СТЕКОВОГО
+ * аргумента через ff25-детур И трамп (mov 0x8(%rsp),%r9). */
+static u32 g_tldd_sc_hit;
+static long g_tldd_sc_nr, g_tldd_sc_a6;
+typedef long (*tldd_sc_fn)(long, long, long, long, long, long, long);
+static long tldd_scdetour(long nr, long a1, long a2, long a3,
+                          long a4, long a5, long a6)
+{
+    tldd_sc_fn tr = (tldd_sc_fn)g_tldd_tramp;
+    g_tldd_sc_hit++;
+    g_tldd_sc_nr = nr;
+    g_tldd_sc_a6 = a6;
+    return tr(nr, a1, a2, a3, a4, a5, a6);
+}
+
 static void test_lddet(void)
 {
     printf("[t] lddet v52 (prologue detour)\n");
@@ -27982,6 +28128,9 @@ static void test_lddet(void)
     tldd_run("2.41 sendto", tldd_g241_st, sizeof tldd_g241_st, 44u, 15u);
     tldd_run("2.41 send",   tldd_g241_sd, sizeof tldd_g241_sd, 44u, 15u);
     tldd_run("2.41 sendmsg",tldd_g241_sm, sizeof tldd_g241_sm, 46u, 15u);
+    /* ---- v56: VARIABLE-NR якорь (обёртка syscall()) ---- */
+    tldd_run("2.39 syscall",tldd_g239_sc, sizeof tldd_g239_sc,
+             C2B_LDD_NR_VAR, 16u);
     /* ---- фиксапы байт-точно (2.39) ---- */
     {
         u8 tr[C2B_LDD_MAXTRAMP];
@@ -28049,6 +28198,20 @@ static void test_lddet(void)
                             0x7f8000000000ull, 44u,
                             &olen, &tlen) == 0u,
               "ldd: дальняя пара = 0");
+        /* v56: VAR-якорь негативы */
+        CHECK(c2b_ldd_build(tldd_g239_sc, sizeof tldd_g239_sc,
+                            0x7f0000001000ull, btr, 0, 44u,
+                            &olen, &tlen) == 0u,
+              "ldd: syscall-форма с фиксированным nr = 0");
+        CHECK(c2b_ldd_build(bad, sizeof bad, 0x7f0000001000ull, btr, 0,
+                            C2B_LDD_NR_VAR, &olen, &tlen) == 0u,
+              "ldd: VAR без якоря = 0");
+        bad[0] = 0xf3; bad[1] = 0x0f; bad[2] = 0x1e; bad[3] = 0xfa;
+        bad[4] = 0x31; bad[5] = 0xc0; bad[6] = 0x90; bad[7] = 0x90;
+        bad[8] = 0x0f; bad[9] = 0x05;
+        CHECK(c2b_ldd_build(bad, sizeof bad, 0x7f0000001000ull, btr, 0,
+                            C2B_LDD_NR_VAR, &olen, &tlen) == 0u,
+              "ldd: VAR без mov rdi,rax в первых 8B = 0");
     }
 /* v52: детур-exec гейт: gcc-asan/ubsan (__SANITIZE_*) + clang-asan/ubsan
  * (__has_feature — только внутри clang-ветки; в gcc = не раскрывается) */
@@ -28176,6 +28339,79 @@ static void test_lddet(void)
         memcpy(pg, saved, 24);          /* рестор сайта (дисциплина) */
         munmap(pg, 8192);
 #undef TLDL_HTONS
+    }
+    /* ---- v56: СИНТЕТИЧЕСКИЙ end-to-end syscall()-формы (7 аргов) ----
+     * РЕАЛЬНЫЕ байты 2.39 syscall() на RWX-странице; ff25-детур = 7-long
+     * сигнатура; вызов с 7 аргами (7-й = СТЕКОВЫЙ [rsp+8]) => детур видит
+     * nr/a6, трамп (stolen 16B) + jmp-back (mov %r8,%r10 | mov %r9,%r8 |
+     * mov 0x8(%rsp),%r9 | syscall) доводит ДО реального syscall: дейтаг-
+     * рамма на проводе = ПОЛНАЯ цепочка (включая стековый addrlen). Errno-
+     * хвост (riprel) НЕ исполняется (rv>=0 = fast-путь). */
+    {
+        u8 *pg = (u8 *)mmap(0, 8192, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        u8 *trx = pg + 4096;
+        unsigned int olen = 0, tlen = 0, q;
+        u8 site[14], saved[24];
+        unsigned long long det;
+        int sfd, rfd, r;
+        struct sockaddr sa, ra;
+        socklen_t slen;
+        u8 snd[24], rcv[64];
+        extern int socket(int, int, int);
+        extern int bind(int, const struct sockaddr *, socklen_t);
+        extern int connect(int, const struct sockaddr *, socklen_t);
+        CHECK(pg != (u8 *)-1, "v56: RWX-страницы");
+        if (pg == (u8 *)-1) return;
+        memset(pg, 0x90, 8192);
+        memcpy(pg, tldd_g239_sc, sizeof tldd_g239_sc);
+        CHECK(c2b_ldd_build(pg, 64u, (unsigned long long)(uptr)pg,
+                            trx, (unsigned long long)(uptr)trx,
+                            C2B_LDD_NR_VAR, &olen, &tlen) == 16u,
+              "v56: синтетика build=16");
+        if (olen != 16u) { munmap(pg, 8192); return; }
+        memcpy(saved, pg, 24);
+        site[0] = 0xff; site[1] = 0x25;
+        site[2] = 0; site[3] = 0; site[4] = 0; site[5] = 0;
+        det = (unsigned long long)(uptr)&tldd_scdetour;
+        for (q = 0; q < 8u; q++)
+            site[6u + q] = (u8)((det >> (8 * q)) & 0xffu);
+        g_tldd_tramp = (void *)trx;
+        memcpy(pg, site, 14);
+        pg[14] = 0x90; pg[15] = 0x90;   /* nop до края окна 16 */
+        sfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+        rfd = socket(2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+        CHECK(sfd >= 0 && rfd >= 0, "v56: udp-сокеты");
+        memset(&ra, 0, sizeof ra);
+        ra.sa_family = C2B_AF_INET;
+        ra.sa_data[0] = (char)0; ra.sa_data[1] = (char)0;  /* порт = 0 */
+        ra.sa_data[2] = (char)127; ra.sa_data[3] = (char)0;
+        ra.sa_data[4] = (char)0; ra.sa_data[5] = (char)1;
+        r = bind(rfd, &ra, (socklen_t)sizeof ra);
+        CHECK(r == 0, "v56: bind rx");
+        slen = (socklen_t)sizeof ra;
+        r = getsockname(rfd, &ra, &slen);
+        CHECK(r == 0, "v56: getsockname rx (порт получен)");
+        r = connect(sfd, &ra, (socklen_t)sizeof ra);
+        CHECK(r == 0, "v56: connect tx");
+        for (q = 0; q < sizeof snd; q++) snd[q] = (u8)(0x30 + q);
+        g_tldd_sc_hit = 0; g_tldd_sc_nr = -1; g_tldd_sc_a6 = -1;
+        r = (int)((tldd_sc_fn)(uptr)pg)(
+            44L, (long)sfd, (long)(uptr)snd, (long)sizeof snd,
+            0L, (long)(uptr)&ra, (long)sizeof ra);
+        CHECK(r == (int)sizeof snd, "v56: rv = число байт");
+        CHECK(g_tldd_sc_hit == 1, "v56: детур видел вызов");
+        CHECK(g_tldd_sc_nr == 44, "v56: nr = 44 (детур)");
+        CHECK(g_tldd_sc_a6 == (long)sizeof ra,
+              "v56: стек-арг a6 прошёл детур+трамп");
+        memset(rcv, 0, sizeof rcv);
+        slen = (socklen_t)sizeof sa;
+        r = (int)recvfrom(rfd, rcv, sizeof rcv, 0, &sa, &slen);
+        CHECK(r == (int)sizeof snd && memcmp(rcv, snd, sizeof snd) == 0,
+              "v56: дейтаграмма через трамп+jmp-back+syscall");
+        close(sfd); close(rfd);
+        memcpy(pg, saved, 24);          /* рестор сайта (дисциплина) */
+        munmap(pg, 8192);
     }
 #else
     printf("[i] lddet exec skipped: self-modifying under sanitizers\n");

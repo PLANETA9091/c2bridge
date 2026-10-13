@@ -59,7 +59,21 @@
  * в c2b_crt_build; (г) HIT'ов ноль, а 0x22 движка на проводе ЕСТЬ =>
  * отправитель = syscall-стаб в анонимной r-x памяти => v53 = скан ано-
  * нимных r-x регионов на '0f 05' с nr=44/46 (pread-прогулка v51 = инст-
- * румент готов). */
+ * румент готов).
+ *
+ * v56 (run411, ledger 01:09): elimination-matrix расширилась — v52 = не
+ * прологи libc (ARMED 4/4, ZERO HITs), v51 = не GOT/PLT, v55 = не
+ * фиксированные стабы (реальный скан = zero в exe/eng/anon), tracefs =
+ * отправитель = raw sys_sendto. Оставшийся libc-путь = ОБЁРТКА syscall
+ * (__NR_sendto, ...) — переменный nr => якорь b8/6a НЕ примет. Новый
+ * якорь C2B_LDD_NR_VAR: '48 89 f8' (mov %rdi,%rax = ЗАГРУЗКА перемен-
+ * ного nr) в первых 8 байтах + '0f 05' в первых 64. Форма glibc 2.39
+ * (дизасм @0x127510): endbr64 | mov rdi,rax | mov rsi,rdi | mov rdx,rsi
+ * | mov rcx,rdx = ОКНО 16B (все copy-класс, riprel НЕТ) | r8->r10 |
+ * r9->r8 | mov 0x8(%rsp),r9 | syscall | cmp -4095 | jae | ret | errno-
+ * хвост (riprel ТОЛЬКО в хвосте = исполняется jmp-back'ом). Детур = 7
+ * long (арг7 = [rsp+8]: ff25 rsp НЕ двигает, трамп читает тот же слот
+ * => addrlen проходит ОБА пути). */
 #ifndef C2B_LDD_H
 #define C2B_LDD_H
 
@@ -73,6 +87,9 @@
  * (CI-урок: mmap'ы на раннере = НЕ соседи; дальняя пара = усечённый disp
  * = дикий riprel-рид = SIGSEGV @первом исполнении трампа) */
 #define C2B_LDD_MAXDIST   0x70000000ull
+/* v56: сентинел nr для VARIABLE-NR цели (обёртка libc syscall()): якорь
+ * = '48 89 f8' в первых 8B + '0f 05' в первых 64B (см. шапку) */
+#define C2B_LDD_NR_VAR    0xffffu
 
 /* класс инструкции */
 #define C2B_LDD_C_COPY   0u     /* копия вербатим */
@@ -250,19 +267,37 @@ static inline unsigned int c2b_ldd_build(const unsigned char *tgt,
     }
     /* ЯКОРЬ идентичности: 'b8 <nr> 00 00 00 0f 05' (inline-syscall форма,
      * glibc 2.35/2.39) ИЛИ '6a <nr>' (push-nr обёртка, glibc 2.41) в пер-
-     * вых 64 байтах. */
+     * вых 64 байтах. v56: nr == C2B_LDD_NR_VAR = VARIABLE-NR цель (обёрт-
+     * ка syscall()): '48 89 f8' (mov %rdi,%rax) в первых 8B + '0f 05' в
+     * первых 64B. */
     {
         unsigned int lim = n < 64u ? n : 64u, found = 0u;
-        for (i = 0u; i + 7u <= lim; i++) {
-            if (tgt[i] == 0xb8u && tgt[i + 1u] == (unsigned char)nr &&
-                tgt[i + 2u] == 0u && tgt[i + 3u] == 0u &&
-                tgt[i + 4u] == 0u && tgt[i + 5u] == 0x0fu &&
-                tgt[i + 6u] == 0x05u) { found = 1u; break; }
-        }
-        if (!found) {
-            for (i = 0u; i + 2u <= lim; i++) {
-                if (tgt[i] == 0x6au && tgt[i + 1u] == (unsigned char)nr) {
-                    found = 1u; break;
+        if (nr == C2B_LDD_NR_VAR) {
+            for (i = 0u; i + 3u <= 8u && i + 3u <= lim; i++) {
+                if (tgt[i] == 0x48u && tgt[i + 1u] == 0x89u &&
+                    tgt[i + 2u] == 0xf8u) { found = 1u; break; }
+            }
+            if (found) {
+                found = 0u;
+                for (i = 0u; i + 2u <= lim; i++) {
+                    if (tgt[i] == 0x0fu && tgt[i + 1u] == 0x05u) {
+                        found = 1u; break;
+                    }
+                }
+            }
+        } else {
+            for (i = 0u; i + 7u <= lim; i++) {
+                if (tgt[i] == 0xb8u && tgt[i + 1u] == (unsigned char)nr &&
+                    tgt[i + 2u] == 0u && tgt[i + 3u] == 0u &&
+                    tgt[i + 4u] == 0u && tgt[i + 5u] == 0x0fu &&
+                    tgt[i + 6u] == 0x05u) { found = 1u; break; }
+            }
+            if (!found) {
+                for (i = 0u; i + 2u <= lim; i++) {
+                    if (tgt[i] == 0x6au &&
+                        tgt[i + 1u] == (unsigned char)nr) {
+                        found = 1u; break;
+                    }
                 }
             }
         }

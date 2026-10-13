@@ -15670,10 +15670,12 @@ static void c2b_k27_maybe_fire(void)
         const char *e = getenv("C2B_K27A");
         if (e && e[0] == '0') g_k27_on = 0;
         else if (e && e[0] == '1') g_k27_on = 1;   /* v35: A/B реарм вручную */
-        {   /* v39: форма ответа на 'A'; v40: 2 = 'q'-твиновый qconnect0x<chal> */
+        {   /* v39: форма ответа на 'A'; v40: 2 = 'q'-твиновый qconnect0x<chal>;
+             * v42: 3 = 11-цифровой val (echo-мимикрия run381) */
             const char *ef = getenv("C2B_K27FORM");
             if (ef && ef[0] == '1') g_k27_form = 1;
             else if (ef && ef[0] == '2') g_k27_form = 2;
+            else if (ef && ef[0] == '3') g_k27_form = 3;
         }
         g_k27_init = 1;
     }
@@ -15730,19 +15732,32 @@ static void c2b_k27_maybe_fire(void)
         kcopy27[0] = 0xff; kcopy27[1] = 0xff;
         kcopy27[2] = 0xff; kcopy27[3] = 0xff;
         if (form27 == 2) {
-            /* v41 (run379-вердикт, ветвь (b)): сервер ОТВЕТИЛ на post-'A'
-             * qconnect(chal=0) ВТОРОЙ 'A' (DEC32 n=2, msg_num=2) = РЕ-ЧЕЛЛЕНДж
-             * => значение в строке НЕПРАВИЛЬНОЕ: chal-поле 'A' = 0 = unused,
-             * РЕАЛЬНЫЙ challenge = VAL (0x00ee0a07 = relay-session challenge,
-             * теория v32; байты '07 0a ee 00' в DEC32 'A' @0x14). v40 (chal)
-             * vs v41 (val) = единственный живой дискриминатор string-пути.
-             * 'q'-твин = ff×4 + "qconnect0x<VAL>\0" = 23B (г76-форма) */
+            /* v41: 'q'-твин 8-цифровой = ff×4 + "qconnect0x%08x\0" = 23B.
+             * run380 (val=0 из-за сниффер-бага) = ручной повтор v40 -> ре-чел-
+             * лендж 'A' #2. run381 (val=0x00ee0a07, v41b-сниффер): сервер
+             * ОТВЕТИЛ 'A' #2 С ДРУГИМ echo — "connect0x00000ee0a07" (11 hex
+             * = low-44 бита u64-челленджа @15: 07 0a ee 00 00 00 00 30 =
+             * 0x3000000000ee0a07) ВМЕСТО "connect0x00000000" = сервер ПРИНЯЛ
+             * наш val в переговоры! Формат echo = %011x. */
             kcopy27[4] = 'q';
             memcpy(kcopy27 + 5, "connect0x", 9);
             for (z27 = 0; z27 < 8; z27++)
                 kcopy27[14 + z27] = hx39[(val >> (28 - z27 * 4)) & 0xf];
             kcopy27[22] = 0;
             kn27 = 23;
+        } else if (form27 == 3) {
+            /* v42 (run381-вердикт): ЭХО-МИМИКРИЯ — сервер сам показал форму:
+             * 'A' #2 echo = "connect0x00000ee0a07" = "connect0x" + %011x(val).
+             * FORM=3 = ff×4 + "qconnect0x" + 11 hex(val) + NUL = 4+1+9+11+1
+             * = 26B, reliable, slot 11 — точный ответ в формате сервера.
+             * Если echo-команда = то, что сервер ждёт назад (аналог win-пути
+             * движка: строка 'A' -> 0x4b9=1), переговоры замкнутся. */
+            kcopy27[4] = 'q';
+            memcpy(kcopy27 + 5, "connect0x", 9);
+            for (z27 = 0; z27 < 11; z27++)
+                kcopy27[14 + z27] = hx39[(val >> (40 - z27 * 4)) & 0xf];
+            kcopy27[25] = 0;
+            kn27 = 26;
         } else {
             /* v39: ascii = ff×4 + "connect0x%08x\0" = 22B */
             memcpy(kcopy27 + 4, "connect0x", 9);
@@ -15770,13 +15785,16 @@ static void c2b_k27_maybe_fire(void)
             return;
         }
         C2B_LOGS(form27 == 2 ? "[c2b] k27: A-fire form=qconnect-val #"
-                             : "[c2b] k27: A-fire form=ascii #");
+                             : (form27 == 3 ? "[c2b] k27: A-fire form=qconnect-val11 #"
+                                            : "[c2b] k27: A-fire form=ascii #"));
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
         C2B_LOGS(" val=");
         C2B_LOGH(val);
-        C2B_LOGS(form27 == 2 ? " len=23 fl=1 live=" : " len=22 fl=1 live=");
+        C2B_LOGS(form27 == 2 ? " len=23 fl=1 live="
+                             : (form27 == 3 ? " len=26 fl=1 live="
+                                            : " len=22 fl=1 live="));
         C2B_LOGN(live27);
         C2B_LOGS(" tgt=");
         C2B_LOGN((u32)g_gns_conn_h);

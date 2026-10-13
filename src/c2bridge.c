@@ -15653,6 +15653,7 @@ static u32 c2b_k24_brlive(void)
  * не стреляем. C2B_K27A=1 = реармить вручную. */
 static u32 g_k27_init, g_k27_on = 0, g_k27_seen, g_k27_fires;
 static u32 g_k27_wait;                /* v30: тики ожидания g_kfull/g_kcap на тек. 'A' */
+static u32 g_k27_form = 0;            /* v39: 0=blob 513B (легаси), 1=ascii connect0x%08x */
 static c2b_k27_A_t *g_k27_Ap;
 #define C2B_K27_CAP 6
 #define C2B_K27_WAIT_TICKS 600   /* v30: ~5 мин на 'A'; дальше — consumed+skip */
@@ -15668,6 +15669,10 @@ static void c2b_k27_maybe_fire(void)
         const char *e = getenv("C2B_K27A");
         if (e && e[0] == '0') g_k27_on = 0;
         else if (e && e[0] == '1') g_k27_on = 1;   /* v35: A/B реарм вручную */
+        {   /* v39: форма ответа на 'A' */
+            const char *ef = getenv("C2B_K27FORM");
+            if (ef && ef[0] == '1') g_k27_form = 1;
+        }
         g_k27_init = 1;
     }
     if (!g_k27_on) return;
@@ -15695,6 +15700,61 @@ static void c2b_k27_maybe_fire(void)
     if (!g_gns_conn_iface || !g_gns_conn_h) return;
     if (g_k27_fires >= C2B_K27_CAP) { g_k27_seen = s1; return; }
     if (g_krel_dead) { g_k27_seen = s1; return; }  /* общий death-stop */
+    /* v39 (run230/376-реконсиляция): FORM=ascii — ответ на 'A' формой
+     * ff×4+"connect0x%08x\0" (22B). Основания: (1) 'A' run376 несёт
+     * echo-хвост "connect0x00000000" = имя ожидаемой команды ответа;
+     * (2) единственный ОТВЕЧЕННЫЙ in-channel посыл за всю историю =
+     * g76-близнец "qconnect0x%08x\0" reliable (run230: 77B-реплай
+     * +172ms; run376: rc=1 + 'A' @t+68 на живой сессии); (3) blob-'k'
+     * 513B = 5 смертей 2047 (365/368/369/370/373), в т.ч. ПО ПОРЯДКУ
+     * танца (run365: 'A' @20.81 -> fire @21.18 -> 2047). chal = поле из
+     * 'A' (run376: 0). reliable=1 = как у g76. Слот 11 (v26).
+     * C2B_K27A=1 + C2B_K27FORM=1 = арм. Тикет не нужен: SDR-auth УЖЕ
+     * доставлен на слое ConnectRequest (cert+crypt = 0x23 ConnectOK). */
+    if (g_k27_form) {
+        static const char hx39[] = "0123456789abcdef";
+        kcopy27[0] = 0xff; kcopy27[1] = 0xff;
+        kcopy27[2] = 0xff; kcopy27[3] = 0xff;
+        memcpy(kcopy27 + 4, "connect0x", 9);
+        for (z27 = 0; z27 < 8; z27++)
+            kcopy27[13 + z27] = hx39[(chal >> (28 - z27 * 4)) & 0xf];
+        kcopy27[21] = 0;
+        kn27 = 22;
+        g_k27_seen = s1;               /* consume 'A' при состоявшемся выстреле */
+        g_k27_wait = 0;
+        g_k27_fires++;
+        live27 = c2b_k24_brlive();     /* тот же тред — вложений нет */
+        vt27 = *(void ***)g_gns_conn_iface;
+        rc27 = -999;
+        out27 = -1;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc27 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt27[11])(
+                g_gns_conn_iface, g_gns_conn_h, kcopy27, kn27,
+                1 /* reliable = как g76-run230-ответленный */, &out27);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] k27: ascii send SEGV\n");
+            return;
+        }
+        C2B_LOGS("[c2b] k27: A-fire form=ascii #");
+        C2B_LOGN(g_k27_fires);
+        C2B_LOGS(" chal=");
+        C2B_LOGH(chal);
+        C2B_LOGS(" len=22 fl=1 live=");
+        C2B_LOGN(live27);
+        C2B_LOGS(" tgt=");
+        C2B_LOGN((u32)g_gns_conn_h);
+        C2B_LOGS(" slot=11 rc=");
+        C2B_LOGN((u32)(i32)rc27);
+        C2B_LOGS("\n");
+        if (rc27 != 1) {
+            g_krel_dead = 1;
+            C2B_LOGS("[c2b] k27: ascii rc!=1 — общий death-stop\n");
+        }
+        return;
+    }
     {
         u32 synth30 = 0;
         if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) {

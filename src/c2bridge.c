@@ -15551,7 +15551,8 @@ static i32 c2b_ss_sub(const char *s, u32 n, const char *t)
     return 0;
 }
 
-/* pure-ядро: стабы в чанке. Возврат = число находок (<= cap). */
+/* pure-ядро: стабы в чанке. Возврат = число находок (<= cap).
+ * v57: '?'-класс = nr 0xffff (маркер переменного nr, = C2B_LDD_NR_VAR). */
 static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
                              u32 cap)
 {
@@ -15573,6 +15574,32 @@ static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
             out[k].off = i; out[k].nr = (u32)p[i + 3u]; k++;
         }
     }
+    /* v57: '?-КЛАСС' — переменный nr: '0f 05' с mov-to-eax СРАЗУ перед
+     * ([i-2..i-1]) или через 1-байтовый наполнитель ([i-3..i-1], 0x90).
+     * 89 <mod=3,rm=0> = mov eax,r32 (89 c8 = mov %ecx,%eax; 89 f8 =
+     * mov %edi,%eax); 8b <mod=3,reg=0> = mov eax,r32 (8b c7 = mov
+     * %edi,%eax). REX-ОТСЕЧЕНИЕ: байт [i-3] (= [i-4] для наполнителя)
+     * 40-4f = предыдущая инструкция РЕКС-нута (48 89 f8 = mov %rdi,%rax
+     * = форма glibc syscall(), НЕ 32-битный mov eax,edi) = ОТКАЗ.
+     * off = позиция syscall (0f 05), nr = 0xffff. */
+    for (i = 2u; i + 2u <= n && k < cap; i++) {
+        if (p[i] != 0x0fu || p[i + 1u] != 0x05u) continue;
+        if (i >= 3u && (p[i - 3u] & 0xf0u) == 0x40u) continue;
+        if (p[i - 2u] == 0x89u && (p[i - 1u] & 0xc7u) == 0xc0u) {
+            out[k].off = i; out[k].nr = 0xffffu; k++;
+        } else if (p[i - 2u] == 0x8bu &&
+                   (p[i - 1u] & 0xf8u) == 0xc0u) {
+            out[k].off = i; out[k].nr = 0xffffu; k++;
+        } else if (i >= 3u && p[i - 1u] == 0x90u &&
+                   !(i >= 4u && (p[i - 4u] & 0xf0u) == 0x40u)) {
+            if (p[i - 3u] == 0x89u && (p[i - 2u] & 0xc7u) == 0xc0u) {
+                out[k].off = i; out[k].nr = 0xffffu; k++;
+            } else if (p[i - 3u] == 0x8bu &&
+                       (p[i - 2u] & 0xf8u) == 0xc0u) {
+                out[k].off = i; out[k].nr = 0xffffu; k++;
+            }
+        }
+    }
     return k;
 }
 
@@ -15591,6 +15618,7 @@ static void c2b_ss_scan_maps(void)
     /* v55c: диагностика — почему chunks=0 в runs 400-405? Счётчики
      * по классам регионов + сбой преада + сырая строка первого r-x. */
     u32 nrx = 0, nexe = 0, neng = 0, nanon = 0, nfull = 0, npf = 0;
+    u32 nmemfd = 0;
     extern i32 open(const char *, i32, ...);
     extern i64 read(i32, void *, u64);
     extern i32 close(i32);
@@ -15628,13 +15656,18 @@ static void c2b_ss_scan_maps(void)
                 if (isrx) nrx++;
                 for (k = 0; k < (u32)llen; k++)
                     if (line[k] == '/') { hasslash = 1; break; }
-                /* v55: kind = 0 anon, 1 = гл. бинарь, 2 = engine_client */
+                /* v55: kind = 0 anon, 1 = гл. бинарь, 2 = engine_client;
+                 * v57: 3 = memfd/"(deleted)" (DRM-класс, раньше = скип) */
                 if (isrx && hasslash) {
                     if (c2b_ss_sub(line, (u32)llen, "csgo_linux64"))
                         kind = 1;
                     else if (c2b_ss_sub(line, (u32)llen,
                                         "engine_client"))
                         kind = 2;
+                    else if (c2b_ss_sub(line, (u32)llen, "memfd") ||
+                             c2b_ss_sub(line, (u32)llen,
+                                        "(deleted)"))
+                        kind = 3;
                 }
                 if (isrx && nrx <= 2u && g_ss_scans == 0u) {
                     /* сырая голова первых двух r-x строк = парс-пруф */
@@ -15655,6 +15688,7 @@ static void c2b_ss_scan_maps(void)
                         u64 off;
                         if (kind == 1) nexe++;
                         else if (kind == 2) neng++;
+                        else if (kind == 3) nmemfd++;
                         else nanon++;
                         g_ss_seen[g_ss_seen_n++] = (u64)lo;
                         for (off = 0; off < (u64)(hi - lo) &&
@@ -15684,6 +15718,7 @@ static void c2b_ss_scan_maps(void)
                                 C2B_LOGN(hits[h].nr);
                                 C2B_LOGS(kind == 1 ? " mod=exe ctx=" :
                                          kind == 2 ? " mod=eng ctx=" :
+                                         kind == 3 ? " mod=memfd ctx=" :
                                                      " ctx=");
                                 {
                                     u32 cs = hits[h].off >= 8u ?
@@ -15725,6 +15760,8 @@ static void c2b_ss_scan_maps(void)
     C2B_LOGN(neng);
     C2B_LOGS(" anon=");
     C2B_LOGN(nanon);
+    C2B_LOGS(" memfd=");
+    C2B_LOGN(nmemfd);
     C2B_LOGS(" seen32=");
     C2B_LOGN(nfull);
     C2B_LOGS(" pf=");
@@ -28490,6 +28527,55 @@ static void test_stubscan(void)
           "ss: sub короче иглы = 0");
     CHECK(c2b_ss_sub(0, 10u, "x") == 0, "ss: sub NULL = 0");
     CHECK(c2b_ss_sub("anything", 8u, "") == 0, "ss: sub пустая игла = 0");
+    /* ---- v57: '?-класс' — переменный nr (nr=0xffff) ---- */
+    memset(buf, 0x00, sizeof buf);
+    buf[10] = 0x89; buf[11] = 0xc8;             /* mov %ecx,%eax */
+    buf[12] = 0x0f; buf[13] = 0x05;
+    n = c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u);
+    CHECK(n == 1 && hits[0].off == 12u && hits[0].nr == 0xffffu,
+          "ss57: 89c8 0f05 = ?-стаб");
+    memset(buf, 0x00, sizeof buf);
+    buf[20] = 0x8b; buf[21] = 0xc7;             /* mov %edi,%eax */
+    buf[22] = 0x0f; buf[23] = 0x05;
+    n = c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u);
+    CHECK(n == 1 && hits[0].off == 22u && hits[0].nr == 0xffffu,
+          "ss57: 8bc7 0f05 = ?-стаб");
+    memset(buf, 0x00, sizeof buf);
+    buf[30] = 0x89; buf[31] = 0xd0;             /* mov %edx,%eax */
+    buf[32] = 0x90;                             /* наполнитель */
+    buf[33] = 0x0f; buf[34] = 0x05;
+    n = c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u);
+    CHECK(n == 1 && hits[0].off == 33u && hits[0].nr == 0xffffu,
+          "ss57: наполнитель 0x90 = ?-стаб");
+    memset(buf, 0x00, sizeof buf);
+    buf[40] = 0x31; buf[41] = 0xc0;             /* xor %eax,%eax = НЕ mov */
+    buf[42] = 0x0f; buf[43] = 0x05;
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
+          "ss57: xor-eax перед syscall = 0");
+    memset(buf, 0x00, sizeof buf);
+    buf[50] = 0x89; buf[51] = 0xc1;             /* mov %eax,%ecx (dest!=eax) */
+    buf[52] = 0x0f; buf[53] = 0x05;
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
+          "ss57: mov в НЕ-eax = 0");
+    /* REX-отсечение: 48 89 f8 0f 05 = mov %rdi,%rax (форма glibc
+     * syscall()) — НЕ 32-битный mov eax,edi = ОТКАЗ */
+    memset(buf, 0x00, sizeof buf);
+    buf[60] = 0x48; buf[61] = 0x89; buf[62] = 0xf8;
+    buf[63] = 0x0f; buf[64] = 0x05;
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
+          "ss57: REX-форма glibc syscall() = 0");
+    /* без REX: 89 f8 = mov %edi,%eax = ЛЕГИТИМНЫЙ ?-стаб */
+    memset(buf, 0x00, sizeof buf);
+    buf[70] = 0x89; buf[71] = 0xf8;
+    buf[72] = 0x0f; buf[73] = 0x05;
+    n = c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u);
+    CHECK(n == 1 && hits[0].off == 72u && hits[0].nr == 0xffffu,
+          "ss57: 89f8 0f05 (без REX) = ?-стаб");
+    /* 0x90-фон = без FP (наполнитель-ветка требует mov-опкод) */
+    memset(buf, 0x90, sizeof buf);
+    buf[80] = 0x0f; buf[81] = 0x05;
+    CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
+          "ss57: 0x90-фон без mov = 0");
 }
 
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)

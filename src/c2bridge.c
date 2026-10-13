@@ -8167,6 +8167,19 @@ static u32 g_gns_relay;                 /* C2B_GNS_RELAY=1 */
 static u32 g_gns_relay_sent;            /* сколько 0x22 ушло через relay */
 static u8  g_gns_connect_target[24];    /* C2B_GNS_CONNECT=ip:port (ascii) */
 static u32 g_gns_connect_go;            /* драйвер вооружён */
+/* v33 (run370-реконциляция): ОДНА СЕССИЯ НА STEAMID — релей отказал
+ * СОБСТВЕННУЮ сессию движка 0x25 после ConnectOK (run367: 40572 = 0x22
+ * с тикетом → 0x23 ConnectOK → 0x25 NoConnection ×4 ОТ РЕЛЕЯ), пока
+ * наша бридж-сессия занимала identity-слот. Default ON: НЕ создавать
+ * бридж-сессию ВООБЩЕ (ConnectByIPAddress подавлен) → собственная
+ * SDR-сессия движка = ПЕРВАЯ = релей её ПРИМЕТ → движок делает ВЕСЬ
+ * родной SDR-флоу сам (0x22 с тикетом → 0x23 → in-channel → signon).
+ * C2B_NOG32=0 = легаси (бридж-сессия как раньше). Наблюдатели остаются:
+ * g48/g49/g51/g60/g62/g64/g66/g129/g130 (движковые детуры), g81/g82w
+ * (class-vtable receive-детуры — видят и сессию движка), g126 dec/enc
+ * тапы, g77fd-карта, pcap. krel-ts/k27/g90/g98/g99/g76/g71 = сами мертвы
+ * при h=0 (гварды на месте). */
+static u32 g_c2b_nog32 = 1;             /* v33 default ON; C2B_NOG32=0 = легаси */
 static u32 g_gns_conn_ver;              /* g71: версия сработавшего интерфейса (0=006 1=009) */
 static void *g_gns_conn_iface;          /* g71: iface сработавшего коннекта */
 static uptr  g_gns_conn_h;              /* g71: хэндл GNS-соединения */
@@ -12318,6 +12331,20 @@ static void c2b_g32_drive(void)
         C2B_LOGS("[c2b] g32: not armed (env/ifactory/user missing)\n");
         return;
     }
+    /* v33: флаг-инит (лениво; env может прийти и после статики) */
+    {
+        static u32 n33_init;
+        if (!n33_init) {
+            const char *e33 = getenv("C2B_NOG32");
+            n33_init = 1;
+            if (e33 && e33[0] == '0') g_c2b_nog32 = 0;
+            C2B_LOGS("[c2b] v33: NOG32="); C2B_LOGN(g_c2b_nog32);
+            if (g_c2b_nog32)
+                C2B_LOGS(" (bridge-session creation SUPPRESSED: engine's own SDR session = the only session on the steamid; one-session-per-steamid run370 theory)\n");
+            else
+                C2B_LOGS(" (legacy: bridge session will be created)\n");
+        }
+    }
     /* 44f-g46: ПРОБА CVAR-ГЕЙТА 'B'-хендлера (@25aa03). Движковый код:
      *   rdi = *(engine+0xe10bf8)   — статический ConVarRef (m_pConVar);
      *   if (rdi == engine+0xe10bc0) -> альтернативный путь 25cf0a =
@@ -12868,7 +12895,9 @@ static void c2b_g32_drive(void)
             u32 att;
             for (att = 0; att < 3; att++) {
                 i32 done75 = 0;
-                for (vi = 0; vi < 2 && !done75; vi++) {
+                /* v33: только vi=0 (006) — арм ОБОИХ классов перезаписал бы
+                 * single-orig g81 (урок g82w: 006/009 = разные классы). */
+                for (vi = 0; vi < (g_c2b_nog32 ? 1u : 2u) && !done75; vi++) {
             void *iface = 0;
             uptr h = 0;
             void **vt;
@@ -12891,6 +12920,18 @@ static void c2b_g32_drive(void)
             C2B_LOGS("[c2b] g32: iface ver="); C2B_LOGS(vers[vi]);
             C2B_LOGS(" ok\n");
             vt = *(void ***)iface;
+            if (g_c2b_nog32) {
+                /* v33: СОЗДАНИЕ БРИДЖ-СЕССИИ ПОДАВЛЕНО. Идентичность steamid
+                 * свободна → собственная SDR-сессия движка (через локальный
+                 * steamclient-прокси) = единственная → релей не откажет её
+                 * 0x25 (run367-теория). h остаётся 0: все h-зависимые пути
+                 * (g71/g75/g76/g85/g97/krel-ts/k27/g98/g99) гвардятся сами. */
+                static u32 n33_once;
+                if (!n33_once) {
+                    n33_once = 1;
+                    C2B_LOGS("[c2b] v33: ConnectByIPAddress SUPPRESSED (NOG32=1) — bridge session NOT created; engine native SDR flow = the only session\n");
+                }
+            } else {
             g_probe_active = 1;
             if (__sigsetjmp(g_probe_jb, 1) == 0) {
                 h = ((uptr (*)(void *, void *, i32, void *))vt[1])(
@@ -12903,6 +12944,7 @@ static void c2b_g32_drive(void)
             }
             C2B_LOGS("[c2b] g32: ConnectByIPAddress h="); C2B_LOGN((u32)h);
             C2B_LOGS("\n");
+            }
             /* g71: запоминаем iface/h/версию для зонда приёмника */
             g_gns_conn_iface = iface;
             g_gns_conn_h = h;
@@ -12972,7 +13014,14 @@ static void c2b_g32_drive(void)
                 C2B_LOGS(" s_hEpoll="); C2B_LOGN((u32)*pep);
                 C2B_LOGS("\n");
             }
-            /* 58f-g75: фазовая проверка ≤12s */
+            /* 58f-g75: фазовая проверка ≤12s (v33: нет сессии — ждать нечего) */
+            if (g_c2b_nog32) {
+                static u32 n33w;
+                if (!n33w) {
+                    n33w = 1;
+                    C2B_LOGS("[c2b] v33: connect-wait skipped (no bridge session to wait for; native engine session observed via taps/pcap)\n");
+                }
+            } else {
             {
                 u32 w;
                 i32 ok75 = 0;
@@ -13000,8 +13049,14 @@ static void c2b_g32_drive(void)
                     g_sdr_conn_dead = 0;
                 }
             }
+            }   /* v33 else (legacy connect-wait) */
                 }   /* vi */
                 if (done75) break;
+                if (g_c2b_nog32) {
+                    /* v33: обе версии iface обработаны (детуры g81/g82w armed),
+                     * ретраи connect-цикла бессмысленны — после 1 аттемпта */
+                    break;
+                }
                 if (att < 2) {
                     C2B_LOGS("[c2b] g75: retry attempt\n");
                     usleep(1000000);

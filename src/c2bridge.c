@@ -15307,6 +15307,242 @@ static long c2b_ldd_dsyscall(long nr, long a1, long a2, long a3,
     return tr(nr, a1, a2, a3, a4, a5, a6);
 }
 
+/* ---------- v59: SITE-ДЕТУР syscall-САЙТОВ libc (r414-census) ----------
+ * ПАРАДОКС (run416): 0x22 = userspace raw sys_sendto с НЕТ-достижимым
+ * syscall-insn путём: 4 пролога (patched, zero), syscall() (patched,
+ * zero), GOT/PLT (hooked, zero), '?'-стабы (только patched-glibc-внутр).
+ * ЕДИНСТВЕННЫЕ непропатченные syscall-insn процесса = САЙТЫ ВНУТРИ libc
+ * (r414-census, libc 2.39, base-относительные vaddr):
+ *   csp1 0x2a1ec  '?'-спин 89 d0 0f 05 eb f8 (cancel-arch класс)
+ *   csp2 0x9cb14  '?'-спин (за 9B e8 = окно строиться не должно)
+ *   csp3 0xee31b  '?'-спин 89 d0 0f 05 48 3d .. (errno-стор класс)
+ *   snd  0x12c136 b8 2c .. (send, ВТОРОЙ inline = intact)
+ *   smg  0x12c183 b8 2c .. (sendmmsg inner)
+ *   smsg 0x12c2c4 b8 2e .. (sendmsg inner)
+ *   sto  0x12c330 b8 2c .. (sendto inner = ПОКРЫТ v52-патчем entry —
+ *                           в таблицу НЕ входит, байты = nop-nop)
+ *   wr1  0x11cd84 b8 01 .. (write-класс мини-фн)
+ *   wr2  0x11c876 b8 01 .. (write inner, вне 18B окна entry)
+ * SITE-детур (c2b_ldd_site_build) = ff25 НА САЙТЕ, tramp = spill 9 рег ->
+ * call ЛОГГЕРА (nr-агностик: nr/fd/buf/len/a4 + ИСХОДНЫЙ rsp = стек-дамп
+ * 6 qword'ов = оффлайн RIP-матч против engine_maps) -> restore -> украде-
+ * нные байты (syscall ВНУТРИ окна) -> jmp-back. РЕ-ВХОД: лог-путь = write
+ * -> v52-dwrite -> tramp -> multi-путь -> __syscall_cancel -> cancel-arch
+ * -> САЙТ -> tramp -> ЛОГГЕР = БЕСКОНЕЧНАЯ РЕКУРСИЯ => гвард g_dsite_busy
+ * (per-process, диагностика капирована — гонка = бенign). Доказательство
+ * живости: FIRE-счётчик (первые 3 ЛЮБЫХ nr на сайт) — урок run415 (триг-
+ * гер зарегистрирован, но молчит = невидимка). 0x22-фильтр на HIT: nr,
+ * fd, len, tramp, стек-дамп. Порядок установки = ДО v52-install1 (окна
+ * не пересекаются, порядок = дисциплина). Версия-дрифт: pread-верификация
+ * 6 ожидаемых байтов; несовпадение = drift-лог + скип (протокол g124). */
+struct c2b_dsite_ent { u32 va; const char *tag; u8 exp[6]; };
+static const struct c2b_dsite_ent g_dsite_tab[8] = {
+    { 0x2a1ecu,  "csp1", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u } },
+    { 0x9cb14u,  "csp2", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u } },
+    { 0xee31bu,  "csp3", { 0x89u, 0xd0u, 0x0fu, 0x05u, 0x48u, 0x3du } },
+    { 0x12c136u, "snd",  { 0xb8u, 0x2cu, 0x00u, 0x00u, 0x00u, 0x0fu } },
+    { 0x12c183u, "smg",  { 0xb8u, 0x2cu, 0x00u, 0x00u, 0x00u, 0x0fu } },
+    { 0x12c2c4u, "smsg", { 0xb8u, 0x2eu, 0x00u, 0x00u, 0x00u, 0x0fu } },
+    { 0x11cd84u, "wr1",  { 0xb8u, 0x01u, 0x00u, 0x00u, 0x00u, 0x0fu } },
+    { 0x11c876u, "wr2",  { 0xb8u, 0x01u, 0x00u, 0x00u, 0x00u, 0x0fu } },
+};
+static void *volatile g_dsite_tr[8];    /* tramp'ы (ra->site-маппинг) */
+static u32 g_dsite_fires[8];            /* FIRE-кап = 3/сайт */
+static volatile u32 g_dsite_busy;       /* ре-вход гвард */
+
+static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
+                          u64 sp, u64 r8v, u64 r9v, u64 r10v)
+{
+    uptr ra = (uptr)__builtin_return_address(0);
+    u32 i, tag = 8u;
+    for (i = 0u; i < 8u; i++) {
+        uptr t = (uptr)g_dsite_tr[i];
+        if (t && ra >= t && ra < t + 4096u) { tag = i; break; }
+    }
+    if (g_dsite_busy) return;       /* рекурсия через собственный лог */
+    /* 0x22-фильтр ДВУКЛАССНЫЙ (см. шапку v59 в c2b_lddet.h):
+     * b8-класс: fd=rdi buf=rsi len=rdx; csp-класс: fd=rcx buf=r8 len=r9,
+     * nr=rdx (спин mov eax,edx — rax на входе окна = ещё мусор) */
+    {
+        u64 fd = 0, buf = 0, len = 0, nr = 0;
+        u32 cls = 0;
+        if (rsi && rdx >= 40u && rdx <= 640u &&
+            ((const u8 *)(uptr)rsi)[0] == 0x22u) {
+            cls = 1u; fd = rdi; buf = rsi; len = rdx;
+            nr = (tag < 8u) ? ((u64)g_dsite_tab[tag].exp[1]) : 0u;
+        } else if (r8v && r9v >= 40u && r9v <= 640u &&
+                   ((const u8 *)(uptr)r8v)[0] == 0x22u) {
+            cls = 2u; fd = rcx; buf = r8v; len = r9v; nr = rdx;
+        }
+        if (cls) {
+            const u64 *st = (const u64 *)(uptr)sp;
+            g_dsite_busy = 1u;
+            if (g_ldd_hits < 24u) {
+                g_ldd_hits++;
+                C2B_LOGS("[c2b] v59: HIT site=");
+                if (tag < 8u) C2B_LOGS(g_dsite_tab[tag].tag);
+                else C2B_LOGS("?");
+                C2B_LOGS(" cls=");
+                C2B_LOGN(cls);
+                C2B_LOGS(" nr=");
+                C2B_LOGN((u32)nr);
+                C2B_LOGS(" fd=");
+                C2B_LOGN((u32)(fd & 0xffffu));
+                C2B_LOGS(" len=");
+                C2B_LOGN((u32)len);
+                C2B_LOGS(" ax=");
+                c2b_gp_lh64((unsigned long long)rax);
+                C2B_LOGS(" dx=");
+                c2b_gp_lh64((unsigned long long)rdx);
+                C2B_LOGS(" cx=");
+                c2b_gp_lh64((unsigned long long)rcx);
+                C2B_LOGS(" r8=");
+                c2b_gp_lh64((unsigned long long)r8v);
+                C2B_LOGS(" r9=");
+                c2b_gp_lh64((unsigned long long)r9v);
+                C2B_LOGS(" r10=");
+                c2b_gp_lh64((unsigned long long)r10v);
+                C2B_LOGS(" sp=");
+                c2b_gp_lh64((unsigned long long)sp);
+                C2B_LOGS(" st=");
+                c2b_gp_lh64((unsigned long long)st[0]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[1]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[2]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[3]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[4]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[5]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[6]);
+                C2B_LOGS(" ");
+                c2b_gp_lh64((unsigned long long)st[7]);
+                C2B_LOGS("\n");
+            }
+            g_dsite_busy = 0u;
+            return;
+        }
+    }
+    /* FIRE: доказательство живости детура (любой nr, кап 3/сайт) */
+    if (tag < 8u && g_dsite_fires[tag] < 3u) {
+        g_dsite_fires[tag]++;
+        g_dsite_busy = 1u;
+        C2B_LOGS("[c2b] v59: FIRE site=");
+        C2B_LOGS(g_dsite_tab[tag].tag);
+        C2B_LOGS(" ax=");
+        c2b_gp_lh64((unsigned long long)rax);
+        C2B_LOGS(" f=");
+        C2B_LOGN(g_dsite_fires[tag]);
+        C2B_LOGS("\n");
+        g_dsite_busy = 0u;
+    }
+}
+
+static u32 g_dsite_armed;
+
+static void c2b_ldd_dsite_install(u8 *libc_base)
+{
+    u32 i;
+    extern i32 close(i32);
+    extern i32 open(const char *, i32, ...);
+    for (i = 0u; i < 8u; i++) {
+        u8 rbuf[32];
+        u8 site[14];
+        u8 *tramp;
+        unsigned int olen = 0, tlen = 0, q;
+        i32 fdm;
+        i64 rn;
+        uptr sa = (uptr)libc_base + (uptr)g_dsite_tab[i].va;
+        fdm = open("/proc/self/mem", 0 /*O_RDONLY*/);
+        if (fdm < 0) {
+            C2B_LOGS("[c2b] v59: mem open fail\n");
+            return;
+        }
+        rn = pread(fdm, rbuf, (uptr)sizeof rbuf, (i64)sa);
+        close(fdm);
+        if (rn < 24) {
+            C2B_LOGS("[c2b] v59: ");
+            C2B_LOGS(g_dsite_tab[i].tag);
+            C2B_LOGS(" pread short\n");
+            continue;
+        }
+        for (q = 0u; q < 6u; q++)
+            if (rbuf[q] != g_dsite_tab[i].exp[q]) break;
+        if (q < 6u) {
+            C2B_LOGS("[c2b] v59: ");
+            C2B_LOGS(g_dsite_tab[i].tag);
+            C2B_LOGS(" drift have=");
+            for (q = 0u; q < 16u && (i32)q < rn; q++)
+                C2B_LOGH((u32)rbuf[q]);
+            C2B_LOGS("\n");
+            continue;
+        }
+        tramp = (u8 *)mmap(0, 4096u, 0x07u /*RWX*/, 0x22u /*PRIV|ANON*/,
+                           -1, 0u);
+        if (tramp == (u8 *)-1) {
+            C2B_LOGS("[c2b] v59: mmap fail\n");
+            return;
+        }
+        if (!c2b_ldd_site_build(rbuf, (u32)rn, (unsigned long long)sa,
+                                tramp,
+                                (unsigned long long)(uptr)tramp,
+                                (unsigned long long)(uptr)&c2b_ldd_dsite,
+                                &olen, &tlen)) {
+            C2B_LOGS("[c2b] v59: ");
+            C2B_LOGS(g_dsite_tab[i].tag);
+            C2B_LOGS(" build=0 have=");
+            for (q = 0u; q < 20u && (i32)q < rn; q++)
+                C2B_LOGH((u32)rbuf[q]);
+            C2B_LOGS("\n");
+            munmap(tramp, 4096u);
+            continue;
+        }
+        site[0] = 0xffu; site[1] = 0x25u;
+        site[2] = 0u; site[3] = 0u; site[4] = 0u; site[5] = 0u;
+        {
+            unsigned long long v =
+                (unsigned long long)(uptr)tramp;
+            for (q = 0u; q < 8u; q++)
+                site[6u + q] = (u8)((v >> (8 * q)) & 0xffu);
+        }
+        /* tramp-глобал ДО патча сайта (окно гонки = ноль) */
+        g_dsite_tr[i] = (void *)tramp;
+        {
+            uptr pg = sa & ~(uptr)0xFFFu;
+            if (mprotect((void *)pg, 0x2000u, 0x03u /*RW*/) != 0) {
+                C2B_LOGS("[c2b] v59: ");
+                C2B_LOGS(g_dsite_tab[i].tag);
+                C2B_LOGS(" mprotect RW fail\n");
+                g_dsite_tr[i] = 0;
+                munmap(tramp, 4096u);
+                continue;
+            }
+            memcpy((void *)sa, site, C2B_LDD_MINSTOLEN);
+            for (q = C2B_LDD_MINSTOLEN; q < olen; q++)
+                ((u8 *)sa)[q] = 0x90u;       /* nop до края окна (v52-
+                                              * паттерн: хвосты мертвы —
+                                              * ff25 уводит поток) */
+            mprotect((void *)pg, 0x2000u, 0x05u /*RX*/);
+        }
+        g_dsite_armed++;
+        C2B_LOGS("[c2b] v59: ARMED ");
+        C2B_LOGS(g_dsite_tab[i].tag);
+        C2B_LOGS(" site=");
+        c2b_gp_lh64((unsigned long long)sa);
+        C2B_LOGS(" stolen=");
+        C2B_LOGN(olen);
+        C2B_LOGS(" tramp=");
+        c2b_gp_lh64((unsigned long long)(uptr)tramp);
+        C2B_LOGS("\n");
+    }
+    C2B_LOGS("[c2b] v59: install done armed=");
+    C2B_LOGN(g_dsite_armed);
+    C2B_LOGS("/8\n");
+}
+
 /* установка одного детура: имя, nr якоря, tramp-глобал, детур-фн. */
 static void c2b_ldd_install1(const char *name, u32 nr,
                              void *volatile *trslot, void *detour)
@@ -15467,6 +15703,18 @@ static void c2b_ldd_maybe(void)
     C2B_LOGS(",");
     c2b_gp_lh64((unsigned long long)g_ldd_hi);
     C2B_LOGS(")\n");
+    /* v59: SITE-детуры syscall-сайтов libc = ДО v52-install1 (порядок
+     * = дисциплина; окна не пересекаются, но site-байты = источник
+     * истины ДО любых entry-патчей). База libc = dladdr от dlsym-
+     * указателя sendto (тот же, что у v52-хуков). */
+    {
+        void *sf = dlsym(C2B_CL_RTLD_NEXT, "sendto");
+        struct c2b_ldd_dlinfo sd;
+        if (sf && (uptr)sf > 4096u && dladdr(sf, &sd) && sd.dli_fbase)
+            c2b_ldd_dsite_install((u8 *)sd.dli_fbase);
+        else
+            C2B_LOGS("[c2b] v59: libc base resolve fail\n");
+    }
     c2b_ldd_install1("sendto", 44u, &g_ldd_tr_st,
                      (void *)&c2b_ldd_dsendto);
     c2b_ldd_install1("sendmsg", 46u, &g_ldd_tr_sm,
@@ -28412,6 +28660,50 @@ static const u8 tldd_g239_sc[] = {
     0x0f,0x05, 0x48,0x3d,0x01,0xf0,0xff,0xff, 0x73,0x01, 0xc3,
     0x48,0x8b,0x0d,0xbb,0xc8,0x0d,0x00,
     0xf7,0xd8, 0x64,0x89,0x01, 0x48,0x83,0xc8,0xff, 0xc3 };
+/* v59: САЙТЫ libc (r414-census, base-относительные vaddr):
+ * csp1 = cancel-arch спин @0x2a1ec: 31 ff 89 d0 0f 05 eb f8 31 c0 eb d6
+ * + 11B-nop (66 66 2e 0f 1f 84 00 00 00 00 00 = SIB-форма!) + 90
+ * csp3 = errno-стор @0xee31b: 89 d0 0f 05 48 3d 00 f0 ff ff 76 f3
+ *        f7 d8 64 89 06 eb ec
+ * csp2 = спин с e8 ЗА 9B (@0x9cb14): 89 d0 0f 05 eb f8 48 89 df e8 ..
+ *        = окно НЕ строится (e8 = отказ) — фиксируем негативом */
+static const u8 tldd_site_csp1[] = {
+    0x31,0xff, 0x89,0xd0, 0x0f,0x05, 0xeb,0xf8,
+    0x31,0xc0, 0xeb,0xd6,
+    0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,
+    0x90, 0xf3,0x0f,0x1e,0xfa };
+static const u8 tldd_site_csp2[] = {
+    0x31,0xff, 0x89,0xd0, 0x0f,0x05, 0xeb,0xf8,
+    0x48,0x89,0xdf, 0xe8,0x60,0xc5,0xff,0xff,
+    0x41,0x83,0xec,0x01, 0x0f,0x85,0x46,0xfd,0xff,0xff, 0xeb,0xd9 };
+static const u8 tldd_site_csp3[] = {
+    0x89,0xd0, 0x0f,0x05,
+    0x48,0x3d,0x00,0xf0,0xff,0xff, 0x76,0xf3,
+    0xf7,0xd8, 0x64,0x89,0x06, 0xeb,0xec, 0x0f,0x1f,0x40,0x00 };
+/* v59-фикстура getpid-синтетики (e2e): b8 27 (mov eax,39) | syscall |
+ * cmp | ja +5 | xor edi,edi | nop-пад | ret — окно от b8 = 5+2+6+2+2+2
+ * = 19 (>=14, <=24), syscall ВНУТРИ окна; СПИН-ВНУТРИ-ОКНА НЕТ (реаль-
+ * ные csp-спины = голова ДО сайта: csp1 31 ff @site-2 = вне патча). */
+static const u8 tldd_site_gid[] = {
+    0xb8,0x27,0x00,0x00,0x00, 0x0f,0x05,
+    0x48,0x3d,0x00,0xf0,0xff,0xff, 0x77,0x05,
+    0x31,0xff, 0x90,0x90,
+    0x90,0x90,0x90,0x90,0x90, 0xc3 };
+
+/* v59-логгер синтетики: фиксирует сырые рег-арги (сигнатура = 9 u64). */
+static u32 g_tldd_site_hit;
+static unsigned long long g_tldd_site_ax;
+static void tldd_sitelog(unsigned long long ax, unsigned long long d1,
+                         unsigned long long d2, unsigned long long d3,
+                         unsigned long long d4, unsigned long long sp,
+                         unsigned long long d5, unsigned long long d6,
+                         unsigned long long d7)
+{
+    (void)d1; (void)d2; (void)d3; (void)d4; (void)d5; (void)d6;
+    (void)d7; (void)sp;
+    g_tldd_site_hit++;
+    g_tldd_site_ax = ax;
+}
 
 static void tldd_run(const char *nm, const u8 *c, u32 cl, u32 nr,
                      u32 want)
@@ -28554,6 +28846,128 @@ static void test_lddet(void)
         CHECK(c2b_ldd_build(bad, sizeof bad, 0x7f0000001000ull, btr, 0,
                             C2B_LDD_NR_VAR, &olen, &tlen) == 0u,
               "ldd: VAR без mov rdi,rax в первых 8B = 0");
+    }
+    /* ---- v59: SITE-детур (чистые тесты: окна + префикс + фиксапы) ---- */
+    {
+        u8 str[C2B_LDD_MAXTRAMP];
+        unsigned int olen = 0, tlen = 0, q;
+        unsigned int v32;
+        long long rel;
+        /* csp1: окно = 2+2+2+2+2+11 = 21 (SIB-фикс: 11B-nop = ЦЕЛЫЙ) */
+        memset(str, 0, sizeof str);
+        CHECK(c2b_ldd_site_build(tldd_site_csp1 + 2u,
+                                 (u32)(sizeof tldd_site_csp1 - 2u),
+                                 0x7f0000001002ull, str,
+                                 0x7f0000200000ull,
+                                 0x7f0000100000ull,   /* ФЕЙК-логгер:
+                                                       * rel32 в диапазоне */
+                                 &olen, &tlen) == 21u,
+              "v59: csp1 build=21 (SIB-фикс 11B-nop)");
+        if (olen == 21u) {
+            CHECK(tlen == 73u + 27u + 14u,
+                  "v59: csp1 tlen=114 (73 префикс + 27 окно + ff25)");
+            /* префикс байт-точно: 9 push + 6 arg-load + call */
+            CHECK(str[0] == 0x50 && str[1] == 0x51 && str[2] == 0x52 &&
+                  str[3] == 0x56 && str[4] == 0x57 &&
+                  str[5] == 0x41 && str[6] == 0x50 &&
+                  str[7] == 0x41 && str[8] == 0x51 &&
+                  str[9] == 0x41 && str[10] == 0x52 &&
+                  str[11] == 0x41 && str[12] == 0x53,
+                  "v59: spill 9 push (rax rcx rdx rsi rdi r8-r11)");
+            CHECK(str[13] == 0x48 && str[14] == 0x8b &&
+                  str[15] == 0x7c && str[16] == 0x24 && str[17] == 0x40,
+                  "v59: arg1 = 0x40(%rsp) (orig rax = nr)");
+            CHECK(str[18] == 0x48 && str[19] == 0x8b &&
+                  str[20] == 0x74 && str[21] == 0x24 && str[22] == 0x20,
+                  "v59: arg2 = 0x20(%rsp) (orig rdi = fd)");
+            CHECK(str[23] == 0x48 && str[24] == 0x8b &&
+                  str[25] == 0x54 && str[26] == 0x24 && str[27] == 0x28,
+                  "v59: arg3 = 0x28(%rsp) (orig rsi = buf)");
+            CHECK(str[28] == 0x48 && str[29] == 0x8b &&
+                  str[30] == 0x4c && str[31] == 0x24 && str[32] == 0x30,
+                  "v59: arg4 = 0x30(%rsp) (orig rdx = len)");
+            CHECK(str[33] == 0x4c && str[34] == 0x8b &&
+                  str[35] == 0x44 && str[36] == 0x24 && str[37] == 0x38,
+                  "v59: arg5 = 0x38(%rsp) (orig rcx)");
+            CHECK(str[38] == 0x49 && str[39] == 0x8d &&
+                  str[40] == 0x4c && str[41] == 0x24 && str[42] == 0x48,
+                  "v59: arg6 = lea 0x48(%rsp) (orig rsp)");
+            CHECK(str[43] == 0xe8,
+                  "v59: call rel32 логгера");
+            rel = 0x7f0000100000ll - (0x7f0000200000ll + 48ll);
+            v32 = 0;
+            for (q = 0; q < 4u; q++)
+                v32 |= ((unsigned int)str[44u + q]) << (8 * q);
+            CHECK((long long)(int)v32 == rel,
+                  "v59: call rel32 пересчитан");
+            /* стек-args pop + restore 9 pop (все 25 хвостовых байтов) */
+            CHECK(str[48] == 0x41 && str[49] == 0x52 &&
+                  str[50] == 0x41 && str[51] == 0x51 &&
+                  str[52] == 0x41 && str[53] == 0x50 &&
+                  str[54] == 0x41 && str[55] == 0x58 &&
+                  str[56] == 0x41 && str[57] == 0x59 &&
+                  str[58] == 0x41 && str[59] == 0x5a &&
+                  str[60] == 0x41 && str[61] == 0x5b &&
+                  str[62] == 0x41 && str[63] == 0x5a &&
+                  str[64] == 0x41 && str[65] == 0x59 &&
+                  str[66] == 0x41 && str[67] == 0x58 &&
+                  str[68] == 0x5f && str[69] == 0x5e &&
+                  str[70] == 0x5a && str[71] == 0x59 &&
+                  str[72] == 0x58,
+                  "v59: push r10 r9 r8 (пост-call) + pop r8 r9 r10 + "
+                  "restore 9 pop (реверс)");
+            /* окно @73: 89 d0 | 0f 05 | eb f8 -> e9 (цель = site-2) */
+            CHECK(str[73] == 0x89 && str[74] == 0xd0 &&
+                  str[75] == 0x0f && str[76] == 0x05,
+                  "v59: stolen = mov eax,edx; syscall @73");
+            CHECK(str[77] == 0xe9,
+                  "v59: eb f8 развёрнут в e9 @77");
+            rel = (0x7f0000001002ll + 4ll + 2ll - 8ll) -
+                  (0x7f0000200000ll + 77ll + 5ll);
+            v32 = 0;
+            for (q = 0; q < 4u; q++)
+                v32 |= ((unsigned int)str[78u + q]) << (8 * q);
+            CHECK((long long)(int)v32 == rel,
+                  "v59: eb f8 rel32 = спин-голова site-2");
+            /* ff25-jmp-back -> site+21 (abs8 = 64-бит) */
+            CHECK(str[tlen - 14u] == 0xff && str[tlen - 13u] == 0x25,
+                  "v59: хвост трампа = ff25");
+            {
+                unsigned long long v64 = 0;
+                for (q = 0; q < 8u; q++)
+                    v64 |= ((unsigned long long)str[tlen - 8u + q]) <<
+                           (8 * q);
+                CHECK(v64 == 0x7f0000001002ull + 21ull,
+                      "v59: jmp-back = site+olen");
+            }
+        }
+        /* csp3: окно = 2+2+6+2+2 = 14 ровно (граница ДО f7 d8/errno-
+         * хвоста — хвост исполняется jmp-back'ом на месте) */
+        memset(str, 0, sizeof str);
+        CHECK(c2b_ldd_site_build(tldd_site_csp3, sizeof tldd_site_csp3,
+                                 0x7f0000001000ull, str,
+                                 0x7f0000200000ull,
+                                 (unsigned long long)(uptr)&tldd_sitelog,
+                                 &olen, &tlen) == 14u,
+              "v59: csp3 build=14 (errno-стор класс)");
+        /* csp2: e8 ЗА окном 9B = отказ (озвучен в shапке) */
+        CHECK(c2b_ldd_site_build(tldd_site_csp2 + 2u,
+                                 (u32)(sizeof tldd_site_csp2 - 2u),
+                                 0x7f0000001002ull, str,
+                                 0x7f0000200000ull,
+                                 (unsigned long long)(uptr)&tldd_sitelog,
+                                 &olen, &tlen) == 0u,
+              "v59: csp2 (e8 в окне) build=0 = отказ-протокол");
+        /* SIB-фикс юнит: 0f 1f 84 00 00 00 00 = 8B (с SIB), НЕ 7 */
+        {
+            unsigned int ilen = 0, tlen2 = 0, cc = 0, doff = 0;
+            const u8 nop11[] = { 0x66,0x66,0x2e,0x0f,0x1f,0x84,
+                                 0x00,0x00,0x00,0x00,0x00 };
+            CHECK(c2b_ldd_class(nop11, sizeof nop11, 0u, &ilen, &tlen2,
+                                &cc, &doff) == C2B_LDD_C_COPY &&
+                  ilen == 11u,
+                  "v59: SIB-фикс — 11B-nop декодируется целым");
+        }
     }
 /* v52: детур-exec гейт: gcc-asan/ubsan (__SANITIZE_*) + clang-asan/ubsan
  * (__has_feature — только внутри clang-ветки; в gcc = не раскрывается) */
@@ -28753,6 +29167,51 @@ static void test_lddet(void)
               "v56: дейтаграмма через трамп+jmp-back+syscall");
         close(sfd); close(rfd);
         memcpy(pg, saved, 24);          /* рестор сайта (дисциплина) */
+        munmap(pg, 8192);
+    }
+    /* ---- v59: СИНТЕТИЧЕСКИЙ end-to-end SITE-ДЕТУРА (getpid) ----
+     * Фикстура tldd_site_gid: сайт = b8 27 (mov eax,39) | syscall ВНУТРИ
+     * окна 19B. Вызов КАК ФУНКЦИИ (rax перезапишется b8; rdi/rsi/rdx =
+     * мусор вызывающего = для getpid безвредны): ff25 -> трамп [spill 9 ->
+     * args -> call логгера -> restore -> stolen (b8 0f 05 cmp ja spin)
+     * -> jmp-back site+19 -> nops -> ret]. Логгер = nr 39; rv = getpid().
+     * = ПОЛНАЯ цепочка spill/logger/restore/stolen/jmp-back ИСПОЛНЕНИЕМ. */
+    {
+        u8 *pg = (u8 *)mmap(0, 8192, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        u8 *trx = pg + 4096;
+        unsigned int olen = 0, tlen = 0, q;
+        u8 site[14], saved[32];
+        unsigned long long det;
+        typedef long (*gid_fn)(void);
+        long rv;
+        CHECK(pg != (u8 *)-1, "v59: RWX-страницы");
+        if (pg == (u8 *)-1) return;
+        memset(pg, 0x90, 8192);
+        memcpy(pg, tldd_site_gid, sizeof tldd_site_gid);
+        CHECK(c2b_ldd_site_build(pg, 32u,
+                                 (unsigned long long)(uptr)pg, trx,
+                                 (unsigned long long)(uptr)trx,
+                                 (unsigned long long)(uptr)&tldd_sitelog,
+                                 &olen, &tlen) == 15u,
+              "v59: синтетика build=15");
+        if (olen != 15u) { munmap(pg, 8192); return; }
+        memcpy(saved, pg, 32);
+        site[0] = 0xff; site[1] = 0x25;
+        site[2] = 0; site[3] = 0; site[4] = 0; site[5] = 0;
+        det = (unsigned long long)(uptr)&tldd_sitelog;
+        for (q = 0; q < 8u; q++)
+            site[6u + q] = (u8)((det >> (8 * q)) & 0xffu);
+        memcpy(pg, site, 14);           /* ff25 = 14B insn ЦЕЛИКОМ */
+        for (q = 14u; q < olen; q++) pg[q] = 0x90;   /* nop до края 15 */
+        g_tldd_site_hit = 0; g_tldd_site_ax = 0;
+        rv = ((gid_fn)(uptr)pg)();
+        CHECK(rv > 0, "v59: rv = getpid (>0)");
+        CHECK(g_tldd_site_hit == 1, "v59: логгер видел вызов");
+        /* rax на входе окна = ЕЩЁ мусор (b8 исполнится ПОСЛЕ логгера):
+         * это ДОКУМЕНТИРОВАННО (шапка) — assert = живость, не значение */
+        (void)g_tldd_site_ax;
+        memcpy(pg, saved, 32);          /* рестор сайта (дисциплина) */
         munmap(pg, 8192);
     }
 #else

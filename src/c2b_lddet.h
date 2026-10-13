@@ -81,7 +81,9 @@
 
 #define C2B_LDD_MINSTOLEN 14u   /* ff 25 00000000 + abs8 */
 #define C2B_LDD_MAXSTOLEN 24u   /* кап окна (сиг-размер) */
-#define C2B_LDD_MAXTRAMP  96u   /* 24 + развороты + ff25(14) с запасом */
+/* v59: 192 — site-детур = 26(spill) + 30(args) + 5(call) + 13(restore)
+ * + 24(окно с разворотами) + 14(ff25) = 112 с запасом */
+#define C2B_LDD_MAXTRAMP  192u  /* 24 + развороты + ff25(14) с запасом */
 #define C2B_LDD_NREAD     64u   /* байт читать с цели (якорь-скан + окно) */
 /* Макс. |tgt - tramp|: все фиксапы = rel32/disp32 = ±2ГБ; запас 0.25ГБ
  * (CI-урок: mmap'ы на раннере = НЕ соседи; дальняя пара = усечённый disp
@@ -159,7 +161,10 @@ static inline unsigned char c2b_ldd_class(const unsigned char *tgt,
             m = (unsigned int)tgt[p + 2];
             disp = c2b_ldd_mdisp((unsigned char)m, &rip, &sib);
             if (rip) return 0xffu;
-            *ilen = (p - o) + 3u + disp; *tlen = *ilen;
+            /* v59-SIB-фикс: rm=4 => байт SIB ПОСЛЕ modrm (0f 1f 84 00 ..
+             * = 11B nop libc-текста; без +sib окно резалось посреди
+             * инструкции => tramp-поток съезжал на 1 байт) */
+            *ilen = (p - o) + 3u + sib + disp; *tlen = *ilen;
             return C2B_LDD_C_COPY;
         }
         if (op >= 0x80u && op <= 0x8fu) {           /* длинный jcc */
@@ -181,8 +186,11 @@ static inline unsigned char c2b_ldd_class(const unsigned char *tgt,
     }
     if (op == 0x88u || op == 0x89u || op == 0x8au || op == 0x8bu ||
         op == 0x85u || op == 0x87u || op == 0x8du || op == 0x63u ||
-        (op <= 0x3du && (op & 7u) != 4u)) {         /* alu/mov modrm-класс
-                                                     * (аккум-формы x4 искл.) */
+        (op <= 0x3du && (op & 7u) != 4u && (op & 7u) != 5u)) {
+        /* alu/mov modrm-класс (аккум-имм формы x8 искл.: (op&7)==4 =
+         * imm8 + (op&7)==5 = imm32 — БЕЗ modrm; v59-урок: 48 3d 00 f0
+         * ff ff (cmp rax,-4096) = в КАЖДОМ syscall-окне — без фикса
+         * ilen = 3 = окно срезалось посреди инструкции) */
         if (p + 1 >= n) return 0xffu;
         m = (unsigned int)tgt[p + 1];
         disp = c2b_ldd_mdisp((unsigned char)m, &rip, &sib);
@@ -233,9 +241,14 @@ static inline unsigned char c2b_ldd_class(const unsigned char *tgt,
         *ilen = (p - o) + 2u; *tlen = (p - o) + 5u;
         return C2B_LDD_C_JMP8;
     }
-    /* 3d (cmp eax,imm32) / 04-классы аккум-имм: только 3d встречается */
-    if (op == 0x3du) { *ilen = (p - o) + 5u; *tlen = *ilen;
-        return C2B_LDD_C_COPY; }
+    /* семейство accum-imm32 (op&7)==5: 05/0d/15/1d/25/2d/35/3d = +imm32
+     * (REX-префикс уже съеден циклом выше => (p-o) учитывает его) */
+    if (op <= 0x3du && (op & 7u) == 5u) {
+        if (p + 4 >= n) return 0xffu;
+        *ilen = (p - o) + 5u; *tlen = *ilen;
+        return C2B_LDD_C_COPY;
+    }
+    /* 3d (cmp eax,imm32) покрыт веткой выше; прочее = отказ */
     return 0xffu;   /* e8/e9/c3/cc/ff/c6/c7/неизвестное = отказ */
 }
 
@@ -369,6 +382,179 @@ static inline unsigned int c2b_ldd_build(const unsigned char *tgt,
         }
         o += ilen; t += tlen;
         if (o >= C2B_LDD_MINSTOLEN) break;           /* граница инструкции */
+    }
+    /* ff25-jmp-back -> tgt_addr + olen */
+    tramp[t] = 0xffu; tramp[t + 1u] = 0x25u;
+    tramp[t + 2u] = 0u; tramp[t + 3u] = 0u;
+    tramp[t + 4u] = 0u; tramp[t + 5u] = 0u;
+    {
+        unsigned int q;
+        unsigned long long v = tgt_addr + (unsigned long long)o;
+        for (q = 0u; q < 8u; q++)
+            tramp[t + 6u + q] = (unsigned char)((v >> (8 * q)) & 0xffu);
+    }
+    *olen_out = o; *tlen_out = t + 14u;
+    return o;
+}
+
+/* v59: SITE-ДЕТУР (MID-ФУНКЦИЯ) — патч syscall-САЙТА внутри чужой ф-ции
+ * (cancel-arch спины + send-family внутренние syscall'ы). ОТЛИЧИЯ от
+ * c2b_ldd_build: (1) БЕЗ якоря-идентичности (вызывающий = pread-верифи-
+ * кация ожидаемых байтов — дрифт-протокол); (2) tramp = ПРЕФИКС spill-
+ * аргументы-call-logger-restore (rax/rcx/rdx/rsi/rdi/r8-r11 = ВСЁ живое
+ * на сайте; xmm = мертвы: glibc cancel-arch = рукописный asm; первый
+ * украденный insn = mov/b8 = флаги-независимый => call-клоббер флагов
+ * безопасен); (3) syscall = ВНУТРИ украденного окна => passthrough =
+ * исполнение украденных байтов. Логгер-сигнатура:
+ *   void fn(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx, u64 sp,
+ *           u64 r8, u64 r9, u64 r10)  — r8/r9/r10 = стек-слоты 7-9
+ * sp = ИСХОДНЫЙ rsp сайта + 3 СТЕКОВЫХ арга (r10/r9/r8 push ДО call =
+ * ABI-слоты 7-9: r8=[rsp+8], r9=[rsp+16], r10=[rsp+24] на входе логгера).
+ * ИНТЕРПРЕТАЦИЯ = класс-зависима (логгер = сырье, анализ = офлайн):
+ *   b8-сайты (snd/smg/smsg/wr): fd=rdi, buf=rsi, len=rdx (nr = const
+ *     сайта — rax на входе окна ЕЩЁ МУСОР: spill ДО b8!)
+ *   csp-сайты (cancel-arch): ch=rdi, cx=rsi, nr=rdx, a1=rcx=fd,
+ *     a2=r8=buf, a3=r9=len (спин = mov eax,edx => nr ИЗ edx)
+ * Байты префикса (порядок push: rax первым => rax=[rsp'+64]=0x40,
+ * rdi=[+32]=0x20, rsi=[+40]=0x28, rdx=[+48]=0x30, rcx=[+56]=0x38;
+ * rsp' = rsp-72; затем push r10/r9/r8 = стек- args):
+ *   50 51 52 56 57 41 50 41 51 41 52 41 53      (9 push, 13B)
+ *   48 8b 7c 24 40   mov 0x40(%rsp),%rdi        (nr -> arg1)
+ *   48 8b 74 24 20   mov 0x20(%rsp),%rsi        (a1 -> arg2)
+ *   48 8b 54 24 28   mov 0x28(%rsp),%rdx        (a2 -> arg3)
+ *   48 8b 4c 24 30   mov 0x30(%rsp),%rcx        (a3 -> arg4)
+ *   4c 8b 44 24 38   mov 0x38(%rsp),%r8         (arg5 = orig rcx)
+ *   49 8d 4c 24 48   lea 0x48(%rsp),%r9         (orig rsp -> arg6)
+ *   41 52 41 51 41 50                            (push r10 r9 r8 = args 9-7)
+ *   e8 <rel32>                                   call logger
+ *   41 58 41 59 41 5a                            (pop r8 r9 r10)
+ *   41 5b 41 5a 41 59 41 58 5f 5e 5a 59 58      (9 pop, реверс)
+ * Возврат: olen (>= 14) или 0 = отказ (окно/дистанция/неизвестный опкод). */
+#define C2B_LDD_SITE_PRE  73u
+static inline unsigned int c2b_ldd_site_prefix(
+    unsigned char *tramp, unsigned long long tramp_addr,
+    unsigned long long logger_addr)
+{
+    static const unsigned char pre[68] = {
+        0x50u, 0x51u, 0x52u, 0x56u, 0x57u,
+        0x41u, 0x50u, 0x41u, 0x51u, 0x41u, 0x52u, 0x41u, 0x53u,
+        0x48u, 0x8bu, 0x7cu, 0x24u, 0x40u,
+        0x48u, 0x8bu, 0x74u, 0x24u, 0x20u,
+        0x48u, 0x8bu, 0x54u, 0x24u, 0x28u,
+        0x48u, 0x8bu, 0x4cu, 0x24u, 0x30u,
+        0x4cu, 0x8bu, 0x44u, 0x24u, 0x38u,
+        0x49u, 0x8du, 0x4cu, 0x24u, 0x48u,
+        /* call rel32 = пишется отдельно ниже; далее 25 байтов:
+         * push r10 r9 r8 | pop r8 r9 r10 | pop r11 r10 r9 r8 rdi rsi
+         * rdx rcx rax */
+        0x41u, 0x52u, 0x41u, 0x51u, 0x41u, 0x50u,
+        0x41u, 0x58u, 0x41u, 0x59u, 0x41u, 0x5au,
+        0x41u, 0x5bu, 0x41u, 0x5au, 0x41u, 0x59u, 0x41u, 0x58u,
+        0x5fu, 0x5eu, 0x5au, 0x59u, 0x58u
+    };
+    unsigned int q, t = 0u;
+    for (q = 0u; q < 43u; q++) tramp[t++] = pre[q];   /* push+args */
+    /* call rel32 -> logger */
+    {
+        long long rel = (long long)logger_addr -
+                        ((long long)tramp_addr + (long long)t + 5ll);
+        tramp[t] = 0xe8u;
+        for (q = 0u; q < 4u; q++)
+            tramp[t + 1u + q] = (unsigned char)(((unsigned long long)rel >>
+                                                (8 * q)) & 0xffu);
+    }
+    t += 5u;
+    for (q = 43u; q < 68u; q++) tramp[t++] = pre[q];  /* стек-args + pop'ы */
+    return t;                   /* 73 байта: 43 + 5 call + 25 хвост */
+}
+
+static inline unsigned int c2b_ldd_site_build(const unsigned char *tgt,
+                                              unsigned int n,
+                                              unsigned long long tgt_addr,
+                                              unsigned char *tramp,
+                                              unsigned long long tramp_addr,
+                                              unsigned long long logger_addr,
+                                              unsigned int *olen_out,
+                                              unsigned int *tlen_out)
+{
+    unsigned int o = 0u, t, j;
+    if (!tgt || !tramp || !olen_out || !tlen_out || n < 16u) return 0u;
+    *olen_out = 0u; *tlen_out = 0u;
+    {
+        unsigned long long d = (tgt_addr > tramp_addr)
+                                   ? (tgt_addr - tramp_addr)
+                                   : (tramp_addr - tgt_addr);
+        if (d > C2B_LDD_MAXDIST) return 0u;
+    }
+    /* ПРЕФИКС spill/args/call-logger/restore = ПЕРВЫМ (украденное окно
+     * = ПОСЛЕ него;_syscall = внутри окна => passthrough = украденные
+     * байты); call-rel32 = известен уже здесь (logger = константа) */
+    t = c2b_ldd_site_prefix(tramp, tramp_addr, logger_addr);
+    /* окно БЕЗ якоря: тот же декодер, та же граница >= 14 */
+    for (;;) {
+        unsigned int ilen, tlen, cc, doff, kind;
+        unsigned char k = c2b_ldd_class(tgt, n, o, &ilen, &tlen, &cc,
+                                        &doff);
+        if (k == 0xffu) return 0u;
+        kind = (unsigned int)k;
+        if (o + ilen > C2B_LDD_MAXSTOLEN) return 0u;
+        if (t + tlen + 14u > C2B_LDD_MAXTRAMP) return 0u;
+        if (kind == C2B_LDD_C_COPY || kind == C2B_LDD_C_RIPREL) {
+            for (j = 0u; j < ilen; j++) tramp[t + j] = tgt[o + j];
+            if (kind == C2B_LDD_C_RIPREL) {
+                long long orig = 0ll, nu, target;
+                unsigned int q;
+                for (q = 0u; q < 4u; q++)
+                    orig |= ((long long)tgt[o + doff + q]) << (8 * q);
+                target = (long long)tgt_addr + (long long)(o + ilen) +
+                         orig;
+                nu = target - ((long long)tramp_addr +
+                               (long long)(t + ilen));
+                for (q = 0u; q < 4u; q++)
+                    tramp[t + doff + q] =
+                        (unsigned char)(((unsigned long long)nu >>
+                                         (8 * q)) & 0xffu);
+            }
+        } else if (kind == C2B_LDD_C_JCC8) {
+            long long target, rel, d8;
+            unsigned int q;
+            d8 = (long long)(signed char)tgt[o + ilen - 1u];
+            tramp[t] = 0x0fu;
+            tramp[t + 1u] = (unsigned char)(0x80u | (cc & 0xfu));
+            target = (long long)tgt_addr + (long long)o +
+                     (long long)ilen + d8;
+            rel = target - ((long long)tramp_addr + (long long)t + 6ll);
+            for (q = 0u; q < 4u; q++)
+                tramp[t + 2u + q] =
+                    (unsigned char)(((unsigned long long)rel >> (8 * q)) &
+                                    0xffu);
+        } else if (kind == C2B_LDD_C_JMP8) {
+            long long target, rel, d8;
+            unsigned int q;
+            d8 = (long long)(signed char)tgt[o + ilen - 1u];
+            tramp[t] = 0xe9u;
+            target = (long long)tgt_addr + (long long)o +
+                     (long long)ilen + d8;
+            rel = target - ((long long)tramp_addr + (long long)t + 5ll);
+            for (q = 0u; q < 4u; q++)
+                tramp[t + 1u + q] =
+                    (unsigned char)(((unsigned long long)rel >> (8 * q)) &
+                                    0xffu);
+        } else { /* C2B_LDD_C_JCC32 */
+            long long orig = 0ll, target, rel;
+            unsigned int q;
+            for (q = 0u; q < 4u; q++)
+                orig |= ((long long)tgt[o + ilen - 4u + q]) << (8 * q);
+            for (j = 0u; j < ilen; j++) tramp[t + j] = tgt[o + j];
+            target = (long long)tgt_addr + (long long)(o + ilen) + orig;
+            rel = target - ((long long)tramp_addr + (long long)t + 6ll);
+            for (q = 0u; q < 4u; q++)
+                tramp[t + doff + q] =
+                    (unsigned char)(((unsigned long long)rel >> (8 * q)) &
+                                    0xffu);
+        }
+        o += ilen; t += tlen;
+        if (o >= C2B_LDD_MINSTOLEN) break;
     }
     /* ff25-jmp-back -> tgt_addr + olen */
     tramp[t] = 0xffu; tramp[t + 1u] = 0x25u;

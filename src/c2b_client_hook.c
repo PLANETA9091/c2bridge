@@ -51,6 +51,15 @@
 #include <stddef.h>
 #include <string.h>
 
+/* v27: общий контракт hook=>мост (структура-ноут + чистый сканер CLV2).
+ * hook = LD_PRELOAD = глобальный скоуп => мост видит через dlsym(0,...). */
+#include "c2b_k27.h"
+
+/* v27: экспортируемый инсанс-ноут 'A' (заполняет g126-dec-снифф).
+ * Порядок записи: поля, ЗАТЕМ seq bump (release). См. c2b_k27.h. */
+__attribute__((visibility("default")))
+c2b_k27_A_t g_c2b_k27_A;
+
 typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -1718,6 +1727,73 @@ static void c2b_g126_setiv_detour(void *gcm, const void *iv, sz_t len)
         tramp(gcm, iv, len);
 }
 
+/* v27: IN-CHANNEL CLV2 SNIFF — расшифрованный plaintext на ff×4+'A'/'B'.
+ * 'A' = сервер-челлендж (run361: chal=0, proto=3, val=relay_session_id) =>
+ * мост отвечает 'k' in-channel с ЭТИМ chal (k27). 'B' = accept = WIN-сигнал.
+ * Сессия-источник (мост vs движок) = пост-фактум по gcm + in=<8B> ↔ pcap.
+ * Rate: лог первые 16; нота мосту = дедап по (gcm,chal,proto,val). */
+static void c2b_g126_k27_sniff(const void *gcm, const void *in,
+                               const void *out, sz_t len)
+{
+    static u32 sn_n, sn_chal, sn_val, sn_proto;
+    static const void *sn_gcm;
+    static u32 sn_have;
+    u32 off = 0, chal, val, proto;
+    unsigned char cls;
+    if (!out || len < 14) return;
+    if (!c2b_k27_scan_clv2((const unsigned char *)out, (unsigned)len, off,
+                           &cls, &chal, &proto, &val))
+        return;
+    if (cls == (unsigned char)'B') {
+        if (sn_n < 16) {
+            sn_n++;
+            klog_s("[c2b] g126: DEC-B!!! n=");
+            klog_h(sn_n);
+            klog_s(" len=");
+            klog_h((u32)len);
+            klog_s(" gcm=");
+            klog_p((uptr)gcm);
+            klog_s("\n");
+        }
+        return;
+    }
+    /* 'A': дедап (та же четвёрка = повторный расшифр того же пакета) */
+    if (sn_have && sn_chal == chal && sn_val == val &&
+        sn_proto == proto && sn_gcm == gcm)
+        return;
+    sn_gcm = gcm; sn_chal = chal; sn_val = val; sn_proto = proto; sn_have = 1;
+    if (sn_n < 16) {
+        sn_n++;
+        klog_s("[c2b] g126: DEC-A n=");
+        klog_h(sn_n);
+        klog_s(" len=");
+        klog_h((u32)len);
+        klog_s(" chal=");
+        klog_h(chal);
+        klog_s(" proto=");
+        klog_h(proto);
+        klog_s(" val=");
+        klog_h(val);
+        klog_s(" gcm=");
+        klog_p((uptr)gcm);
+        if (in) {
+            u8 bi27[8];
+            u32 z27, cl27 = len < 8 ? (u32)len : 8;
+            for (z27 = 0; z27 < 8; z27++) bi27[z27] = 0;
+            memcpy(bi27, in, cl27);
+            klog_s(" in=");
+            klog_x(bi27, 8);
+        }
+        klog_s("\n");
+    }
+    /* нота мосту: поля, ЗАТЕМ seq (release) — см. c2b_k27.h */
+    g_c2b_k27_A.chal = chal;
+    g_c2b_k27_A.proto = proto;
+    g_c2b_k27_A.val = val;
+    g_c2b_k27_A.gcm = (unsigned long long)(uptr)gcm;
+    (void)__atomic_add_fetch(&g_c2b_k27_A.seq, 1u, __ATOMIC_RELEASE);
+}
+
 /* the decrypt capture: the out = THE PLAINTEXT (post-tramp), the in-head =
  * the direction-proof; the rate = the first 64 + every 8th; the len-gate =
  * the sane SNP range (1..2KB); the log = [c2b] g126: DEC32|DECL n=len= rc=
@@ -1734,6 +1810,8 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
     u32 cl, z;
 
     if (!out || !len || len > 0x800) return;
+    /* v27: снифф ДО rate-гейта — 'A'/'B' редкие, пропуск = потеря окна */
+    c2b_g126_k27_sniff(gcm, in, out, len);
     if (n > 64 && (n & 7) != 0) return;
     {
         /* v23 k23: ОДНОРАЗОВЫЙ снейкшот стека (24 qwords вверх от кадра)

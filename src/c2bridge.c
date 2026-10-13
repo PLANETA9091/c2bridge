@@ -38,6 +38,11 @@ typedef unsigned long  uptr;
 typedef unsigned int   uptr;
 #endif
 
+/* v27: общий контракт hook=>мост (k27-ноут 'A' + чистый сканер CLV2).
+ * Инсанс живёт в c2b_client_hook64.so (LD_PRELOAD = глобальный скоуп);
+ * мост резолвит dlsym(0, "g_c2b_k27_A") на первом тике g97. */
+#include "c2b_k27.h"
+
 #ifdef C2B_SELFTEST
 /* ---------- режим selftest: нормальная libc ---------- */
 #include <stdio.h>
@@ -15006,6 +15011,9 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
                              * ВТОРОЕ убийство ('GetInfo rc=1+state0' = мисрид).
                              * Проба = УДАЛЕНА; полл = [13] + sigsetjmp-гард. */
 
+/* v27: A-driven 'k'-fire — объявление (тело = после c2b_k24_brlive) */
+static void c2b_k27_maybe_fire(void);
+
 static void *c2b_g97_thread(void *arg)
 {
     u32 t, prev = 0xFFFFFFFFu, dead_run = 0, done = 0, h_seen = 0;
@@ -15179,6 +15187,10 @@ static void *c2b_g97_thread(void *arg)
                 C2B_LOGS("\n");
             }
         }
+        /* v27: A-driven in-channel 'k' — снифф'нутый 'A' (hook g126-dec)
+         * + сохраненный движковый 'k' (g_kfull) => RAW=1 513B с chal из 'A'.
+         * Тот же тред = проверенный контекст отправки. См. блок у brlive. */
+        c2b_k27_maybe_fire();
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -15407,6 +15419,112 @@ static u32 c2b_k24_brlive(void)
             md24[i24 + 8] == 'd') return 1;
     }
     return 0;
+}
+
+/* ---------- v27: A-DRIVEN IN-CHANNEL 'k' ----------
+ * РАЗГАДКА (run357 vs run361/364): сервер шлёт IN-CHANNEL 'A'
+ * (ff×4+'A'+chal+proto+val+echo; run361 DEC32#1: chal=0, proto=3,
+ * val=gameserver_relay_session_id) в ЖИВУЮ сессию и ЖДЁТ 'k' in-channel
+ * С ЭТИМ chal. run357 = 'k' был, НО chal = 0x222eaef9 (коннлесс-путь,
+ * g90-патч) при in-channel контексте => отказ => смерть сессии ~15с.
+ * run364 = RAW=0 стрипнутый (496B, без ff×4-хедера) => сервер не смог
+ * парсить => тишина при живой сессии (relay-stats 51B = жив, ест 304 B/s).
+ * V27: снифф 'A' (hook g126-dec, c2b_k27.h-ноут) + g_kfull (движковый 'k'
+ * 513B) => полная RAW=1 форма с chal = ЭТОГО 'A' => слот 11 с g97-треда
+ * (проверенный контекст отправки, run360/364). Дедап по A-seq (1 выстрел
+ * на новый 'A'), кап 6/ран, killswitch C2B_K27A=0. Смерть = общий
+ * death-stop (g_krel_dead). Атрибуция сессии-источника 'A' (мост vs
+ * движок) = пост-фактум: gcm + in=<8B> ↔ pcap. */
+static u32 g_k27_init, g_k27_on = 1, g_k27_seen, g_k27_fires;
+static c2b_k27_A_t *g_k27_Ap;
+#define C2B_K27_CAP 6
+
+static void c2b_k27_maybe_fire(void)
+{
+    u32 s1, s2, chal, proto, val, kn27, z27, live27;
+    u8 kcopy27[640];
+    void **vt27;
+    i32 rc27;
+    i64 out27;
+    if (!g_k27_init) {
+        const char *e = getenv("C2B_K27A");
+        if (e && e[0] == '0') g_k27_on = 0;
+        g_k27_init = 1;
+    }
+    if (!g_k27_on) return;
+    if (!g_k27_Ap) {
+        /* RTLD_DEFAULT = 0: hook = LD_PRELOAD = глобальный скоуп */
+        g_k27_Ap = (c2b_k27_A_t *)dlsym((void *)0, "g_c2b_k27_A");
+        if (!g_k27_Ap) {
+            static u32 k27_miss;
+            if (++k27_miss == 16)
+                C2B_LOGS("[c2b] k27: g_c2b_k27_A NOT FOUND (hook без сниффа?)\n");
+            return;
+        }
+    }
+    s1 = __atomic_load_n(&g_k27_Ap->seq, __ATOMIC_ACQUIRE);
+    if (!s1 || s1 == g_k27_seen) return;
+    chal = g_k27_Ap->chal;
+    proto = g_k27_Ap->proto;
+    val = g_k27_Ap->val;
+    s2 = __atomic_load_n(&g_k27_Ap->seq, __ATOMIC_ACQUIRE);
+    if (s1 != s2) return;              /* гонка — возьмём на следующем тике */
+    g_k27_seen = s1;
+    if (!g_gns_conn_iface || !g_gns_conn_h) return;
+    if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
+    if (g_k27_fires >= C2B_K27_CAP) return;
+    if (g_krel_dead) return;           /* общий death-stop */
+    /* консистентный снепшот g_kfull (писатель = контекст движка, гонка
+     * возможна): n до/после копии должен совпасть, иначе скип — сервер
+     * перечелленджит 'A' => новый seq => повтор */
+    {
+        u32 n1 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+        u32 n2;
+        if (!n1) return;
+        for (z27 = 0; z27 < sizeof kcopy27; z27++) kcopy27[z27] = 0;
+        for (z27 = 0; z27 < g_kfull_len; z27++) kcopy27[z27] = g_kfull[z27];
+        kn27 = g_kfull_len;
+        n2 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+        if (n1 != n2) { g_k27_seen = 0; return; }   /* ретрай этого же 'A' */
+    }
+    g_k27_fires++;
+    /* полная форма (ff×4-хедер на месте, RAW=1) + chal = chal из 'A' */
+    (void)c2b_krel_patchchal(kcopy27, kn27, chal);
+    live27 = c2b_k24_brlive();         /* тот же тред — вложений нет */
+    vt27 = *(void ***)g_gns_conn_iface;
+    rc27 = -999;
+    out27 = -1;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc27 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt27[11])(
+            g_gns_conn_iface, g_gns_conn_h, kcopy27, kn27, 1, &out27);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] k27: send SEGV\n");
+        return;
+    }
+    C2B_LOGS("[c2b] k27: A-fire #");
+    C2B_LOGN(g_k27_fires);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(chal);
+    C2B_LOGS(" proto=");
+    C2B_LOGH(proto);
+    C2B_LOGS(" val=");
+    C2B_LOGH(val);
+    C2B_LOGS(" len=");
+    C2B_LOGN(kn27);
+    C2B_LOGS(" raw=1 live=");
+    C2B_LOGN(live27);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 rc=");
+    C2B_LOGN((u32)(i32)rc27);
+    C2B_LOGS("\n");
+    if (rc27 != 1) {
+        g_krel_dead = 1;
+        C2B_LOGS("[c2b] k27: tgt dead — общий death-stop (detail у krel/g97)\n");
+    }
 }
 
 static void c2b_k19_relay(void)
@@ -25507,6 +25625,54 @@ static void test_krelpatch(void)
     CHECK(c2b_krel_patchchal(0, 17, 1u) == 0, "krel: null = 0");
 }
 
+/* v27: k27-сканер CLV2 'A'/'B' в расшифрованном plaintext (c2b_k27.h). */
+static void test_k27scan(void)
+{
+    unsigned char cls = 0;
+    u32 chal = 0, proto = 0, val = 0;
+    /* SNP-префикс 12B + ff×4+'A'+chal+proto+val (форма run361 DEC32#1) */
+    const u8 buf_a[26] = { 0x80, 0x00, 0x98, 0x02, 0x00, 0xf8, 0x00, 0x37,
+                           0x01, 0x00, 0x00, 0x00,
+                           0xff, 0xff, 0xff, 0xff, 'A',
+                           0x00, 0x00, 0x00, 0x00,   /* chal=0 */
+                           0x03,                      /* proto=3 */
+                           0x07, 0x0a, 0xee, 0x00 };  /* val=0x00ee0a07 */
+    CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 0, &cls, &chal, &proto,
+                            &val) == 1, "k27: 'A' найден за SNP-префиксом");
+    CHECK(cls == 'A', "k27: cls='A'");
+    CHECK(chal == 0u, "k27: chal=0 (run361 форма)");
+    CHECK(proto == 3u, "k27: proto=3");
+    CHECK(val == 0x00ee0a07u, "k27: val=0x00ee0a07 (LE)");
+    /* 'B' accept */
+    {
+        const u8 buf_b[14] = { 0xff, 0xff, 0xff, 0xff, 'B',
+                               0x11, 0x22, 0x33, 0x44, 0x05,
+                               0x78, 0x56, 0x34, 0x12 };
+        CHECK(c2b_k27_scan_clv2(buf_b, sizeof buf_b, 0, &cls, &chal, &proto,
+                                &val) == 1, "k27: 'B' найден");
+        CHECK(cls == 'B', "k27: cls='B'");
+        CHECK(chal == 0x44332211u, "k27: 'B' chal LE");
+    }
+    /* негативы: без ff×4, короткий буфер, off за краем */
+    {
+        const u8 buf_n[14] = { 0xff, 0xff, 0xff, 0x00, 'A', 1, 2, 3, 4, 5,
+                               6, 7, 8, 9 };
+        CHECK(c2b_k27_scan_clv2(buf_n, sizeof buf_n, 0, &cls, &chal, &proto,
+                                &val) == 0, "k27: неполный ff×4 = 0");
+        CHECK(c2b_k27_scan_clv2(buf_a, 13, 0, &cls, &chal, &proto,
+                                &val) == 0, "k27: короткий = 0");
+        CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 26, &cls, &chal,
+                                &proto, &val) == 0, "k27: off за краем = 0");
+        CHECK(c2b_k27_scan_clv2(0, 26, 0, &cls, &chal, &proto,
+                                &val) == 0, "k27: null = 0");
+    }
+    /* off=12 = ровно на ff×4 — находит; off=13 (за первым ff) = мимо */
+    CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 12, &cls, &chal, &proto,
+                            &val) == 1, "k27: off=12 (на ff×4) находит 'A'");
+    CHECK(c2b_k27_scan_clv2(buf_a, sizeof buf_a, 13, &cls, &chal, &proto,
+                            &val) == 0, "k27: off=13 (за ff) = 0");
+}
+
 /* Детур-тесты патчат код заглушек в рантайме — под санитайзерами исполняемая
    инструментированная пролог-часть (stolen bytes) невалидна вне родного фрейма
    (clang+ASan: SIGSEGV). Логика детура покрыта test_up_dispatch без патчей. */
@@ -25553,6 +25719,7 @@ int main(void)
     test_g130_relay();  /* 61b-v17: кантур-релей 'k' (kfull+фвд на фейк-sendto) */
     test_g77fd();       /* v18: g77fd-форматтер sockaddr_in */
     test_krelpatch();   /* v19: krel-patchchal (chal в копии 'k') */
+    test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

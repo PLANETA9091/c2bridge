@@ -906,6 +906,37 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       log "attempt $ATTEMPT: tracefs NOT available (kernel census skipped)"
     fi
   fi
+  # v55: PERF CALLCHAIN — сайт raw-syscall назван (RIP + user-callchain).
+  # perf_event_open = НЕ ptrace = TracerPid = 0 = анти-дебуг слеп (класс
+  # tracefs run403 = движок стрелял как обычно). Фильтр = класс 0x22
+  # (len == 512; ~40 вызовов/ран = объём копеечный). -c 1 = каждый вызов;
+  # -g dwarf = user-callchain (движок без fp — dwarf разворачивает по
+  # .eh_frame прямо на раннере, бандл на месте); -I = user-regs = RIP =
+  # АДРЕС ИНСНУКЦИИ syscall = САЙТ. Выход: perf_send.a<N>.data +
+  # perf_send.a<N>.txt (perf script, символика на раннере) = module+offset
+  # отправителя = ЦЕЛЬ ДЕТУРА v56 (кросс-реф с v55-сканом стабов).
+  if [[ "${PERFCALL:-0}" = "1" ]]; then
+    sudo -n sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
+    PERF_BIN=""
+    if command -v perf >/dev/null 2>&1 && perf --version >/dev/null 2>&1; then
+      PERF_BIN="$(command -v perf)"
+    else
+      for _pc in /usr/lib/linux-tools/*/perf /usr/bin/perf-* /usr/lib/linux-tools-*/perf; do
+        [[ -x "$_pc" ]] || continue
+        if "$_pc" --version >/dev/null 2>&1; then PERF_BIN="$_pc"; break; fi
+      done
+    fi
+    if [[ -n "$PERF_BIN" ]]; then
+      rm -f "$RUNDIR/perf_send.a${ATTEMPT}.data"
+      sudo -n "$PERF_BIN" record -q -o "$RUNDIR/perf_send.a${ATTEMPT}.data" \
+        -e syscalls:sys_enter_sendto -c 1 -g dwarf -I \
+        --filter 'len == 512' -- sleep $((DURATION + 30)) >/dev/null 2>&1 &
+      PERF_PID=$!
+      log "attempt $ATTEMPT: perf callchain ARMED (pid $PERF_PID, sendto len=512, dwarf+regs, bin=$PERF_BIN)"
+    else
+      log "attempt $ATTEMPT: perf NOT available (callchain skipped)"
+    fi
+  fi
   log "attempt $ATTEMPT: client launched (launch pid $ENGINE_PID), waiting up to ${DURATION}s for menu"
 
   # wait for the main menu (modals may cover it — steam://connect still works)
@@ -1152,6 +1183,34 @@ if [[ "${TRACEFS_GAME:-0}" = "1" ]] && sudo -n test -d /sys/kernel/tracing/event
   sudo -n cat /sys/kernel/tracing/trace > "$RUNDIR/tracefs_send.log" 2>/dev/null || true
   sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > events/syscalls/sys_enter_sendto/enable; echo 0 > events/syscalls/sys_enter_sendmsg/enable; echo 0 > events/syscalls/sys_enter_send/enable' 2>/dev/null || true
   log "tracefs send-census collected: $(wc -l < "$RUNDIR/tracefs_send.log" 2>/dev/null || echo 0) lines"
+fi
+
+# v55: perf collect + decode — сайт raw-syscall (RIP + chain) -> артефакт.
+# perf script = символика НА РАННЕРЕ (бандл на месте, symtab/.eh_frame
+# читаются perf'ом напрямую) => в txt = module+offset каждого кадра.
+if [[ "${PERFCALL:-0}" = "1" ]]; then
+  sudo -n pkill -INT -x perf 2>/dev/null || true
+  sleep 1
+  PERF_BIN=""
+  if command -v perf >/dev/null 2>&1 && perf --version >/dev/null 2>&1; then
+    PERF_BIN="$(command -v perf)"
+  else
+    for _pc in /usr/lib/linux-tools/*/perf /usr/bin/perf-* /usr/lib/linux-tools-*/perf; do
+      [[ -x "$_pc" ]] || continue
+      if "$_pc" --version >/dev/null 2>&1; then PERF_BIN="$_pc"; break; fi
+    done
+  fi
+  _pf_any=0
+  for _pf in "$RUNDIR"/perf_send.a*.data; do
+    [[ -s "$_pf" ]] || continue
+    _pf_any=1
+    if [[ -n "$PERF_BIN" ]]; then
+      sudo -n "$PERF_BIN" script -i "$_pf" > "${_pf%.data}.txt" 2>&1 || true
+    fi
+    sudo -n chown "$(id -u):$(id -g)" "$_pf" "${_pf%.data}.txt" 2>/dev/null || true
+    log "perf callchain: $(basename "$_pf") -> $(wc -l < "${_pf%.data}.txt" 2>/dev/null || echo 0) script lines"
+  done
+  (( _pf_any )) || log "perf callchain: NO data files (record failed or perf absent)"
 fi
 
 (( VERDICT_CODE != 0 )) && VERDICT_TEXT="FAIL: no connection to ${TARGET:-<smoke>} (menu=$MENU, logs: $RUNDIR)"

@@ -75,6 +75,13 @@ jobs:
       # живёт как обычно; trace = pid+tid+fd+len+timestamp -> tracefs_send.log
       # в артефакте; кросс-реф len=512/timestamps с pcap = отправитель назван.
       TRACEFS_GAME: "1"
+      # v55: PERF CALLCHAIN — сайт raw-syscall назван (RIP + цепочка
+      # вызовов). perf_event_open = НЕ ptrace = TracerPid = 0 = анти-дебуг
+      # слеп (класс tracefs run403 = движок стрелял). Фильтр = класс 0x22
+      # (len == 512); -g dwarf = user-callchain; -I = user-regs = RIP =
+      # адрес insn syscall. Выход: perf_send.a*.data + .txt (perf script,
+      # символика на раннере) = module+offset отправителя = ЦЕЛЬ v56.
+      PERFCALL: "1"
       C2B_GAME_DIR: ${{ github.workspace }}/csgo-lite
       STEAM_USER: ${{ secrets.STEAM_USER }}
       STEAM_PASS: ${{ secrets.STEAM_PASS }}
@@ -162,6 +169,13 @@ jobs:
           fi
           sudo sysctl -w vm.overcommit_memory=1 || true
           sudo sysctl -w vm.max_map_count=1048576 || true
+          # v55: perf = perf_events юзерленд (НЕ ptrace, анти-дебуг слеп).
+          # Версионный бинарь может не совпасть с ядром раннера — харнесс
+          # резолвит /usr/lib/linux-tools/*/perf напрямую. Soft-fail:
+          # отсутствие perf = минус callchain, ран живёт (tracefs остаётся).
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic linux-tools-azure 2>/dev/null \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic 2>/dev/null \
+            || true
           # Steam client: official steam.deb. NOTE: the apt-repo route is dead —
           # Valve's steam.asc key URL 404s (2026-10), which killed run 37115551190.
           if ! [ -x "$HOME/.local/share/Steam/steam.sh" ] && ! command -v steam >/dev/null; then

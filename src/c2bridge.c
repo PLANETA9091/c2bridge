@@ -15367,34 +15367,54 @@ static void c2b_ldd_maybe(void)
 static void c2b_ldd_maybe(void) { }
 #endif  /* v52 */
 
-/* ---------- v53: СКАН АНОН-r-x SYSCALL-СТАБОВ ----------
- * ФИНАЛ elimination-матрицы (v51 = не-GOT/PLT, v52 = не-libc-send-
- * прологи, run399: ARMED 3/3 + ZERO HITs при 40 живых 0x22 на проводе)
- * => отправитель = СВОЙ syscall-инструктаж в АНОНИМНОЙ r-x памяти
- * (run392 '?'-ra) и/или прямой-укатель write (v53 закрыл write-детуром
- * выше). СКАН = диагностика-локатор: /proc/self/maps -> КАЖДЫЙ r-xp
- * регион БЕЗ пути (файл-бэкед движок/либы = отсечены; аноним r-x =
- * JIT/трамплины/самодельные стабы = ровно класс подозреваемого) ->
- * pread-прогулка 64KB-чанками (v4.3-дисциплина, ноль прямых
- * разыменований) -> подписи стабов:
+/* ---------- v53/v55: СКАН SYSCALL-СТАБОВ (anon-r-x + движковый код) ----
+ * v53 = финал elimination-матрицы (v51 = не-GOT/PLT, v52 = не-libc-
+ * send-прологи, run399: ARMED 3/3 + ZERO HITs при 40 живых 0x22).
+ * v55-урок run403 (tracefs-census): отправитель = tid csgo_linux64
+ * ЧЕРЕЗ RAW sys_sendto = НЕ libc-энтри, НЕ GOT/PLT => стаб = в коде,
+ * который v51-аудит НЕ ПОКРЫЛ: (а) анон-r-x (v53-класс), (б) ГЛАВНЫЙ
+ * бинарь csgo_linux64 (в heist-map НЕ дампился, офлайн-аудит НЕ
+ * проходил), (в) engine_client.so (дампился, но v51-аудит = zero
+ * classified СРЕДИ ВСЕХ 13 модулей = его стабы = '?'-класс переменный
+ * nr — статически неперечислимы, зато фиксированные формы ловятся).
+ * СКАН = диагностика-локатор: /proc/self/maps -> r-xp регионы БЕЗ
+ * пути (anon) ИЛИ csgo_linux64 (mod=exe) ИЛИ engine_client
+ * (mod=eng) — остальные файл-бэкед (steamclient/GNS/matchmaking/
+ * vstdlib) = v51-аудитом ЗАКРЫТЫ = скан не жжёт бюджет -> pread-
+ * прогулка 64KB-чанками (v4.3-дисциплина, ноль прямых разыменований)
+ * -> подписи стабов:
  *   b8 2c 00 00 00 0f 05   mov eax,44; syscall  (sendto)
  *   b8 2e 00 00 00 0f 05   (sendmsg)
  *   b8 01 00 00 00 0f 05   (write!)
  *   48 c7 c0 <nr> 00 00 00 0f 05   (mov rax,imm32-форма)
- * Локатор: '[c2b] v53: stub region=<lo>-<hi> off=<o> nr=<n> ctx=<hex>'
- * = цель ДЛЯ СЛЕДУЮЩЕГО шага (тот же c2b_ldd_build принимает ЛЮБЫЕ
- * байты цели = детур ПРЯМО стаба). Гейт = C2B_LIBCDET=1 (тот же рычаг
- * кампании), триггер = свиньячки sendto/recvfrom хуков, rate 5s, кап
- * 24 скана/ран (~120s покрытия от первого sendto = окно 0x22 t≈36s+),
- * дедуп по базе региона (новые регионы = сканируются по мере мапа),
- * бюджет 32МБ преада/скан, регион > 64МБ = скип. Ядро = pure
+ * Локатор: '[c2b] v53: stub region=<lo>-<hi> off=<o> nr=<n> mod=<tag>
+ * ctx=<hex>' — off = ВИРТУАЛЬНЫЙ офсет от базы региона (= файл-офсет
+ * для r-x сегмента линковщика при off==addr-lo; кросс-реф с perf
+ * script RIP run404 = САЙТ НАЗВАН ДВАЖДЫ). Гейт = C2B_LIBCDET=1,
+ * триггер = свиньячки sendto/recvfrom хуков, rate 5s, кап 24 скана/
+ * ран, дедуп по базе региона, бюджет 128МБ преада/скан (v55: гл.
+ * бинарь = десятки МБ r-x), регион > 192МБ = скип. Ядро = pure
  * (selftest-ируемое). */
 #define C2B_SS_RATE_MS  5000u
 #define C2B_SS_CAP      24u
-#define C2B_SS_BUDGET   (32u << 20)
-#define C2B_SS_REGIONMAX (64u << 20)
+#define C2B_SS_BUDGET   (128u << 20)
+#define C2B_SS_REGIONMAX (192u << 20)
 #define C2B_SS_LOGCAP   24u
 struct c2b_ss_hit { u32 off; u32 nr; };
+
+/* v55 pure: substring в maps-строке (0 = miss). Возврат 1 = найдено. */
+static i32 c2b_ss_sub(const char *s, u32 n, const char *t)
+{
+    u32 i, j, m = 0u;
+    if (!s || !t) return 0;
+    while (t[m]) m++;
+    if (m == 0u || n < m) return 0;
+    for (i = 0u; i + m <= n; i++) {
+        for (j = 0u; j < m && s[i + j] == t[j]; j++) { }
+        if (j == m) return 1;
+    }
+    return 0;
+}
 
 /* pure-ядро: стабы в чанке. Возврат = число находок (<= cap). */
 static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
@@ -15452,17 +15472,25 @@ static void c2b_ss_scan_maps(void)
             }
             if (j == (u32)r) break;
             i = j + 1;
-            /* полная строка: r-xp, БЕЗ '/', бюджет, дедуп */
+            /* полная строка: r-xp, (anon ИЛИ exe/engine_client), бюджет, дедуп */
             {
                 unsigned long lo = 0, hi = 0;
-                i32 isrx = 0, hasslash = 0;
+                i32 isrx = 0, hasslash = 0, kind = 0;
                 for (k = 0; k + 4u <= (u32)llen; k++)
                     if (line[k] == 'r' && line[k + 1u] == '-' &&
                         line[k + 2u] == 'x' && line[k + 3u] == 'p')
                         isrx = 1;
                 for (k = 0; k < (u32)llen; k++)
                     if (line[k] == '/') { hasslash = 1; break; }
-                if (isrx && !hasslash && budget &&
+                /* v55: kind = 0 anon, 1 = гл. бинарь, 2 = engine_client */
+                if (isrx && hasslash) {
+                    if (c2b_ss_sub(line, (u32)llen, "csgo_linux64"))
+                        kind = 1;
+                    else if (c2b_ss_sub(line, (u32)llen,
+                                        "engine_client"))
+                        kind = 2;
+                }
+                if (isrx && (!hasslash || kind) && budget &&
                     c2b_gp_lohi(line, &lo, &hi) && hi > lo &&
                     (hi - lo) <= C2B_SS_REGIONMAX) {
                     u32 dupe = 0;
@@ -15496,7 +15524,9 @@ static void c2b_ss_scan_maps(void)
                                                 (off + hits[h].off));
                                 C2B_LOGS("nr=");
                                 C2B_LOGN(hits[h].nr);
-                                C2B_LOGS("ctx=");
+                                C2B_LOGS(kind == 1 ? " mod=exe ctx=" :
+                                         kind == 2 ? " mod=eng ctx=" :
+                                                     " ctx=");
                                 {
                                     u32 cs = hits[h].off >= 8u ?
                                              hits[h].off - 8u : 0u;
@@ -28158,6 +28188,17 @@ static void test_stubscan(void)
     /* NULL/короткий */
     CHECK(c2b_ss_scan_chunk(0, 100u, hits, 16u) == 0u, "ss: NULL = 0");
     CHECK(c2b_ss_scan_chunk(buf, 3u, hits, 16u) == 0u, "ss: n=3 = 0");
+    /* v55: substring-фильтр maps-строк (kind-детект exe/engine_client) */
+    CHECK(c2b_ss_sub("/x/csgo_lite/csgo_linux64", 25u,
+                     "csgo_linux64") == 1, "ss: sub exe hit");
+    CHECK(c2b_ss_sub("/x/csgo/bin/linux64/engine_client.so", 36u,
+                     "engine_client") == 1, "ss: sub eng hit");
+    CHECK(c2b_ss_sub("/usr/lib/x86_64-linux-gnu/libc.so.6", 35u,
+                     "csgo_linux64") == 0, "ss: sub libc miss");
+    CHECK(c2b_ss_sub("csgo", 4u, "csgo_linux64") == 0,
+          "ss: sub короче иглы = 0");
+    CHECK(c2b_ss_sub(0, 10u, "x") == 0, "ss: sub NULL = 0");
+    CHECK(c2b_ss_sub("anything", 8u, "") == 0, "ss: sub пустая игла = 0");
 }
 
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)

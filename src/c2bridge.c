@@ -15162,6 +15162,7 @@ static void c2b_ldd_install1(const char *name, u32 nr,
     i32 fdm;
     i64 rn;
     extern i32 close(i32);
+    extern i32 open(const char *, i32, ...);   /* house g24: block-scope */
     (void)tlen;
     if (!fa || (uptr)fa < 4096u) {
         C2B_LOGS("[c2b] v52: ");
@@ -15243,6 +15244,7 @@ static void c2b_ldd_maybe(void)
     const char *ec;
     struct c2b_ldd_dlinfo di;
     i32 fdm;
+    extern i32 open(const char *, i32, ...);   /* house g24: block-scope */
     if (g_ldd_init) return;
     g_ldd_init = 1;
     ec = getenv("C2B_LIBCDET");
@@ -15289,7 +15291,7 @@ static void c2b_ldd_maybe(void)
                                 }
                             if (same) {
                                 unsigned long lo = 0, hi2 = 0;
-                                if (c2b_gp_lohi(line, llen, &lo, &hi2)) {
+                                if (c2b_gp_lohi(line, &lo, &hi2)) {
                                     g_ldd_lo = (uptr)lo;
                                     g_ldd_hi = (uptr)hi2;
                                 }

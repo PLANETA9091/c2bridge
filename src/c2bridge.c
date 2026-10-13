@@ -15392,12 +15392,29 @@ static void c2b_ldd_maybe(void) { }
  * для r-x сегмента линковщика при off==addr-lo; кросс-реф с perf
  * script RIP run404 = САЙТ НАЗВАН ДВАЖДЫ). Гейт = C2B_LIBCDET=1,
  * триггер = свиньячки sendto/recvfrom хуков, rate 5s, кап 24 скана/
- * ран, дедуп по базе региона, бюджет 128МБ преада/скан (v55: гл.
+ * ран, дедуп по базе региона, бюджет 256МБ преада/скан (v55: гл.
  * бинарь = десятки МБ r-x), регион > 192МБ = скип. Ядро = pure
- * (selftest-ируемое). */
+ * (selftest-ируемое).
+ *
+ * v55b-УРОК run404 (КРИТИЧЕСКИЙ БАГФИКС): v53/v55-сканер pread'ил
+ * ЧЕРЕЗ fdm = /proc/self/maps (!) по виртуальным адресам — преад
+ * мимо EOF файла maps = всегда 0 = chunks=0 = сканер НИКОГДА НЕ
+ * ЧИТАЛ ПАМЯТЬ (runs 400-404: 'chunks=0 budget=full stubs=0' =
+ * НЕ "стабов нет", а "чтения не было"). Вывод run400 'anon-r-x =
+ * пусто' = НЕДОСТОВЕРЕН. Фикс: отдельный fdmem = /proc/self/mem
+ * (v51-дисциплина), pread = ПО НЕМУ. Одновременно run404-урок:
+ * 40 сломанных 0x22 на проводе при НУЛЕ sendto/sendmsg/send
+ * трейспойнт-событий (tracefs 12899 записей, окно 0x22 внутри;
+ * двиг-комм sendto=8456 без единого len 0x200; sendmsg=53 без
+ * burst) => отправитель 0x22 = НЕ sendto/sendmsg/send syscall
+ * ВООБЩЕ => основной подозреваемый = raw-syscall write() на
+ * коннектнутый сокет (v52-write-детур armed + zero HIT = не libc)
+ * или io_uring. run403-вердикт 'отправитель = tid 6106 raw
+ * sys_sendto' = МИСАТРИБУЦИЯ (6106 = ХЕЛЛО-отправитель моста:
+ * 0x20-hello = тоже 512B, cadence совпал). */
 #define C2B_SS_RATE_MS  5000u
 #define C2B_SS_CAP      24u
-#define C2B_SS_BUDGET   (128u << 20)
+#define C2B_SS_BUDGET   (256u << 20)
 #define C2B_SS_REGIONMAX (192u << 20)
 #define C2B_SS_LOGCAP   24u
 struct c2b_ss_hit { u32 off; u32 nr; };
@@ -15448,7 +15465,7 @@ static u32 g_ss_seen_n;
 
 static void c2b_ss_scan_maps(void)
 {
-    i32 fdm;
+    i32 fdm, fdmem;
     char chunk[65536], line[4096];
     i32 llen = 0;
     i64 r;
@@ -15457,7 +15474,14 @@ static void c2b_ss_scan_maps(void)
     extern i64 read(i32, void *, u64);
     extern i32 close(i32);
     fdm = open("/proc/self/maps", 0 /*O_RDONLY*/);
-    if (fdm < 0) return;
+    /* v55b: преад = ЧЕРЕЗ /proc/self/mem (fdm = maps = только парс!
+     * старый код преадил fdm(=maps) по вирт-адресам = всегда 0). */
+    fdmem = open("/proc/self/mem", 0 /*O_RDONLY*/);
+    if (fdm < 0 || fdmem < 0) {
+        if (fdm >= 0) close(fdm);
+        if (fdmem >= 0) close(fdmem);
+        return;
+    }
     while ((r = read(fdm, chunk, (uptr)sizeof chunk)) > 0) {
         u32 i = 0;
         while (i < (u32)r) {
@@ -15502,7 +15526,7 @@ static void c2b_ss_scan_maps(void)
                         for (off = 0; off < (u64)(hi - lo) &&
                                       budget > 0u; ) {
                             u8 buf[65536];
-                            i64 rn = pread(fdm, buf,
+                            i64 rn = pread(fdmem, buf,
                                            (uptr)sizeof buf,
                                            (i64)(lo + off));
                             struct c2b_ss_hit hits[16];
@@ -15547,6 +15571,7 @@ static void c2b_ss_scan_maps(void)
         }
     }
     close(fdm);
+    close(fdmem);
     g_ss_scans++;
     C2B_LOGS("[c2b] v53: scan #");
     C2B_LOGN(g_ss_scans);

@@ -29685,6 +29685,26 @@ static void test_lddet(void)
         g_tldd_site_hit = 0; g_tldd_site_ax = 0;
         rv = ((gid_fn)(uptr)pg)();
         CHECK(rv > 0, "v59: rv = getpid (>0)");
+        if (rv <= 0) {
+            /* v71-CI-диагноз: gcc-13-plain = rv<=0 при живом логгере
+             * (gcc-14 локально = PASS). Печатаем ВСЁ: rv, logger-ax,
+             * tramp-байты окна (сдвиг?), повторный вызов. */
+            printf("    [v71-cidbg] rv=%ld ax=%llx hit=%u\n", rv,
+                   (unsigned long long)g_tldd_site_ax, g_tldd_site_hit);
+            printf("    [v71-cidbg] win:");
+            for (q = 75u; q < 98u && q < tlen; q++)
+                printf(" %02x", trx[q]);
+            printf("\n    [v71-cidbg] pre:");
+            for (q = 0u; q < 75u; q++) printf(" %02x", trx[q]);
+            printf("\n");
+            rv = ((gid_fn)(uptr)pg)();
+            printf("    [v71-cidbg] retry rv=%ld\n", rv);
+            g_tldd_site_hit = 0;
+            rv = ((gid_fn)(uptr)pg)();
+            printf("    [v71-cidbg] retry2 rv=%ld hit=%u\n", rv,
+                   g_tldd_site_hit);
+            CHECK(rv > 0, "v59: rv = getpid (>0) [retry2]");
+        }
         CHECK(g_tldd_site_hit == 1, "v59: логгер видел вызов");
         /* rax на входе окна = ЕЩЁ мусор (b8 исполнится ПОСЛЕ логгера):
          * это ДОКУМЕНТИРОВАННО (шапка) — assert = живость, не значение */

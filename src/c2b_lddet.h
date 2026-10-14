@@ -690,5 +690,46 @@ static inline unsigned long long c2b_ldd_mh_len(const unsigned char *mh)
     return ln;
 }
 
+/* v64: FIRE-аргументы = ABI-сплит по КЛАССУ сайта (g_dsite_tab-индекс).
+ * КЛАСС b8 (tab[3..7] = snd/smg/smsg/wr1(+wr2), диск = b8 <nr> 00 00 00
+ * 0f ..): ловушка = ПЕРЕД окном (ax = pre-site мусор — FIRE ax=0/2 =
+ * доказательство), syscall-аргументы УЖЕ разведены: fd=rdi, len=rdx
+ * (rdx = НЕ флаги — флаги = r10). => fd/len = rdi/rdx ВСЕГДА, БЕЗ
+ * fallback'а: прежний "иначе fd=rcx len=r9v" = сырые pre-syscall
+ * остатки libc (run425/427/428 FIRE-1 smg fd=0x8940/0x5940 len=0 =
+ * МУСОР, не данные; run427 FIRE smg fd=0x17 len=0x48 = rdx=0x48 =
+ * прошла [40,640]-окно случайно). rdx вне [40,640] = ВСЁ РАВНО
+ * реальные данные (0 = 0-лен датаграмма-класс; >640 = крупный кадр).
+ * КЛАСС csp (tab[0..2] = '?'-спин 89 d0 0f 05): rdx = НОМЕР (mov
+ * eax,edx) => syscall-аргументы сдвинуты, конвенция cls=2 (fd=rcx,
+ * len=r9) — держится. smsg (tab[5], nr 46 = sendmsg): len = ИСТИННЫЙ
+ * iov[0].len = c2b_ldd_mh_len (v63; сайт-гейт = дисциплина v62b,
+ * инвариант инсталлера v62b гвардит tab[5] = b8 2e — здесь тот же
+ * индекс 5 = константа-дубль, пин selftest'ом).
+ * v64b-вердикт (census-лейбл): smg = sendto-КЛАСС (b8 2c = nr 44 на
+ * диске + fd=rdi/len=rdx=0x48 в рантайме = ABI sendto; sendmmsg =
+ * nr 307 = b8 33 01 00 00 = НЕ эта форма) — 'sendmmsg inner' =
+ * МИСНОМЕР run414-census, mmsghdr-план 0839 = СНЯТ.
+ * Pure = в хедере = обе компиляции = selftest. */
+static inline void c2b_ldd_fire_args(unsigned int tag,
+                                     unsigned long long rdi,
+                                     unsigned long long rsi,
+                                     unsigned long long rdx,
+                                     unsigned long long rcx,
+                                     unsigned long long r9v,
+                                     unsigned long long *fd,
+                                     unsigned long long *len)
+{
+    if (tag == 5u) {                /* smsg = sendmsg (v63, гейт v62b) */
+        *fd = rdi;
+        *len = rsi ? c2b_ldd_mh_len((const unsigned char *)(uptr)rsi)
+                   : 0ull;
+    } else if (tag >= 3u) {         /* b8-класс: syscall ABI без fallback */
+        *fd = rdi; *len = rdx;
+    } else {                        /* csp-спин: конвенция cls=2 */
+        *fd = rcx; *len = r9v;
+    }
+}
+
 #endif /* __x86_64__ */
 #endif /* C2B_LDD_H */

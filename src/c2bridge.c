@@ -15317,7 +15317,10 @@ static long c2b_ldd_dsyscall(long nr, long a1, long a2, long a3,
  *   csp2 0x9cb14  '?'-спин (за 9B e8 = окно строиться не должно)
  *   csp3 0xee31b  '?'-спин 89 d0 0f 05 48 3d .. (errno-стор класс)
  *   snd  0x12c136 b8 2c .. (send, ВТОРОЙ inline = intact)
- *   smg  0x12c183 b8 2c .. (sendmmsg inner)
+ *   smg  0x12c183 b8 2c .. (sendto-класс #2: nr 44 НА ДИСКЕ + рантайм
+ *                           fd=rdi/len=rdx=0x48 = ABI sendto; census-
+ *                           лейбл 'sendmmsg inner' = МИСНОМЕР v64b —
+ *                           sendmmsg = nr 307 = b8 33 01 00 00)
  *   smsg 0x12c2c4 b8 2e .. (sendmsg inner)
  *   sto  0x12c330 b8 2c .. (sendto inner = ПОКРЫТ v52-патчем entry —
  *                           в таблицу НЕ входит, байты = nop-nop)
@@ -15468,21 +15471,17 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
         c2b_gp_lh64((unsigned long long)rax);
         {
             u64 ffd, flen;
-            if (tag == C2B_DSITE_SMSG) {
-                /* v63: sendmsg-сайт = fd=rdi, len = ИСТИННЫЙ iov[0].len
-                 * (rdx = флаги, r9v = мусор — прежние FIRE-значения =
-                 * сырое reg-гадание run425/427, не длины; парс = тот же
-                 * msghdr-класс что фильтр-3, сайт-гейт = дисциплина
-                 * v62b: на sendto-сайтах rsi = буфер = дикий deref;
-                 * g_dsite_busy уже поднят = лог-рекурсия закрыта) */
-                ffd = rdi;
-                flen = rsi ? c2b_ldd_mh_len((const unsigned char *)
-                                           (uptr)rsi) : 0ull;
-            } else if (rsi && rdx >= 40u && rdx <= 640u) {
-                ffd = rdi; flen = rdx;         /* b8-класс */
-            } else {
-                ffd = rcx; flen = r9v;         /* csp-класс */
-            }
+            /* v64: ABI-сплит = c2b_ldd_fire_args (c2b_lddet.h, pure =
+             * selftest): b8-сайты (snd/smg/smsg/wr1) = fd=rdi len=rdx
+             * ВСЕГДА (syscall-аргументы разведены до окна; rdx вне
+             * [40,640] = реальные данные — прежний fallback fd=rcx
+             * len=r9v = pre-syscall мусор libc: run425/427/428 FIRE-1
+             * smg fd=0x8940/0x5940 len=0); csp-спин (csp1/2/3, rdx =
+             * nr) = конвенция cls=2 (fd=rcx len=r9v); smsg = v63
+             * mh_len (истинный iov[0].len, гейт v62b). v64b: smg =
+             * sendto-класс (b8 2c = nr 44 + рантайм rdx=0x48 = len),
+             * mmsghdr-план 0839 = СНЯТ (census-лейбл = мисномер). */
+            c2b_ldd_fire_args(tag, rdi, rsi, rdx, rcx, r9v, &ffd, &flen);
             C2B_LOGS(" fd=");
             C2B_LOGN((u32)(ffd & 0xffffu));
             C2B_LOGS(" len=");
@@ -29005,6 +29004,52 @@ static void test_lddet(void)
             for (kq = 0u; kq < 8u; kq++) mh[16u + kq] = 0u;
             CHECK(c2b_ldd_mh_len(mh) == 0ull, "v63: msg_iov = null = 0");
         }
+        /* v64: FIRE-аргументы = ABI-сплит по классу сайта (pure fn в
+         * хедере — РАНЬШЕ ветка была в логгере = нетестируема; урок
+         * v63: FIRE-значения = факты ТОЛЬКО после истинного парсера) */
+        {
+            u64 fa_fd = 0, fa_len = 0;
+            u8 mh2[64];
+            unsigned int kv;
+            unsigned long long iv2 = (unsigned long long)(uptr)&mh2[32];
+            for (kv = 0u; kv < 64u; kv++) mh2[kv] = 0u;
+            for (kv = 0u; kv < 8u; kv++) mh2[16u + kv] =
+                (u8)((iv2 >> (8u * kv)) & 0xffu);   /* msg_iov = &mh2[32] */
+            mh2[24u] = 1u;                          /* iovlen = 1 */
+            mh2[40u] = 0xa0u;                       /* iv[0].len = 160 */
+            /* b8-класс = rdi/rdx ВСЕГДА: FIRE-1 smg-реплика (rcx/r9v =
+             * мусор 0x8940/0x51515151, rdx=0) => НЕТ fallback'а */
+            c2b_ldd_fire_args(4u, 23ull, 0xdeadbeefull, 0ull,
+                              0x8940ull, 0x51515151ull, &fa_fd, &fa_len);
+            CHECK(fa_fd == 23ull && fa_len == 0ull,
+                  "v64: smg FIRE-1 = fd=rdi len=rdx=0 БЕЗ rcx/r9v-fallback");
+            c2b_ldd_fire_args(4u, 22ull, 0xdeadbeefull, 72ull,
+                              0x8940ull, 0ull, &fa_fd, &fa_len);
+            CHECK(fa_fd == 22ull && fa_len == 72ull,
+                  "v64: smg FIRE-2/3 = rdx=0x48 = len (sendto-ABI)");
+            c2b_ldd_fire_args(4u, 9ull, 0xdeadbeefull, 1200ull,
+                              0x777ull, 88ull, &fa_fd, &fa_len);
+            CHECK(fa_fd == 9ull && fa_len == 1200ull,
+                  "v64: rdx>640 = реальные данные (крупный кадр, не мусор)");
+            c2b_ldd_fire_args(6u, 9ull, 0ull, 213ull, 0ull, 0ull,
+                              &fa_fd, &fa_len);
+            CHECK(fa_fd == 9ull && fa_len == 213ull,
+                  "v64: wr1 = write-ABI fd=rdi len=rdx");
+            c2b_ldd_fire_args(0u, 0x1111ull, 0x2222ull, 44ull,
+                              0x777ull, 88ull, &fa_fd, &fa_len);
+            CHECK(fa_fd == 0x777ull && fa_len == 88ull,
+                  "v64: csp-спин = fd=rcx len=r9v (rdx = nr, cls=2)");
+            /* smsg через сплит: v63-семантика + null-гейт */
+            c2b_ldd_fire_args(5u, 8ull,
+                              (unsigned long long)(uptr)mh2, 0x48ull,
+                              0ull, 0ull, &fa_fd, &fa_len);
+            CHECK(fa_fd == 8ull && fa_len == 160ull,
+                  "v64: smsg = mh_len 160 через ABI-сплит (rdx=0x48 не len)");
+            c2b_ldd_fire_args(5u, 8ull, 0ull, 0x48ull, 0ull, 0ull,
+                              &fa_fd, &fa_len);
+            CHECK(fa_fd == 8ull && fa_len == 0ull,
+                  "v64: smsg rsi=0 = null-гейт жив через сплит");
+        }
         /* csp1: окно = 2+2+2+2+2+11 = 21 (SIB-фикс: 11B-nop = ЦЕЛЫЙ) */
         memset(str, 0, sizeof str);
         CHECK(c2b_ldd_site_build(tldd_site_csp1 + 2u,
@@ -29115,6 +29160,34 @@ static void test_lddet(void)
                                  (unsigned long long)(uptr)&tldd_sitelog,
                                  &olen, &tlen) == 0u,
               "v59: csp2 (e8 в окне) build=0 = отказ-протокол");
+        /* v64b: ТОЧНЫЕ дисковые байты csp2 (run425/427/428 have=20B):
+         * 89 d0 0f 05 eb f8 | 48 89 df | e8 -15072 | 41 83 ec 01 | 0f 85.
+         * ОТКАЗ = ШТАТНЫЙ протокол, НЕ баг декодера: (1) e8 rel32 @+9
+         * замораживает walk ДО границы 14B; (2) ГЛАВНОЕ — спин-эксит =
+         * site+6 (продолжение после eb f8 достигается ТОЛЬКО прыжком —
+         * site+6 = ВНУТРИ ff25-addr-зоны [site+6, site+14) ЛЮБОГО
+         * легального >=14B патча => прыжок сядет НА 8B-адрес-байты =
+         * дикий экзек = класс wr2). e8-релокация = математика триви-
+         * альна, но ЗДЕСЬ бессмысленно-опасна => декодер НЕ расширяет-
+         * ся, build=0 = ПРАВИЛЬНО. Базовый лайн никогда не зависел от
+         * csp2 (run425-428 = 6 сайтов = PASS attempt-1). */
+        {
+            static const u8 csp2_run425[20] = {
+                0x89u, 0xd0u, 0x0fu, 0x05u, 0xebu, 0xf8u,
+                0x48u, 0x89u, 0xdfu,
+                0xe8u, 0x60u, 0xc5u, 0xffu, 0xffu,
+                0x41u, 0x83u, 0xecu, 0x01u,
+                0x0fu, 0x85u
+            };
+            CHECK(c2b_ldd_site_build(csp2_run425, 20u,
+                                     0x7f0000001004ull, str,
+                                     0x7f0000200000ull,
+                                     (unsigned long long)(uptr)
+                                     &tldd_sitelog,
+                                     &olen, &tlen) == 0u,
+                  "v64b: csp2 run425-байты = build=0 (e8@9; сайт = "
+                  "патч-несовместим: спин-эксит site+6 = ff25-addr-зона)");
+        }
         /* SIB-фикс юнит: 0f 1f 84 00 00 00 00 = 8B (с SIB), НЕ 7 */
         {
             unsigned int ilen = 0, tlen2 = 0, cc = 0, doff = 0;

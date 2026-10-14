@@ -17121,11 +17121,12 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
  * sendto-хука всё уже замаплено). Логи: '[c2b] v75: site/PATCH/raw/
  * done'. Бюджет скана: 512МБ преада, регион >256МБ = скип (v55-урок). */
 #define C2B_RAW_RATE_MS   2000u
-#define C2B_RAW_MAXSCANS  8u
-#define C2B_RAW_BUDGET    (512u << 20)
+#define C2B_RAW_MAXSCANS  30u   /* v75b: ресканы — RWX-стабы пишутся в рантайме
+                                 * (steamclient-init); seen-dedup = дешёво */
+#define C2B_RAW_BUDGET    (768u << 20)  /* v75b: весь r-x процесса ~200-300MB */
 #define C2B_RAW_REGIONMAX (256u << 20)
-#define C2B_RAW_LOGCAP    48u
-#define C2B_RAW_PATCHMAX  16u
+#define C2B_RAW_LOGCAP    64u
+#define C2B_RAW_PATCHMAX  24u
 extern i32 munmap(void *, u32);   /* g24-паттерн: блочная extern (.so) */
 static u32 g_raw_init, g_raw_scans, g_raw_busy, g_raw_last;
 static u32 g_raw_sites, g_raw_patched, g_raw_bytes_hi, g_raw_regs;
@@ -17234,7 +17235,11 @@ static u8 *c2b_raw_tramp_alloc(unsigned long long near_site)
     return 0;
 }
 
-/* скан: maps -> r-x регионы steam/csgo -> стабы -> патч. */
+/* скан: maps -> r-x/rwx регионы (файл-бэкед) -> стабы -> патч.
+ * v75b: regs[] = ПЕРСИСТЕНТНЫ (append-only по (lo,hi)): флаг scanned/
+ * rwx живёт между ресканами (большие статические r-x = один раз;
+ * малые + RWX = каждый рескан). Новые регионы (поздние dlopen) =
+ * добавляются. Лог region = только скан #1 (спам-гвард). */
 static void c2b_raw_scan(void)
 {
     static const char *pmap = "/proc/self/maps";
@@ -17242,12 +17247,14 @@ static void c2b_raw_scan(void)
     static u8 chunk[256u * 1024u + 32u];
     static char mb[2 * 1024 * 1024];    /* СТАТИК (v51-урок): стек GNS-тредов
                                          * мал; бизи-гвард = реентерабельность */
+    static u32 nregs = 0;
     char *p, *endp;
     i32 mfd, ffd = -1;
     i64 n = 0, r;
     u64 budget = C2B_RAW_BUDGET;
-    static struct { char path[300]; unsigned long lo, hi; } regs[48];
-    u32 nregs = 0, ri;
+    static struct { char path[300]; unsigned long lo, hi; u32 rwx, scanned; }
+        regs[160];
+    u32 ri;
     /* файловые декларации: .so = блок extern (g24-паттерн, 22:09-урок:
      * блок-скоуп extern = конфликт с libc-хедерами только в selftest) */
     extern i32 open(const char *, i32, ...);
@@ -17280,30 +17287,34 @@ static void c2b_raw_scan(void)
     mb[n] = 0;
     p = mb;
     endp = mb + n;
-    while (p < endp && nregs < 48u) {
+    while (p < endp && nregs < 160u) {
         unsigned long lo, hi, off;
         unsigned int prot, plen, linelen;
         const char *pa;
+        u32 q;
         if (!c2b_gp_line(p, (u32)(endp - p), &lo, &hi, &prot, &off,
                          &pa, &plen, &linelen)) break;
         p += linelen;
-        if (!(prot & 4u)) continue;                 /* только r-x */
+        if (!(prot & 4u)) continue;                 /* только исполняемые */
         if (!pa || plen == 0u || plen >= 300u) continue;
         if (!c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn)) continue;
-        {
-            u32 q;
-            for (q = 0; q < nregs; q++)
-                if (regs[q].lo == lo && regs[q].hi == hi) break;
-            if (q < nregs) continue;                /* дупль строки */
+        for (q = 0; q < nregs; q++)
+            if (regs[q].lo == lo && regs[q].hi == hi) break;
+        if (q < nregs) {
+            /* уже знаем (персистент) — обновить только RWX-флаг */
+            if (prot & 2u) regs[q].rwx = 1u;
+            continue;
         }
         {
             char *d = regs[nregs].path;
-            u32 q;
-            for (q = 0; q < plen; q++) d[q] = pa[q];
+            u32 k;
+            for (k = 0; k < plen; k++) d[k] = pa[k];
             d[plen] = 0;
         }
         regs[nregs].lo = lo;
         regs[nregs].hi = hi;
+        regs[nregs].rwx = (prot & 2u) ? 1u : 0u;    /* RWX/W-x = mutable */
+        regs[nregs].scanned = 0u;
         nregs++;
     }
     if (!nregs) return;
@@ -17316,13 +17327,23 @@ static void c2b_raw_scan(void)
         while (regs[ri].path[pathn]) pathn++;
         rlen = hi - lo;
         if (rlen > C2B_RAW_REGIONMAX) continue;
-        C2B_LOGS("[c2b] v75: region lo=");
-        c2b_gp_lh64(lo);
-        C2B_LOGS("len=");
-        C2B_LOGN((u32)(rlen >> 10));
-        C2B_LOGS("K ");
-        C2B_LOGS(regs[ri].path);
-        C2B_LOGS("\n");
+        /* v75b-рескан-дисциплина: большой статический r-x = читается ОДИН
+         * раз (стабы = константы линкера); малые (<8МБ) и RWX (mutable,
+         * рантайм-генерация) = КАЖДЫЙ рескан. Дешёво и покрывает
+         * поздние стабы (steamclient-init/GNS-потоки). */
+        if (regs[ri].scanned && rlen >= (8ul << 20) && !regs[ri].rwx)
+            continue;
+        regs[ri].scanned = 1u;
+        if (g_raw_scans <= 1u) {                    /* спам-гвард: регион-лог
+                                                     * = только первый скан */
+            C2B_LOGS("[c2b] v75: region lo=");
+            c2b_gp_lh64(lo);
+            C2B_LOGS("len=");
+            C2B_LOGN((u32)(rlen >> 10));
+            C2B_LOGS("K ");
+            C2B_LOGS(regs[ri].path);
+            C2B_LOGS("\n");
+        }
         g_raw_regs++;
         for (off = 0; off < rlen && budget > 0ull; off += 256u * 1024u) {
             unsigned long want = rlen - off;
@@ -17457,7 +17478,7 @@ static void c2b_raw_maybe(void)
     if (__sync_lock_test_and_set(&g_raw_busy, 1u)) return;
     g_raw_scans++;
     c2b_raw_scan();
-    if (g_raw_patched > 0u || g_raw_scans >= C2B_RAW_MAXSCANS) {
+    if (g_raw_scans >= C2B_RAW_MAXSCANS) {
         g_raw_done = 1;
         C2B_LOGS("[c2b] v75: done scans=");
         C2B_LOGD(g_raw_scans);
@@ -30775,8 +30796,14 @@ static void test_raw(void)
         CHECK(c2b_raw_path_want(p_eng, (u32)strlen(p_eng),
                                 p_self, (u32)strlen(p_self)) == 1,
               "raw: путь репо (c2bridge в PATH) НЕ режет движковые либы");
-        CHECK(c2b_raw_path_want(p_std, (u32)strlen(p_std), 0, 0) == 0,
-              "raw: системная либа без steam/csgo = нет");
+        /* v75b-ИНВЕРСИЯ: всё файл-бэкед = want (кроме системы/сам-софт) */
+        CHECK(c2b_raw_path_want(p_std, (u32)strlen(p_std), 0, 0) == 1,
+              "raw: v75b системная third-party (libstdc++) = СКАН");
+        CHECK(c2b_raw_path_want("/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+                                39u, 0, 0) == 1,
+              "raw: v75b libcrypto = СКАН");
+        CHECK(c2b_raw_path_want(p_libc, (u32)strlen(p_libc), 0, 0) == 0,
+              "raw: v75b libc = ВСЁ ЕЩЁ НЕТ (рекурсия)");
         CHECK(c2b_raw_path_want(0, 0, 0, 0) == 0, "raw: NULL-путь = нет");
     }
 }

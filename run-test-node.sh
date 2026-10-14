@@ -963,7 +963,19 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
           nm -D --defined-only "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null | sort > "$RUNDIR/sns_stref.txt" || true
           readelf -n "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null | grep -a "Build ID" > "$RUNDIR/sns_buildid.txt" || true
           sudo -n cat /usr/lib/x86_64-linux-gnu/libc.so.6 > "$RUNDIR/libc.node.so" 2>/dev/null || true
-          log "attempt $ATTEMPT: v70 SNS lib captured ($(stat -c%s "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null || echo ?)B from $_sns)"
+          # v75b: ДАМП ВСЕХ подозреваемых на raw-syscall стабы. run469-урок:
+          # GNS-либа = 0 стабов (байт-верифицировано), отправитель raw
+          # sendto НЕ найден => оффлайн-поиск по ПОЛНОМУ набору модулей.
+          _sc="$(sudo -n cat "/proc/$_vp/maps" 2>/dev/null | grep -o '[^ ]*steamclient\.so[^ ]*' | head -1)"
+          [[ -n "$_sc" ]] && sudo -n cat "$_sc" > "$RUNDIR/steamclient.so" 2>/dev/null || true
+          _bd="/home/runner/work/c2bridge/c2bridge/csgo-lite/bin/linux64"
+          for _m in filesystem_stdio_client.so launcher_client.so \
+                    libSDL2-2.0.so.0 libsteam_api.so libtier0_client.so \
+                    libtogl_client.so libvstdlib_client.so \
+                    serverbrowser_client.so; do
+            [[ -f "$_bd/$_m" ]] && cat "$_bd/$_m" > "$RUNDIR/dump_$_m" 2>/dev/null || true
+          done
+          log "attempt $ATTEMPT: v70 SNS lib captured ($(stat -c%s "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null || echo ?)B from $_sns; steamclient=$(stat -c%s "$RUNDIR/steamclient.so" 2>/dev/null || echo 0)B)"
           break
         fi
       fi

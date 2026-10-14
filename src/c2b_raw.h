@@ -133,12 +133,18 @@ static i32 c2b_raw_has(const char *s, u32 n, const char *t)
     return 0;
 }
 
-/* pure: фильтр путей r-x регионов. 1 = СКАНИРОВАТЬ. Классы: steam/csgo
- * (libsteamnetworkingsockets*, steamclient.so, csgo-lite/...), минус
- * система (libc/ld/pthread), минус наш собственный .so (точное совпа-
- * дение пути из dladdr — ПУТЬ РЕПО СОДЕРЖИТ 'c2bridge' (work/
- * c2bridge/c2bridge/), поэтому НЕ подстрокой!), минус псевдо-пути
- * ([vdso]/[vvar] — нет '/'). */
+/* pure: фильтр путей r-x/rwx регионов. 1 = СКАНИРОВАТЬ.
+ * v75b-ИНВЕРСИЯ (run469-урок: steam|csgo-фильтр = sites=0 — отправитель
+ * raw-sendto НЕ в GNS-либе (дамп байт-верифицирован: 0 стабов), не в
+ * просканированной половине steamclient (48-кап). want = РАСШИРЕН до
+ * всего файл-бэкед, исключения = минимальны:
+ *   ХОТИМ: всё файл-бэкед (csgo-модули, steamclient, steam-рантайм,
+ *   SDL/crypto/любые third-party — стаб может быть где угодно; RWX-
+ *   регионы steamclient = рантайм-генерация кода = тоже скан).
+ *   НЕ хотим: СИСТЕМНАЯ libc ("libc.so"/"libc-" — её стабы = путь наших
+ *   собственных g_clp-вызовов = РЕКУРСИЯ), ld, libpthread, наш
+ *   собственный .so (точное dladdr-совпадение — путь РЕПО содержит
+ *   'c2bridge', подстрокой НЕ гвард!), псевдо-пути ([vdso]/[vvar]). */
 static i32 c2b_raw_path_want(const char *p, u32 n, const char *self,
                              u32 selfn)
 {
@@ -152,8 +158,7 @@ static i32 c2b_raw_path_want(const char *p, u32 n, const char *self,
         for (i = 0u; i < n && p[i] == self[i]; i++) { }
         if (i == n) return 0;               /* наш собственный .so */
     }
-    if (c2b_raw_has(p, n, "steam") || c2b_raw_has(p, n, "csgo")) return 1;
-    return 0;
+    return 1;
 }
 
 #endif /* C2B_RAW_H */

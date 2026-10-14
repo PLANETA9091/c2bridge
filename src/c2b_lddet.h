@@ -415,45 +415,25 @@ static inline unsigned int c2b_ldd_build(const unsigned char *tgt,
  *     сайта — rax на входе окна ЕЩЁ МУСОР: spill ДО b8!)
  *   csp-сайты (cancel-arch): ch=rdi, cx=rsi, nr=rdx, a1=rcx=fd,
  *     a2=r8=buf, a3=r9=len (спин = mov eax,edx => nr ИЗ edx)
- * Байты префикса (v74 ГИБРИД = v71-дисциплина + v70-раскладка): v65-
- * класс бага = mov r8,[..] (arg5) и lea r9 (arg6) КОЛОТЯЛИ живые r8/r9
- * ДО push r10/r9/r8 => arg7 (ad) = ИСХОДНЫЙ rcx, arg8 (al) = sp-lea
- * (run439-ФАКТ: ad=0x212 при kernel addr=0); v71 = push r10/r9/r8 ДО
- * всех load'ов => arg7/8/9 = ИСТИННЫЕ живые r8/r9/r10 (kernel-валида-
- * ция run442: fl/ad/al байт-точны). НО v71 также переставил align-push
- * rax с 10-й на 1-ю позицию => раскладка стека под [ret] ИЗМЕНИЛАСЬ:
- * v70 = [ret][r8][r9][r10][ALIGN][r11][r10][r9][r8][rdi][rsi][rdx]
- * [rcx][rax], v71 = [ret][r8][r9][r10][r11][r10][r9][r8][rdi][rsi]
- * [rdx][rcx][rax][ALIGN]. A/B (run442/443 FAIL x4-5 vs run444 @v73-
- * revert PASS): v71-раскладка = детерминированный краш 0x27afe в анон-
- * модуле 0x47000 (cmpb $0x22,(%rdx) 0x22-сканер; [rsp+0x300] = 2 =
- * тег вместо указателя); v70-раскладка = здоровый baseline (440/444
- * PASS). v74 = ОБЕ цели: стек-арги push ДО load'ов (v71-фикс жив) +
- * финальная раскладка БАЙТ-ТОЧНО v70 (align = 10-й push; гипотеза:
- * верификатор инспектирует стек под своим кадром — раскладка = тот же
- * 104B, другое ПОЗИЦИОНИРОВАНИЕ мусорного qword). Порядок push:
- *   50 51 52 56 57          push rax rcx rdx rsi rdi   (spill 1-5)
- *   41 50 41 51 41 52 41 53 push r8 r9 r10 r11         (6-9)
- *   50                      push rax (ВЫРАВНИВАНИЕ = 10-й, v70-позиция)
- *   41 52 41 51 41 50       push r10 r9 r8   (стек-арги 11-13, ДО load!)
- *   48 8b 7c 24 60   mov 0x60(%rsp),%rdi   (rax -> arg1; rsp'' = rsp-104)
- *   48 8b 74 24 40   mov 0x40(%rsp),%rsi   (rdi -> arg2)
- *   48 8b 54 24 48   mov 0x48(%rsp),%rdx   (rsi -> arg3)
- *   48 8b 4c 24 50   mov 0x50(%rsp),%rcx   (rdx -> arg4)
- *   4c 8b 44 24 58   mov 0x58(%rsp),%r8    (rcx -> arg5; r8 УЖЕ НА СТЕКЕ)
- *   4c 8d 4c 24 68   lea 0x68(%rsp),%r9    (orig rsp -> arg6; r9 УЖЕ НА
- *        СТЕКЕ; v68: БЫЛО 49 = lea rcx,[r12+0x48] = sp-арг мусор)
- *   e8 <rel32>        call logger
- *   41 58 41 59 41 5a pop r8 r9 r10        (стек-арги = живые рег)
- *   58                pop rax (выравнивание-слот)
- *   41 5b 41 5a 41 59 41 58  (pop r11 r10 r9 r8)
- *   5f 5e 5a 59 58    (pop rdi rsi rdx rcx rax; финальный rax =
- *   spill-rax = ИСХОДНЫЙ rax — реверс push-порядка 1:1)
- * Раскладка при call = БАЙТ-ТОЧНО v70 (13 push = 104B, rsp%16=0 = ABI;
- * стек-арги = [sp+8]=r8 [sp+16]=r9 [sp+24]=r10 = v70 = v71 = ABI).
- * СЕМАНТИК-ТЕСТ (v71, анти-таутология v68-урок): selftest ИСПОЛНЯЕТ
- * префикс (mmap RWX + sentinel-регs + mock-логгер) = ловит КАЖДЫЙ
- * клоббер-баг класса v65/v68 байт-точно.
+ * Байты префикса (порядок push: rax первым => rax=[rsp'+64]=0x40,
+ * rdi=[+32]=0x20, rsi=[+40]=0x28, rdx=[+48]=0x30, rcx=[+56]=0x38;
+ * rsp' = rsp-72; затем push r10/r9/r8 = стек- args):
+ *   50 51 52 56 57 41 50 41 51 41 52 41 53      (9 push, 13B)
+ *   48 8b 7c 24 40   mov 0x40(%rsp),%rdi        (nr -> arg1)
+ *   48 8b 74 24 20   mov 0x20(%rsp),%rsi        (a1 -> arg2)
+ *   48 8b 54 24 28   mov 0x28(%rsp),%rdx        (a2 -> arg3)
+ *   48 8b 4c 24 30   mov 0x30(%rsp),%rcx        (a3 -> arg4)
+ *   4c 8b 44 24 38   mov 0x38(%rsp),%r8         (arg5 = orig rcx)
+ *   4c 8d 4c 24 48   lea 0x48(%rsp),%r9         (orig rsp -> arg6; v68: БЫЛО 49)
+ *   50                                           (push rax = ВЫРАВНИВАНИЕ:
+ *     13 push = 104B; site-rsp%16==8 (стандартный кадр) => call при
+ *     rsp%16==0 = ABI-контракт; run417-урок: 12 push = misaligned
+ *     call => gcc-логгер movaps-класс = SIGSEGV = menu=0)
+ *   41 52 41 51 41 50                            (push r10 r9 r8 = args 9-7)
+ *   e8 <rel32>                                   call logger
+ *   41 58 41 59 41 5a                            (pop r8 r9 r10)
+ *   58                                           (pop rax = выравнивание)
+ *   41 5b 41 5a 41 59 41 58 5f 5e 5a 59 58      (9 pop, реверс)
  * Возврат: olen (>= 14) или 0 = отказ (окно/дистанция/неизвестный опкод). */
 #define C2B_LDD_SITE_PRE  75u
 static inline unsigned int c2b_ldd_site_prefix(
@@ -463,35 +443,29 @@ static inline unsigned int c2b_ldd_site_prefix(
     static const unsigned char pre[70] = {
         0x50u, 0x51u, 0x52u, 0x56u, 0x57u,
         0x41u, 0x50u, 0x41u, 0x51u, 0x41u, 0x52u, 0x41u, 0x53u,
-        0x50u,                               /* v74: align = 10-й push */
-        0x41u, 0x52u, 0x41u, 0x51u, 0x41u, 0x50u,
-        0x48u, 0x8bu, 0x7cu, 0x24u, 0x60u,
-        0x48u, 0x8bu, 0x74u, 0x24u, 0x40u,
-        0x48u, 0x8bu, 0x54u, 0x24u, 0x48u,
-        0x48u, 0x8bu, 0x4cu, 0x24u, 0x50u,
-        0x4cu, 0x8bu, 0x44u, 0x24u, 0x58u,
-        0x4cu, 0x8du, 0x4cu, 0x24u, 0x68u,   /* v68-ФИКС БЫЛО 49: REX=49
+        0x48u, 0x8bu, 0x7cu, 0x24u, 0x40u,
+        0x48u, 0x8bu, 0x74u, 0x24u, 0x20u,
+        0x48u, 0x8bu, 0x54u, 0x24u, 0x28u,
+        0x48u, 0x8bu, 0x4cu, 0x24u, 0x30u,
+        0x4cu, 0x8bu, 0x44u, 0x24u, 0x38u,
+        0x4cu, 0x8du, 0x4cu, 0x24u, 0x48u,   /* v68-ФИКС БЫЛО 49: REX=49
             = R=0,B=1 = lea rcx,[r12+0x48] (арг6 r9 НИКОГДА не грузился:
             логгер получал ИСХОДНЫЙ r9 = мусор/0 => [0] = SEGV addr=0
             = run433 4/4 смерть + v67 st=FAULT 6/6; arg4 = rcx
-            затирался r12+0x48). REX=4c = R=1,B=0 = lea r9,[rsp+0x68]
+            затирался r12+0x48). REX=4c = R=1,B=0 = lea r9,[rsp+0x48]
             = ЗАДУМАННОЕ кодирование (arg6 = sp, arg4 = цел) */
-        /* call rel32 = пишется отдельно ниже; далее 20 байтов = РЕВЕРС
-         * push-порядка v74 1:1 (spill-rax pop = ИСХОДНЫЙ rax; align-слот
-         * = мусорный rax = промежуточно в rax, перекрывается финальным
-         * pop = безвреден):
-         *   41 58 41 59 41 5a   pop r8 r9 r10 (стек-арги)
-         *   58                  pop rax (align-слот)
-         *   41 5b 41 5a 41 59 41 58   pop r11 r10 r9 r8
-         *   5f 5e 5a 59 58      pop rdi rsi rdx rcx rax (rax = spill =
-         *                       ИСХОДНЫЙ) */
+        /* call rel32 = пишется отдельно ниже; далее 27 байтов:
+         * push rax (выравнивание) | push r10 r9 r8 | pop r8 r9 r10 |
+         * pop rax | pop r11 r10 r9 r8 rdi rsi rdx rcx rax */
+        0x50u,
+        0x41u, 0x52u, 0x41u, 0x51u, 0x41u, 0x50u,
         0x41u, 0x58u, 0x41u, 0x59u, 0x41u, 0x5au,
         0x58u,
         0x41u, 0x5bu, 0x41u, 0x5au, 0x41u, 0x59u, 0x41u, 0x58u,
         0x5fu, 0x5eu, 0x5au, 0x59u, 0x58u
     };
     unsigned int q, t = 0u;
-    for (q = 0u; q < 50u; q++) tramp[t++] = pre[q];   /* push+args+loads */
+    for (q = 0u; q < 43u; q++) tramp[t++] = pre[q];   /* push+args */
     /* call rel32 -> logger */
     {
         long long rel = (long long)logger_addr -
@@ -502,8 +476,8 @@ static inline unsigned int c2b_ldd_site_prefix(
                                                 (8 * q)) & 0xffu);
     }
     t += 5u;
-    for (q = 50u; q < 70u; q++) tramp[t++] = pre[q];  /* стек-args pop + pop'ы */
-    return t;                   /* 75 байта: 50 + 5 call + 20 хвост */
+    for (q = 43u; q < 70u; q++) tramp[t++] = pre[q];  /* стек-args + pop'ы */
+    return t;                   /* 75 байта: 43 + 5 call + 27 хвост */
 }
 
 static inline unsigned int c2b_ldd_site_build(const unsigned char *tgt,

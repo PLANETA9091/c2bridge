@@ -14201,6 +14201,14 @@ static u32 c2b_susp_decide(u32 on, u32 retire, u32 now, u32 until_ms,
 static u32 g_susp_init, g_susp_on = 1;
 static volatile u32 g_susp_until_ms, g_susp_retire, g_susp_retire_ms;
 
+/* v68c: fallback-источник серверного 'A' для krel. run459-урок: g71-детект
+ * (g_g90_A_seq, мост-сайд receive-свип) запаздывает за g126-dec-tap на ~100
+ * лог-строк — krel-poke из a2e-fire гейтнулся в молчание (krel = 0 выстре-
+ * лов, контрактная 'k'-ответка НЕ ушла). a2e-файрпойнт пишет hint ДО poke:
+ * seq-маркер + чал из g_a2e_Ap->chal (тот же серверный 'A', продюсер =
+ * g126-dec-tap = hook-сайд, доступен через dlsym в a2e). */
+static volatile u32 g_krel_A_hint_seq, g_krel_A_hint_chal;
+
 static u32 c2b_susp_ison(void)
 {
     if (!g_susp_init) {
@@ -18166,11 +18174,13 @@ static void c2b_a2e_maybe(void)
     }
     /* v68-fwa: ОТВЕТ на серверный 'A' = контрактная форма 'k' (полный
      * ff×4+'k' + chal = A.chal, c2b_k27.h) — krel с жёстким гейтом
-     * g_g90_A_seq>0. Шаблон = g_kfull (движковый 'k' с тикетом, капчур
-     * ДО susp-окна — локальный цикл успевает до первого серверного 'A').
-     * Вызов из g97-треда = правильный контекст (v25: из движка rc=1, но
-     * на провод не уходит; отсюда = уходит, run360). Пуш уйдёт в дрейне
-     * следующего тика (pend-очередь). */
+     * (g_g90_A_seq || hint). v68c: hint пишется ДО poke — run459-урок:
+     * g71-детект запаздывает за g126-dec-tap, гейт съел poke молча
+     * (krel = 0 выстрелов за прогон). Шаблон = g_kfull (движковый 'k' с
+     * тикетом, капчур ДО susp-окна). Вызов из g97-треда = правильный
+     * контекст (v25); пуш уйдёт в дрейне следующего тика (pend). */
+    g_krel_A_hint_seq++;
+    g_krel_A_hint_chal = g_a2e_Ap->chal;
     c2b_k19_relay();
 }
 
@@ -18303,10 +18313,11 @@ static void c2b_k19_relay(void)
         C2B_LOGS("\n");
     }
     if (!g_krel_on || !g_gns_conn_h || !g_gns_conn_iface) return;
-    if (!g_g90_A_seq) return;   /* v68: ЖЁСТКИЙ гейт — ТОЛЬКО с серверным
-                                 * in-channel 'A' (контракт c2b_k27.h: chal =
-                                 * A.chal; без 'A' = сырой движковый chal =
-                                 * 5-смертный класс runs 365-373) */
+    if (!g_g90_A_seq && !g_krel_A_hint_seq)
+        return;   /* v68: ЖЁСТКИЙ гейт — ТОЛЬКО с серверным in-channel 'A'
+                   * (контракт c2b_k27.h: chal = A.chal; без 'A' = сырой
+                   * движковый chal = 5-смертный класс runs 365-373).
+                   * v68c: hint от a2e-poke (g71-детект запаздывает). */
     if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
     if (g_krel_sent >= C2B_KREL_CAP) return;
     kch = ((u32)g_kfull[13]) | ((u32)g_kfull[14] << 8) |
@@ -18357,6 +18368,9 @@ static void c2b_k19_relay(void)
     g_krel_sent++;
     if (!g_krel_keep && g_g90_A_seq) {
         (void)c2b_krel_patchchal(kcopy, kn, g_g90_A_chal);
+    } else if (!g_krel_keep && g_krel_A_hint_seq) {
+        /* v68c: fallback = чал от a2e-poke (серверный 'A' hook-сайд) */
+        (void)c2b_krel_patchchal(kcopy, kn, g_krel_A_hint_chal);
     }
     /* v29: RAW default = 1 — в канал уходит ПОЛНЫЙ 513B (ff×4+'k'+ver u16+6B+chal
      * u32@13; run355-декод). ОСНОВАНИЕ: run366 (v28 unreliable-фикс) — стрипнутый

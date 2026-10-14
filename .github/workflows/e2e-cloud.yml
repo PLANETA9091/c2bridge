@@ -64,7 +64,7 @@ on:
         type: choice
         options: ["0", "1", "2", "3"]
       timeout_min:
-        description: "v72: the JOB timeout in minutes. DEFAULT 60. The 3600s soak = ~62-65 min wall = run441 was KILLED by the default 60 => dispatch with timeout_min=80. MUST be type:number (v72b: the string '60' = the workflow-level rejection, run38518494260 = 0 jobs)."
+        description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
         required: false
         type: number
@@ -74,7 +74,7 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.timeout_min || 60 }}
+    timeout-minutes: 80
     env:
       MODE: ${{ inputs.mode || 'smoke' }}
       C2B_TARGET: ${{ inputs.target || '152.233.19.133:28022' }}

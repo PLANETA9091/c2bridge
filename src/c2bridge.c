@@ -7147,7 +7147,7 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
  * ff×4+'k' + chal = A.chal + unreliable) НИКОГДА не посылалась. v68 =
  * default ON + ЖЁСТКИЙ гейт g_g90_A_seq>0 (без серверного 'A' релей
  * МОЛЧИТ). C2B_KREL=0 = киллисвитч. */
-static u32 g_krel_on = 1, g_krel_keep, g_krel_init;  /* v68: default ON (был 0 с v36) */
+static u32 g_krel_on = 0, g_krel_keep, g_krel_init;  /* v69: default OFF — v68-тезис опровергнут run460: full 513B ff×4+'k' НА СЕССИИ = смерть 2047 (тот же blob, что k27-raw; chal=val + unreliable НЕ спасли — GNSLIB closed by peer PARSE_ERROR). Контракт-форма жива только как k27k-noff4 (K27K=1, run459=терпима). C2B_KREL=1 = opt-in для ручного A/B */
 static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal, g_krel_chalv;
 #define C2B_KREL_CAP 12
 /* v21: цель krel = ЖИВАЯ сессия ДВИЖКА (run357-урок: krel#1 rc=1 улетел в
@@ -17624,7 +17624,13 @@ static u32 c2b_k24_brlive(void)
  * не стреляем. C2B_K27A=1 = реармить вручную. */
 static u32 g_k27_init, g_k27_on = 0, g_k27_seen, g_k27_fires;
 static u32 g_k27_wait;                /* v30: тики ожидания g_kfull/g_kcap на тек. 'A' */
-static u32 g_k27_form = 0;            /* v39: 0=blob 513B (легаси), 1=ascii connect0x%08x */
+/* v69: дефолт формы = 4 (вербатим-эхо, run456/459-безопасная). БЫЛО 0 =
+ * blob 513B ff×4 на сессии = КЛАСС СМЕРТИ 2047: runs 365/368/369/370/373
+ * + run460 (k27-raw выстрел = 6-я смерть: GNSLIB closed by peer 2047
+ * NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR через ~70 строк после 'A').
+ * Механизм (v47-комментарий): ff×4 = вариант-взрыв NET-фреймера
+ * (0xffffffff -> кламп 2047 -> PARSE_ERROR). C2B_K27FORM=0 = легаси opt-in. */
+static u32 g_k27_form = 4;            /* v69: дефолт 4=verbatim-echo (был 0=blob = смерть) */
 static c2b_k27_A_t *g_k27_Ap;
 /* v47 K27K: 'k'-БЕЗ-ff×4 in-channel uplink — единственная непроверенная
  * форма доставки тикета после 5x2047 (ff×4 = варинт-взрыв NET-фреймера:
@@ -17733,10 +17739,18 @@ static void c2b_k27_maybe_fire(void)
 {
     u32 s1, s2, chal, proto, val, kn27, z27, live27;
     u8 kcopy27[640];
-    u32 form27 = g_k27_form;   /* v40: снепшот формы на весь выстрел */
     void **vt27;
     i32 rc27;
     i64 out27;
+    /* v69-ФИКС ПОРЯДКА: init ДО снепшота формы. БЫЛО: form27 снепшотился
+     * ДО init-блока (v40-снепшот на строке объявления) — если первый вызов
+     * maybe_fire совпадал с уже-пендящимся 'A' (g97-цикл стартует ТОЛЬКО
+     * после g_gns_conn_h; серверный 'A' приходит сразу после 0x23-accept),
+     * init читал C2B_K27FORM=4 и ставил g_k27_form=4, НО локальный form27
+     * оставался 0 => RAW 513B blob = смерть 2047 (run460: env K27FORM=4
+     * был выставлен, а выстрел ушёл raw=1 — форма-путь обошлась).
+     * Теперь снепшот ПОСЛЕ init => первый выстрел = форма из env. */
+    u32 form27;
     if (!g_k27_init) {
         const char *e = getenv("C2B_K27A");
         if (e && e[0] == '0') g_k27_on = 0;
@@ -17755,6 +17769,7 @@ static void c2b_k27_maybe_fire(void)
         }
         g_k27_init = 1;
     }
+    form27 = g_k27_form;   /* v69: снепшот ПОСЛЕ init (см. коммент выше) */
     if (!g_k27_on) return;
     if (!g_k27_Ap) {
         /* RTLD_DEFAULT = 0: hook = LD_PRELOAD = глобальный скоуп */

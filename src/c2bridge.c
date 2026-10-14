@@ -17126,7 +17126,7 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
 #define C2B_RAW_BUDGET    (768u << 20)  /* v75b: весь r-x процесса ~200-300MB */
 #define C2B_RAW_REGIONMAX (256u << 20)
 #define C2B_RAW_LOGCAP    64u
-#define C2B_RAW_PATCHMAX  24u
+#define C2B_RAW_PATCHMAX  32u
 extern i32 munmap(void *, u32);   /* g24-паттерн: блочная extern (.so) */
 static u32 g_raw_init, g_raw_scans, g_raw_busy, g_raw_last;
 static u32 g_raw_sites, g_raw_patched, g_raw_bytes_hi, g_raw_regs;
@@ -17253,7 +17253,7 @@ static void c2b_raw_scan(void)
     i64 n = 0, r;
     u64 budget = C2B_RAW_BUDGET;
     static struct { char path[300]; unsigned long lo, hi; u32 rwx, scanned; }
-        regs[160];
+        regs[256];
     u32 ri;
     /* файловые декларации: .so = блок extern (g24-паттерн, 22:09-урок:
      * блок-скоуп extern = конфликт с libc-хедерами только в selftest) */
@@ -17287,7 +17287,7 @@ static void c2b_raw_scan(void)
     mb[n] = 0;
     p = mb;
     endp = mb + n;
-    while (p < endp && nregs < 160u) {
+    while (p < endp && nregs < 256u) {
         unsigned long lo, hi, off;
         unsigned int prot, plen, linelen;
         const char *pa;
@@ -17296,8 +17296,19 @@ static void c2b_raw_scan(void)
                          &pa, &plen, &linelen)) break;
         p += linelen;
         if (!(prot & 4u)) continue;                 /* только исполняемые */
-        if (!pa || plen == 0u || plen >= 300u) continue;
-        if (!c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn)) continue;
+        if (pa && (plen == 0u || plen >= 300u)) continue;
+        if (pa && !c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn))
+            continue;
+        if (!pa) pa = "[anon]";                     /* v75c: ANON = ЖЕЛАЕМ!
+                                                     * (run469/470-урок: файл-
+                                                     * бэкед исчерпан = 0 ста-
+                                                     * бов; JIT/vscript/unpacker
+                                                     * = остальной класс; v53-
+                                                     * seen-cap 256 = хвост maps
+                                                     * (anon) НИКОГДА не сканиро-
+                                                     * вался ни одной версией) */
+        plen = 0;
+        while (pa[plen]) plen++;
         for (q = 0; q < nregs; q++)
             if (regs[q].lo == lo && regs[q].hi == hi) break;
         if (q < nregs) {
@@ -17360,10 +17371,6 @@ static void c2b_raw_scan(void)
                 pl = c2b_raw_patchable(chunk + i, got - i, &nr);
                 if (!pl) continue;
                 site = (unsigned long long)lo + off + i;
-                for (q = 0; q < g_raw_seen_n; q++)
-                    if (g_raw_seen[q] == site) break;
-                if (q < g_raw_seen_n) continue;
-                if (g_raw_seen_n < 64u) g_raw_seen[g_raw_seen_n++] = site;
                 g_raw_sites++;
                 if (g_raw_logn < C2B_RAW_LOGCAP) {
                     u32 z, cl = pl + 4u;
@@ -17379,6 +17386,10 @@ static void c2b_raw_scan(void)
                     C2B_LOGS("\n");
                     g_raw_logn++;
                 }
+                /* v75c: JIT-регионы = РЕГЕНЕРИРУЮТ байты — патчим ПОВТОРНО
+                 * (паттерн совпал = байты не e9 = не запатчено сейчас);
+                 * seen[] = только лог-дедуп. Старый трамплин сайта = утечёт
+                 * (4KB), патч-кап связывает. */
                 if (g_raw_patched >= C2B_RAW_PATCHMAX) continue;
                 {
                     u8 tramp[16];

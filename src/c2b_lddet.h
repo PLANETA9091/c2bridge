@@ -622,5 +622,44 @@ static inline unsigned int c2b_dsite_pass(const char *flt, const char *tag)
     return 0u;
 }
 
+/* v62: sendmsg-ФОРМА (сайт smsg = nr 46 = b8 2e): у syscall sendmsg
+ * rsi = msghdr*, rdx = ФЛАГИ — buf/len = ВНУТРИ msghdr (msg_iov[0]).
+ * glibc/x86-64 struct msghdr: msg_name@0, msg_namelen@8 (4B), msg_iov@
+ * 16, msg_iovlen@24, msg_control@32, msg_controllen@40, msg_flags@48;
+ * struct iovec = {iov_base@0, iov_len@8} = 16B. Прежний фильтр (rsi[0]
+ * == 0x22 && rdx in [40,640]) для smsg = СЛЕП: rsi[0] = байт msg_name-
+ * указателя, rdx = флаги => 0x22 ЧЕРЕЗ sendmsg = НЕВИДИМ (run425: smsg
+ * FIRE fd=33 len=72 = rdx = НЕ len). Pure (byte-wise = без выравн).
+ * Возврат 1 = 0x22-форма найдена (base/len = выходы), 0 = мимо. */
+static inline unsigned int c2b_ldd_mh0x22(const unsigned char *mh,
+                                          unsigned long long *base_out,
+                                          unsigned long long *len_out)
+{
+    unsigned long long iovec, base, ln;
+    const unsigned char *iv;
+    unsigned int q;
+    if (!mh || !base_out || !len_out) return 0u;
+    iovec = 0ull;
+    for (q = 0u; q < 8u; q++)
+        iovec |= ((unsigned long long)mh[16u + q]) << (8u * q);
+    if (!iovec) return 0u;
+    ln = 0ull;
+    for (q = 0u; q < 8u; q++)
+        ln |= ((unsigned long long)mh[24u + q]) << (8u * q);
+    if (!ln) return 0u;             /* iovlen = 0 = мимо */
+    iv = (const unsigned char *)(uptr)iovec;
+    base = 0ull;
+    for (q = 0u; q < 8u; q++)
+        base |= ((unsigned long long)iv[q]) << (8u * q);
+    ln = 0ull;
+    for (q = 0u; q < 8u; q++)
+        ln |= ((unsigned long long)iv[8u + q]) << (8u * q);
+    if (!base || ln < 40u || ln > 640u) return 0u;
+    if (((const unsigned char *)(uptr)base)[0] != 0x22u) return 0u;
+    *base_out = base;
+    *len_out = ln;
+    return 1u;
+}
+
 #endif /* __x86_64__ */
 #endif /* C2B_LDD_H */

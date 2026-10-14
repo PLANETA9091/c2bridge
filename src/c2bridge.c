@@ -15365,11 +15365,13 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
         if (t && ra >= t && ra < t + 4096u) { tag = i; break; }
     }
     if (g_dsite_busy) return;       /* рекурсия через собственный лог */
-    /* 0x22-фильтр ДВУКЛАССНЫЙ (см. шапку v59 в c2b_lddet.h):
+    /* 0x22-фильтр ТРИКЛАССНЫЙ (см. шапку v59 в c2b_lddet.h + v62):
      * b8-класс: fd=rdi buf=rsi len=rdx; csp-класс: fd=rcx buf=r8 len=r9,
-     * nr=rdx (спин mov eax,edx — rax на входе окна = ещё мусор) */
+     * nr=rdx (спин mov eax,edx — rax на входе окна = ещё мусор);
+     * v62 sendmsg-класс: rsi = msghdr*, rdx = флаги, buf/len = iov[0]
+     * (сайт smsg = СЛЕП для прежнего фильтра: rsi[0] = байт msg_name) */
     {
-        u64 fd = 0, buf = 0, len = 0, nr = 0;
+        u64 fd = 0, buf = 0, len = 0, nr = 0, mbase = 0, mlen = 0;
         u32 cls = 0;
         if (rsi && rdx >= 40u && rdx <= 640u &&
             ((const u8 *)(uptr)rsi)[0] == 0x22u) {
@@ -15378,6 +15380,10 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
         } else if (r8v && r9v >= 40u && r9v <= 640u &&
                    ((const u8 *)(uptr)r8v)[0] == 0x22u) {
             cls = 2u; fd = rcx; buf = r8v; len = r9v; nr = rdx;
+        } else if (rsi && c2b_ldd_mh0x22((const unsigned char *)(uptr)rsi,
+                                          &mbase, &mlen)) {
+            cls = 3u; fd = rdi; buf = mbase; len = mlen;
+            nr = (tag < 8u) ? ((u64)g_dsite_tab[tag].exp[1]) : 0u;
         }
         if (cls) {
             const u64 *st = (const u64 *)(uptr)sp;
@@ -15425,6 +15431,15 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
                 c2b_gp_lh64((unsigned long long)st[6]);
                 C2B_LOGS(" ");
                 c2b_gp_lh64((unsigned long long)st[7]);
+                /* v62: полезная нагрузка 0x22 = первые 32B (сeq/steamid
+                 * для офлайн-кросс-рефа; live-deref = тот же класс риска,
+                 * что и фильтр-дeref выше) */
+                C2B_LOGS(" pl=");
+                {
+                    const u8 *pb = (const u8 *)(uptr)buf;
+                    u32 pq;
+                    for (pq = 0u; pq < 32u; pq++) C2B_LOGH(pb[pq]);
+                }
                 C2B_LOGS("\n");
             }
             g_dsite_busy = 0u;
@@ -28896,6 +28911,52 @@ static void test_lddet(void)
               "v60: smsg НЕ сабстринг smg");
         CHECK(c2b_dsite_pass("snd", "csp1") == 0u,
               "v60: чужой класс = out");
+        /* v62: sendmsg-msghdr фильтр (pure): 0x22 в iov[0] = hit;
+         * негативы: чужой iov_base / len вне [40,640] / iovlen=0 / null */
+        {
+            static const u8 pay[64] = { 0x22u, 0x01u, 0x02u, 0x03u, 0 };
+            u8 mh[64];
+            u8 iov[16];             /* iov[0..7] = base, [8..15] = len */
+            unsigned long long mb = 0, ml = 0;
+            u32 kq;
+            const unsigned long long payaddr =
+                (unsigned long long)(uptr)pay;
+            const unsigned long long iovaddr =
+                (unsigned long long)(uptr)iov;
+            memset(mh, 0, sizeof mh);
+            memset(iov, 0, sizeof iov);
+            mh[0] = 0x5au;              /* msg_name = мусор (детерм.) */
+            for (kq = 0u; kq < 8u; kq++)
+                mh[16u + kq] = (u8)((iovaddr >> (8u * kq)) & 0xffu);
+            mh[24u] = 1u;               /* msg_iovlen = 1 */
+            for (kq = 0u; kq < 8u; kq++) {
+                iov[kq] = (u8)((payaddr >> (8u * kq)) & 0xffu);
+                iov[8u + kq] = (u8)(((u64)512 >> (8u * kq)) & 0xffu);
+            }
+            CHECK(c2b_ldd_mh0x22(mh, &mb, &ml) == 1u &&
+                  mb == payaddr && ml == 512u,
+                  "v62: msghdr iov[0] 0x22 len=512 = hit");
+            iov[0] ^= 0x01u;            /* iov_base сломан => miss */
+            CHECK(c2b_ldd_mh0x22(mh, &mb, &ml) == 0u,
+                  "v62: чужой iov_base = miss");
+            iov[0] ^= 0x01u;
+            iov[8] = 20u;               /* iov_len = 20 < 40 => miss
+                                         * (iov[9] = 0 обязателен: остаток
+                                         * 0x02 от 512 = len 0x214!) */
+            iov[9] = 0u;
+            CHECK(c2b_ldd_mh0x22(mh, &mb, &ml) == 0u,
+                  "v62: iov_len < 40 = miss");
+            iov[8] = 0u; iov[9] = 2u;   /* рестор = 512 */
+            iov[11] = 2u;               /* iov_len = 0x02000200 > 640 */
+            CHECK(c2b_ldd_mh0x22(mh, &mb, &ml) == 0u,
+                  "v62: iov_len > 640 = miss");
+            iov[11] = 0u;               /* рестор = 512 */
+            mh[24u] = 0u;               /* iovlen = 0 => miss */
+            CHECK(c2b_ldd_mh0x22(mh, &mb, &ml) == 0u,
+                  "v62: iovlen = 0 = miss");
+            CHECK(c2b_ldd_mh0x22(0, &mb, &ml) == 0u,
+                  "v62: null msghdr = miss");
+        }
         /* csp1: окно = 2+2+2+2+2+11 = 21 (SIB-фикс: 11B-nop = ЦЕЛЫЙ) */
         memset(str, 0, sizeof str);
         CHECK(c2b_ldd_site_build(tldd_site_csp1 + 2u,

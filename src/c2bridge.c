@@ -7140,11 +7140,14 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
  * (ретраи движка = тот же chal), cap 12/сессия, SEGV-гард на send,
  * killswitch C2B_KREL=0. */
 #ifndef C2B_SELFTEST
-/* v36: DEFAULT OFF (дополнение v35: там выключили только k27, krel остался
- * вооружён и УБИЛ сессию в run373 — 548B-кадр @t+2.6s после ConnectOK ->
- * 0x24 2047 за 160ms; пятая смерть от raw-'k': 365/368/369/370/373).
- * C2B_KREL=1 = реарм для A/B. */
-static u32 g_krel_on = 0, g_krel_keep, g_krel_init;
+/* v36-ИСТОРИЯ: default OFF после 5 смертей raw-'k' (365/368/369/370/373 —
+ * 0x24 2047 после доставки 'k'). v68-ПЕРЕСМОТР: все 5 = 'k' с ЧАЛОМ НЕ ОТ
+ * серверного in-channel 'A' (коннлесс-класс — контракт c2b_k27.h нарушен;
+ * run373 = 548B @t+2.6s после ConnectOK). Контрактная комбинация (полный
+ * ff×4+'k' + chal = A.chal + unreliable) НИКОГДА не посылалась. v68 =
+ * default ON + ЖЁСТКИЙ гейт g_g90_A_seq>0 (без серверного 'A' релей
+ * МОЛЧИТ). C2B_KREL=0 = киллисвитч. */
+static u32 g_krel_on = 1, g_krel_keep, g_krel_init;  /* v68: default ON (был 0 с v36) */
 static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal, g_krel_chalv;
 #define C2B_KREL_CAP 12
 /* v21: цель krel = ЖИВАЯ сессия ДВИЖКА (run357-урок: krel#1 rc=1 улетел в
@@ -14183,6 +14186,38 @@ static u64 c2b_mono_ms(void)
 #endif
 }
 
+/* v68: чистое решение susp-гейта (selftest-покрытие). until-окно =
+ * серверный 'A' жив; retire-окно = серверный 'B' пришёл. (i32)-разность
+ * переживает u32-заворот моно-часов. ЖИВЫЕ переменные и гейт = рядом
+ * (both-modes: recvfrom-хук в selftest тоже компилится и зовёт гейт). */
+static u32 c2b_susp_decide(u32 on, u32 retire, u32 now, u32 until_ms,
+                           u32 retire_ms)
+{
+    if (!on) return 0;
+    if (retire) return (i32)(retire_ms - now) > 0;
+    return (i32)(until_ms - now) > 0;
+}
+
+static u32 g_susp_init, g_susp_on = 1;
+static volatile u32 g_susp_until_ms, g_susp_retire, g_susp_retire_ms;
+
+static u32 c2b_susp_ison(void)
+{
+    if (!g_susp_init) {
+        const char *e = getenv("C2B_SUSP");
+        if (e && e[0] == '0') g_susp_on = 0;
+        g_susp_init = 1;
+    }
+    return g_susp_on;
+}
+
+static u32 c2b_clv2_suspended(void)
+{
+    if (!c2b_susp_ison()) return 0;
+    return c2b_susp_decide(g_susp_on, g_susp_retire, c2b_mono_ms(),
+                           g_susp_until_ms, g_susp_retire_ms);
+}
+
 /* ================= 41f-g31: протокол 0x22 ConnectRequest ================= */
 
 /* нестрогая запись КАЖДОГО 0x21 (без expect-чека — сервер шлёт парами и по
@@ -18119,6 +18154,24 @@ static void c2b_a2e_maybe(void)
     C2B_LOGS(" fd=");
     C2B_LOGN((u32)g_clv2_fd);
     C2B_LOGS("\n");
+    /* v68-susp: серверный 'A' доставлен — фейк-'B' гранты молчат 45с
+     * (движок остаётся в challenge-фазе сервера; окно самовосстанавливается). */
+    if (c2b_susp_ison()) {
+        g_susp_until_ms = c2b_mono_ms() + 45000u;
+        C2B_LOGS("[c2b] susp: fake-'B' suspended 45s (server-'A' #");
+        C2B_LOGN(g_a2e_fires);
+        C2B_LOGS(" chal=");
+        C2B_LOGH(g_a2e_Ap->chal);
+        C2B_LOGS(")\n");
+    }
+    /* v68-fwa: ОТВЕТ на серверный 'A' = контрактная форма 'k' (полный
+     * ff×4+'k' + chal = A.chal, c2b_k27.h) — krel с жёстким гейтом
+     * g_g90_A_seq>0. Шаблон = g_kfull (движковый 'k' с тикетом, капчур
+     * ДО susp-окна — локальный цикл успевает до первого серверного 'A').
+     * Вызов из g97-треда = правильный контекст (v25: из движка rc=1, но
+     * на провод не уходит; отсюда = уходит, run360). Пуш уйдёт в дрейне
+     * следующего тика (pend-очередь). */
+    c2b_k19_relay();
 }
 
 /* v45: a2e-B — ДАУНЛИНК серверского 'B' (accept) в движок. Продюсер =
@@ -18193,6 +18246,15 @@ static void c2b_a2eb_maybe(void)
     C2B_LOGS(" fd=");
     C2B_LOGN((u32)g_clv2_fd);
     C2B_LOGS("\n");
+    /* v68-susp: серверный 'B' = фейк-'B' больше не нужен (retire 600с):
+     * signon должен пойти от СЕРВЕРНОЙ сессии, локальные гранты = шум. */
+    if (c2b_susp_ison()) {
+        g_susp_retire = 1;
+        g_susp_retire_ms = c2b_mono_ms() + 600000u;
+        C2B_LOGS("[c2b] susp: fake-'B' RETIRED 600s (server-'B' #");
+        C2B_LOGN(g_a2eb_fires);
+        C2B_LOGS(" relayed)\n");
+    }
 }
 
 static void c2b_k19_relay(void)
@@ -18207,7 +18269,17 @@ static void c2b_k19_relay(void)
     u32 he21;
     if (!g_krel_init) {
         const char *e = getenv("C2B_KREL");
-        if (e && e[0] == '1') g_krel_on = 1;   /* v36: default OFF, C2B_KREL=1 = реарм */
+        /* v68: default flip ON. Основание (run456-разбор): ответ на серверный
+         * in-channel 'A' в КОНТРАКТНОЙ форме (полный ff×4+'k' + chal = A.chal,
+         * контракт c2b_k27.h) = отсутствующее звено танца. krel = единственная
+         * реализация контрактной формы: k27k-noff = игнорируется сервером
+         * (run366: connless-хендлер требует ff×4-маршрутизацию), k27-строковые
+         * формы = терпимы-но-неотвечены (run378/456). Смерти runs 258/262/264
+         * = RELIABLE-флаг (v28/run366-опровержение), не форма 'k'; krel-ts
+         * шлёт через c2b_krel_send_flags() (v67-дисциплина, unreliable
+         * default). Chal-патч = g_g90_A_chal (продюсер g71 in-channel 'A'-
+         * детект = ИМЕННО серверный челлендж). C2B_KREL=0 = киллисвитч. */
+        if (e && e[0] == '0') g_krel_on = 0;   /* v68: default ON, C2B_KREL=0 = выкл */
         e = getenv("C2B_KREL_KEEP");
         if (e && e[0] == '1') g_krel_keep = 1;
         e = getenv("C2B_K21ENG");
@@ -18231,6 +18303,10 @@ static void c2b_k19_relay(void)
         C2B_LOGS("\n");
     }
     if (!g_krel_on || !g_gns_conn_h || !g_gns_conn_iface) return;
+    if (!g_g90_A_seq) return;   /* v68: ЖЁСТКИЙ гейт — ТОЛЬКО с серверным
+                                 * in-channel 'A' (контракт c2b_k27.h: chal =
+                                 * A.chal; без 'A' = сырой движковый chal =
+                                 * 5-смертный класс runs 365-373) */
     if (!g_kfull_n || g_kfull_len < 17 || g_kfull_len > 640) return;
     if (g_krel_sent >= C2B_KREL_CAP) return;
     kch = ((u32)g_kfull[13]) | ((u32)g_kfull[14] << 8) |
@@ -22185,6 +22261,8 @@ static void *c2b_g63_thread(void *arg)
             u32 alen;
             ssize_t sr;
             usleep(3000000);
+            if (c2b_clv2_suspended())
+                continue;   /* v68-susp: сервер-'A' жив — фейк-'B' молчит */
             if (!g_clv2_fd || !g_clv2_ch32) continue;
             /* g63v2 (run215): 'A' ПЕРЕД 'B' — self-push 'A' (na=127.0.0.1)
              * обновляет снап @25aa33 (снап = ПОСЛЕДНИЙ 'A'), после чего
@@ -22560,7 +22638,9 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                      * packet). Варианты хвоста (C2B_CLV2_BHEX): 0="AAAAAAAA"
                      * (ран 80-93), 1=hex challenge из 'A', 2=hex qc_val
                      * (эхо qconnect0x). Дифференцирует реакцию движка. */
-                    if ((u32)len >= 14) {
+                    if ((u32)len >= 14 && !c2b_clv2_suspended()) {
+                        /* v68-susp: сервер-'A' жив — фаза-6 фейк-'B' молчит
+                         * (движок остаётся в challenge-фазе сервера). */
                         u32 hx;
                         u32 pl;
                         /* 50i-g58: приманка фазы-6 = ПОЛНЫЙ kaccept (g42-формат:
@@ -29997,6 +30077,28 @@ static void test_seccomp(void)
     }
 }
 
+/* v68: susp-гейт — чистое решение c2b_susp_decide (until/retire-окна +
+ * киллисвитч; (i32)-разность = u32-заворот). */
+static void test_susp(void)
+{
+    /* until-окно (серверный 'A' жив) */
+    CHECK(c2b_susp_decide(1, 0, 1000, 2000, 0) == 1, "susp: until>now = 1");
+    CHECK(c2b_susp_decide(1, 0, 2000, 2000, 0) == 0, "susp: until==now = 0");
+    CHECK(c2b_susp_decide(1, 0, 3000, 2000, 0) == 0, "susp: until<now = 0");
+    /* u32-заворот моно-часов: until чуть «меньше» now числом, но впереди */
+    CHECK(c2b_susp_decide(1, 0, 0xFFFFFFF0u, 10, 0) == 1,
+          "susp: u32 wrap until = 1");
+    /* retire-окно (серверный 'B' пришёл) */
+    CHECK(c2b_susp_decide(1, 1, 1000, 0, 900000) == 1, "susp: retire active = 1");
+    CHECK(c2b_susp_decide(1, 1, 900000, 5000, 900000) == 0,
+          "susp: retire expired = 0");
+    CHECK(c2b_susp_decide(1, 1, 1000, 2000, 5000) == 1,
+          "susp: retire приоритет над until = 1");
+    /* киллисвитч */
+    CHECK(c2b_susp_decide(0, 1, 100, 900, 900) == 0, "susp: killswitch = 0");
+    CHECK(c2b_susp_decide(0, 0, 100, 900, 0) == 0, "susp: killswitch2 = 0");
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -30111,6 +30213,7 @@ int main(void)
     test_stubscan();    /* v53: anon-r-x syscall-stub matcher */
     test_seccomp();     /* v58: seccomp-user-notif (BPF + живой e2e) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
+    test_susp();        /* v68: susp-гейт (until/retire-окна + киллисвитч) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

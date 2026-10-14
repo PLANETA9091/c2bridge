@@ -424,7 +424,7 @@ static inline unsigned int c2b_ldd_build(const unsigned char *tgt,
  *   48 8b 54 24 28   mov 0x28(%rsp),%rdx        (a2 -> arg3)
  *   48 8b 4c 24 30   mov 0x30(%rsp),%rcx        (a3 -> arg4)
  *   4c 8b 44 24 38   mov 0x38(%rsp),%r8         (arg5 = orig rcx)
- *   49 8d 4c 24 48   lea 0x48(%rsp),%r9         (orig rsp -> arg6)
+ *   4c 8d 4c 24 48   lea 0x48(%rsp),%r9         (orig rsp -> arg6; v68: БЫЛО 49)
  *   50                                           (push rax = ВЫРАВНИВАНИЕ:
  *     13 push = 104B; site-rsp%16==8 (стандартный кадр) => call при
  *     rsp%16==0 = ABI-контракт; run417-урок: 12 push = misaligned
@@ -448,7 +448,12 @@ static inline unsigned int c2b_ldd_site_prefix(
         0x48u, 0x8bu, 0x54u, 0x24u, 0x28u,
         0x48u, 0x8bu, 0x4cu, 0x24u, 0x30u,
         0x4cu, 0x8bu, 0x44u, 0x24u, 0x38u,
-        0x49u, 0x8du, 0x4cu, 0x24u, 0x48u,
+        0x4cu, 0x8du, 0x4cu, 0x24u, 0x48u,   /* v68-ФИКС БЫЛО 49: REX=49
+            = R=0,B=1 = lea rcx,[r12+0x48] (арг6 r9 НИКОГДА не грузился:
+            логгер получал ИСХОДНЫЙ r9 = мусор/0 => [0] = SEGV addr=0
+            = run433 4/4 смерть + v67 st=FAULT 6/6; arg4 = rcx
+            затирался r12+0x48). REX=4c = R=1,B=0 = lea r9,[rsp+0x48]
+            = ЗАДУМАННОЕ кодирование (arg6 = sp, arg4 = цел) */
         /* call rel32 = пишется отдельно ниже; далее 27 байтов:
          * push rax (выравнивание) | push r10 r9 r8 | pop r8 r9 r10 |
          * pop rax | pop r11 r10 r9 r8 rdi rsi rdx rcx rax */

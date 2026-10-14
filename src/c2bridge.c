@@ -29159,9 +29159,11 @@ static void test_lddet(void)
             CHECK(str[33] == 0x4c && str[34] == 0x8b &&
                   str[35] == 0x44 && str[36] == 0x24 && str[37] == 0x38,
                   "v59: arg5 = 0x38(%rsp) (orig rcx)");
-            CHECK(str[38] == 0x49 && str[39] == 0x8d &&
+            CHECK(str[38] == 0x4c && str[39] == 0x8d &&
                   str[40] == 0x4c && str[41] == 0x24 && str[42] == 0x48,
-                  "v59: arg6 = lea 0x48(%rsp) (orig rsp)");
+                  "v68: arg6 = lea r9,[rsp+0x48] (REX=4c: R=1 dest=r9, "
+                  "B=0 base=rsp; BYLO 49 = lea rcx,[r12+0x48] = sp-arg "
+                  "= musor = run433 4/4 smert, v67 st=FAULT 6/6)");
             CHECK(str[43] == 0xe8,
                   "v59: call rel32 логгера");
             rel = 0x7f0000100000ll - (0x7f0000200000ll + 48ll);

@@ -17320,6 +17320,129 @@ static void *c2b_g82wp_thread(void *arg)
     C2B_LOGS("\n");
     return (void *)0;
 }
+
+/* ---------- v66: СМЕРТНЫЙ ДИАГНОСТ (death-reason hunt) ----------
+ * run453-факты: GNS-сессия h=0x22e69fec = УСТАНОВЛЕНА (0x23-accept 328B
+ * на проводе + 3 encrypted-data от сервера: 77B seq02/03, 33B seq04), НО
+ * receive-очередь (слоты 12/14, 4096 поллов g82w hb) = ПУСТА, g97:
+ * slot-13 st=0 rc=1 каждый тик (слепой/zero-буфер), detail(slot-17) rc=1
+ * с ascii ПУСТО = m_szEndDebug НЕ ИЗВЛЕКАЕТСЯ НИ РАЗУ. run256: сервер
+ * закрывает сессию ~15с после первого in-channel 'k' — ПРИЧИНА закрытия
+ * = end-debug строка, которую мы до сих пор не достали. g66 = read-only
+ * матрица под SEGV-гардой:
+ * (a) статус-матрица: слоты {13,17} x {2-arg, 3-arg cb=2048}, снимки
+ *     t=1/21/61с: rc + первые 8 u32-слов + ВСЕ печатные прогоны >=4
+ *     (c2b_g97_log_ascii) = охота на m_szEndDebug. Слот 3 = ЗАПРЕЩЁН
+ *     (v5-урок: s=3 SEGV = коннект умирает даже под гардой).
+ * (b) receive-свип: детурнутые 12/14 1/с x 120с (rc>0 = дамп бесплатный
+ *     через g81/g82w + свой g71 по v19-гейту heap-ptr).
+ * ВСЁ read-only; убийцы {1,4,5,10,11} не трогаются. Киллисвитч C2B_G66=0. */
+static void *c2b_g66_thread(void *arg)
+{
+    static const u32 mslots[2] = { 13u, 17u };
+    u32 t, si, ar, k, dead = 0;
+    void **vt;
+    (void)arg;
+    {
+        const char *e = getenv("C2B_G66");
+        if (e && e[0] == '0') {
+            C2B_LOGS("[c2b] g66: disabled by env\n");
+            return (void *)0;
+        }
+    }
+    for (t = 0; t < 600; t++) {
+        if (g_gns_conn_h && g_gns_conn_iface) break;
+        usleep(500000);
+    }
+    if (!g_gns_conn_h || !g_gns_conn_iface) {
+        C2B_LOGS("[c2b] g66: no session in 5min — exit\n");
+        return (void *)0;
+    }
+    vt = *(void ***)g_gns_conn_iface;
+    C2B_LOGS("[c2b] g66: armed h=0x");
+    C2B_LOGH((u32)g_gns_conn_h);
+    C2B_LOGS("matrix={13,17}x{2,3a} snap=1/21/61 recv=12/14 1/sx120\n");
+    for (t = 0; t < 121; t++) {
+        u64 ma[512];
+        i32 rc;
+        usleep(1000000u);
+        if (!g_gns_conn_h || !g_gns_conn_iface) break;
+        if (t == 1 || t == 21 || t == 61) {
+            C2B_LOGS("[c2b] g66: SNAPSHOT t=");
+            C2B_LOGD(t);
+            C2B_LOGS("s\n");
+            for (si = 0; si < 2; si++) {
+                u32 s = mslots[si];
+                for (ar = 0; ar < 2; ar++) {
+                    u32 key = si * 2 + ar;
+                    if (dead & (1u << key)) continue;
+                    for (k = 0; k < 512; k++) ma[k] = 0;
+                    g_probe_active = 1;
+                    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                        if (ar == 0)
+                            rc = ((i32 (*)(void *, uptr, void *))vt[s])(
+                                g_gns_conn_iface, g_gns_conn_h, (void *)ma);
+                        else
+                            rc = ((i32 (*)(void *, uptr, void *, i32))vt[s])(
+                                g_gns_conn_iface, g_gns_conn_h, (void *)ma,
+                                2048);
+                    } else {
+                        g_probe_active = 0;
+                        dead |= (1u << key);
+                        C2B_LOGS("[c2b] g66: s=");
+                        C2B_LOGD(s);
+                        C2B_LOGS(ar == 0 ? "2a SEGV — bl\n" : "3a SEGV — bl\n");
+                        continue;
+                    }
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] g66: s=");
+                    C2B_LOGD(s);
+                    C2B_LOGS(ar == 0 ? " 2a rc=" : " 3a rc=");
+                    C2B_LOGD((u32)rc);
+                    C2B_LOGS(" w0..7=");
+                    for (k = 0; k < 8; k++)
+                        C2B_LOGH((u32)(ma[k] & 0xffffffffu));
+                    C2B_LOGS("\n");
+                    C2B_LOGS("[c2b] g66: ascii:");
+                    c2b_g97_log_ascii((const u8 *)ma, 4096);
+                    C2B_LOGS("\n");
+                }
+            }
+        }
+        {
+            u32 rs[2] = { 12u, 14u };
+            u32 ri;
+            for (ri = 0; ri < 2; ri++) {
+                for (k = 0; k < 512; k++) ma[k] = 0;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    rc = ((i32 (*)(void *, uptr, void **, i32))vt[rs[ri]])(
+                        g_gns_conn_iface, g_gns_conn_h, (void **)ma, 32);
+                } else {
+                    g_probe_active = 0;
+                    continue;
+                }
+                g_probe_active = 0;
+                if (rc > 0) {
+                    C2B_LOGS("[c2b] g66: recv s=");
+                    C2B_LOGD(rs[ri]);
+                    C2B_LOGS(" rc=");
+                    C2B_LOGD((u32)rc);
+                    C2B_LOGS(" m0=0x");
+                    C2B_LOGH((u32)((ma[0] >> 32) & 0xffffffffu));
+                    C2B_LOGH((u32)(ma[0] & 0xffffffffu));
+                    C2B_LOGS("\n");
+                    if (ma[0] > 0x1000000ull && ma[0] < 0x800000000000ull &&
+                        (ma[0] & 0xffffffffull) > 0xffffull &&
+                        ((ma[0] >> 32) == 0 || (ma[0] >> 32) > 0xffffull))
+                        (void)c2b_g71_dumpmsg((void *)(uptr)ma[0]);
+                }
+            }
+        }
+    }
+    C2B_LOGS("[c2b] g66: exit\n");
+    return (void *)0;
+}
 #endif
 
 /* ---------- v19: krel — РЕЛЕЙ 'k' IN-CHANNEL (см. блок у g130) ----------
@@ -23924,6 +24047,10 @@ i32 c2b_main(void)
         {
             void *t82wp;
             pthread_create(&t82wp, 0, c2b_g82wp_thread, 0);
+        }
+        {   /* v66: смерть-диагност (статус-матрица + receive-свип) */
+            void *t66 = 0;
+            pthread_create(&t66, 0, c2b_g66_thread, 0);
         }
     }
     {   /* 58f-g98: S2 in-channel frame bisect (one shot per session) */

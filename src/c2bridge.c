@@ -6299,6 +6299,83 @@ static void c2b_cl_trace(i32 up, const u8 *p, u32 n, i32 act)
     C2B_LOGS(" | "); C2B_LOGS(ln); C2B_LOGS("\n");
 }
 
+/* ---------- v70 g131: серверный 0x24-reject декодер ----------
+ * run460-пкп (сессия B :35447): сервер отвечает на яд-посыл 0x24-кадром
+ * В ОТКРЫТОМ ТЕКСТЕ (не шифруется!): 24 <u16 len> 12 <len> <reason-ascii>
+ * 18 <varint code> 25 <u32 cid>. Пример: code=2047
+ * reason='NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR'. = КАНАЛ ОБРАТНОЙ СВЯЗИ
+ * СЕРВЕРА, читаемый без ключей: причина каждого reject = в логе, не в pcap.
+ * Чистый парсер = selftest-покрытие (реальный кадр run460). Возврат 1 =
+ * распознан 0x24. */
+static u32 c2b_g131_parse(const u8 *p, u32 n, u32 *code, char *reason,
+                          u32 rcap, u32 *cid)
+{
+    u32 o = 3, ln;                               /* v70: 0x24 + u16-len = 3B хедера */
+    if (!p || n < 8 || p[0] != 0x24) return 0;
+    ln = (u32)p[1] | ((u32)p[2] << 8);          /* u16 protobuf-длина */
+    if (ln < 4 || (u32)ln + 3 > n) return 0;
+    n = ln + 3;                                  /* граница = конец protobuf */
+    *code = 0; *cid = 0;
+    if (rcap) reason[0] = 0;
+    while (o + 1 < n) {
+        u8 tag = p[o++];
+        u32 f = (u32)(tag >> 3), wt = tag & 7;
+        if (wt == 2) {                           /* len-delim = reason */
+            u32 l = 0, sh = 0, k;
+            while (o < n && p[o] & 0x80) {
+                l |= (u32)(p[o++] & 0x7f) << sh; sh += 7;
+            }
+            if (o >= n) return 0;
+            l |= (u32)(p[o++] & 0x7f) << sh;
+            if (o + l > n) return 0;
+            if (rcap) {
+                for (k = 0; k < l && k < rcap - 1; k++) {
+                    u8 c = p[o + k];
+                    reason[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+                }
+                reason[k] = 0;
+            }
+            o += l;
+        } else if (wt == 0) {                    /* varint (field 3 = code) */
+            u64 v = 0;
+            u32 sh = 0;
+            while (o < n && p[o] & 0x80) {
+                v |= (u64)(p[o++] & 0x7f) << sh; sh += 7;
+            }
+            if (o >= n) return 0;
+            v |= (u64)(p[o++] & 0x7f) << sh;
+            if (f == 3) *code = (u32)v;
+        } else if (wt == 5) {                    /* fixed32 (field 4 = cid, тег 0x25) */
+            if (o + 4 > n) return 0;
+            if (f == 4) *cid = (u32)p[o] | ((u32)p[o + 1] << 8) |
+                              ((u32)p[o + 2] << 16) | ((u32)p[o + 3] << 24);
+            o += 4;
+        } else if (wt == 1) {
+            if (o + 8 > n) return 0;
+            o += 8;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static char g131_reason[64];
+
+static void c2b_g131_maybe(const u8 *p, u32 n)
+{
+    u32 code = 0, cid = 0;
+    if (!c2b_g131_parse(p, n, &code, g131_reason,
+                        (u32)sizeof g131_reason, &cid)) return;
+    C2B_LOGS("[c2b] g131: srv-reject code=");
+    C2B_LOGN(code);
+    C2B_LOGS(" cid=");
+    C2B_LOGH(cid);
+    C2B_LOGS(" reason='");
+    C2B_LOGS(g131_reason);
+    C2B_LOGS("'\n");
+}
+
 extern i32 *__errno_location(void);   /* libc TLS-errno; errno.h не тянем */
 
 /* ---------- 41e-c: CL v2 phase A — S1 qconnect -> S2 GNS challenge ----------
@@ -17766,6 +17843,7 @@ static void c2b_k27_maybe_fire(void)
             else if (ef && ef[0] == '2') g_k27_form = 2;
             else if (ef && ef[0] == '3') g_k27_form = 3;
             else if (ef && ef[0] == '4') g_k27_form = 4;   /* v44: вербатим-эхо */
+            else if (ef && ef[0] == '5') g_k27_form = 5;   /* v70: 4 + A-ответ */
         }
         g_k27_init = 1;
     }
@@ -17851,7 +17929,7 @@ static void c2b_k27_maybe_fire(void)
                 kcopy27[14 + z27] = hx39[(val >> (28 - z27 * 4)) & 0xf];
             kcopy27[22] = 0;
             kn27 = 23;
-        } else if (form27 == 4) {
+        } else if (form27 == 4 || form27 == 5) {
             /* v44 (run383-вердикт): ВЕРБАТИМ-ЭХО — сервер РОЛЛИРУЕТ токен
              * (run381 echo 'connect0x00000ee0a07' -> run383 'A'#2 'connect0x
              * 00700ee0a07'), а FORM=2/3 отвечают ПЕРЕФОРМАТИРОВАННЫМ
@@ -17859,7 +17937,15 @@ static void c2b_k27_maybe_fire(void)
              * view сервера => погоня бесконечна ПО КОНСТРУКЦИИ. FORM=4 =
              * 'q' + СТРОКА ЭХО ИЗ RAW-'A' БЕЗ ИЗМЕНЕНИЙ (v43-капчер несёт
              * raw[24..NUL] = 'connect0x<11 hex сервера>') = ответ ТОЧНО
-             * в view сервера на момент 'A'. ff×4+'q'+echo+NUL = 26B. */
+             * в view сервера на момент 'A'. ff×4+'q'+echo+NUL = 26B.
+             * v70 FORM=5 = ТО ЖЕ спрос + ОТВЕТ: run460-пкп расшифровал
+             * танец (сессия B): наш 23B 'qconnect0x<tok>' -> ЧЕРЕЗ 173мс
+             * 77B-шифрованный 'A' С ТОКЕНОМ (форма-4 = ОТВЕЧЕННАЯ форма,
+             * run230-класс вживую!). Классический протокол: ответ на 'A' =
+             * "connect0x<token>" (run378-класс = ff×4+connect-строка =
+             * ТЕРПИМАЯ форма на сессии) — но с ТОКУНОМ ЭТОГО 'A' (ран378
+             * слал статичный chal=0 = тишина). Отправка = после лога ниже
+             * (второй слот-11 send, unreliable). */
             u32 rle44 = g_k27_Ap->rawlen;
             const volatile unsigned char *rw44;
             u32 e44, nul44 = 0;
@@ -17932,13 +18018,14 @@ static void c2b_k27_maybe_fire(void)
         C2B_LOGS(form27 == 2 ? "[c2b] k27: A-fire form=qconnect-val #"
                              : (form27 == 3 ? "[c2b] k27: A-fire form=qconnect-val11 #"
                              : (form27 == 4 ? "[c2b] k27: A-fire form=verbatim-echo #"
-                                            : "[c2b] k27: A-fire form=ascii #")));
+                             : (form27 == 5 ? "[c2b] k27: A-fire form=verbatim-echo+ans #"
+                                            : "[c2b] k27: A-fire form=ascii #"))));
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
         C2B_LOGS(" val=");
         C2B_LOGH(val);
-        if (form27 == 4) {
+        if (form27 == 4 || form27 == 5) {
             C2B_LOGS(" len=");
             C2B_LOGN(kn27);
             C2B_LOGS(" fl=1 live=");
@@ -17953,6 +18040,66 @@ static void c2b_k27_maybe_fire(void)
         C2B_LOGS(" slot=11 rc=");
         C2B_LOGN((u32)(i32)rc27);
         C2B_LOGS("\n");
+        /* v70 FORM=5: ОТВЕТ на 'A' = голый серверный echo (ff×4+raw[24..NUL]
+         * БЕЗ 'q') — токен ИМЕННО этого 'A'. Второй слот-11 send, unreliable
+         * (v67-дисциплина). run378-класс формы = терпимая; новизна = токен
+         * текущего 'A' + пара спрос->ответ в одном окне. Смерть-стоп общий
+         * (rc!=1 => g_krel_dead) — как у основного выстрела. */
+        if (form27 == 5 && rc27 == 1 && !g_krel_dead) {
+            u32 rle70 = g_k27_Ap->rawlen;
+            const volatile unsigned char *rw70 = g_k27_Ap->raw;
+            u32 e70, kn70 = 4, nul70 = 0;
+            i32 rc70 = -999;
+            i64 out70 = -1;
+            u8 kcopy70[640];
+            void **vt70;
+            for (e70 = 0; e70 < sizeof kcopy70; e70++) kcopy70[e70] = 0;
+            kcopy70[0] = 0xff; kcopy70[1] = 0xff;
+            kcopy70[2] = 0xff; kcopy70[3] = 0xff;
+            if (rle70 >= 25 && rle70 <= 639 &&
+                rw70[24] == 'c' && rw70[25] == 'o' && rw70[26] == 'n' &&
+                rw70[27] == 'n' && rw70[28] == 'e' && rw70[29] == 'c' &&
+                rw70[30] == 't') {
+                for (e70 = 24; e70 < rle70 && e70 < 200 && kn70 < 639; e70++) {
+                    kcopy70[kn70++] = rw70[e70];
+                    if (rw70[e70] == 0) { nul70 = 1; break; }
+                }
+            }
+            if (nul70 && kn70 > 5) {
+                vt70 = *(void ***)g_gns_conn_iface;
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    rc70 = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                                     i64 *))vt70[11])(
+                        g_gns_conn_iface, g_gns_conn_h, kcopy70, kn70,
+                        c2b_krel_send_flags(), &out70);
+                    g_probe_active = 0;
+                } else {
+                    g_probe_active = 0;
+                    C2B_LOGS("[c2b] k27: A-answer send SEGV\n");
+                    return;
+                }
+                C2B_LOGS("[c2b] k27: A-answer #");
+                C2B_LOGN(g_k27_fires);
+                C2B_LOGS(" len=");
+                C2B_LOGN(kn70);
+                C2B_LOGS(" tok='");
+                C2B_LOGS((const char *)kcopy70 + 4);
+                C2B_LOGS("' fl=");
+                C2B_LOGN((u32)c2b_krel_send_flags());
+                C2B_LOGS(" tgt=");
+                C2B_LOGN((u32)g_gns_conn_h);
+                C2B_LOGS(" slot=11 rc=");
+                C2B_LOGN((u32)(i32)rc70);
+                C2B_LOGS("\n");
+                if (rc70 != 1) {
+                    g_krel_dead = 1;
+                    C2B_LOGS("[c2b] k27: A-answer tgt dead — death-stop\n");
+                }
+            } else {
+                C2B_LOGS("[c2b] k27: A-answer SKIP (raw-эхо не 'connect')\n");
+            }
+        }
         /* v45: фаза B(а) таск-текста — дамп состояния тикета на каждый
          * выстрел (тикет = g_ticket_* из FUv-интерцептора SteamUser,
          * run99: slot 13, 252B, наш steamid внутри; здесь = свежий слепок
@@ -22813,6 +22960,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             }
             i32 act = c2b_cl_filter_downlink(p, (u32)r);
             c2b_cl_trace(0, p, (u32)r, act);
+            c2b_g131_maybe(p, (u32)r);   /* v70: 0x24-reject декодер (до DROP) */
             if (act == C2B_CL_DROP) return 0;   /* v2: движку нулевая датаграмма */
         }
     }
@@ -30139,6 +30287,42 @@ static void test_susp(void)
     CHECK(c2b_susp_decide(0, 0, 100, 900, 0) == 0, "susp: killswitch2 = 0");
 }
 
+/* v70: g131 — декодер серверного 0x24-reject (реальный кадр из run460-пкп,
+ * сессия B :35447 t=+230.050: code=2047, reason=PARSE_ERROR, cid=0x1cbf5162
+ * = хэндл моста/сессии — g_gns_conn_h!). 0x24 = cleartext-канал обратной
+ * связи сервера. */
+static void test_g131(void)
+{
+    const u8 fr[60] = {
+        0x24, 0x35, 0x00, 0x12, 0x26,
+        'N', 'E', 'T', 'W', 'O', 'R', 'K', '_', 'D', 'I', 'S', 'C', 'O',
+        'N', 'N', 'E', 'C', 'T', '_', 'M', 'E', 'S', 'S', 'A', 'G', 'E',
+        '_', 'P', 'A', 'R', 'S', 'E', '_', 'E', 'R', 'R', 'O', 'R',
+        0x18, 0xff, 0x0f, 0x25, 0x62, 0x51, 0xbf, 0x1c,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   /* паддинг кадра */
+    };
+    u32 code = 99, cid = 99;
+    char rs[64];
+    CHECK(c2b_g131_parse(fr, sizeof fr, &code, rs, (u32)sizeof rs, &cid) == 1,
+          "g131: 0x24-кадр распознан");
+    CHECK(code == 2047, "g131: code==2047 (varint ff 0f)");
+    CHECK(cid == 0x1cbf5162u, "g131: cid==0x1cbf5162 (fixed32 LE = хэндл сессии)");
+    CHECK(strcmp(rs, "NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR") == 0,
+          "g131: reason-строка байт-точна");
+    {
+        const u8 nf[8] = {0x21, 0x0d, 1, 2, 3, 4, 5, 6};
+        CHECK(c2b_g131_parse(nf, sizeof nf, &code, rs,
+                             (u32)sizeof rs, &cid) == 0,
+              "g131: 0x21-кадр отвергнут");
+    }
+    {
+        const u8 tf[6] = {0x24, 0x35, 0x00, 0x12, 0x26, 0x41};
+        CHECK(c2b_g131_parse(tf, sizeof tf, &code, rs,
+                             (u32)sizeof rs, &cid) == 0,
+              "g131: усечённый кадр отвергнут");
+    }
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -30254,6 +30438,7 @@ int main(void)
     test_seccomp();     /* v58: seccomp-user-notif (BPF + живой e2e) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_susp();        /* v68: susp-гейт (until/retire-окна + киллисвитч) */
+    test_g131();        /* v70: 0x24-reject декодер */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

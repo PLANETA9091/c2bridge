@@ -58,11 +58,11 @@ on:
         required: false
         type: string
       fire_abi:
-        description: "v67: FIRE verbosity: 0 = v64 line (PROVEN-SAFE volume, DEFAULT — run433: v65 volume = deterministic 4/4 instant death in the anon verifier +0x24a9b); 1 = +buf/fl/ad/al registers; 2 = +st0..3 (GUARDED derefs) = the caller-naming investigation mode"
+        description: "v67/v69: FIRE verbosity: 0 = v64 line (PROVEN-SAFE, DEFAULT); 1 = +buf/fl/ad/al registers; 2 = +st0..3 (GUARDED, sp-arg FIXED v68); 3 = +st0..15 = 128B caller-frame walk (the caller-code-pointer hunt)"
         default: "0"
         required: false
         type: choice
-        options: ["0", "1", "2"]
+        options: ["0", "1", "2", "3"]
   schedule:
     - cron: "0 4 * * *"   # daily 04:00 UTC smoke
 

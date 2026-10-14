@@ -679,7 +679,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # Дискриминатор в инсталле: всё кроме '1'/'2' = 0.
   case "${C2B_FIRE_ABI_V-0}" in
     0|""|all) : ;;
-    1|2)      MODES="$MODES C2B_FIRE_ABI=$C2B_FIRE_ABI_V" ;;
+    1|2|3)    MODES="$MODES C2B_FIRE_ABI=$C2B_FIRE_ABI_V" ;;
     *)        : ;;
   esac
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so

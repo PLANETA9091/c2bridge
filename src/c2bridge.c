@@ -15532,11 +15532,21 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
             {
                 const u64 *fst = (const u64 *)(uptr)sp;
                 u32 fq;
+                /* v69: уровень 3 = 16 слотов (128B кадр-волк): run436-факт —
+                 * [rsp0..+24] = данные кадра зовущего (паки аргументов:
+                 * st[3]=0x2ba00000017 = fd|0x2ba, buf-копии), НЕТ кодовых
+                 * пойнтеров = 4 слота = мелко; 16 слотов = до первых
+                 * кодовых пойнтеров (сохранённые r14/r15/rbx возвраты
+                 * фрейма) = идентификация зовущего. Объём = +12 write/FIRE
+                 * БЕЗОПАСЕН: run435 опроверг теорию счётчика syscalls
+                 * (fire_abi=2 = объём v65 = PASS); смерть run433 = ТОЛЬКО
+                 * дикий deref [0] (sp-арг-баг v68-фикс) — он невозможен
+                 * (leal-fix + гард). */
 #ifndef C2B_SELFTEST
                 g_probe_active = 1u;
                 if (__sigsetjmp(g_probe_jb, 1) == 0) {
 #endif
-                for (fq = 0u; fq < 4u; fq++) {
+                for (fq = 0u; fq < ((g_fire_abi >= 3u) ? 16u : 4u); fq++) {
                     C2B_LOGS((fq) ? " " : "");
                     c2b_gp_lh64((unsigned long long)fst[fq]);
                 }

@@ -81,6 +81,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      mpw:
+        description: "v76: the exec-watcher (C2B_MPW=1): LD_PRELOAD-interposes mprotect/mmap/mmap64 and censuses every exec-protected range ON THE SPOT (fixed A/B + '?'-class + REX-dispatcher '48 89 f8 0f 05' + raw05 taxonomy) with the caller module attribution = catches the TRANSIENT JIT stub class (the last unexplained native-lane sender after the full static elimination matrix). Census-only, no patching. '0' = pure passthrough"
+        default: "1"
+        required: false
+        type: choice
+        options: ["0", "1"]
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -139,6 +145,9 @@ jobs:
       # v75: the raw-syscall stub patcher lever (default '1' = ARMED;
       # '0' = the run468 behavior, the rollback path).
       C2B_GPR_V: ${{ inputs.gpr || '1' }}
+      # v76: the exec-watcher lever (default '1' = census on; '0' =
+      # the passthrough-only rollback path).
+      C2B_MPW_V: ${{ inputs.mpw || '1' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

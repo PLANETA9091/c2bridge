@@ -74,8 +74,8 @@ static void c2b_segv(int sig, siginfo_t *si, void *uc)
 #define C2B_LOGD(v) do { printf("%u ", (unsigned)(v)); } while (0)
 #else
 /* ---------- режим .so: только объявления, резолв через ld.so ---------- */
-extern void *mmap(void *addr, u32 len, i32 prot, i32 flags, i32 fd, u32 off);
-extern i32   mprotect(void *addr, u32 len, i32 prot);
+extern void *mmap(void *addr, unsigned long len, i32 prot, i32 flags, i32 fd, long off);
+extern i32   mprotect(void *addr, unsigned long len, i32 prot);
 extern void *memcpy(void *d, const void *s, u32 n);
 extern i32   memcmp(const void *a, const void *b, u32 n);
 extern void *memset(void *d, i32 c, u32 n);
@@ -16138,6 +16138,33 @@ static u32 c2b_ss_scan_chunk(const u8 *p, u32 n, struct c2b_ss_hit *out,
     return k;
 }
 
+/* v76: REX-класс census (ЧИСТЫЙ, selftest-ируемый). '48 89 f8 0f 05' =
+ * mov %rdi,%rax; syscall = форма glibc syscall() = GENERIC-диспетчер
+ * (nr = аргумент rdi). Ровно ЭТА форма = дыра в матчерах v53/v57/v75:
+ * '?'-класс её ОТКЛЮЧАЕТ (REX-отсечение), fixed-формы её не видят.
+ * run473-офлайн (scripts/elf_o05_taxonomy.py): в ФАЙЛ-бэкед модулях
+ * REX-сайты = лea-шум, а syscall@plt-вызовы = getrandom/exit/futex —
+ * generic-диспетчер в файлах ОТСУТСТВУЕТ. Остался анон/JIT (транзиент-
+ * ный класс) = v76-watcher считает его ЗДЕСЬ (mprotect/mmap-хуки = мо-
+ * мент между защитой RX и первым исполнением). raw05 = попутный полный
+ * счётчик 0f 05 (таксономия региона одной цифрой). Возврат = число
+ * REX-сайтов (<= 255). */
+static u32 c2b_mpw_rex_census(const u8 *p, u32 n, u32 *raw05)
+{
+    u32 i, k = 0;
+    if (raw05) *raw05 = 0u;
+    if (!p || n < 5u) return 0u;
+    for (i = 3u; i + 2u <= n; i++) {
+        if (p[i] != 0x0fu || p[i + 1u] != 0x05u) continue;
+        if (raw05) (*raw05)++;
+        if ((p[i - 3u] & 0xf8u) == 0x48u && !(p[i - 3u] & 0x01u) &&
+            p[i - 2u] == 0x89u && (p[i - 1u] & 0xc7u) == 0xc0u) {
+            if (k < 255u) k++;
+        }
+    }
+    return k;
+}
+
 #if !defined(C2B_SELFTEST) && defined(__x86_64__)
 static u32 g_ss_scans, g_ss_last, g_ss_logn, g_ss_done;
 static u32 g_ss_rescans;   /* v58b: лэйзи-ресканы (seen-очистки) */
@@ -17517,6 +17544,293 @@ static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
                               const struct sockaddr *addr)
 { (void)fd; (void)buf; (void)len; (void)addr; }
 #endif  /* v75 */
+
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+/* ---------- v76: EXEC-WATCHER (mprotect/mmap census) ----------
+ * МАТРИЦА ЭЛИМИНАЦИИ ЗАКРЫТА (run468-472 + run473-офлайн): отправитель
+ * нативных GNS-кадров (sys_sendto len 0x200/0x201, fd 0x29 = сокет
+ * движка :27005, треды пула csgo_linux64) НЕ находится ни в одном
+ * достижимом статикой классе:
+ *   (v51) GOT = все 'already' (резолвятся в наши хуки);
+ *   (v52/v56) прологи libc sendto/sendmsg/send/write/syscall = детуры,
+ *             ZERO HIT (syscall()-обёртка = ОТДЕЛЬНЫЙ слот g_ldd_tr_sc —
+ *             тоже ноль);
+ *   (v53/v57) '?'-класс (mov eax,r32; syscall) = живой скан anon+exe+eng
+ *             (run472: 335 rx-линий, 123 анона, 11 стабов = ВСЕ mod=sys
+ *             libc) + сегодн. офлайн qscan ВСЕХ дампов (GNS 5.6МБ,
+ *             steamclient 49.8МБ, engine_client x2, matchmaking, 8
+ *             dump_*.so) = НОЛЬ движковых '?'-сайтов;
+ *   (v75b-d) fixed-формы (b8-nr / 48c7c0-nr) = весь файл-бэкед + весь
+ *            анон = 0;
+ *   (офлайн-таксономия) REX-диспетчеры в файлах = lea-шум; e8-вызовы
+ *            syscall@plt = getrandom(318)/exit(60)/futex(202) — nr 44
+ *            НИКТО не грузит; b8-семейство на дистанции до 10Б = 0;
+ *   sendmmsg = 0 событий; io_uring = исключён (tracepoint = прямые
+ *            syscall); форк-потомок = ss: сокет :27005 = fd 41 ТОЛЬКО
+ *            pid 16082 (главный).
+ * ОСТАЛСЯ ОДИН КЛАСС: ТРАНЗИЕНТНЫЙ КОД — JIT/само-распаковка, пишущий
+ * байты стаба и исполняющий их МЕЖДУ 2с-сканами v75 (30 сканов x 2с
+ * против каденции 2/с = поймать статикой = почти невозможно).
+ * РЕШЕНИЕ: LD_PRELOAD-интерпозиция mprotect/mmap/mmap64 — ЛЮБОЙ JIT
+ * обязан перевести страницу в RX (mprotect RW->RX) или замапить сразу
+ * исполнимой (mmap PROT_EXEC); энти вызовы из модулей движка идут ЧЕРЕЗ
+ * PLT (интерпозируемы; ld.so/glibc-внутренние = мимо — но их классы
+ * уже покрыты v53/v75). МОМЕНТ между защитой и первым исполнением =
+ * окно watcher'а: census региона на месте.
+ * CENSUS (без патча!): fixed A/B (44/46/1) + '?'-класс (v57-матчер,
+ * c2b_ss_scan_chunk) + REX-диспетчеры (c2b_mpw_rex_census — новая
+ * чистая функция: 48/49/4c 89 <mod=3,rm=rax> 0f 05 = форма glibc
+ * syscall(), не видимая НИ одной прежней генерацией) + raw05-таксономия.
+ * Аттрибуция: dladdr(ra) = базоним модуля вызывавшего; 'self' = мост
+ * (свой census пропускаем). Лог = ТОЛЬКО на находках (S/W/Q/R>0) + пе-
+ * риодическая счётчик-строка на каждые 4096 exec-вызовов. Бюджет:
+ * регион <= 16МБ за вызов, глобал <= 2048МБ. Гейт C2B_MPW=1 (дефолт
+ * '1' = раунд-эксперимент; killswitch = dispatch-инпут mpw='0').
+ * РЕКУРСИЯ: резолв реальных fn = dlsym(RTLD_NEXT) лениво с TLS-гардом;
+ * glibc-внутренний malloc/длсим = не через PLT = не зацикливается.
+ * Свои вызовы моста (mmap/mprotect трамплинов v59/v75) = tag 'self' =
+ * passthrough без census. */
+#define C2B_MPW_CHUNK   16384u
+#define C2B_MPW_MAXLEN  (16ul << 20)
+#define C2B_MPW_MBMAX   2048ul
+#define C2B_MPW_LOGCAP  48u
+#define C2B_MPW_PERIOD  4096u
+static u32 g_mpw_init, g_mpw_on, g_mpw_calls, g_mpw_exec, g_mpw_hits;
+static u32 g_mpw_logn, g_mpw_self;
+static unsigned long g_mpw_mb;
+static void *g_clp_mpw_mprotect, *g_clp_mpw_mmap;
+static __thread int g_mpw_tls;
+
+typedef int (*c2b_mpw_mprot_fn)(void *, unsigned long, int);
+typedef void *(*c2b_mpw_mmap_fn)(void *, unsigned long, int, int, int,
+                                 long);
+
+/* [c2b] v76: census региона [a, a+len): fixed A/B + '?' + REX + raw05 */
+static void c2b_mpw_census(unsigned long long a, unsigned long long l,
+                           const char *tag)
+{
+    static const char *pmem = "/proc/self/mem";
+    u8 chunk[C2B_MPW_CHUNK];
+    i32 fd;
+    unsigned long long off;
+    u32 S = 0, W = 0, Q = 0, R = 0, raw = 0, k, hn = 0;
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    if (l > C2B_MPW_MAXLEN) l = C2B_MPW_MAXLEN;
+    if (g_mpw_mb >= C2B_MPW_MBMAX) return;
+    g_mpw_mb += l >> 20;
+    fd = open(pmem, 0);
+    if (fd < 0) return;
+    for (off = 0; off < l; off += (C2B_MPW_CHUNK - 8u)) {
+        unsigned long long want = l - off;
+        i64 r;
+        u32 got, i;
+        struct c2b_ss_hit hl[12];
+        u32 rw = 0;
+        if (want > C2B_MPW_CHUNK) want = C2B_MPW_CHUNK;
+        r = pread(fd, chunk, (uptr)want, (uptr)(a + off));
+        if (r <= 0) break;
+        got = (u32)r;
+        k = c2b_ss_scan_chunk(chunk, got, hl, 12u);
+        for (i = 0; i < k; i++) {
+            if (hl[i].nr == 0xffffu) Q++;
+            else if (hl[i].nr == 1u) W++;
+            else S++;
+            if (hn < 4u && g_mpw_logn < C2B_MPW_LOGCAP) {
+                u32 z, cl = 8u;
+                C2B_LOGS("[c2b] v76: hit k=");
+                C2B_LOGD(hl[i].nr);
+                C2B_LOGS(" off=");
+                c2b_gp_lh64((unsigned long long)(off + hl[i].off));
+                C2B_LOGS(" b=");
+                for (z = 0; z < cl && (i64)(hl[i].off + z) < (i64)got;
+                     z++)
+                    C2B_LOGH(chunk[hl[i].off + z]);
+                C2B_LOGS(" ");
+                C2B_LOGS(tag);
+                C2B_LOGS("\n");
+                hn++;
+            }
+        }
+        R += c2b_mpw_rex_census(chunk, got, &rw);
+        raw += rw;
+        if (R && g_mpw_logn < C2B_MPW_LOGCAP && hn < 4u) {
+            C2B_LOGS("[c2b] v76: rex off=");
+            c2b_gp_lh64(a + off);
+            C2B_LOGS(" n=");
+            C2B_LOGD(R);
+            C2B_LOGS(" ");
+            C2B_LOGS(tag);
+            C2B_LOGS("\n");
+            hn++;
+        }
+    }
+    close(fd);
+    g_mpw_hits += S + Q;
+    if (S + W + Q + R > 0u && g_mpw_logn < C2B_MPW_LOGCAP) {
+        C2B_LOGS("[c2b] v76: exec mod=");
+        C2B_LOGS(tag);
+        C2B_LOGS(" addr=");
+        c2b_gp_lh64(a);
+        C2B_LOGS("K=");
+        C2B_LOGD((u32)((l >> 10) & 0x3ffffu));
+        C2B_LOGS(" S=");
+        C2B_LOGD(S);
+        C2B_LOGS(" W=");
+        C2B_LOGD(W);
+        C2B_LOGS(" Q=");
+        C2B_LOGD(Q);
+        C2B_LOGS(" R=");
+        C2B_LOGD(R);
+        C2B_LOGS(" raw=");
+        C2B_LOGD(raw);
+        C2B_LOGS("\n");
+        g_mpw_logn++;
+    }
+}
+
+/* базоним dli_fname (или '?' ) */
+static const char *c2b_mpw_tag(const char *p)
+{
+    const char *b;
+    if (!p) return "?";
+    b = p;
+    for (; *p; p++)
+        if (*p == '/') b = p + 1;
+    return b;
+}
+
+static void c2b_mpw_gate(void)
+{
+    if (g_mpw_init) return;
+    {
+        const char *ec = getenv("C2B_MPW");
+        g_mpw_init = 1;
+        if (ec && ec[0] == '1') g_mpw_on = 1;
+    }
+}
+
+/* ra = в тексте моста? */
+static i32 c2b_mpw_is_self(void *ra)
+{
+    struct c2b_ldd_dlinfo m1, m2;
+    if (!dladdr((void *)&c2b_mpw_census, &m1)) return 0;
+    if (!dladdr(ra, &m2)) return 0;
+    return m1.dli_fbase == m2.dli_fbase;
+}
+
+__attribute__((visibility("default")))
+int mprotect(void *addr, unsigned long len, int prot)
+{
+    c2b_mpw_gate();
+    if (!g_clp_mpw_mprotect) {
+        if (!g_mpw_tls) {
+            g_mpw_tls = 1;
+            g_clp_mpw_mprotect = dlsym(C2B_CL_RTLD_NEXT, "mprotect");
+            g_mpw_tls = 0;
+        }
+        if (!g_clp_mpw_mprotect) {
+            /* raw-syscall страховка (nr 10), окно резолва */
+            long r;
+            __asm__ volatile("syscall"
+                             : "=a"(r)
+                             : "a"(10L), "D"((long)addr), "S"((long)len),
+                               "d"((long)prot)
+                             : "rcx", "r11", "memory");
+            return (i32)r;
+        }
+    }
+    g_mpw_calls++;
+    if (g_mpw_on && (prot & 0x4)) {
+        g_mpw_exec++;
+        if ((g_mpw_exec & (C2B_MPW_PERIOD - 1u)) == 0u &&
+            g_mpw_logn < C2B_MPW_LOGCAP) {
+            C2B_LOGS("[c2b] v76: calls=");
+            C2B_LOGD(g_mpw_calls);
+            C2B_LOGS(" exec=");
+            C2B_LOGD(g_mpw_exec);
+            C2B_LOGS(" MB=");
+            C2B_LOGD((u32)g_mpw_mb);
+            C2B_LOGS(" hits=");
+            C2B_LOGD(g_mpw_hits);
+            C2B_LOGS("\n");
+            g_mpw_logn++;
+        }
+        if (!c2b_mpw_is_self(__builtin_return_address(0))) {
+            struct c2b_ldd_dlinfo di;
+            const char *tg = "unk";
+            if (dladdr(__builtin_return_address(0), &di) &&
+                di.dli_fname)
+                tg = c2b_mpw_tag(di.dli_fname);
+            c2b_mpw_census((unsigned long long)(unsigned long)addr,
+                           len, tg);
+        } else {
+            g_mpw_self++;
+        }
+    }
+    return ((c2b_mpw_mprot_fn)g_clp_mpw_mprotect)(addr, len, prot);
+}
+
+static void *c2b_mpw_mmap_common(void *addr, unsigned long len, int prot,
+                                 int flags, int fd, long off, void *ra)
+{
+    void *r;
+    c2b_mpw_gate();
+    if (!g_clp_mpw_mmap) {
+        if (!g_mpw_tls) {
+            g_mpw_tls = 1;
+            g_clp_mpw_mmap = dlsym(C2B_CL_RTLD_NEXT, "mmap");
+            g_mpw_tls = 0;
+        }
+        if (!g_clp_mpw_mmap) {
+            long rr;
+            register long r10f __asm__("r10") = (long)flags;
+            register long r8f __asm__("r8") = (long)fd;
+            register long r9f __asm__("r9") = (long)off;
+            __asm__ volatile("syscall"
+                             : "=a"(rr)
+                             : "a"(9L), "D"((long)addr), "S"((long)len),
+                               "d"((long)prot), "r"(r10f), "r"(r8f),
+                               "r"(r9f)
+                             : "rcx", "r11", "memory");
+            return (void *)rr;
+        }
+    }
+    r = ((c2b_mpw_mmap_fn)g_clp_mpw_mmap)(addr, len, prot, flags, fd,
+                                          off);
+    if (g_mpw_on && r != (void *)-1 && (prot & 0x4) && len &&
+        len <= C2B_MPW_MAXLEN) {
+        g_mpw_exec++;
+        if (!c2b_mpw_is_self(ra)) {
+            struct c2b_ldd_dlinfo di;
+            const char *tg = "unk";
+            if (dladdr(ra, &di) && di.dli_fname)
+                tg = c2b_mpw_tag(di.dli_fname);
+            c2b_mpw_census((unsigned long long)(unsigned long)r, len,
+                           tg);
+        } else {
+            g_mpw_self++;
+        }
+    }
+    return r;
+}
+
+__attribute__((visibility("default")))
+void *mmap(void *addr, unsigned long len, int prot, int flags, int fd,
+           long off)
+{
+    return c2b_mpw_mmap_common(addr, len, prot, flags, fd, off,
+                               __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void *mmap64(void *addr, unsigned long len, int prot, int flags, int fd,
+             long off)
+{
+    return c2b_mpw_mmap_common(addr, len, prot, flags, fd, off,
+                               __builtin_return_address(0));
+}
+#endif  /* v76 */
 
 #ifndef C2B_SELFTEST
 static void c2b_g50_force_cstate(void);
@@ -30693,6 +31007,53 @@ static void test_stubscan(void)
     buf[80] = 0x0f; buf[81] = 0x05;
     CHECK(c2b_ss_scan_chunk(buf, sizeof buf, hits, 16u) == 0u,
           "ss57: 0x90-фон без mov = 0");
+    /* ---- v76: REX-класс census (c2b_mpw_rex_census) ---- */
+    memset(buf, 0x00, sizeof buf);
+    buf[10] = 0x48; buf[11] = 0x89; buf[12] = 0xf8;   /* mov %rdi,%rax */
+    buf[13] = 0x0f; buf[14] = 0x05;
+    {
+        u32 rw = 0;
+        CHECK(c2b_mpw_rex_census(buf, sizeof buf, &rw) == 1u && rw == 1u,
+              "v76: 4889f8 0f05 = 1 REX-сайт, raw05=1");
+    }
+    memset(buf, 0x00, sizeof buf);
+    buf[20] = 0x4c; buf[21] = 0x89; buf[22] = 0xc0;   /* mov %r8,%rax */
+    buf[23] = 0x0f; buf[24] = 0x05;
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 1u,
+          "v76: 4c89c0 (REX 4c) = 1 сайт");
+    memset(buf, 0x00, sizeof buf);
+    buf[30] = 0x49; buf[31] = 0x89; buf[32] = 0xd8;   /* REX.WB: mov %rbx,%r8 (rm=000 +B = r8!) */
+    buf[33] = 0x0f; buf[34] = 0x05;
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 0u,
+          "v76: REX.B=1 (dest = r8, не rax) = 0");
+    memset(buf, 0x00, sizeof buf);
+    buf[34] = 0x4d; buf[35] = 0x89; buf[36] = 0xc0;   /* REX.WRB: dest = r8 */
+    buf[37] = 0x0f; buf[38] = 0x05;
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 0u,
+          "v76: REX 4d (B=1) = 0");
+    memset(buf, 0x00, sizeof buf);
+    buf[44] = 0x4a; buf[45] = 0x89; buf[46] = 0xc0;   /* REX.WX (B=0): dest = rax */
+    buf[47] = 0x0f; buf[48] = 0x05;
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 1u,
+          "v76: REX 4a (B=0, X неважно) = 1 сайт");
+    memset(buf, 0x00, sizeof buf);
+    buf[40] = 0x48; buf[41] = 0x8b; buf[42] = 0xf8;   /* mov %rdi,%rdi (8b) */
+    buf[43] = 0x0f; buf[44] = 0x05;
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 0u,
+          "v76: опкод 8b (mov r,r load) = 0 (только 89)");
+    memset(buf, 0x00, sizeof buf);
+    buf[50] = 0x48; buf[51] = 0x89; buf[52] = 0xf8;
+    buf[53] = 0x0f; buf[54] = 0x07;                   /* не syscall */
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 0u,
+          "v76: без 0f 05 = 0");
+    /* glibc-шум наоборот: '?'-класс НЕ считается REX'ом (89 f8 без REX) */
+    memset(buf, 0x00, sizeof buf);
+    buf[60] = 0x89; buf[61] = 0xf8;
+    buf[62] = 0x0f; buf[63] = 0x05;
+    CHECK(c2b_mpw_rex_census(buf, sizeof buf, 0) == 0u,
+          "v76: 32-бит mov (без REX) = 0");
+    CHECK(c2b_mpw_rex_census(0, 100u, 0) == 0u, "v76: NULL = 0");
+    CHECK(c2b_mpw_rex_census(buf, 4u, 0) == 0u, "v76: n<5 = 0");
 }
 
 /* v75: raw-syscall стаб-патчер (c2b_raw.h) — паттерны/трамплин/rel32/

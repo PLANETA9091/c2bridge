@@ -686,6 +686,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     1) MODES="$MODES C2B_GPR=1" ;;
     *) : ;;
   esac
+  # v76: exec-watcher (workflow input mpw -> C2B_MPW_V). Дефолт '1' =
+  # census mprotect/mmap-хуками (транзиентный JIT-класс = последний
+  # необъяснённый отправитель; см. матрицу элиминации в c2bridge.c).
+  # Откат = dispatch с mpw='0' (хуки = чистый passthrough).
+  case "${C2B_MPW_V-1}" in
+    1) MODES="$MODES C2B_MPW=1" ;;
+    *) : ;;
+  esac
   # v60: bisect-рычаг C2B_DSITES (workflow input dsites -> C2B_DSITES_V).
   # СЕМАНТИКА-СЕНТИНЕЛ (УРОК: ${VAR:-all} И inputs.x||'all' СЪЕДАЮТ
   # пустую строку => '' НЕВЫРАЗИМ через воркфлоу): 'all' (дефолт) = НЕ

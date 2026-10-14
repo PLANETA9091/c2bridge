@@ -93,6 +93,7 @@ extern i32   __sigsetjmp(void *buf, i32 savemask);   /* 41f-c: SEGV-защита
 extern void  siglongjmp(void *buf, i32 val);
 extern i32   sigaction(i32 sig, const void *act, void *oldact);
 extern i32   sigemptyset(void *set);   /* маска sa_mask */
+extern i32   raise(i32 sig);   /* v77b: чужой SIGTRAP = re-raise на DFL */
 extern i64   pread(i32 fd, void *buf, uptr n, uptr off);   /* g24 v4.2: ssize_t/size_t/off_t = 64-bit */
 extern i64   pwrite(i32 fd, const void *buf, uptr n, uptr off);   /* v51: GOT-патч (self-запись мимо прота) */
 extern i32   vsnprintf(char *s, uptr n, const char *fmt, void *va);   /* g34v2: GNS lib-spew hook */
@@ -17224,6 +17225,10 @@ static ssize_t c2b_raw_st_entry(int fd, const void *buf, size_t len,
     }
     r = (ssize_t)c2b_raw_sys_sendto(fd, sbuf, slen, flags, addr,
                                     (long)addrlen);
+    if (r < 0 && r > -4096) {
+        *__errno_location() = (i32)-r;          /* C-ABI: errno = -rax */
+        r = -1;
+    }
     g_raw_tls = 0;
     return r;
 }
@@ -17234,8 +17239,61 @@ static ssize_t c2b_raw_sm_entry(int fd, const struct c2b_msghdr *msg,
     ssize_t r;
     g_raw_tls = 1;
     r = (ssize_t)c2b_raw_sys_sendmsg(fd, msg, flags);
+    if (r < 0 && r > -4096) {
+        *__errno_location() = (i32)-r;      /* C-ABI: errno = -rax, ret -1 */
+        r = -1;
+    }
     g_raw_tls = 0;
     return r;
+}
+
+/* v77b: АТОМАРНЫЙ int3-двухфазный патч ЖИВОГО стаба (run475-урок: pwrite
+ * 7B на горячий libc-стаб = torn-write = SEGV foreign rip=1 = движок умер).
+ * ф1: site[0] = 0xCC (1Б = атомарно) + реестр (site -> tramp) — вызовы =
+ *     SIGTRAP -> хендлер ставит RIP = tramp (ПОЛНАЯ наша семантика);
+ * ф2: site[1..5] = e9 rel32 (входы по-прежнему через CC-хендлер);
+ * ф3: site[0] = 0xe9 (1Б = атомарно) = патч полон, CC-путь мёртв.
+ * Ни в один момент нет рваного состояния: 1Б-записи = всегда атомарны. */
+static volatile u32 g_raw_int3_n;
+static volatile u64 g_raw_int3_site[16];
+static volatile u64 g_raw_int3_tramp[16];
+
+static void c2b_raw_trap(i32 sig, void *si, void *uc)
+{
+    (void)sig; (void)si;
+    if (uc) {
+        volatile uptr *gr = (volatile uptr *)((const u8 *)uc + 0x28);
+        uptr rip = gr[16];
+        u32 i;
+        for (i = 0; i < g_raw_int3_n && i < 16u; i++) {
+            if (g_raw_int3_site[i] && rip == g_raw_int3_site[i] + 1u) {
+                gr[16] = g_raw_int3_tramp[i];   /* продолжить в трамплин */
+                return;
+            }
+        }
+    }
+    {
+        /* чужой SIGTRAP = дефолт-цепочка (re-raise на DFL) */
+        struct c2b_sigaction dfl;
+        u32 t;
+        for (t = 0; t < sizeof(dfl); t++) ((u8 *)&dfl)[t] = 0;
+        dfl.handler = 0;                        /* SIG_DFL = 0 */
+        sigaction(5, &dfl, (void *)0);          /* SIGTRAP = 5 */
+        raise(5);
+    }
+}
+
+static void c2b_raw_trap_arm(void)
+{
+    static u8 armed;
+    struct c2b_sigaction sa;
+    u32 t;
+    if (armed) return;
+    for (t = 0; t < sizeof(sa); t++) ((u8 *)&sa)[t] = 0;
+    sa.handler = (uptr)c2b_raw_trap;
+    sa.flags = 4u | 0x40000000u;                /* SA_SIGINFO | SA_NODEFER */
+    sigemptyset(sa.mask);
+    if (sigaction(5, &sa, (void *)0) == 0) armed = 1;
 }
 
 /* census сырой ланы: один лог на класс (fd,len,head3), повторы на 50/200. */
@@ -17530,15 +17588,72 @@ static void c2b_raw_scan(void)
                     code[5] = 0x90u;
                     code[6] = 0x90u;
                     code[7] = 0x90u;   /* форма B (9B): пад до pl */
-                    wr = pwrite(mfd, code, (uptr)pl, (uptr)site);
-                    if (wr != (long long)pl) {
-                        C2B_LOGS("[c2b] v75: write-fail site=");
-                        c2b_gp_lh64(site);
-                        C2B_LOGS("\n");
-                        munmap(pg, 0x1000u);
-                        continue;
+                    if (regs[ri].sys) {
+                        /* v77b: АТОМАРНЫЙ int3-двухфазный патч живого стаба
+                         * (run475: односайтовый pwrite 7B = torn-write =
+                         * SEGV rip=1 на горячем libc-стабе). ф1 = CC (1Б),
+                         * ф2 = e9 rel32 @+1 (входы = CC-хендлер), ф3 = e9
+                         * @0 (1Б). Ни в один момент нет рваного состояния. */
+                        u32 slot;
+                        u8 c1;
+                        long long wr2;
+                        c2b_raw_trap_arm();
+                        slot = g_raw_int3_n;
+                        if (slot >= 16u) {
+                            C2B_LOGS("[c2b] v77: int3-cap site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                        /* ф1: реестр ДО записи CC (хендлер уже смотрит) */
+                        g_raw_int3_site[slot] = site;
+                        g_raw_int3_tramp[slot] = (u64)(unsigned long)pg;
+                        c1 = 0xCCu;
+                        wr2 = pwrite(mfd, &c1, 1u, (uptr)site);
+                        if (wr2 != 1) {
+                            g_raw_int3_site[slot] = 0;
+                            C2B_LOGS("[c2b] v77: cc-fail site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                        __sync_synchronize();
+                        /* ф2: e9 rel32 @site+1 (входы = CC-хендлер) */
+                        wr2 = pwrite(mfd, code + 1, 5u, (uptr)(site + 1));
+                        if (wr2 != 5) {
+                            g_raw_int3_site[slot] = 0;   /* CC-путь жив */
+                            C2B_LOGS("[c2b] v77: e9-fail site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                        __sync_synchronize();
+                        /* ф3: site[0] = 0xe9 (1Б атомарно) = патч полон */
+                        c1 = 0xe9u;
+                        wr2 = pwrite(mfd, &c1, 1u, (uptr)site);
+                        if (wr2 != 1) {
+                            C2B_LOGS("[c2b] v77: e90-fail site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                        __sync_synchronize();
+                        g_raw_int3_n = slot + 1u;
+                    } else {
+                        wr = pwrite(mfd, code, (uptr)pl, (uptr)site);
+                        if (wr != (long long)pl) {
+                            C2B_LOGS("[c2b] v75: write-fail site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
                     }
-                    /* verify: читаем обратно — e9 rel32 90... */
+                    /* verify: читаем обратно — e9 rel32 ... */
                     if (pread(mfd, tbuf, (uptr)pl, (uptr)site) == (i64)pl &&
                         tbuf[0] == 0xe9u &&
                         tbuf[1] == code[1] && tbuf[2] == code[2] &&

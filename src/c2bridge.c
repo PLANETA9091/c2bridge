@@ -15573,10 +15573,15 @@ static void c2b_ldd_dsite_install(u8 *libc_base)
 {
     u32 i;
     const char *flt = getenv("C2B_DSITES");
-    /* v67: FIRE-ABI уровень — строка '1'/'2' = уровень, иначе 0 */
+    /* v67: FIRE-ABI уровень — строка '1'/'2'/'3' = уровень, иначе 0.
+     * v69-УРОК: уровень-3 добавлен в печать/воркфлоу/harness, но НЕ сюда
+     * => run437/438 = fire_abi=3 молча = 0 (дискриминатор = единственный
+     * арбитр уровней — ВСЕ новые уровни = сюда в первую очередь). */
     {
         const char *fab = getenv("C2B_FIRE_ABI");
-        g_fire_abi = (fab && fab[0] == '1') ? 1u : (fab && fab[0] == '2') ? 2u : 0u;
+        g_fire_abi = (fab && fab[0] == '1') ? 1u :
+                     (fab && fab[0] == '2') ? 2u :
+                     (fab && fab[0] == '3') ? 3u : 0u;
         if (g_fire_abi) {
             C2B_LOGS("[c2b] v67: FIRE-ABI=");
             C2B_LOGN(g_fire_abi);

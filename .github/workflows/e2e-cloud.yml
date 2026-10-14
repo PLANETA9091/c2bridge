@@ -75,6 +75,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      gpr:
+        description: "v75: the raw-syscall stub patcher (C2B_GPR=1): scans the engine/steam file-backed r-x modules for raw sendto/sendmsg stubs (mov eax,nr; syscall) and redirects them into the bridge hooks (the crt-fix finally gets the engine's native 0x22s). DEFAULT 1 = ARMED (the run469 experiment); '0' = OFF = the exact run468 behavior (the rollback lever)"
+        default: "1"
+        required: false
+        type: choice
+        options: ["0", "1"]
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -130,6 +136,9 @@ jobs:
       # as v67: the defaults are truthy strings = pass the ||).
       C2B_K27FORM_V: ${{ inputs.k27form || '6' }}
       C2B_K27ANSOLO_V: ${{ inputs.ansolo || '0' }}
+      # v75: the raw-syscall stub patcher lever (default '1' = ARMED;
+      # '0' = the run468 behavior, the rollback path).
+      C2B_GPR_V: ${{ inputs.gpr || '1' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

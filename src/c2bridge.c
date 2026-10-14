@@ -46,6 +46,7 @@ typedef unsigned int   uptr;
 #include "c2b_k27.h"
 #include "c2b_crt.h"
 #include "c2b_lddet.h"
+#include "c2b_raw.h"
 
 #ifdef C2B_SELFTEST
 /* ---------- режим selftest: нормальная libc ---------- */
@@ -16614,10 +16615,19 @@ static void c2b_sn_maybe(void)
 static void c2b_sn_maybe(void) { }
 #endif  /* v58 */
 
+/* v75: raw-ланы — маркер 'вызов пришёл из ЗАПАТЧЕНОГО raw-syscall стаба'.
+ * TLS = стабы могут зваться с любого треда GNS (16536/16803/...). Файл-
+ * скоуп (по образцу g_crt_inwl); тела raw-машинерии = после sendmsg-хука. */
+__thread int g_raw_tls;
+static void c2b_raw_maybe(void);
+static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
+                              const struct sockaddr *addr);
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
+    c2b_raw_maybe();    /* v75: свиньячок — raw-syscall стаб-патчер */
     c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
     c2b_ldd_maybe();    /* v52: свиньячок — детур прологов libc */
     c2b_ss_maybe();     /* v53: свиньячок — скан анон-r-x стабов */
@@ -16658,6 +16668,16 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 return rc;      /* переписанный кадр ушёл вместо исходного */
             }
         }
+    }
+    /* v75: raw-syscall лан (запатченные стабы движка). crt-класс УЖЕ отра-
+     * ботал выше (сигнатурно); здесь = census + PASSTHROUGH МИМО CLV2-клас-
+     * сифаера: сырые ff×4-блобы/hello/A2S движка = классы, которые классифи-
+     * цатор не имеет права трогать (qconnect-трансформ/бейты/шим = движение
+     * чужих кадров = запрещено на нативной лане движок<->сервер). */
+    if (g_raw_tls) {
+        c2b_raw_lane_note(fd, buf, (u32)len, addr);
+        return ((c2b_sendto_fn)g_clp_sendto)(fd, buf, len, flags, addr,
+                                             addrlen);
     }
     if (addr && (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_s_total++;
@@ -17081,7 +17101,382 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
     }
 }
 
-/* 47f-g50: форвард (тело в non-selftest части; в selftest — no-op) */
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+/* ---------- v75: RAW-SYSCALL SEND INTERCEPT (c2b_raw.h) ----------
+ * Скан+патч raw-syscall стабов sendto(44)/sendmsg(46) в ФАЙЛ-БЭКЕД
+ * r-x модулях движка/стима (c2b_raw_path_want: steam/csgo классы) —
+ * единственный непокрытый класс отправителя нативных GNS-кадров
+ * (run468-форензика: sys_sendto len 0x200/0x201 с fd 0x29 = сокет
+ * движка :27005, кадры [20]/[22][4c 00] НАПРАВЛЯЮТСЯ НА РЕАЛЬНЫЙ
+ * СЕРВЕР мимо ВСЕХ хуков; v51/v52/v53/v55/v57 = этот класс не скани-
+ * ровали — v53 файл-бэкед steam/GNS исключал сознательно).
+ * Патч: трамплин (mov rcx,r10 + movabs fn + jmp rax, 16B на свежей
+ * anon-странице возле сайта, MAP_FIXED_NOREPLACE-пробы +/-16MB) +
+ * e9 rel32 90 90 на сайте (7/9B, хвост-гвард 0xc3 = ret стаба).
+ * Энтри = g_raw_tls=1 -> НАШ sendto/sendmsg-хук (crt сам отработает)
+ * -> g_raw_tls=0; в sendto-хуке ветка g_raw_tls = census+passthrough
+ * МИМО классифаера. Гейт C2B_GPR=1 (armed-класс: меняет ЧУЖОЙ текст;
+ * killswitch = dispatch-инпут gpr=0). One-shot-скан (8 попыток 2с,
+ * стоп при patched>0 — стабы грузятся при линке движка, до первого
+ * sendto-хука всё уже замаплено). Логи: '[c2b] v75: site/PATCH/raw/
+ * done'. Бюджет скана: 512МБ преада, регион >256МБ = скип (v55-урок). */
+#define C2B_RAW_RATE_MS   2000u
+#define C2B_RAW_MAXSCANS  8u
+#define C2B_RAW_BUDGET    (512u << 20)
+#define C2B_RAW_REGIONMAX (256u << 20)
+#define C2B_RAW_LOGCAP    48u
+#define C2B_RAW_PATCHMAX  16u
+extern i32 munmap(void *, u32);   /* g24-паттерн: блочная extern (.so) */
+static u32 g_raw_init, g_raw_scans, g_raw_busy, g_raw_last;
+static u32 g_raw_sites, g_raw_patched, g_raw_bytes_hi, g_raw_regs;
+static u32 g_raw_logn, g_raw_done;
+static u64 g_raw_seen[64];
+static u32 g_raw_seen_n;
+static char g_raw_self[256];
+static u32 g_raw_selfn;
+
+/* энтри: из raw-стаба -> маркер -> НАШ хук -> маркер сброшен. Возврат
+ * = rax (как syscall). rcx/r11 = syscall-колонные = коллер не хранит. */
+static ssize_t c2b_raw_st_entry(int fd, const void *buf, size_t len,
+                                int flags, const struct sockaddr *addr,
+                                socklen_t addrlen)
+{
+    ssize_t r;
+    g_raw_tls = 1;
+    r = sendto(fd, buf, len, flags, addr, addrlen);
+    g_raw_tls = 0;
+    return r;
+}
+
+static ssize_t c2b_raw_sm_entry(int fd, const struct c2b_msghdr *msg,
+                                int flags)
+{
+    ssize_t r;
+    g_raw_tls = 1;
+    r = sendmsg(fd, msg, flags);
+    g_raw_tls = 0;
+    return r;
+}
+
+/* census сырой ланы: один лог на класс (fd,len,head3), повторы на 50/200. */
+struct c2b_raw_lane_ent { u32 fd, len, h3, n; };
+static struct c2b_raw_lane_ent g_raw_lane[16];
+static u32 g_raw_lane_n;
+
+static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
+                              const struct sockaddr *addr)
+{
+    const u8 *p = (const u8 *)buf;
+    u32 h3 = 0, i;
+    if (p && len >= 3u) h3 = ((u32)p[0] << 16) | ((u32)p[1] << 8) | (u32)p[2];
+    for (i = 0; i < g_raw_lane_n; i++) {
+        if (g_raw_lane[i].fd == (u32)fd && g_raw_lane[i].len == len &&
+            g_raw_lane[i].h3 == h3) {
+            g_raw_lane[i].n++;
+            if (g_raw_lane[i].n == 50u || g_raw_lane[i].n == 200u) {
+                C2B_LOGS("[c2b] v75: raw class#");
+                C2B_LOGD(i);
+                C2B_LOGS(" n=");
+                C2B_LOGN(g_raw_lane[i].n);
+                C2B_LOGS("\n");
+            }
+            return;
+        }
+    }
+    if (g_raw_lane_n >= 16u) return;
+    g_raw_lane[g_raw_lane_n].fd = (u32)fd;
+    g_raw_lane[g_raw_lane_n].len = len;
+    g_raw_lane[g_raw_lane_n].h3 = h3;
+    g_raw_lane[g_raw_lane_n].n = 1;
+    g_raw_lane_n++;
+    C2B_LOGS("[c2b] v75: raw fd=");
+    C2B_LOGN((u32)fd);
+    C2B_LOGS(" len=");
+    C2B_LOGN(len);
+    C2B_LOGS(" h=");
+    C2B_LOGH(h3);
+    if (addr && addr->sa_family == C2B_AF_INET) {
+        const u8 *a = (const u8 *)addr;
+        C2B_LOGS(" dst=");
+        C2B_LOGH(((u32)a[4]) | ((u32)a[5] << 8) | ((u32)a[6] << 16) |
+                 ((u32)a[7] << 24));
+        C2B_LOGS(":");
+        C2B_LOGN(((u32)a[2] << 8) | (u32)a[3]);
+    }
+    C2B_LOGS("\n");
+}
+
+/* anon-страница возле сайта (MAP_FIXED_NOREPLACE пробы, шаг 16MB,
+ * +/-1.5GB). Возврат = страница RW (вызов должен mprotect RX) или 0. */
+static u8 *c2b_raw_tramp_alloc(unsigned long long near_site)
+{
+    unsigned long long base = near_site & ~0xfffull;
+    u32 k;
+    for (k = 0; k <= 96u; k++) {
+        i32 sgn;
+        for (sgn = 0; sgn < 2; sgn++) {
+            unsigned long long hint = base;
+            void *pg;
+            if (k == 0u && sgn == 1) break;
+            if (k) {
+                unsigned long long d = (unsigned long long)k * 0x1000000ull;
+                hint = sgn ? (base - d) : (base + d);
+            }
+            pg = mmap((void *)(unsigned long)hint, 0x1000u, 0x3 /*RW*/,
+                      0x02 /*PRIVATE*/ | 0x20 /*ANON*/ |
+                      0x100000 /*FIXED_NOREPLACE*/, -1, 0);
+            if (pg == (void *)-1) continue;
+            if (c2b_raw_rel32(near_site, (unsigned long long)pg))
+                return (u8 *)pg;
+            munmap(pg, 0x1000u);
+        }
+    }
+    return 0;
+}
+
+/* скан: maps -> r-x регионы steam/csgo -> стабы -> патч. */
+static void c2b_raw_scan(void)
+{
+    static const char *pmap = "/proc/self/maps";
+    static const char *pmem = "/proc/self/mem";
+    static u8 chunk[256u * 1024u + 32u];
+    static char mb[2 * 1024 * 1024];    /* СТАТИК (v51-урок): стек GNS-тредов
+                                         * мал; бизи-гвард = реентерабельность */
+    char *p, *endp;
+    i32 mfd, ffd = -1;
+    i64 n = 0, r;
+    u64 budget = C2B_RAW_BUDGET;
+    static struct { char path[300]; unsigned long lo, hi; } regs[48];
+    u32 nregs = 0, ri;
+    /* файловые декларации: .so = блок extern (g24-паттерн, 22:09-урок:
+     * блок-скоуп extern = конфликт с libc-хедерами только в selftest) */
+    extern i32 open(const char *, i32, ...);
+    extern i64 read(i32, void *, u64);
+    extern i32 close(i32);
+    if (g_raw_selfn == 0u) {
+        /* v52-структура (c2b_ldd_dlinfo) = file-scope в v52-блоке = тот же
+         * guard; ВТОРАЯ struct-декларация = конфликт типов dladdr (error:
+         * conflicting types) — переиспользуем существующую. */
+        struct c2b_ldd_dlinfo di;
+        const char *q;
+        if (dladdr((void *)&c2b_raw_scan, &di) && di.dli_fname) {
+            for (q = di.dli_fname; *q && (u32)(q - di.dli_fname) <
+                 sizeof g_raw_self - 1u; q++)
+                g_raw_self[q - di.dli_fname] = *q;
+            g_raw_self[q - di.dli_fname] = 0;
+            g_raw_selfn = (u32)(q - di.dli_fname);
+        }
+    }
+    ffd = open(pmap, 0);
+    if (ffd < 0) return;
+    for (;;) {
+        r = read(ffd, mb + n, (u64)(sizeof(mb) - 1 - (unsigned long)n));
+        if (r <= 0) break;
+        n += r;
+        if (n >= (i64)sizeof(mb) - 1) break;
+    }
+    close(ffd);
+    if (n <= 0) return;
+    mb[n] = 0;
+    p = mb;
+    endp = mb + n;
+    while (p < endp && nregs < 48u) {
+        unsigned long lo, hi, off;
+        unsigned int prot, plen, linelen;
+        const char *pa;
+        if (!c2b_gp_line(p, (u32)(endp - p), &lo, &hi, &prot, &off,
+                         &pa, &plen, &linelen)) break;
+        p += linelen;
+        if (!(prot & 4u)) continue;                 /* только r-x */
+        if (!pa || plen == 0u || plen >= 300u) continue;
+        if (!c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn)) continue;
+        {
+            u32 q;
+            for (q = 0; q < nregs; q++)
+                if (regs[q].lo == lo && regs[q].hi == hi) break;
+            if (q < nregs) continue;                /* дупль строки */
+        }
+        {
+            char *d = regs[nregs].path;
+            u32 q;
+            for (q = 0; q < plen; q++) d[q] = pa[q];
+            d[plen] = 0;
+        }
+        regs[nregs].lo = lo;
+        regs[nregs].hi = hi;
+        nregs++;
+    }
+    if (!nregs) return;
+    mfd = open(pmem, 2 /*O_RDWR*/);
+    if (mfd < 0) return;
+    for (ri = 0; ri < nregs; ri++) {
+        unsigned long lo = regs[ri].lo, hi = regs[ri].hi, rlen;
+        unsigned long off;
+        u32 pathn = 0;
+        while (regs[ri].path[pathn]) pathn++;
+        rlen = hi - lo;
+        if (rlen > C2B_RAW_REGIONMAX) continue;
+        C2B_LOGS("[c2b] v75: region lo=");
+        c2b_gp_lh64(lo);
+        C2B_LOGS("len=");
+        C2B_LOGN((u32)(rlen >> 10));
+        C2B_LOGS("K ");
+        C2B_LOGS(regs[ri].path);
+        C2B_LOGS("\n");
+        g_raw_regs++;
+        for (off = 0; off < rlen && budget > 0ull; off += 256u * 1024u) {
+            unsigned long want = rlen - off;
+            u32 got, i;
+            if (want > 256u * 1024u + 16u) want = 256u * 1024u + 16u;
+            r = pread(mfd, chunk, want, (uptr)(lo + off));
+            if (r <= 0) break;
+            got = (u32)r;
+            budget -= (u64)got;
+            for (i = 0; i + 10u <= got; i++) {
+                u32 nr = 0, pl;
+                unsigned long long site;
+                u32 q;
+                pl = c2b_raw_patchable(chunk + i, got - i, &nr);
+                if (!pl) continue;
+                site = (unsigned long long)lo + off + i;
+                for (q = 0; q < g_raw_seen_n; q++)
+                    if (g_raw_seen[q] == site) break;
+                if (q < g_raw_seen_n) continue;
+                if (g_raw_seen_n < 64u) g_raw_seen[g_raw_seen_n++] = site;
+                g_raw_sites++;
+                if (g_raw_logn < C2B_RAW_LOGCAP) {
+                    u32 z, cl = pl + 4u;
+                    C2B_LOGS("[c2b] v75: site nr=");
+                    C2B_LOGD(nr);
+                    C2B_LOGS(" off=");
+                    c2b_gp_lh64((unsigned long long)(off + i));
+                    C2B_LOGS(" b=");
+                    for (z = 0; z < cl && z < got - i; z++)
+                        C2B_LOGH(chunk[i + z]);
+                    C2B_LOGS(" ");
+                    C2B_LOGS(regs[ri].path);
+                    C2B_LOGS("\n");
+                    g_raw_logn++;
+                }
+                if (g_raw_patched >= C2B_RAW_PATCHMAX) continue;
+                {
+                    u8 tramp[16];
+                    u8 code[8];
+                    u8 *pg;
+                    i32 rel;
+                    long long wr;
+                    u8 tbuf[16];
+                    pg = c2b_raw_tramp_alloc(site);
+                    if (!pg) {
+                        C2B_LOGS("[c2b] v75: tramp-fail site=");
+                        c2b_gp_lh64(site);
+                        C2B_LOGS("\n");
+                        continue;
+                    }
+                    {
+                        unsigned long long fn = (nr == 44u)
+                            ? (unsigned long long)(unsigned long)&c2b_raw_st_entry
+                            : (unsigned long long)(unsigned long)&c2b_raw_sm_entry;
+                        if (!c2b_raw_tramp(tramp, sizeof tramp, fn, nr)) {
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                    }
+                    for (q = 0; q < 16u; q++) pg[q] = tramp[q];
+                    if (mprotect((void *)pg, 0x1000u, 0x5 /*RX*/) != 0) {
+                        munmap(pg, 0x1000u);
+                        continue;
+                    }
+                    rel = c2b_raw_rel32(site, (unsigned long long)pg);
+                    if (!rel) { munmap(pg, 0x1000u); continue; }
+                    code[0] = 0xe9u;
+                    code[1] = (u8)((u32)rel & 0xffu);
+                    code[2] = (u8)(((u32)rel >> 8) & 0xffu);
+                    code[3] = (u8)(((u32)rel >> 16) & 0xffu);
+                    code[4] = (u8)(((u32)rel >> 24) & 0xffu);
+                    code[5] = 0x90u;
+                    code[6] = 0x90u;
+                    code[7] = 0x90u;   /* форма B (9B): пад до pl */
+                    wr = pwrite(mfd, code, (uptr)pl, (uptr)site);
+                    if (wr != (long long)pl) {
+                        C2B_LOGS("[c2b] v75: write-fail site=");
+                        c2b_gp_lh64(site);
+                        C2B_LOGS("\n");
+                        munmap(pg, 0x1000u);
+                        continue;
+                    }
+                    /* verify: читаем обратно — e9 rel32 90... */
+                    if (pread(mfd, tbuf, (uptr)pl, (uptr)site) == (i64)pl &&
+                        tbuf[0] == 0xe9u &&
+                        tbuf[1] == code[1] && tbuf[2] == code[2] &&
+                        tbuf[3] == code[3] && tbuf[4] == code[4]) {
+                        C2B_LOGS("[c2b] v75: PATCH nr=");
+                        C2B_LOGD(nr);
+                        C2B_LOGS(" site=");
+                        c2b_gp_lh64(site);
+                        C2B_LOGS(" tramp=");
+                        c2b_gp_lh64((unsigned long long)pg);
+                        C2B_LOGS("\n");
+                        g_raw_patched++;
+                    } else {
+                        C2B_LOGS("[c2b] v75: verify-FAIL site=");
+                        c2b_gp_lh64(site);
+                        C2B_LOGS("\n");
+                    }
+                }
+            }
+        }
+    }
+    close(mfd);
+    g_raw_bytes_hi = (u32)((C2B_RAW_BUDGET - budget) >> 20);
+    C2B_LOGS("[c2b] v75: scan regs=");
+    C2B_LOGD(g_raw_regs);
+    C2B_LOGS(" sites=");
+    C2B_LOGD(g_raw_sites);
+    C2B_LOGS(" patched=");
+    C2B_LOGD(g_raw_patched);
+    C2B_LOGS(" usedMB=");
+    C2B_LOGD(g_raw_bytes_hi);
+    C2B_LOGS("\n");
+}
+
+/* свиньячок: one-shot (8 попыток, шаг 2с, стоп при patched>0). */
+static void c2b_raw_maybe(void)
+{
+    if (g_raw_done) return;
+    if (!g_raw_init) {
+        const char *ec = getenv("C2B_GPR");
+        g_raw_init = 1;
+        if (!ec || ec[0] != '1') { g_raw_done = 1; return; }
+    }
+    {
+        u64 now = c2b_mono_ms();
+        if (now - g_raw_last < C2B_RAW_RATE_MS) return;
+        g_raw_last = now;
+    }
+    if (__sync_lock_test_and_set(&g_raw_busy, 1u)) return;
+    g_raw_scans++;
+    c2b_raw_scan();
+    if (g_raw_patched > 0u || g_raw_scans >= C2B_RAW_MAXSCANS) {
+        g_raw_done = 1;
+        C2B_LOGS("[c2b] v75: done scans=");
+        C2B_LOGD(g_raw_scans);
+        C2B_LOGS(" sites=");
+        C2B_LOGD(g_raw_sites);
+        C2B_LOGS(" patched=");
+        C2B_LOGD(g_raw_patched);
+        C2B_LOGS("\n");
+    }
+    __sync_lock_release(&g_raw_busy);
+}
+
+#else /* selftest / i386: no-op */
+static void c2b_raw_maybe(void) { }
+static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
+                              const struct sockaddr *addr)
+{ (void)fd; (void)buf; (void)len; (void)addr; }
+#endif  /* v75 */
+
 #ifndef C2B_SELFTEST
 static void c2b_g50_force_cstate(void);
 #else
@@ -30259,6 +30654,133 @@ static void test_stubscan(void)
           "ss57: 0x90-фон без mov = 0");
 }
 
+/* v75: raw-syscall стаб-патчер (c2b_raw.h) — паттерны/трамплин/rel32/
+ * фильтр путей. Байт-точные фикстуры стабов (run468-класс) + негативы. */
+static void test_raw(void)
+{
+    u8 buf[64];
+    u32 nr = 0;
+    u8 tr[16];
+    printf("[t] raw v75 (raw-syscall send intercept: pat/tramp/rel32)\n");
+    /* --- c2b_raw_pat: форма A sendto (7B, run468-стаб байт-точный) --- */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 44; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05; buf[7] = 0xc3;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 7u && nr == 44u,
+          "raw: форма A sendto = 7B/nr44");
+    CHECK(c2b_raw_patchable(buf, sizeof buf, &nr) == 7u && nr == 44u,
+          "raw: sendto-стаб с ret-хвостом патч-пригоден");
+    /* --- форма A sendmsg (7B) --- */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 46; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05; buf[7] = 0xc3;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 7u && nr == 46u,
+          "raw: форма A sendmsg = 7B/nr46");
+    CHECK(c2b_raw_patchable(buf, sizeof buf, &nr) == 7u,
+          "raw: sendmsg-стаб патч-пригоден");
+    /* --- форма B sendto (9B, 48 c7 c0) --- */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0x48; buf[1] = 0xc7; buf[2] = 0xc0; buf[3] = 44;
+    buf[4] = 0; buf[5] = 0; buf[6] = 0; buf[7] = 0x0f; buf[8] = 0x05;
+    buf[9] = 0xc3;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 9u && nr == 44u,
+          "raw: форма B (48c7c0) sendto = 9B/nr44");
+    CHECK(c2b_raw_patchable(buf, sizeof buf, &nr) == 9u,
+          "raw: форма B патч-пригодна (9+ret)");
+    /* --- НЕ-классы: recvfrom(45), write(1), без syscall, без ret-хвоста --- */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 45; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 0u,
+          "raw: recvfrom(45) = не наш класс");
+    buf[1] = 1;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 0u,
+          "raw: write(1) = не наш класс (v75 не трогает write)");
+    buf[1] = 44; buf[6] = 0x07;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 0u,
+          "raw: без 0f 05 = 0");
+    buf[6] = 0x05; buf[7] = 0x48;    /* syscall без ret-хвоста */
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 7u,
+          "raw: паттерн есть");
+    CHECK(c2b_raw_patchable(buf, sizeof buf, &nr) == 0u,
+          "raw: без ret-хвоста = НЕ патчим (мид-инструкшн гвард)");
+    /* усечения/NULL */
+    buf[7] = 0xc3;
+    CHECK(c2b_raw_patchable(buf, 5u, &nr) == 0u, "raw: cap=5 = 0");
+    CHECK(c2b_raw_pat(0, 16u, &nr) == 0u, "raw: NULL = 0");
+    /* --- c2b_raw_tramp: sendto-трамплин = 4c 89 d1 | 48 b8 imm64 | ff e0 --- */
+    memset(tr, 0, sizeof tr);
+    CHECK(c2b_raw_tramp(tr, sizeof tr, 0x1122334455667788ull, 44u) == 16u,
+          "raw: sendto-трамплин = 16B");
+    CHECK(tr[0] == 0x4cu && tr[1] == 0x89u && tr[2] == 0xd1u,
+          "raw: mov rcx,r10 (4c 89 d1) = r10->rcx фиксап");
+    CHECK(tr[3] == 0x48u && tr[4] == 0xb8u,
+          "raw: movabs rax (48 b8)");
+    CHECK(tr[5] == 0x88u && tr[6] == 0x77u && tr[7] == 0x66u &&
+          tr[8] == 0x55u && tr[9] == 0x44u && tr[10] == 0x33u &&
+          tr[11] == 0x22u && tr[12] == 0x11u,
+          "raw: imm64 fn = LE байты 0x1122334455667788");
+    CHECK(tr[13] == 0xffu && tr[14] == 0xe0u && tr[15] == 0x90u,
+          "raw: jmp rax (ff e0) + 0x90-пад до 16");
+    /* sendmsg-трамплин = БЕЗ rcx-фиксапа (3 аргс = АБИ-идентично) */
+    memset(tr, 0, sizeof tr);
+    CHECK(c2b_raw_tramp(tr, sizeof tr, 0xaabbccddull, 46u) == 16u,
+          "raw: sendmsg-трамплин = 16B");
+    CHECK(tr[0] == 0x48u && tr[1] == 0xb8u && tr[2] == 0xddu &&
+          tr[3] == 0xccu && tr[4] == 0xbbu && tr[5] == 0xaau,
+          "raw: sendmsg = без 4c89d1, imm64 сразу");
+    CHECK(tr[10] == 0xffu && tr[11] == 0xe0u && tr[12] == 0x90u,
+          "raw: sendmsg jmp rax @10 + пад");
+    /* чужой nr = 0 */
+    CHECK(c2b_raw_tramp(tr, sizeof tr, 1ull, 44u) == 16u, "raw: nr44 ok");
+    CHECK(c2b_raw_tramp(tr, sizeof tr, 1ull, 1u) == 0u,
+          "raw: чужой nr = отказ");
+    CHECK(c2b_raw_tramp(tr, 8u, 1ull, 44u) == 0u, "raw: cap<16 = 0");
+    /* --- c2b_raw_rel32: в диапазоне / вне --- */
+    CHECK(c2b_raw_rel32(0x7f000001000ull, 0x7f000001100ull) == 0xfb,
+          "raw: rel32 = 0x1100-0x1000-5 = 0xfb");
+    CHECK(c2b_raw_rel32(0x7f000001100ull, 0x7f000001000ull) ==
+          -(i32)0x105,
+          "raw: rel32 назад = -(0x1100-0x1000+5) = -0x105");
+    CHECK(c2b_raw_rel32(0x1000ull, 0x90000000ull) == 0,
+          "raw: вне +/-2GB = 0 (отказ патча)");
+    /* --- c2b_raw_path_want: steam/csgo классы, минус libc/self/[vdso] ---
+     * длины = strlen (урок asan: ручные длины = over-read за литералом) */
+    {
+        const char *p_gns = "/home/runner/work/c2bridge/c2bridge/csgo-lite/"
+                            "bin/linux64/libsteamnetworkingsockets.so";
+        const char *p_sc = "/home/runner/.local/share/Steam/linux64/"
+                           "steamclient.so";
+        const char *p_libc = "/usr/lib/x86_64-linux-gnu/libc.so.6";
+        const char *p_ld = "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2";
+        const char *p_self = "/tmp/c2bridge64.so";
+        const char *p_eng = "/home/runner/work/c2bridge/c2bridge/csgo-lite/"
+                            "bin/linux64/engine_client.so";
+        const char *p_std = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6";
+        CHECK(c2b_raw_path_want(p_gns, (u32)strlen(p_gns), 0, 0) == 1,
+              "raw: GNS-либа движка = СКАН (критичный класс)");
+        CHECK(c2b_raw_path_want(p_sc, (u32)strlen(p_sc), 0, 0) == 1,
+              "raw: steamclient.so = СКАН");
+        CHECK(c2b_raw_path_want(p_libc, (u32)strlen(p_libc), 0, 0) == 0,
+              "raw: libc = НИКОГДА (рекурсия)");
+        CHECK(c2b_raw_path_want(p_ld, (u32)strlen(p_ld), 0, 0) == 0,
+              "raw: ld = нет");
+        CHECK(c2b_raw_path_want("[vdso]", 6u, 0, 0) == 0,
+              "raw: [vdso] = нет");
+        CHECK(c2b_raw_path_want(p_self, (u32)strlen(p_self),
+                                p_self, (u32)strlen(p_self)) == 0,
+              "raw: собственный .so = нет (точное dladdr-совпадение)");
+        /* v75-УРОК: путь РЕПО содержит 'c2bridge' — движковые либы НЕ выкинуть
+         * подстрокой 'c2bridge'; точное self-совпадение = единственный гвард */
+        CHECK(c2b_raw_path_want(p_eng, (u32)strlen(p_eng),
+                                p_self, (u32)strlen(p_self)) == 1,
+              "raw: путь репо (c2bridge в PATH) НЕ режет движковые либы");
+        CHECK(c2b_raw_path_want(p_std, (u32)strlen(p_std), 0, 0) == 0,
+              "raw: системная либа без steam/csgo = нет");
+        CHECK(c2b_raw_path_want(0, 0, 0, 0) == 0, "raw: NULL-путь = нет");
+    }
+}
+
 /* v58: seccomp-user-notif супервизор — pure-сборка BPF (байт-точные
  * инструкции + граф прыжков) + ЖИВОЙ e2e: фильтр nr==44 на САМ процесс,
  * супервизор-поток (создан ДО инсталла = не фильтрован), raw
@@ -30664,6 +31186,7 @@ int main(void)
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */
     test_stubscan();    /* v53: anon-r-x syscall-stub matcher */
+    test_raw();         /* v75: raw-syscall стаб-патчер (pat/tramp/rel32) */
     test_seccomp();     /* v58: seccomp-user-notif (BPF + живой e2e) */
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_susp();        /* v68: susp-гейт (until/retire-окна + киллисвитч) */

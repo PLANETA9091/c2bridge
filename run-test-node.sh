@@ -678,6 +678,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     1) MODES="$MODES C2B_K27ANSOLO=1" ;;
     *) : ;;
   esac
+  # v75: raw-syscall стаб-патчер (workflow input gpr -> C2B_GPR_V).
+  # Дефолт '1' = ARMED (раунд-эксперимент: сырые GNS-стабы движка
+  # редиректятся в хуки = crt-класс получает нативные 0x22). Откат =
+  # dispatch с gpr='0' (стабы не трогаются = run468-поведение).
+  case "${C2B_GPR_V-1}" in
+    1) MODES="$MODES C2B_GPR=1" ;;
+    *) : ;;
+  esac
   # v60: bisect-рычаг C2B_DSITES (workflow input dsites -> C2B_DSITES_V).
   # СЕМАНТИКА-СЕНТИНЕЛ (УРОК: ${VAR:-all} И inputs.x||'all' СЪЕДАЮТ
   # пустую строку => '' НЕВЫРАЗИМ через воркфлоу): 'all' (дефолт) = НЕ

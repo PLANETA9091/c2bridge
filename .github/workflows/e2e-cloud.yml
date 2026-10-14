@@ -48,8 +48,8 @@ on:
         type: choice
         options: ["1", "0"]
       dsites:
-        description: "v60: C2B_DSITES site-filter: 'all' = v59b (8 sites); 'none' = sites-OFF; 'wr1,wr2' = subset. DEFAULT = 'none' — the run419-422 bisect: wr2 (libc write-inner site) = the menu=0 killer when FIRED; sites stay OFF until the v61 tramp fix"
-        default: "none"
+        description: "v60: C2B_DSITES site-filter: 'all' = v59b (8 sites); 'none' = sites-OFF; subset = CSV. DEFAULT = 7 sites minus wr2 — run420-425: wr2 (libc write() cancellable path, the S_API-pipe 13-14B writes fd=6464) = the instant-death site (the engine startup protocol corrupted); the other 7 = PASS run425 with the live FIRE telemetry"
+        default: "csp1,csp2,csp3,snd,smg,smsg,wr1"
         required: false
         type: string
   schedule:

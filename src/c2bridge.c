@@ -17130,7 +17130,7 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
 extern i32 munmap(void *, u32);   /* g24-паттерн: блочная extern (.so) */
 static u32 g_raw_init, g_raw_scans, g_raw_busy, g_raw_last;
 static u32 g_raw_sites, g_raw_patched, g_raw_bytes_hi, g_raw_regs;
-static u32 g_raw_logn, g_raw_done;
+static u32 g_raw_logn, g_raw_done, g_raw_anon;
 static u64 g_raw_seen[64];
 static u32 g_raw_seen_n;
 static char g_raw_self[256];
@@ -17253,7 +17253,9 @@ static void c2b_raw_scan(void)
     i64 n = 0, r;
     u64 budget = C2B_RAW_BUDGET;
     static struct { char path[300]; unsigned long lo, hi; u32 rwx, scanned; }
-        regs[256];
+        regs[512];   /* v75d: 256 = МАЛО (run471-сим на живых maps: want =
+                      * 359 = 145 anon + 214 файл) — хвост maps (поздние
+                      * dlopen/anon-JIT) = ПОТЕРЯН за капом */
     u32 ri;
     /* файловые декларации: .so = блок extern (g24-паттерн, 22:09-урок:
      * блок-скоуп extern = конфликт с libc-хедерами только в selftest) */
@@ -17287,7 +17289,7 @@ static void c2b_raw_scan(void)
     mb[n] = 0;
     p = mb;
     endp = mb + n;
-    while (p < endp && nregs < 256u) {
+    while (p < endp && nregs < 512u) {
         unsigned long lo, hi, off;
         unsigned int prot, plen, linelen;
         const char *pa;
@@ -17299,7 +17301,7 @@ static void c2b_raw_scan(void)
         if (pa && (plen == 0u || plen >= 300u)) continue;
         if (pa && !c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn))
             continue;
-        if (!pa) pa = "[anon]";                     /* v75c: ANON = ЖЕЛАЕМ!
+        if (!pa) {                                  /* v75c: ANON = ЖЕЛАЕМ!
                                                      * (run469/470-урок: файл-
                                                      * бэкед исчерпан = 0 ста-
                                                      * бов; JIT/vscript/unpacker
@@ -17307,6 +17309,9 @@ static void c2b_raw_scan(void)
                                                      * seen-cap 256 = хвост maps
                                                      * (anon) НИКОГДА не сканиро-
                                                      * вался ни одной версией) */
+            pa = "[anon]";
+            g_raw_anon++;
+        }
         plen = 0;
         while (pa[plen]) plen++;
         for (q = 0; q < nregs; q++)
@@ -17463,6 +17468,10 @@ static void c2b_raw_scan(void)
     g_raw_bytes_hi = (u32)((C2B_RAW_BUDGET - budget) >> 20);
     C2B_LOGS("[c2b] v75: scan regs=");
     C2B_LOGD(g_raw_regs);
+    C2B_LOGS(" want=");
+    C2B_LOGD(nregs);
+    C2B_LOGS(" anon=");
+    C2B_LOGD(g_raw_anon);
     C2B_LOGS(" sites=");
     C2B_LOGD(g_raw_sites);
     C2B_LOGS(" patched=");

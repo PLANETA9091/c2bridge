@@ -916,6 +916,37 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     done
   ) &
   EARLY_MAPS_PID=$!
+  # v70: SNS-стотч — САМИ байты libsteamnetworkingsockets.so с ноды в
+  # артефакт. run439-вердикт: зовущий FIRE-сайтов send() = SNS lib
+  # (+0x8a4e2/+0x13f383/+0xc956b) — офлайн cross-ref (nm -D / objdump
+  # по офсетам) требует файла; sns_stref.txt = dynsyms с ноды (адреса =
+  # file-vaddr, офсет от base = vaddr). libc.node.so = копия libc НОДЫ
+  # (build-id уже в libc_stref.txt — сверка версии рантайма). Вотчер =
+  # polls maps (steamclient-init = поздняя загрузка lib), cap 240s,
+  # sudo -n cat (файл может быть не читаем харнесс-юзером). Копия через
+  # cat-redirect = файл владелец-харнесс (sudo cp = root-владелец =
+  # tar артефакта не возьмёт).
+  (
+    for _i in $(seq 1 480); do
+      _vp="$(pgrep -x csgo_linux64 | head -1)"
+      _sns=""
+      if [[ -n "$_vp" ]]; then
+        _sns="$(sudo -n cat "/proc/$_vp/maps" 2>/dev/null | grep -o '[^ ]*libsteamnetworkingsockets[^ ]*' | head -1)"
+      fi
+      if [[ -n "$_sns" ]]; then
+        sudo -n cat "$_sns" > "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null || true
+        if [[ -s "$RUNDIR/libsteamnetworkingsockets.so" ]]; then
+          nm -D --defined-only "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null | sort > "$RUNDIR/sns_stref.txt" || true
+          readelf -n "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null | grep -a "Build ID" > "$RUNDIR/sns_buildid.txt" || true
+          sudo -n cat /usr/lib/x86_64-linux-gnu/libc.so.6 > "$RUNDIR/libc.node.so" 2>/dev/null || true
+          log "attempt $ATTEMPT: v70 SNS lib captured ($(stat -c%s "$RUNDIR/libsteamnetworkingsockets.so" 2>/dev/null || echo ?)B from $_sns)"
+          break
+        fi
+      fi
+      sleep 0.5
+    done
+  ) &
+  SNS_CAPTURE_PID=$!
   # 41f: GNS-видимость — Valve-код ходит мимо libc-хуков (runs 85/86), поэтому
   # 'k'-connect / ConnectRequest невидимы в CL-трейсе. tcpdump отвечает на
   # вопрос, уходит ли connect-трафик на провод ВООБЩЕ (цель / SDR-релеи /

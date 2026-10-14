@@ -14092,13 +14092,23 @@ static u32 c2b_clv2_build_chalreply(u8 *out, u32 cap, u32 fmt, u32 qc_val, u32 c
         for (i = 0; i < 4; i++) out[n++] = CS2_SID_LOW[i];        /* value */
         out[n++] = 0;                                             /* flag */
         for (i = 0; i < 4; i++) out[n++] = MYSTERY[i];
-        /* строка: "connect0x%08X\0" — ЭХО токена из qconnect движка */
+        /* строка: "connect-granted0x\0" (56-g64: ТОТ ЖЕ 17-симв формат —
+         * позиции хвоста НЕДВИЖНЫ, g56-раскладка pw@45/b2@47/lobby@48 цела).
+         * run452-RE хвоста: 25d8b5 strstr(r12,"connect-granted"@0x9377d8) ->
+         * match + 0x4c5==0 (pw="") -> 25d8e3 call 24b520 SendConnectPacket
+         * НАПРЯМУЮ + jmp 259f50 = чистый выход из диспетчера — БЕЗ
+         * grace/"did not approve"-машины. run452 эмпирика: win 0x4b9=1 x26
+         * (g56 b9=1, c2=1, pw0=0, lob=0) и НОЛЬ "Retrying public"/"did not
+         * approve", но INGAME->MAINMENU x15 = "connect0x..." не матчит НИ
+         * ОДНУ иглу (retry/matchmaking/lan-only/granted) -> grace-цикл
+         * 25d816 "Grace request retry for unreserved server" -> отскок.
+         * lobby=1 НЕ спасает (25d877: jne 25d7b5 = обратно в цепочку) —
+         * только granted-игла даёт прямой SendConnectPacket. Эхо qc-токена
+         * сохранено префиксом "0x" (г51-лог различим). */
         {
-            static const char pfx[] = "connect0x";
-            static const char hx[] = "0123456789ABCDEF";
-            u32 v = g_clv2_qc_val, j;
-            for (j = 0; j < 9; j++) out[n++] = (u8)pfx[j];
-            for (j = 0; j < 8; j++) out[n++] = (u8)hx[(v >> (28 - 4 * j)) & 15];
+            static const char pfx[] = "connect-granted0x";
+            u32 j;
+            for (j = 0; j < 17; j++) out[n++] = (u8)pfx[j];
             out[n++] = 0;
         }
         out[n++] = '9'; out[n++] = '6'; out[n++] = 0;  /* "96\0" — ver u32 = 0x3639 */
@@ -27974,11 +27984,11 @@ static void test_cl(void)
                           ar[22]==0x00 && ar[23]==0x00,
                           "clv2: fmt9 flag+mystry4 (g53: [23]=0x00 флаг=0; g55: [22]=0x00 -> 0x4e0=0x0030... v>>48=0x30)");
                     {
-                        static const char p9[] = "connect0x00000000";
+                        static const char p9[] = "connect-granted0x";
                         u32 ok9 = 1;
                         for (i9 = 0; i9 < 17; i9++)
                             if (ar[24 + i9] != (u8)p9[i9]) ok9 = 0;
-                        CHECK(ok9, "clv2: fmt9 эхо connect0x%08X (qc=0)");
+                        CHECK(ok9, "clv2: fmt9 строка connect-granted0x (g64: игла 25d8b5 -> 24b520 напрямую)");
                     }
                     CHECK(ar[41]==0 && ar[42]=='9' && ar[43]=='6' && ar[44]==0,
                           "clv2: fmt9 NUL строки + '96'");

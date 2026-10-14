@@ -15352,6 +15352,13 @@ static void *volatile g_dsite_tr[8];    /* tramp'ы (ra->site-маппинг) */
 static u32 g_dsite_fires[8];            /* FIRE-кап = 3/сайт */
 static volatile u32 g_dsite_busy;       /* ре-вход гвард */
 
+/* v62: индекс sendmsg-сайта в g_dsite_tab (exp[1] = 0x2e = nr 46 =
+ * sendmsg). Класс-3 (msghdr-парс) = ТОЛЬКО для него: у sendto-сайтов
+ * rsi = БУФЕР (не msghdr) => слепой mh-парс = чтение mh[16..23] из
+ * СОДЕРЖИМОГО буфера = мусор-указатель = ДИКИЙ deref = SIGSEGV =
+ * инстант-выход (run426 FAIL menu=0 4/5, a1=10s/a2=5s — УРОК). */
+#define C2B_DSITE_SMSG 5u
+
 /* v60: C2B_DSITES-фильтр (c2b_dsite_pass) = в c2b_lddet.h (static
  * inline, обе компиляции); рычаг flake-vs-v59, семантика там же. */
 
@@ -15380,8 +15387,9 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
         } else if (r8v && r9v >= 40u && r9v <= 640u &&
                    ((const u8 *)(uptr)r8v)[0] == 0x22u) {
             cls = 2u; fd = rcx; buf = r8v; len = r9v; nr = rdx;
-        } else if (rsi && c2b_ldd_mh0x22((const unsigned char *)(uptr)rsi,
-                                          &mbase, &mlen)) {
+        } else if (tag == C2B_DSITE_SMSG && rsi &&
+                   c2b_ldd_mh0x22((const unsigned char *)(uptr)rsi,
+                                  &mbase, &mlen)) {
             cls = 3u; fd = rdi; buf = mbase; len = mlen;
             nr = (tag < 8u) ? ((u64)g_dsite_tab[tag].exp[1]) : 0u;
         }
@@ -15485,6 +15493,14 @@ static void c2b_ldd_dsite_install(u8 *libc_base)
     const char *flt = getenv("C2B_DSITES");
     extern i32 close(i32);
     extern i32 open(const char *, i32, ...);
+    /* v62b: инвариант сайт-гейта класса-3 — tab[C2B_DSITE_SMSG] =
+     * sendmsg (b8 2e). Нарушен порядок таблицы = инсталл молча
+     * отказывается (класс-3 без гейта = дикий deref = run426) */
+    if (g_dsite_tab[C2B_DSITE_SMSG].exp[0] != 0xb8u ||
+        g_dsite_tab[C2B_DSITE_SMSG].exp[1] != 0x2eu) {
+        C2B_LOGS("[c2b] v59: smsg-gate INVARIANT FAIL = install off\n");
+        return;
+    }
     for (i = 0u; i < 8u; i++) {
         if (!c2b_dsite_pass(flt, g_dsite_tab[i].tag)) {
             C2B_LOGS("[c2b] v59: ");

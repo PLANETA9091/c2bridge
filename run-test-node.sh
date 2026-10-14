@@ -882,6 +882,31 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     sh -c "cd '$GAME_DIR' && ${DBG_INNER:-exec ./csgo_linux64} -novid -nojoy -nosteamcontroller -nobreakpad -insecure -nosound -windowed -w 1280 -h 720 -condebug +sdr_spew_level 7" \
     >"$OUT" 2>&1 &
   ENGINE_PID=$!
+  # v66: st-ref-база для FIRE st0..3 (офлайн-резолв зовущего). Два артефакта:
+  # (a) libc_stref.txt = build-id (точная версия для archive-fetch) + nm -D
+  #     dynsyms (адреса = file-vaddr; base-относительный офсет = vaddr, т.к.
+  #     libc ET_DYN base = её lowest mapping) — статика, без sudo;
+  # (b) engine_maps.early.txt = карты движка КАК ТОЛЬКО pid жив = INIT-фаза
+  #     (FIRE-фаза = steamclient-init = РАНЬШЕ маркера Connected, где v55d
+  #     льёт engine_maps.txt => steamclient.so/init-модули могли не успеть).
+  # Наблюдатель = 300s cap, sudo -n cat (движок = GAME_USER, harness = не root).
+  {
+    echo "== libc build-id =="
+    readelf -n /usr/lib/x86_64-linux-gnu/libc.so.6 2>/dev/null | grep -a "Build ID"
+    echo "== libc dynsyms =="
+    nm -D --defined-only /usr/lib/x86_64-linux-gnu/libc.so.6 2>/dev/null | sort
+  } > "$RUNDIR/libc_stref.txt" 2>/dev/null || true
+  (
+    for _i in $(seq 1 600); do
+      _vp="$(pgrep -x csgo_linux64 | head -1)"
+      if [[ -n "$_vp" ]]; then
+        sudo -n cat "/proc/$_vp/maps" > "$RUNDIR/engine_maps.early.txt" 2>/dev/null
+        [[ -s "$RUNDIR/engine_maps.early.txt" ]] && break
+      fi
+      sleep 0.5
+    done
+  ) &
+  EARLY_MAPS_PID=$!
   # 41f: GNS-видимость — Valve-код ходит мимо libc-хуков (runs 85/86), поэтому
   # 'k'-connect / ConnectRequest невидимы в CL-трейсе. tcpdump отвечает на
   # вопрос, уходит ли connect-трафик на провод ВООБЩЕ (цель / SDR-релеи /
@@ -1148,6 +1173,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       # (kprobe c2b_rip) -> модуль+офсет офлайн.
       _EPID="$(pgrep -x csgo_linux64 | head -1 || true)"
       if [[ -n "$_EPID" ]]; then
+        kill "$EARLY_MAPS_PID" 2>/dev/null || true
         sudo -n cat "/proc/$_EPID/maps" > "$RUNDIR/engine_maps.txt" 2>/dev/null || true
         log "attempt $ATTEMPT: engine maps dumped (pid $_EPID, $(wc -l < "$RUNDIR/engine_maps.txt" 2>/dev/null || echo 0) lines)"
       fi

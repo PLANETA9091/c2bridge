@@ -698,6 +698,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     1) MODES="$MODES C2B_KREL=1" ;;
     *) : ;;
   esac
+  # v81: k21wait (workflow input k21wait -> C2B_K21WAIT_V). '0' = krel НЕ
+  # ждёт слепой скан движковой сессии (eng-h=0, u32-хэши) и слепой br-live
+  # (slot-17 нули на connected — run484: k24 wait x10 при всех живых входах
+  # гейта = НОЛЬ krel-выстрелов) — падает сквозь и шлёт на hsend =
+  # g_gns_conn_h = МОСТОВУЮ сессию слот 11 (та же, где приходит серверный
+  # 'A' и где k27 доставляет rc=1, верифицировано на проводе). Дефолт '1' =
+  # поведение run479-484 (ждать). Имеет смысл только вместе с krel=1.
+  case "${C2B_K21WAIT_V-1}" in
+    0) MODES="$MODES C2B_K21WAIT=0" ;;
+    *) : ;;
+  esac
   # v75: raw-syscall стаб-патчер (workflow input gpr -> C2B_GPR_V).
   # Дефолт '1' = ARMED (раунд-эксперимент: сырые GNS-стабы движка
   # редиректятся в хуки = crt-класс получает нативные 0x22). Откат =

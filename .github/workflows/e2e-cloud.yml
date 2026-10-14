@@ -93,6 +93,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      k21wait:
+        description: "v81: the krel k21-wait lever: '0' = the krel does NOT wait for the (blind) engine-session scan / br-live probe and sends the FULL-ff x4 'k' (chal=A.chal) on the BRIDGE session slot 11 (the same healthy session the server's 'A' arrives on; k27 delivers rc=1 there, verified on-wire). '1' (default) = the run479-484 wait behavior (zero krel sends when both probes are blind). Requires krel=1 to matter."
+        default: "1"
+        required: false
+        type: choice
+        options: ["0", "1"]
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -155,6 +161,17 @@ jobs:
       # v76: the exec-watcher lever (default '1' = census on; '0' =
       # the passthrough-only rollback path).
       C2B_MPW_V: ${{ inputs.mpw || '1' }}
+      # v81: the k21-wait lever (run484 finding: the krel body runs (v80 fix
+      # verified: k21 eng-scan + k24 wait lines present) but the k21 engscan
+      # = blind (eng-h=0, the u32-hash-handle scan gap) AND c2b_k24_brlive
+      # = blind (slot-17 info zeros on a connected session) => g_k21_wait
+      # (default ON) returns silently forever = ZERO krel sends despite all
+      # the gate inputs present. k21wait='0' = the krel falls through and
+      # sends on hsend = g_gns_conn_h = THE BRIDGE SESSION slot 11 = the
+      # same session the server's 'A' arrives on and where k27 delivers
+      # rc=1 verified-on-wire. Default '1' = the run479-484 wait behavior
+      # (the single-variable discipline: only krel=1+k21wait=0 changes).
+      C2B_K21WAIT_V: ${{ inputs.k21wait || '1' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

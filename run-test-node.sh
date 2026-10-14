@@ -673,6 +673,15 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     ""|none)  MODES="$MODES C2B_DSITES=" ;;
     *)        MODES="$MODES C2B_DSITES=$C2B_DSITES_V" ;;
   esac
+  # v67: FIRE-ABI (workflow input fire_abi -> C2B_FIRE_ABI_V). Сентинель-
+  # дисциплина (урок v60): unset = 0 (дефолт = v64-объём = базовый лайн);
+  # '1' = +регистры buf/fl/ad/al; '2' = +st0..3 (дерефы под гардой).
+  # Дискриминатор в инсталле: всё кроме '1'/'2' = 0.
+  case "${C2B_FIRE_ABI_V-0}" in
+    0|""|all) : ;;
+    1|2)      MODES="$MODES C2B_FIRE_ABI=$C2B_FIRE_ABI_V" ;;
+    *)        : ;;
+  esac
   # farm mode: VANILLA engine netstack (passive bridge; no translate envs) so
   # its behavior against the fake server matches a real client 1:1
   BRIDGE_SO="$BIN_DST/c2bridge64.stable.so"

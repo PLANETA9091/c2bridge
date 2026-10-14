@@ -15353,6 +15353,12 @@ static const struct c2b_dsite_ent g_dsite_tab[8] = {
 };
 static void *volatile g_dsite_tr[8];    /* tramp'ы (ra->site-маппинг) */
 static u32 g_dsite_fires[8];            /* FIRE-кап = 3/сайт */
+/* v67: FIRE-ABI уровень (0 = v64-объём дефолт; 1 = +регистры; 2 = +st-дерефы
+ * под гардой). Инсталл = getenv("C2B_FIRE_ABI"): '1'/'2' = уровень, всё
+ * остальное/unset = 0 (базовый лайн = доказанно-безопасный объём run425-431;
+ * run433-урок: v65-объём (+13 write/FIRE) = детерминированная смерть
+ * 4/4 в анонимном верификаторе anon+0x24a9b). */
+static u8 g_fire_abi;
 static volatile u32 g_dsite_busy;       /* ре-вход гвард */
 
 /* v62: индекс sendmsg-сайта в g_dsite_tab (exp[1] = 0x2e = nr 46 =
@@ -15499,6 +15505,19 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
              * класс стека, что HIT st-дамп с v59) = офлайн кросс-реф
              * против engine_maps/libc-офсетов = КТО исполняет через
              * сайт. FIRE-кап 3/сайт = объём лога ограничен. */
+            /* v67: FIRE-ABI ДИСКРИМИНАТОР (run433-урок: 4/4 attempt'а
+             * МГНОВЕННАЯ смерть = SEGV foreign rip=anon+0x24a9b СТАБИЛЬНО
+             * (mov rsi,[rbp], rbp=0) СРАЗУ после FIRE-1 smg v65-формата;
+             * v64-объём = 7 ранов PASS подряд). Дельта v65 = +13 write()
+             * на FIRE = анонимный верификатор (исполняет сайт с тестовым
+             * ABI: fd=22, buf=stack, len=stack-lo32) падает детерминизмом
+             * = счётчик/бюджет syscalls за сайтом. УРОВНИ: 0 (дефолт) =
+             * v64-строка (ax/fd/len/f = ДОКАЗАННО БЕЗОПАСНЫЙ объём);
+             * 1 = +buf/fl/ad/al (регистры, ноль дерефов); 2 = +st0..3
+             * (дерефы ПОД ГАРДОЙ sigsetjmp — сырые fst[fq] = последний
+             * газп = смерть процесса при фолте). Инвестигейт-режимы =
+             * opt-in через env, базовый лайн = всегда уровень 0. */
+            if (g_fire_abi >= 1u) {
             C2B_LOGS(" buf=");
             c2b_gp_lh64((unsigned long long)rsi);
             C2B_LOGS(" fl=");
@@ -15507,14 +15526,28 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
             c2b_gp_lh64((unsigned long long)r8v);
             C2B_LOGS(" al=");
             c2b_gp_lh64((unsigned long long)r9v);
+            }
+            if (g_fire_abi >= 2u) {
             C2B_LOGS(" st=");
             {
                 const u64 *fst = (const u64 *)(uptr)sp;
                 u32 fq;
+#ifndef C2B_SELFTEST
+                g_probe_active = 1u;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+#endif
                 for (fq = 0u; fq < 4u; fq++) {
                     C2B_LOGS((fq) ? " " : "");
                     c2b_gp_lh64((unsigned long long)fst[fq]);
                 }
+#ifndef C2B_SELFTEST
+                g_probe_active = 0u;
+                } else {
+                    C2B_LOGS("FAULT");
+                    g_probe_active = 0u;
+                }
+#endif
+            }
             }
         }
         C2B_LOGS(" f=");
@@ -15530,6 +15563,16 @@ static void c2b_ldd_dsite_install(u8 *libc_base)
 {
     u32 i;
     const char *flt = getenv("C2B_DSITES");
+    /* v67: FIRE-ABI уровень — строка '1'/'2' = уровень, иначе 0 */
+    {
+        const char *fab = getenv("C2B_FIRE_ABI");
+        g_fire_abi = (fab && fab[0] == '1') ? 1u : (fab && fab[0] == '2') ? 2u : 0u;
+        if (g_fire_abi) {
+            C2B_LOGS("[c2b] v67: FIRE-ABI=");
+            C2B_LOGN(g_fire_abi);
+            C2B_LOGS("\n");
+        }
+    }
     extern i32 close(i32);
     extern i32 open(const char *, i32, ...);
     /* v62b: инвариант сайт-гейта класса-3 — tab[C2B_DSITE_SMSG] =

@@ -57,6 +57,12 @@ on:
         default: "90"
         required: false
         type: string
+      fire_abi:
+        description: "v67: FIRE verbosity: 0 = v64 line (PROVEN-SAFE volume, DEFAULT — run433: v65 volume = deterministic 4/4 instant death in the anon verifier +0x24a9b); 1 = +buf/fl/ad/al registers; 2 = +st0..3 (GUARDED derefs) = the caller-naming investigation mode"
+        default: "0"
+        required: false
+        type: choice
+        options: ["0", "1", "2"]
   schedule:
     - cron: "0 4 * * *"   # daily 04:00 UTC smoke
 
@@ -99,6 +105,10 @@ jobs:
       # copy of the PASS-tree 404-416 => PASS = v59 guilty => site-bisect;
       # FAIL = the runner flake); 'wr1,wr2' = the subset (site-bisect).
       C2B_DSITES_V: ${{ inputs.dsites || 'all' }}
+      # v67: the FIRE-ABI discriminator (0 = the proven-safe v64 volume).
+      # The default '0' = a truthy STRING => passes the || (the sentinel
+      # discipline: the value '0' never equals the unset-default path).
+      C2B_FIRE_ABI_V: ${{ inputs.fire_abi || '0' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

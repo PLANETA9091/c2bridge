@@ -63,13 +63,18 @@ on:
         required: false
         type: choice
         options: ["0", "1", "2", "3"]
+      timeout_min:
+        description: "v72: the JOB timeout in minutes. DEFAULT 60. The 3600s soak = ~62-65 min wall = run441 was KILLED by the default 60 => dispatch with timeout_min=80. (The truthy-|| trap: '0' = truthy = 0 = invalid — never dispatch 0.)"
+        default: "60"
+        required: false
+        type: string
   schedule:
     - cron: "0 4 * * *"   # daily 04:00 UTC smoke
 
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.timeout_min || 60 }}
     env:
       MODE: ${{ inputs.mode || 'smoke' }}
       C2B_TARGET: ${{ inputs.target || '152.233.19.133:28022' }}

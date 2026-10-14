@@ -17844,6 +17844,7 @@ static void c2b_k27_maybe_fire(void)
             else if (ef && ef[0] == '3') g_k27_form = 3;
             else if (ef && ef[0] == '4') g_k27_form = 4;   /* v44: вербатим-эхо */
             else if (ef && ef[0] == '5') g_k27_form = 5;   /* v70: 4 + A-ответ */
+            else if (ef && ef[0] == '6') g_k27_form = 6;   /* v71: 4 + ответ %011x(val) */
         }
         g_k27_init = 1;
     }
@@ -17929,7 +17930,7 @@ static void c2b_k27_maybe_fire(void)
                 kcopy27[14 + z27] = hx39[(val >> (28 - z27 * 4)) & 0xf];
             kcopy27[22] = 0;
             kn27 = 23;
-        } else if (form27 == 4 || form27 == 5) {
+        } else if (form27 == 4 || form27 == 5 || form27 == 6) {
             /* v44 (run383-вердикт): ВЕРБАТИМ-ЭХО — сервер РОЛЛИРУЕТ токен
              * (run381 echo 'connect0x00000ee0a07' -> run383 'A'#2 'connect0x
              * 00700ee0a07'), а FORM=2/3 отвечают ПЕРЕФОРМАТИРОВАННЫМ
@@ -18019,13 +18020,14 @@ static void c2b_k27_maybe_fire(void)
                              : (form27 == 3 ? "[c2b] k27: A-fire form=qconnect-val11 #"
                              : (form27 == 4 ? "[c2b] k27: A-fire form=verbatim-echo #"
                              : (form27 == 5 ? "[c2b] k27: A-fire form=verbatim-echo+ans #"
-                                            : "[c2b] k27: A-fire form=ascii #"))));
+                             : (form27 == 6 ? "[c2b] k27: A-fire form=verbatim-echo+ans11 #"
+                                            : "[c2b] k27: A-fire form=ascii #")))));
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
         C2B_LOGS(" val=");
         C2B_LOGH(val);
-        if (form27 == 4 || form27 == 5) {
+        if (form27 == 4 || form27 == 5 || form27 == 6) {
             C2B_LOGS(" len=");
             C2B_LOGN(kn27);
             C2B_LOGS(" fl=1 live=");
@@ -18044,8 +18046,14 @@ static void c2b_k27_maybe_fire(void)
          * БЕЗ 'q') — токен ИМЕННО этого 'A'. Второй слот-11 send, unreliable
          * (v67-дисциплина). run378-класс формы = терпимая; новизна = токен
          * текущего 'A' + пара спрос->ответ в одном окне. Смерть-стоп общий
-         * (rc!=1 => g_krel_dead) — как у основного выстрела. */
-        if (form27 == 5 && rc27 == 1 && !g_krel_dead) {
+         * (rc!=1 => g_krel_dead) — как у основного выстрела.
+         * v71 FORM=6: run462-вердикт — форма-5 (verbatim-токен 'connect0x
+         * 00000000') = ТЕРПИМА (0x24=0!) но СЕРВЕР РЕ-ЧЕЛЛЕНДЖИТ 'A'#2 —
+         * ответ не закрыл танец. run383: серверный 'A'#2 САМ показал формат
+         * токена = 'connect0x' + %011x(ROLL(val)) = 11-hex VAL-класса!
+         * FORM-6 = ответ 'connect0x' + %011x(val ЭТОГО 'A') = val-токен.
+         * A/B: форма-5 = verbatim (run462: тихо) vs форма-6 = val-11hex. */
+        if ((form27 == 5 || form27 == 6) && rc27 == 1 && !g_krel_dead) {
             u32 rle70 = g_k27_Ap->rawlen;
             const volatile unsigned char *rw70 = g_k27_Ap->raw;
             u32 e70, kn70 = 4, nul70 = 0;
@@ -18056,14 +18064,24 @@ static void c2b_k27_maybe_fire(void)
             for (e70 = 0; e70 < sizeof kcopy70; e70++) kcopy70[e70] = 0;
             kcopy70[0] = 0xff; kcopy70[1] = 0xff;
             kcopy70[2] = 0xff; kcopy70[3] = 0xff;
-            if (rle70 >= 25 && rle70 <= 639 &&
-                rw70[24] == 'c' && rw70[25] == 'o' && rw70[26] == 'n' &&
-                rw70[27] == 'n' && rw70[28] == 'e' && rw70[29] == 'c' &&
-                rw70[30] == 't') {
-                for (e70 = 24; e70 < rle70 && e70 < 200 && kn70 < 639; e70++) {
-                    kcopy70[kn70++] = rw70[e70];
-                    if (rw70[e70] == 0) { nul70 = 1; break; }
+            if (form27 == 5) {
+                if (rle70 >= 25 && rle70 <= 639 &&
+                    rw70[24] == 'c' && rw70[25] == 'o' && rw70[26] == 'n' &&
+                    rw70[27] == 'n' && rw70[28] == 'e' && rw70[29] == 'c' &&
+                    rw70[30] == 't') {
+                    for (e70 = 24; e70 < rle70 && e70 < 200 && kn70 < 639; e70++) {
+                        kcopy70[kn70++] = rw70[e70];
+                        if (rw70[e70] == 0) { nul70 = 1; break; }
+                    }
                 }
+            } else {
+                /* v71 форма-6: 'connect0x' + %011x(val) + NUL = 4+9+11+1 = 25B */
+                memcpy(kcopy70 + 4, "connect0x", 9);
+                for (e70 = 0; e70 < 11; e70++)
+                    kcopy70[13 + e70] = hx39[(val >> (40 - e70 * 4)) & 0xf];
+                kcopy70[24] = 0;
+                kn70 = 25;
+                nul70 = 1;
             }
             if (nul70 && kn70 > 5) {
                 vt70 = *(void ***)g_gns_conn_iface;
@@ -18081,6 +18099,8 @@ static void c2b_k27_maybe_fire(void)
                 }
                 C2B_LOGS("[c2b] k27: A-answer #");
                 C2B_LOGN(g_k27_fires);
+                C2B_LOGS(" form=");
+                C2B_LOGN(form27);
                 C2B_LOGS(" len=");
                 C2B_LOGN(kn70);
                 C2B_LOGS(" tok='");

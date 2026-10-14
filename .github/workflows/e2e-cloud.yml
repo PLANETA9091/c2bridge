@@ -64,10 +64,10 @@ on:
         type: choice
         options: ["0", "1", "2", "3"]
       timeout_min:
-        description: "v72: the JOB timeout in minutes. DEFAULT 60. The 3600s soak = ~62-65 min wall = run441 was KILLED by the default 60 => dispatch with timeout_min=80. (The truthy-|| trap: '0' = truthy = 0 = invalid — never dispatch 0.)"
-        default: "60"
+        description: "v72: the JOB timeout in minutes. DEFAULT 60. The 3600s soak = ~62-65 min wall = run441 was KILLED by the default 60 => dispatch with timeout_min=80. MUST be type:number (v72b: the string '60' = the workflow-level rejection, run38518494260 = 0 jobs)."
+        default: 60
         required: false
-        type: string
+        type: number
   schedule:
     - cron: "0 4 * * *"   # daily 04:00 UTC smoke
 

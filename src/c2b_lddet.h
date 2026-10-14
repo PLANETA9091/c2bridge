@@ -661,5 +661,34 @@ static inline unsigned int c2b_ldd_mh0x22(const unsigned char *mh,
     return 1u;
 }
 
+/* v63: FIRE-профайлер sendmsg-пути = ИСТИННЫЙ iov[0].len (без 0x22-
+ * гейта и без [40,640]-окна — профайл = ЛЮБАЯ форма: run425/427 FIRE
+ * len=72/213/220 = сырое reg-гадание (rdx = флаги, r9v = мусор), не
+ * длины). Дисциплина = ТА ЖЕ что класс-3 (v62b): вызыватель обязан
+ * сайт-гейтить tag == C2B_DSITE_SMSG — на sendto-сайтах rsi = буфер =
+ * слепой парс msg_iov = дикий deref (урок run426). Дереф = ТОЛЬКО
+ * msghdr->msg_iov (указатель, который сам sendmsg разыменует дальше
+ * по коду) + iv[8..15]; iov_base НЕ трогаем. 0 = парс не удался. */
+static inline unsigned long long c2b_ldd_mh_len(const unsigned char *mh)
+{
+    unsigned long long iovec, ln;
+    const unsigned char *iv;
+    unsigned int q;
+    if (!mh) return 0ull;
+    iovec = 0ull;
+    for (q = 0u; q < 8u; q++)
+        iovec |= ((unsigned long long)mh[16u + q]) << (8u * q);
+    if (!iovec) return 0ull;
+    ln = 0ull;
+    for (q = 0u; q < 8u; q++)
+        ln |= ((unsigned long long)mh[24u + q]) << (8u * q);
+    if (!ln) return 0ull;           /* iovlen = 0 = мимо */
+    iv = (const unsigned char *)(uptr)iovec;
+    ln = 0ull;
+    for (q = 0u; q < 8u; q++)
+        ln |= ((unsigned long long)iv[8u + q]) << (8u * q);
+    return ln;
+}
+
 #endif /* __x86_64__ */
 #endif /* C2B_LDD_H */

@@ -15468,7 +15468,17 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
         c2b_gp_lh64((unsigned long long)rax);
         {
             u64 ffd, flen;
-            if (rsi && rdx >= 40u && rdx <= 640u) {
+            if (tag == C2B_DSITE_SMSG) {
+                /* v63: sendmsg-сайт = fd=rdi, len = ИСТИННЫЙ iov[0].len
+                 * (rdx = флаги, r9v = мусор — прежние FIRE-значения =
+                 * сырое reg-гадание run425/427, не длины; парс = тот же
+                 * msghdr-класс что фильтр-3, сайт-гейт = дисциплина
+                 * v62b: на sendto-сайтах rsi = буфер = дикий deref;
+                 * g_dsite_busy уже поднят = лог-рекурсия закрыта) */
+                ffd = rdi;
+                flen = rsi ? c2b_ldd_mh_len((const unsigned char *)
+                                           (uptr)rsi) : 0ull;
+            } else if (rsi && rdx >= 40u && rdx <= 640u) {
                 ffd = rdi; flen = rdx;         /* b8-класс */
             } else {
                 ffd = rcx; flen = r9v;         /* csp-класс */
@@ -28972,6 +28982,28 @@ static void test_lddet(void)
                   "v62: iovlen = 0 = miss");
             CHECK(c2b_ldd_mh0x22(0, &mb, &ml) == 0u,
                   "v62: null msghdr = miss");
+            /* v63: FIRE-профайлер = ИСТИННЫЙ iov[0].len (без 0x22-гейта
+             * и без [40,640]-окна; сайт-гейт = дисциплина v62b) */
+            mh[24u] = 1u;               /* рестор iovlen = 1 */
+            iov[0] ^= 0x01u;            /* base вне 0x22-формы */
+            CHECK(c2b_ldd_mh_len(mh) == 512ull,
+                  "v63: mh_len=512 НЕзависимо от 0x22-формы base");
+            CHECK(c2b_ldd_mh0x22(mh, &mb, &ml) == 0u,
+                  "v63: тот же mh = 0x22-miss (гейты независимы)");
+            iov[0] ^= 0x01u;
+            iov[8] = 0xd8u; iov[9] = 0u;   /* len = 216 (пейлоад-класс) */
+            CHECK(c2b_ldd_mh_len(mh) == 216ull,
+                  "v63: mh_len=216 (пейлоад-класс run425/427)");
+            iov[10] = 0x20u;               /* len = 0x2000d8 > 640 */
+            CHECK(c2b_ldd_mh_len(mh) == 0x2000d8ull,
+                  "v63: mh_len БЕЗ [40,640]-окна = полный профайл");
+            iov[10] = 0u;
+            CHECK(c2b_ldd_mh_len(0) == 0ull, "v63: null msghdr = 0");
+            mh[24u] = 0u;                  /* iovlen = 0 */
+            CHECK(c2b_ldd_mh_len(mh) == 0ull, "v63: iovlen = 0 = 0");
+            mh[24u] = 1u;
+            for (kq = 0u; kq < 8u; kq++) mh[16u + kq] = 0u;
+            CHECK(c2b_ldd_mh_len(mh) == 0ull, "v63: msg_iov = null = 0");
         }
         /* csp1: окно = 2+2+2+2+2+11 = 21 (SIB-фикс: 11B-nop = ЦЕЛЫЙ) */
         memset(str, 0, sizeof str);

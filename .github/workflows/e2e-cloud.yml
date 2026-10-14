@@ -63,6 +63,18 @@ on:
         required: false
         type: choice
         options: ["0", "1", "2", "3"]
+      k27form:
+        description: "v72: the k27 answer/ask form: 4 = verbatim-echo ask; 5 = ask+verbatim-answer (run462); 6 = ask+%011x(val)-answer (v72: the CORRECT shifts; the v71 UB-scramble is dead). DEFAULT 6 = the run463 state"
+        default: "6"
+        required: false
+        type: choice
+        options: ["1", "2", "3", "4", "5", "6"]
+      ansolo:
+        description: "v72: ANSOLO = the answer WITHOUT the ask (C2B_K27ANSOLO=1; requires k27form>=5). run464 = k27form=5 + ansolo=1 = the single-variable A/B vs run462 (the answer bytes identical, the ask suppressed). 0 = the ask+answer pair (the run462/463 dynamics)"
+        default: "0"
+        required: false
+        type: choice
+        options: ["0", "1"]
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -114,6 +126,10 @@ jobs:
       # The default '0' = a truthy STRING => passes the || (the sentinel
       # discipline: the value '0' never equals the unset-default path).
       C2B_FIRE_ABI_V: ${{ inputs.fire_abi || '0' }}
+      # v72: the k27 form/ansolo dispatch levers (the sentinel discipline
+      # as v67: the defaults are truthy strings = pass the ||).
+      C2B_K27FORM_V: ${{ inputs.k27form || '6' }}
+      C2B_K27ANSOLO_V: ${{ inputs.ansolo || '0' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

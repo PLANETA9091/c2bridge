@@ -17576,6 +17576,52 @@ static void *c2b_g66_thread(void *arg)
 }
 #endif
 
+/* ---------- v72: ANSOLO-билдер ответа (чистая функция, selftest) ----------
+ * Те же байты, что форм-5/6 второй посыл (run462: len=22 вербатим
+ * 'connect0x00000000'; run463: len=25), но в ГЛАВНЫЙ слот kcopy27.
+ * Форма-5 = вербатим raw[24..NUL] (токен СЕРВЕРА — его текущий view).
+ * Форма-6 = 'connect0x' + %011x(val) + NUL = 25B.
+ * УРОК v72 (run463-постмортем): код v71 строил токен сдвигами
+ * val>>(40-4i), а val = u32 => сдвиги 40/36/32 = UB (маска x86:
+ * 40&31=8, 36&31=4, 32&31=0) => токен = ПЕРЕСТАНОВКА нибблов val
+ * ('a0700ee0a07' из val=0x00ee0a07 — run463-трактовка 'rolled nonce'
+ * = артефакт UB, НЕ серверный формат!). Здесь сдвиги КОРРЕКТНЫЕ:
+ * %011x(u32) = "000" + 8 hex MSB-first (run381 серверный echo
+ * 'connect0x00000ee0a07' = ровно этот формат).
+ * Возврат: полная длина (с ff×4); 0 = ответ нестроим (raw-эхо не
+ * 'connect' / bufcap мала) = skip+consume.
+ * ВНИМАНИЕ: ЗДЕСЬ (вне #ifndef C2B_SELFTEST) — чистая функция должна
+ * быть видна selftest-сборке (v72-урок: первая посадка была внутри
+ * GNS-консьюмер региона 17583..18734 => implicit declaration). */
+static u32 c2b_k27_ansolo_build(u32 form27, u32 val,
+                                const volatile unsigned char *rw, u32 rlen,
+                                unsigned char *buf, u32 bufcap)
+{
+    static const char hx72[] = "0123456789abcdef";
+    u32 i, kn = 4;
+    if (!buf || bufcap < 26) return 0;
+    buf[0] = 0xff; buf[1] = 0xff; buf[2] = 0xff; buf[3] = 0xff;
+    if (form27 == 5) {
+        if (rw && rlen >= 25 && rlen <= 639 &&
+            rw[24] == 'c' && rw[25] == 'o' && rw[26] == 'n' &&
+            rw[27] == 'n' && rw[28] == 'e' && rw[29] == 'c' &&
+            rw[30] == 't') {
+            for (i = 24; i < rlen && i < 200 && kn < bufcap; i++) {
+                buf[kn++] = rw[i];
+                if (rw[i] == 0) return kn;
+            }
+        }
+        return 0;
+    }
+    /* форма-6 (и всё остальное): 'connect0x' + %011x(val) + NUL = 25B */
+    memcpy(buf + 4, "connect0x", 9);
+    buf[13] = '0'; buf[14] = '0'; buf[15] = '0';  /* %011x: 3 старших нуля u32 */
+    for (i = 0; i < 8; i++)
+        buf[16 + i] = (unsigned char)hx72[(val >> (28 - i * 4)) & 0xf];
+    buf[24] = 0;
+    return 25;
+}
+
 /* ---------- v19: krel — РЕЛЕЙ 'k' IN-CHANNEL (см. блок у g130) ----------
  * Определяем ЗДЕСЬ (все декларации видны: g_gns_conn_h/ver 8076-78,
  * g_g90_A_seq/chal 11838-40, g_kfull 11834). Зовётся из c2b_g130_log
@@ -17708,6 +17754,15 @@ static u32 g_k27_wait;                /* v30: тики ожидания g_kfull/
  * Механизм (v47-комментарий): ff×4 = вариант-взрыв NET-фреймера
  * (0xffffffff -> кламп 2047 -> PARSE_ERROR). C2B_K27FORM=0 = легаси opt-in. */
 static u32 g_k27_form = 4;            /* v69: дефолт 4=verbatim-echo (был 0=blob = смерть) */
+/* v72: ANSOLO (C2B_K27ANSOLO=1) — ответ БЕЗ спроса. Гипотеза (a) run463-дерева:
+ * СПРОС (форма-4 qconnect-roll) = генератор 'A'#2 (ре-челлендж 450мс после
+ * ответа в run462/463 = реакция на СПРОС-roll, не на ответ); если 'A' =
+ * пост-accept-челлендж (v69-гонка: 'A' пендится сразу после 0x23-accept),
+ * спрашивающий цикл СБИВАЕТ стейт-машину сервера. ANSOLO = на каждый 'A'
+ * шлём ТОЛЬКО ответ (форма K27FORM>=5), спрос подавлен. Если 'A' без
+ * спроса НЕ приходит (0 A-fires в прогоне) = спрос = элицитор 'A',
+ * гипотеза (a) отвергнута эмпирически. */
+static u32 g_k27_ansolo = 0;
 static c2b_k27_A_t *g_k27_Ap;
 /* v47 K27K: 'k'-БЕЗ-ff×4 in-channel uplink — единственная непроверенная
  * форма доставки тикета после 5x2047 (ff×4 = варинт-взрыв NET-фреймера:
@@ -17846,6 +17901,10 @@ static void c2b_k27_maybe_fire(void)
             else if (ef && ef[0] == '5') g_k27_form = 5;   /* v70: 4 + A-ответ */
             else if (ef && ef[0] == '6') g_k27_form = 6;   /* v71: 4 + ответ %011x(val) */
         }
+        {   /* v72: ANSOLO — ответ без спроса (см. коммент у g_k27_ansolo) */
+            const char *ea72 = getenv("C2B_K27ANSOLO");
+            if (ea72 && ea72[0] == '1') g_k27_ansolo = 1;
+        }
         g_k27_init = 1;
     }
     form27 = g_k27_form;   /* v69: снепшот ПОСЛЕ init (см. коммент выше) */
@@ -17950,6 +18009,20 @@ static void c2b_k27_maybe_fire(void)
             u32 rle44 = g_k27_Ap->rawlen;
             const volatile unsigned char *rw44;
             u32 e44, nul44 = 0;
+            if (g_k27_ansolo && form27 >= 5) {
+                /* v72 ANSOLO: спрос подавлен — ответ = ЕДИНСТВЕННЫЙ посыл
+                 * (те же байты, что форм-5/6 второй посыл, но главным
+                 * слотом; второй посыл ниже скипается по флагу). */
+                kn27 = c2b_k27_ansolo_build(form27, val, g_k27_Ap->raw,
+                                            g_k27_Ap->rawlen, kcopy27,
+                                            (u32)sizeof kcopy27);
+                if (!kn27) {
+                    g_k27_seen = s1;
+                    C2B_LOGS("[c2b] k27: ANSOLO skip (ответ нестроим)\n");
+                    return;
+                }
+                rle44 = 0;   /* ansolo: спрос-билд не выполняется */
+            } else {
             kcopy27[0] = 0xff; kcopy27[1] = 0xff;
             kcopy27[2] = 0xff; kcopy27[3] = 0xff;
             kcopy27[4] = 'q';
@@ -17973,6 +18046,7 @@ static void c2b_k27_maybe_fire(void)
                 kcopy27[25] = 0;
                 kn27 = 26;
                 C2B_LOGS("[c2b] k27: form4 фолбэк на 11-значный (raw-эхо не 'connect')\n");
+            }
             }
         } else if (form27 == 3) {
             /* v42 (run381-вердикт): ЭХО-МИМИКРИЯ — сервер сам показал форму:
@@ -18027,6 +18101,12 @@ static void c2b_k27_maybe_fire(void)
         C2B_LOGH(chal);
         C2B_LOGS(" val=");
         C2B_LOGH(val);
+        if (g_k27_ansolo) {   /* v72: токен ответа виден в A-fire-логе
+                               * (второй посыл скипается — tok= там нет) */
+            C2B_LOGS(" ANSOLO=1 tok='");
+            C2B_LOGS((const char *)kcopy27 + 4);
+            C2B_LOGS("'");
+        }
         if (form27 == 4 || form27 == 5 || form27 == 6) {
             C2B_LOGS(" len=");
             C2B_LOGN(kn27);
@@ -18053,7 +18133,8 @@ static void c2b_k27_maybe_fire(void)
          * токена = 'connect0x' + %011x(ROLL(val)) = 11-hex VAL-класса!
          * FORM-6 = ответ 'connect0x' + %011x(val ЭТОГО 'A') = val-токен.
          * A/B: форма-5 = verbatim (run462: тихо) vs форма-6 = val-11hex. */
-        if ((form27 == 5 || form27 == 6) && rc27 == 1 && !g_krel_dead) {
+        if ((form27 == 5 || form27 == 6) && rc27 == 1 && !g_krel_dead &&
+            !g_k27_ansolo) {   /* v72: ANSOLO — ответ уже ушёл главным слотом */
             u32 rle70 = g_k27_Ap->rawlen;
             const volatile unsigned char *rw70 = g_k27_Ap->raw;
             u32 e70, kn70 = 4, nul70 = 0;
@@ -30343,6 +30424,68 @@ static void test_g131(void)
     }
 }
 
+/* v72: ANSOLO-билдер — те же байты ответа, что форм-5/6 второй посыл
+ * (run462 len=0x16 / run463 len=0x19), но в главный слот + КОРРЕКТНЫЕ
+ * сдвиги (v71-токен 'a0700ee0a07' = UB-перестановка нибблов val — урок
+ * в шапке билдера; серверный формат = run381 echo '00000ee0a07'). */
+static void test_ansolo(void)
+{
+    /* РЕАЛЬНЫЙ raw-'A' run381 #2 (тот же фикстур, что test_a2epatch) */
+    const u8 real_a[42] = {
+        0xff, 0xff, 0xff, 0xff, 'A',
+        0x00, 0x00, 0x00, 0x00,                   /* chal=0 */
+        0x03,                                     /* proto=3 */
+        0x00, 0x00, 0x00, 0x00, 0x00,             /* pad5 @10..14 */
+        0x07, 0x0a, 0xee, 0x00,                   /* val @15..18 */
+        0x00, 0x00, 0x30, 0x01, 0x01,             /* @19..23 */
+        'c', 'o', 'n', 'n', 'e', 'c', 't', '0', 'x',   /* echo @24.. */
+        '0', '0', 'e', 'e', '0', 'a', '0', '7', 0x00    /* NUL @41 */
+    };
+    u8 buf[640];
+    u32 i, n;
+    for (i = 0; i < sizeof buf; i++) buf[i] = 0xAA;
+    n = c2b_k27_ansolo_build(5, 0, real_a, (u32)sizeof real_a,
+                             buf, (u32)sizeof buf);
+    CHECK(n == 22u, "ansolo: форма-5 = 22B (формат run462 len=0x16)");
+    CHECK(buf[0] == 0xff && buf[1] == 0xff && buf[2] == 0xff &&
+          buf[3] == 0xff, "ansolo: ff×4 сохранены");
+    CHECK(buf[4] == 'c' && buf[12] == 'x', "ansolo: 'connect0x' @4..12");
+    CHECK(memcmp(buf + 4, "connect0x00ee0a07", 17) == 0,
+          "ansolo: форма-5 = вербатим raw[24..NUL]");
+    CHECK(buf[20] == '7' && buf[21] == 0, "ansolo: NUL-терминатор скопирован");
+    for (i = 0; i < sizeof buf; i++) buf[i] = 0xAA;
+    n = c2b_k27_ansolo_build(6, 0x00ee0a07u, real_a, (u32)sizeof real_a,
+                             buf, (u32)sizeof buf);
+    CHECK(n == 25u, "ansolo: форма-6 = 25B (формат run463 len=0x19)");
+    CHECK(memcmp(buf + 4, "connect0x00000ee0a07", 20) == 0,
+          "ansolo: форма-6 = КОРРЕКТНЫЙ %011x ('00000ee0a07' = run381-серверный формат; НЕ UB-перестановка 'a0700ee0a07')");
+    CHECK(buf[24] == 0, "ansolo: форма-6 NUL @24");
+    for (i = 0; i < sizeof buf; i++) buf[i] = 0xAA;
+    n = c2b_k27_ansolo_build(6, 0xffffffffu, real_a, (u32)sizeof real_a,
+                             buf, (u32)sizeof buf);
+    CHECK(n == 25u && memcmp(buf + 13, "000ffffffff", 11) == 0,
+          "ansolo: %011x(0xffffffff)='000ffffffff'");
+    {
+        /* форма-5: raw БЕЗ connect-эха = 0 (skip+consume) */
+        const u8 bad[30] = {0xff, 0xff, 0xff, 0xff, 'A'};
+        CHECK(c2b_k27_ansolo_build(5, 0, bad, (u32)sizeof bad,
+                                   buf, (u32)sizeof buf) == 0,
+              "ansolo: raw без 'connect'-эха отвергнут");
+    }
+    {
+        /* форма-5: rlen=24 (короче гейта 25) = 0, OOB-чит исключён */
+        CHECK(c2b_k27_ansolo_build(5, 0, real_a, 24,
+                                   buf, (u32)sizeof buf) == 0,
+              "ansolo: rlen<25 отвергнут (OOB-гейт)");
+    }
+    {
+        u8 small[8];
+        CHECK(c2b_k27_ansolo_build(6, 0, real_a, (u32)sizeof real_a,
+                                   small, (u32)sizeof small) == 0,
+              "ansolo: bufcap<26 = 0");
+    }
+}
+
 /* v43: a2e-patch — серверный wire-'A' (42B, run381 #2 полный plaintext)
  * -> 59B fmt-9-легальная копия (патчи @22-23 + хвост "96\0"+b2). */
 static void test_a2epatch(void)
@@ -30459,6 +30602,7 @@ int main(void)
     test_a2epatch();    /* v43: a2e-patch (серверный 'A' -> fmt-9-легальный) */
     test_susp();        /* v68: susp-гейт (until/retire-окна + киллисвитч) */
     test_g131();        /* v70: 0x24-reject декодер */
+    test_ansolo();      /* v72: ANSOLO-билдер (корректный %011x) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();

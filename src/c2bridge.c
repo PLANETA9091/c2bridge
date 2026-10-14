@@ -7226,7 +7226,7 @@ void c2b_g129_log(uptr st, uptr snap, u32 chal, u32 proto)
  * ff×4+'k' + chal = A.chal + unreliable) НИКОГДА не посылалась. v68 =
  * default ON + ЖЁСТКИЙ гейт g_g90_A_seq>0 (без серверного 'A' релей
  * МОЛЧИТ). C2B_KREL=0 = киллисвитч. */
-static u32 g_krel_on = 0, g_krel_keep, g_krel_init;  /* v69: default OFF — v68-тезис опровергнут run460: full 513B ff×4+'k' НА СЕССИИ = смерть 2047 (тот же blob, что k27-raw; chal=val + unreliable НЕ спасли — GNSLIB closed by peer PARSE_ERROR). Контракт-форма жива только как k27k-noff4 (K27K=1, run459=терпима). C2B_KREL=1 = opt-in для ручного A/B */
+static u32 g_krel_on = 0, g_krel_keep, g_krel_init;  /* v69: default OFF — v68-тезис опровергнут run460: full 513B ff×4+'k' НА СЕССИИ = смерть 2047 (тот же blob, что k27-raw; chal=val + unreliable НЕ спасли — GNSLIB closed by peer PARSE_ERROR). Контракт-форма жива только как k27k-noff4 (K27K=1, run459=терпима). C2B_KREL=1 = opt-in (v80: ВКЛ-путь реально восстановлен в krel-инициализации — v69 потерял строку, рычаг v79 был no-op) */
 static volatile u32 g_krel_sent, g_krel_ok, g_krel_chal, g_krel_chalv;
 #define C2B_KREL_CAP 12
 /* v21: цель krel = ЖИВАЯ сессия ДВИЖКА (run357-урок: krel#1 rc=1 улетел в
@@ -19645,7 +19645,8 @@ static void c2b_k19_relay(void)
          * шлёт через c2b_krel_send_flags() (v67-дисциплина, unreliable
          * default). Chal-патч = g_g90_A_chal (продюсер g71 in-channel 'A'-
          * детект = ИМЕННО серверный челлендж). C2B_KREL=0 = киллисвитч. */
-        if (e && e[0] == '0') g_krel_on = 0;   /* v68: default ON, C2B_KREL=0 = выкл */
+        if (e && e[0] == '0') g_krel_on = 0;   /* v80: default OFF (v69) + ВКЛ-путь восстановлен ниже — v69 выставил static=0, но строку opt-in '1' ПОТЕРЯЛ: C2B_KREL=1 был no-op (runs 482/483 = рычаг не стрелял в принципе!) */
+        if (e && e[0] == '1') g_krel_on = 1;   /* v80: РЕАЛЬНЫЙ opt-in — единственный g_krel_on=1 в коде */
         e = getenv("C2B_KREL_KEEP");
         if (e && e[0] == '1') g_krel_keep = 1;
         e = getenv("C2B_K21ENG");

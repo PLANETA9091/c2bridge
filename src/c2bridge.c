@@ -17226,9 +17226,14 @@ static void *c2b_g82wp_thread(void *arg)
     u32 t, sl, k;
     (void)arg;
     {
+        /* v67 (run454-урок): {15,16} = poll-group/listen-socket хэндл-ассерты
+         * ("A poll group handle was used where a listen socket handle was
+         * expected" x2) + 295ms лок-голодание service-треда = assert-шторм
+         * + минидампы + дестабилизация клиента (menu=0). Default = OFF;
+         * C2B_G82WP=1 = легаси-opt-in. */
         const char *e = getenv("C2B_G82WP");
-        if (e && e[0] == '0') {
-            C2B_LOGS("[c2b] g82wp: disabled by env\n");
+        if (!e || e[0] != '1') {
+            C2B_LOGS("[c2b] g82wp: default-off (run454 assert-storm lesson; C2B_G82WP=1 to opt-in)\n");
             return (void *)0;
         }
     }
@@ -17331,11 +17336,17 @@ static void *c2b_g82wp_thread(void *arg)
  * = end-debug строка, которую мы до сих пор не достали. g66 = read-only
  * матрица под SEGV-гардой:
  * (a) статус-матрица: слоты {13,17} x {2-arg, 3-arg cb=2048}, снимки
- *     t=1/21/61с: rc + первые 8 u32-слов + ВСЕ печатные прогоны >=4
- *     (c2b_g97_log_ascii) = охота на m_szEndDebug. Слот 3 = ЗАПРЕЩЁН
- *     (v5-урок: s=3 SEGV = коннект умирает даже под гардой).
- * (b) receive-свип: детурнутые 12/14 1/с x 120с (rc>0 = дамп бесплатный
- *     через g81/g82w + свой g71 по v19-гейту heap-ptr).
+ *     (rc + первые 8 u32-слов + ВСЕ печатные прогоны >=4 = охота на
+ *     m_szEndDebug). Слот 3 = ЗАПРЕЩЁН (v5-урок: s=3 SEGV = коннект
+ *     умирает даже под гардой).
+ * (b) receive-свип.
+ * v67 (run454-уроки, a2-SEGV + assert-шторм): (1) слот-12 = ОКНО СМЕРТИ
+ * ПОДТВЕРЖДЕНО БУКВАЛЬНО (g15 R12 ra=c2bridge64.so = наш поток; SIGSEGV
+ * в конце a2) — свип = ТОЛЬКО слот-14; (2) темп 1/с = шторм лок-грэбов
+ * GNS ("service thread waited 295ms for lock" + assert-минидампы +
+ * "poll group handle where listen socket expected" = g82wp {15,16}) =>
+ * 1/2с x 30 итераций (60с — окна коннекта хватает: в a4 recv-хиты =
+ * t≈0-2с после арма); (3) g82wp = default-off (см. его шапку).
  * ВСЁ read-only; убийцы {1,4,5,10,11} не трогаются. Киллисвитч C2B_G66=0. */
 static void *c2b_g66_thread(void *arg)
 {
@@ -17361,13 +17372,13 @@ static void *c2b_g66_thread(void *arg)
     vt = *(void ***)g_gns_conn_iface;
     C2B_LOGS("[c2b] g66: armed h=0x");
     C2B_LOGH((u32)g_gns_conn_h);
-    C2B_LOGS("matrix={13,17}x{2,3a} snap=1/21/61 recv=12/14 1/sx120\n");
-    for (t = 0; t < 121; t++) {
+    C2B_LOGS("matrix={13,17}x{2,3a} snap=1/11/26 recv=14-only 1/2sx30\n");
+    for (t = 0; t < 30; t++) {
         u64 ma[512];
         i32 rc;
-        usleep(1000000u);
+        usleep(2000000u);
         if (!g_gns_conn_h || !g_gns_conn_iface) break;
-        if (t == 1 || t == 21 || t == 61) {
+        if (t == 1 || t == 11 || t == 26) {
             C2B_LOGS("[c2b] g66: SNAPSHOT t=");
             C2B_LOGD(t);
             C2B_LOGS("s\n");
@@ -17410,9 +17421,9 @@ static void *c2b_g66_thread(void *arg)
             }
         }
         {
-            u32 rs[2] = { 12u, 14u };
+            u32 rs[1] = { 14u };   /* v67: слот-12 = окно смерти (a2-SEGV) */
             u32 ri;
-            for (ri = 0; ri < 2; ri++) {
+            for (ri = 0; ri < 1; ri++) {
                 for (k = 0; k < 512; k++) ma[k] = 0;
                 g_probe_active = 1;
                 if (__sigsetjmp(g_probe_jb, 1) == 0) {
@@ -17850,7 +17861,10 @@ static void c2b_k27_maybe_fire(void)
         if (__sigsetjmp(g_probe_jb, 1) == 0) {
             rc27 = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt27[11])(
                 g_gns_conn_iface, g_gns_conn_h, kcopy27, kn27,
-                1 /* reliable = как g76-run230-ответленный */, &out27);
+                c2b_krel_send_flags() /* v67: run454-урок — fl=1-reliable 'A'-эхо
+                = 0x24-парс-смерть сервера (v28/run365-дисциплина: raw-S1
+                connless = ТОЛЬКО unreliable; k27-лог "fl=1" + s=17 w0=3
+                ClosedByPeer в a4). C2B_KREL_FLAGS=1 = легаси-opt-in */, &out27);
             g_probe_active = 0;
         } else {
             g_probe_active = 0;

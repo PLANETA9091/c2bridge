@@ -688,6 +688,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     1) MODES="$MODES C2B_K27ANSOLO=1" ;;
     *) : ;;
   esac
+  # v79: krel (workflow input krel -> C2B_KREL_V). '1' = the FULL-ff×4
+  # engine-'k' relay IN-CHANNEL (the mirror of the server's own ff×4-'A'
+  # framing, run481-decrypt proof: the server itself sends ff×4-prefixed
+  # packets in-channel => the v47 noff4-only rationale is void). chal =
+  # A.chal verbatim (the c2b_k27.h contract). Default '0' = the
+  # run479-481 behavior (krel OFF, the k27k noff4 only).
+  case "${C2B_KREL_V-0}" in
+    1) MODES="$MODES C2B_KREL=1" ;;
+    *) : ;;
+  esac
   # v75: raw-syscall стаб-патчер (workflow input gpr -> C2B_GPR_V).
   # Дефолт '1' = ARMED (раунд-эксперимент: сырые GNS-стабы движка
   # редиректятся в хуки = crt-класс получает нативные 0x22). Откат =

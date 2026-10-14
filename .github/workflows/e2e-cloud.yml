@@ -75,6 +75,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      krel:
+        description: "v79: the FULL-ff×4 engine-'k' relay in-channel (C2B_KREL=1): the mirror of the server's own ff×4-'A' framing (run481 decrypt: the server itself sends ff×4-prefixed packets in-channel => the noff4-only rationale void); chal = A.chal verbatim. Default 0 = krel OFF (the run479-481 behavior)"
+        default: "0"
+        required: false
+        type: choice
+        options: ["0", "1"]
       gpr:
         description: "v75: the raw-syscall stub patcher (C2B_GPR=1): scans the engine/steam file-backed r-x modules for raw sendto/sendmsg stubs (mov eax,nr; syscall) and redirects them into the bridge hooks (the crt-fix finally gets the engine's native 0x22s). DEFAULT 1 = ARMED (the run469 experiment); '0' = OFF = the exact run468 behavior (the rollback lever)"
         default: "1"
@@ -142,6 +148,7 @@ jobs:
       # as v67: the defaults are truthy strings = pass the ||).
       C2B_K27FORM_V: ${{ inputs.k27form || '6' }}
       C2B_K27ANSOLO_V: ${{ inputs.ansolo || '0' }}
+      C2B_KREL_V: ${{ inputs.krel || '0' }}
       # v75: the raw-syscall stub patcher lever (default '1' = ARMED;
       # '0' = the run468 behavior, the rollback path).
       C2B_GPR_V: ${{ inputs.gpr || '1' }}

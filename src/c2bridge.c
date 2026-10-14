@@ -6440,7 +6440,7 @@ static u32 g_clv2_bhex;          /* C2B_CLV2_BHEX: хвост 'b' 0=AAAAAAAA 1=c
  * Вердикт-лог: любой 0x23/0x24/0x25 на g_clv2_fd -> hexline (0x23 ConnectOK =
  * ДЖЕКПОТ; 0x24 Closed = причина = точный оставшийся gap; тишина = нужен
  * подписной серт -> следующий трек: реальный cert+crypt движка). */
-static u32 g_clv2_cr;            /* C2B_CLV2_CR: 0=off 1=bare 2=+crypt */
+static u32 g_clv2_cr;            /* C2B_CLV2_CR: 0=off 1=bare 2=+crypt 3=+cert */
 static u32 g_clv2_cr_sent;       /* сколько 0x22 ушло */
 static u64 g_clv2_cr_last_ms;    /* темп: не чаще 1/250ms */
 static u32 g_clv2_cr_pending;    /* 1 = послали 0x20 с 'k'-капчера, ждём 0x21 -> 0x22 */
@@ -14423,10 +14423,26 @@ static void c2b_clv2_cr_keygen(void)
  * 'steam2_auth_ticket' @0xd4d453 steamclient = поле CMsgClientLogon (Steam-
  * сеть, не игровой сервер). Ticket-zone 'k' (byte 17+) капчерится g70
  * отдельно — пригодится ВНУТРИ зашифрованной сессии (game-level auth). */
+static u8 g_crt_cert[C2B_CRT_CERTMAX];   /* v50/v3: капчуренный cert-блоб
+                                          * (определение ЗАРАНЕЕ билдера v3) */
+static u32 g_crt_certlen;
 static u32 c2b_clv2_build_connreq(u8 *out, u32 variant, u32 cid, u64 ch, u64 ts)
 {
-    u8 pb[128];
+    u8 pb[512];
     u32 n = 0, i;
+    /* v3 = NATIVE-CERT EXPLOIT (60a-приоритет ii): принятая проводная форма
+     * [22][0d cid4][11 chal8][19 sid8][22 len cert][29 ts8][30 ping]
+     * [3a 26 crypt] — БЕЗ f8 (у принятой формы нет). cert = капчуренный
+     * нативный блоб g_crt_cert (run478: 0xae = 174B, SignedCert protobuf
+     * с CA-key + ed25519-подписью, identity = наш steamid). Нет серта
+     * (капчер ещё не выстрелил) -> честный фоллбэк в v2 (форма-гвард). */
+    u32 cert = 0;
+    if (variant >= 3u) {
+        if (g_crt_certlen >= 32u && g_crt_certlen <= C2B_CRT_CERTMAX)
+            cert = g_crt_certlen;
+        else
+            variant = 2u;                       /* серта нет -> v2-форма */
+    }
     if (variant >= 2) c2b_clv2_cr_keygen();
     pb[n++] = 0x0d;                              /* f1 fixed32 client_connection_id */
     pb[n++] = (u8)cid; pb[n++] = (u8)(cid >> 8);
@@ -14437,10 +14453,19 @@ static u32 c2b_clv2_build_connreq(u8 *out, u32 variant, u32 cid, u64 ch, u64 ts)
         pb[n++] = 0x19;                          /* f3 fixed64 legacy_client_steam_id */
         for (i = 0; i < 8; i++) pb[n++] = (u8)(g_clv2_sid64 >> (8 * i));
     }
+    if (cert) {
+        pb[n++] = 0x22;                          /* f4 LEN cert-signed blob */
+        pb[n++] = (u8)((cert & 0x7f) | 0x80);    /* varint (cert<256 => 2B) */
+        pb[n++] = (u8)(cert >> 7);
+        for (i = 0; i < cert; i++) pb[n++] = g_crt_cert[i];
+    }
     pb[n++] = 0x29;                              /* f5 fixed64 my_timestamp */
     for (i = 0; i < 8; i++) pb[n++] = (u8)(ts >> (8 * i));
     pb[n++] = 0x30; pb[n++] = 20;                /* f6 varint ping_est_ms */
-    pb[n++] = 0x40; pb[n++] = 0x0d;              /* f8 varint legacy_protocol_version=13 */
+    if (variant < 3) {
+        pb[n++] = 0x40; pb[n++] = 0x0d;          /* f8 legacy_protocol_version=13
+                                                  * (v3 = принятая форма, нет f8) */
+    }
     if (variant >= 2) {
         /* f7 crypt: SessionCryptInfoSigned{1: key_info{1: 1(CURVE25519),
          * 2: pub32}}; key_info = 08 01 12 20 <32B> = 36B; crypt =
@@ -15049,8 +15074,7 @@ static i32 c2b_clv2_on_s1_connect(i32 fd, const u8 *p, u32 len, i32 flags,
  * Капчер НЕ гейтится (пассивный, без wire-эффекта) — диагностическая
  * ценность даже при C2B_CRTFIX=0. */
 static u32 g_crt_init, g_crt_fix, g_crt_n, g_crt_capn;
-static u8 g_crt_cert[C2B_CRT_CERTMAX];
-static u32 g_crt_certlen;
+/* g_crt_cert/g_crt_certlen = определены РАНЕЕ (перед билдером connreq v3) */
 #define C2B_CRT_CAP 12
 
 /* wire-хелпер: пассивный капчер серта (оба хука зовут на каждом 0x22). */
@@ -25376,13 +25400,15 @@ i32 c2b_main(void)
                     C2B_LOGS("[c2b] clv2 fwdk=1 ('k'->target raw-forward ON)\n");
                 }
             }
-            {   /* 41f-g31: C2B_CLV2_CR=1 bare | =2 +crypt(x25519); SID override */
+            {   /* 41f-g31: C2B_CLV2_CR=1 bare | =2 +crypt | =3 +cert(native) */
                 const char *e2 = getenv("C2B_CLV2_CR");
-                if (e2 && (e2[0] == '1' || e2[0] == '2')) {
+                if (e2 && e2[0] >= '1' && e2[0] <= '3') {
                     g_clv2_cr = (u32)(e2[0] - '0');
                     C2B_LOGS("[c2b] clv2 cr=");
                     C2B_LOGN(g_clv2_cr);
-                    C2B_LOGS(g_clv2_cr == 2 ? " (0x22 +crypt x25519)\n" : " (0x22 bare)\n");
+                    C2B_LOGS(g_clv2_cr == 3 ? " (0x22 +crypt +cert NATIVE-EXPLOIT)\n"
+                             : g_clv2_cr == 2 ? " (0x22 +crypt x25519)\n"
+                             : " (0x22 bare)\n");
                 }
                 e2 = getenv("C2B_CLV2_SID");
                 if (e2 && e2[0]) {
@@ -29780,6 +29806,83 @@ static void test_cl(void)
                         for (qi = 79; qi < 512; qi++)
                             if (cr[qi] != 0) okz = 0;
                         CHECK(okz, "g70: v2 хвост = NUL-паддинг");
+                    }
+                    /* v3 = NATIVE-CERT EXPLOIT: принятая форма с f4 CERT.
+                     * Фикстура = run478-нативный блоб (0xae, head 22 61 08 01
+                     * 12 20...) — статически известный паттерн. v3 pb:
+                     * f1(5) f2(9) f3(9) f4(3+174) f5(9) f6(2) f7(40) = 251,
+                     * БЕЗ f8. Смещения: f4key@23 varint[ae 01]@24..25
+                     * cert@26..199, f5@200, f6@209, f7@211. */
+                    {
+                        u32 ci;
+                        g_crt_certlen = 174u;
+                        for (ci = 0; ci < 174u; ci++)
+                            g_crt_cert[ci] = (u8)((ci * 7u + 3u) & 0xffu);
+                        g_crt_cert[0] = 0x22; g_crt_cert[1] = 0x61;
+                        g_crt_cert[2] = 0x08; g_crt_cert[3] = 0x01;
+                        g_crt_cert[4] = 0x12; g_crt_cert[5] = 0x20;
+                        g_crt_cert[173] = 0x5a;
+                        g_clv2_cr_have = 0;
+                        for (qi = 0; qi < 32; qi++) g_clv2_cr_pub[qi] = 0;
+                        pl2 = c2b_clv2_build_connreq(cr, 3, 0x12345678u,
+                                                     0x1122334455667788ull,
+                                                     0x0102030405060708ull);
+                        CHECK(pl2 == 512, "g70v3: кадр = 512 (pad)");
+                        CHECK(cr[0] == 0x22, "g70v3: msgid 0x22");
+                        pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
+                        CHECK(pl2 == 251, "g70v3: pb-длина = 251 (f1+f2+f3+f4+f5+f6+f7, без f8)");
+                        CHECK(cr[3] == 0x0d && cr[4] == 0x78 && cr[7] == 0x12,
+                              "g70v3: f1 cid LE");
+                        CHECK(cr[8] == 0x12 && cr[9] == 0x88 && cr[16] == 0x11,
+                              "g70v3: f2 challenge LE");
+                        CHECK(cr[17] == 0x19 && cr[25] == 0x01,
+                              "g70v3: f3 steamid64 LE");
+                        CHECK(cr[26] == 0x22 && cr[27] == 0xae && cr[28] == 0x01,
+                              "g70v3: f4 key + varint(174)=[ae 01]");
+                        CHECK(cr[29] == 0x22 && cr[30] == 0x61 && cr[31] == 0x08 &&
+                              cr[32] == 0x01 && cr[33] == 0x12 && cr[34] == 0x20,
+                              "g70v3: cert head = run478-нативный (22 61 08 01 12 20)");
+                        CHECK(cr[29 + 173u] == 0x5a, "g70v3: cert tail @202");
+                        CHECK(cr[29 + 87u] == (u8)((87u * 7u + 3u) & 0xffu),
+                              "g70v3: cert середина = паттерн");
+                        CHECK(cr[203] == 0x29 && cr[204] == 0x08 && cr[211] == 0x01,
+                              "g70v3: f5 ts LE");
+                        CHECK(cr[212] == 0x30 && cr[213] == 20, "g70v3: f6 ping=20");
+                        CHECK(cr[214] == 0x3a && cr[215] == 38 &&
+                              cr[216] == 0x0a && cr[217] == 36 &&
+                              cr[218] == 0x08 && cr[219] == 0x01 &&
+                              cr[220] == 0x12 && cr[221] == 32,
+                              "g70v3: f7 crypt tag+len+key_info");
+                        {
+                            u32 nz = 0;
+                            for (qi = 222; qi < 254; qi++) if (cr[qi]) nz = 1;
+                            CHECK(nz, "g70v3: x25519 pub сгенерён");
+                        }
+                        {
+                            u32 okz = 1;
+                            for (qi = 257; qi < 512; qi++)
+                                if (cr[qi] != 0) okz = 0;
+                            CHECK(okz, "g70v3: хвост = NUL-паддинг");
+                        }
+                        /* ФОЛЛБЭК: серта нет (len=0) -> v3 = v2-форма (76, f8). */
+                        g_crt_certlen = 0;
+                        g_clv2_cr_have = 0;
+                        pl2 = c2b_clv2_build_connreq(cr, 3, 0x12345678u,
+                                                     0x1122334455667788ull,
+                                                     0x0102030405060708ull);
+                        pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
+                        CHECK(pl2 == 76, "g70v3fb: без серта = v2-форма (76)");
+                        CHECK(cr[37] == 0x40 && cr[38] == 0x0d,
+                              "g70v3fb: f8 на месте (v2-фоллбэк)");
+                        /* ФОЛЛБЭК: серт короткий (<32) = мусор -> тоже v2. */
+                        g_crt_certlen = 16u;
+                        g_clv2_cr_have = 0;
+                        pl2 = c2b_clv2_build_connreq(cr, 3, 0x12345678u,
+                                                     0x1122334455667788ull,
+                                                     0x0102030405060708ull);
+                        pl2 = (u32)cr[1] | ((u32)cr[2] << 8);
+                        CHECK(pl2 == 76, "g70v3fb2: cert<32 = v2-фоллбэк");
+                        g_crt_certlen = 0;      /* не протекает в другие тесты */
                     }
                     g_clv2_sid64 = 0;            /* не протекает в другие тесты */
                 }

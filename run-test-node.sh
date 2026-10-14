@@ -661,7 +661,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # отравлял счётчик инициализации BSteamNetworkingSocketsLowLevelAddRef
   # (скип init -> s_hEpoll=-1 -> epoll_ctl EBADF -> ConnectByIPAddress h=0,
   # RE run181); больше не выставлять ни в каких MODES.
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
+  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=3 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
+  # v78 (run479): C2B_CLV2_CR=2 -> =3 = NATIVE-CERT EXPLOIT (single-variable
+  # A/B к run478): собственный 0x22 моста на legacy-челлендж = ПРИНЯТАЯ форма
+  # (f1 cid + f2 chal + f3 sid + f4 CERT = капчуренный нативный блоб 0xae +
+  # f5 ts + f6 ping + f7 crypt, БЕЗ f8). Селфтест = 18 v3-чеков (байт-строгий
+  # лэйаут + оба фоллбэка: нет серта / cert<32 => v2-форма 76B = поведение
+  # run478). Капчер серта = пассивный (крт-кап fired в run478 на t+0, натив-
+  # лана fp44) => к моменту первого 0x22 блоб почти наверняка есть; если нет
+  # = фоллбэк = run478-поведение. Вердикт-дерево: PASS = сертификат-форма
+  # жива и на legacy-пути; 0x24 named-reject = названный gap; тишина/тот же
+  # исход = форма не изменила (смотри cr=3 в логе + crt-cap# + v3-фоллбэк).
   # v72/v73: K27FORM/ANSOLO = dispatch-рычаги (v60/v67 sentinel-дисциплина).
   # C2B_K27FORM_V: 1..7 = форма (дефолт 6 = v71-состояние run463);
   # run464-эксперимент = 5 + ansolo=1 (ответ-без-спроса, байты ответа

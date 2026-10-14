@@ -151,6 +151,127 @@ static i32 c2b_raw_has(const char *s, u32 n, const char *t)
     return 0;
 }
 
+/* v77c pure: ХВОСТ-дискриминатор СИСТЕМНОГО стаба. run476-РАЗБОР: у libc
+ * обёрток send/sendto/sendmsg ДВА стаба каждый — хвостовой (fast-путь:
+ * ...; стаб; cmp -4096; ja; RET = хвост функции, [rsp] = адрес возврата
+ * коллера -> e9 на C-энтри = корректный tail-call) и СЕРЕДИННЫЙ (full-путь
+ * асинк-отмены: call enable_asynccancel; стаб; cmp; ja; mov edi,ebx;...
+ * leave; ret — кадр АКТИВЕН, rsp = rbp-0x30, [rsp] = ЛОКАЛ -> e9 на C-энтри
+ * = ret pops МУСОР = rip=1 (run475/476 = детерминированный SEGV)).
+ * Движок многопоточный (__libc_single_threaded=0) => HOT = ИМЕННО full-путь
+ * => хвост-стабы никогда не исполняются, середина = боевые.
+ * Хвост = стаб + 48 3d 00 f0 ff ff (cmp) + 77 ?? (ja disp8) + c3 (ret).
+ * Возврат = pl (7), 0 = не хвост (=> мид-сайт -> трамплин-санка). */
+static u32 c2b_raw_patchable_sys_tail(const u8 *p, u32 n, u32 *nr)
+{
+    u32 pl = c2b_raw_patchable_sys(p, n, nr);
+    if (!pl) return 0u;
+    if (n < pl + 9u) return 0u;
+    /* p[pl..pl+5] = 48 3d 00 f0 ff ff — уже проверено patchable_sys;
+     * здесь строго: 77 <disp8> c3 */
+    if (p[pl + 6u] != 0x77u || p[pl + 8u] != 0xc3u) return 0u;
+    return pl;
+}
+
+/* v77c pure: САНКА мид-сайта (регистро-сохраняющая, БЕЗ кадра).
+ * Контракт на входе: rsp кратно 16 (проверено: __send rbp-0x30, sendmsg
+ * rbp-0x20 — оба кратно 0 mod 16); живы kernel-арги rdi/rsi/rdx/r10/r8/r9
+ * (sendmsg: r8 = cancel-type — НЕ арг!), rbx/rbp/r12-15 = кадр обёртки.
+ * Санка: сэйв 6 аргов -> вызов C-хелпера (C АБИ: 5 аргов в регах, rax:rdx
+ * = struct из 2 qword) -> перезагрузка fd/buf/flags/addr/addrlen ->
+ * mov eax,nr; syscall (в самой санке; rcx/r11 = колонные — пост-код их
+ * не читает) -> ВОССТАНОВЛЕНИЕ r8 (cancel-type sendmsg!) -> jmp site+7.
+ * Пост-стаб код читает ТОЛЬКО rax/rbx/rbp/rsp/r8 (+память rbp-0x18).
+ * rbx/rbp/r12-15 сохраняет САМ хелпер (C АБИ callee-saved).
+ * ЛЭЙАУТ (112B, все офсеты фикс. — селфтест байт-строгий):
+ *   00: 48 83 ec 40           sub rsp,0x40            (rsp: 0->0 mod 16)
+ *   04: 48 89 3c 24           mov [rsp],rdi
+ *   08: 48 89 74 24 08        mov [rsp+8],rsi         (disp8! без disp = [rsp])
+ *   0d: 48 89 54 24 10        mov [rsp+0x10],rdx      (disp8! УРОК: 48 89 34/14 24
+ *                              = БЕЗ disp = ТОТ ЖЕ [rsp] — слот rdi затирается,
+ *                              fd в хелпер = len (харнесс v77c, run-класс))
+ *   12: 4c 89 54 24 18        mov [rsp+0x18],r10
+ *   17: 4c 89 44 24 20        mov [rsp+0x20],r8
+ *   1c: 4c 89 4c 24 28        mov [rsp+0x28],r9
+ *   21: 48 8b 3c 24           mov rdi,[rsp]           (arg1 fd)
+ *   25: 48 8b 74 24 08        mov rsi,[rsp+8]         (arg2 buf/msg)
+ *   2a: 48 8b 54 24 10        mov rdx,[rsp+0x10]      (arg3 len/flags46)
+ *   2f: 48 8b 4c 24 18        mov rcx,[rsp+0x18]      (arg4 flags44)
+ *   34: 4c 8b 44 24 20        mov r8,[rsp+0x20]       (arg5 addr44)
+ *   39: 48 b8 <imm64>         movabs rax,helper       (10B)
+ *   43: ff d0                 call rax                (rsp кратно 16 -> C_std)
+ *   45: 48 89 c6              mov rsi,rax             (new buf/msg)
+ *   48: (rdx = new len/flags — возврат хелпера, уже на месте)
+ *   48: 48 8b 3c 24           mov rdi,[rsp]
+ *   4c: 4c 8b 54 24 18        mov r10,[rsp+0x18]
+ *   51: 4c 8b 44 24 20        mov r8,[rsp+0x20]
+ *   56: 4c 8b 4c 24 28        mov r9,[rsp+0x28]
+ *   5b: b8 <nr>               mov eax,nr              (5B)
+ *   60: 0f 05                 syscall
+ *   62: 4c 8b 44 24 20        mov r8,[rsp+0x20]       (RESTORE cancel-type!)
+ *   67: 48 83 c4 40           add rsp,0x40
+ *   6b: e9 <rel32>            jmp back (site+7 = cmp rax,-4096)
+ * Возврат = длина (112), 0 = кап/NULL. rel32 = back - (pg+0x70). */
+static u32 c2b_raw_thunk(u8 *t, u32 cap, unsigned long long helper, u32 nr,
+                         unsigned long long pg, unsigned long long back)
+{
+    u32 i = 0, q;
+    i32 rel;
+    if (!t || cap < 112u || (nr != 44u && nr != 46u)) return 0u;
+    /* rel32 от конца jmp (pg+0x70) до back */
+    {
+        long long d = (long long)(back - (pg + 0x70ull));
+        if (d > 2147483647ll || d < -2147483648ll) return 0u;
+        rel = (i32)d;
+    }
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xecu; t[i++] = 0x40u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;                     /* [rsp+8] — disp8 ОБЯЗАТЕЛЕН */
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;                     /* [rsp+0x10] — disp8 ОБЯЗАТЕЛЕН */
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x48u; t[i++] = 0xb8u;
+    for (q = 0; q < 8u; q++) t[i + q] = (u8)((helper >> (q * 8u)) & 0xffu);
+    i += 8u;
+    t[i++] = 0xffu; t[i++] = 0xd0u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0xc6u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    t[i++] = 0xb8u; t[i++] = (u8)(nr & 0xffu); t[i++] = 0u; t[i++] = 0u;
+    t[i++] = 0u;
+    t[i++] = 0x0fu; t[i++] = 0x05u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xc4u; t[i++] = 0x40u;
+    t[i++] = 0xe9u;
+    t[i++] = (u8)((u32)rel & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 8) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 16) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 24) & 0xffu);
+    if (i != 112u) return 0u;
+    return i;
+}
+
 /* v77 pure: СИСТЕМНЫЙ класс путей (libc/libpthread и родня). Эти регионы
  * = исключены v75b-фильтром (рекурсия-страховка), НО их raw-стабы = посы-
  * латель нативной ланы (run474). Патчим ТОЛЬКО со строгим glibc-хвостом

@@ -17344,6 +17344,55 @@ static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
     C2B_LOGS("\n");
 }
 
+/* v77c: C-хелперы мид-сайтов (санка вызывает их через call rax).
+ * КОНТРАКТ: C АБИ (callee-saved rbx/rbp/r12-15 сохраняет компилятор —
+ * кадр обёртки жив), возврат = struct из 2 qword = rax:rdx (SysV) =
+ * (buf/msg, len/flags) — санка кладёт их в rsi/rdx перед syscall.
+ * БЕЗ рекурсии: хелпер НЕ шлёт ничего (только capture+census-лог),
+ * syscall делает САМА санка. */
+typedef struct { unsigned long a, b; } c2b_fp2_t;
+
+static c2b_fp2_t c2b_fp44_helper(unsigned long fd, const void *buf,
+                                 unsigned long len, unsigned long flags,
+                                 const void *addr)
+{
+    c2b_fp2_t r;
+    const u8 *p = (const u8 *)buf;
+    r.a = (unsigned long)buf;           /* passthrough по умолчанию */
+    r.b = len;
+    g_raw_tls = 1;
+    if (p && len >= 40ul && len <= 640ul && p[0] == 0x22) {
+        /* нативный connect-кадр мимо всех хуков — каптурим ВПЕРВЫЕ */
+        c2b_crt_maybe_capture(p, (u32)len);
+    }
+    c2b_raw_lane_note((int)fd, buf, (u32)len, (const struct sockaddr *)addr);
+    (void)flags;
+    g_raw_tls = 0;
+    return r;
+}
+
+static c2b_fp2_t c2b_fp46_helper(unsigned long fd, const void *msg,
+                                 unsigned long flags)
+{
+    c2b_fp2_t r;
+    const struct c2b_msghdr *m = (const struct c2b_msghdr *)msg;
+    const void *base = (const void *)msg;   /* фолбэк: сама msghdr */
+    unsigned long blen = 0;
+    r.a = (unsigned long)msg;           /* passthrough */
+    r.b = flags;                        /* для sendmsg rdx = FLAGS */
+    g_raw_tls = 1;
+    if (m && m->msg_iov && m->msg_iovlen >= 1ul) {
+        if (m->msg_iov[0].iov_base && m->msg_iov[0].iov_len) {
+            base = m->msg_iov[0].iov_base;
+            blen = m->msg_iov[0].iov_len;
+        }
+    }
+    c2b_raw_lane_note((int)fd, base, (u32)blen,
+                      (const struct sockaddr *)(m ? m->msg_name : (void *)0));
+    g_raw_tls = 0;
+    return r;
+}
+
 /* anon-страница возле сайта (MAP_FIXED_NOREPLACE пробы, шаг 16MB,
  * +/-1.5GB). Возврат = страница RW (вызов должен mprotect RX) или 0. */
 static u8 *c2b_raw_tramp_alloc(unsigned long long near_site)
@@ -17557,6 +17606,7 @@ static void c2b_raw_scan(void)
                     i32 rel;
                     long long wr;
                     u8 tbuf[16];
+                    u32 istail = 1u;    /* v77c: sys-сайт = хвост или середина */
                     pg = c2b_raw_tramp_alloc(site);
                     if (!pg) {
                         C2B_LOGS("[c2b] v75: tramp-fail site=");
@@ -17564,16 +17614,41 @@ static void c2b_raw_scan(void)
                         C2B_LOGS("\n");
                         continue;
                     }
-                    {
+                    if (regs[ri].sys) {
+                        u32 tnr = 0;
+                        istail = c2b_raw_patchable_sys_tail(chunk + i,
+                                                            got - i,
+                                                            &tnr) ? 1u : 0u;
+                    }
+                    if (regs[ri].sys && !istail) {
+                        /* v77c: МИД-САЙТ (full-путь асинк-отмены, кадр
+                         * активен) — e9 на C-энтри = ret pops локал =
+                         * rip=1 (run475/476). Вместо C-энтри = САНКА:
+                         * сэйв аргов -> хелпер (capture/census) ->
+                         * syscall в санке -> restore r8 -> jmp site+7. */
+                        unsigned long long hfn = (nr == 44u)
+                            ? (unsigned long long)(unsigned long)
+                              &c2b_fp44_helper
+                            : (unsigned long long)(unsigned long)
+                              &c2b_fp46_helper;
+                        if (!c2b_raw_thunk((u8 *)pg, 0x1000u, hfn, nr,
+                                           (unsigned long long)pg,
+                                           site + (unsigned long long)pl)) {
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                    } else {
                         unsigned long long fn = (nr == 44u)
-                            ? (unsigned long long)(unsigned long)&c2b_raw_st_entry
-                            : (unsigned long long)(unsigned long)&c2b_raw_sm_entry;
+                            ? (unsigned long long)(unsigned long)
+                              &c2b_raw_st_entry
+                            : (unsigned long long)(unsigned long)
+                              &c2b_raw_sm_entry;
                         if (!c2b_raw_tramp(tramp, sizeof tramp, fn, nr)) {
                             munmap(pg, 0x1000u);
                             continue;
                         }
+                        for (q = 0; q < 16u; q++) pg[q] = tramp[q];
                     }
-                    for (q = 0; q < 16u; q++) pg[q] = tramp[q];
                     if (mprotect((void *)pg, 0x1000u, 0x5 /*RX*/) != 0) {
                         munmap(pg, 0x1000u);
                         continue;
@@ -17658,8 +17733,9 @@ static void c2b_raw_scan(void)
                         tbuf[0] == 0xe9u &&
                         tbuf[1] == code[1] && tbuf[2] == code[2] &&
                         tbuf[3] == code[3] && tbuf[4] == code[4]) {
-                        C2B_LOGS(regs[ri].sys ? "[c2b] v77: PATCH sys nr="
-                                              : "[c2b] v75: PATCH nr=");
+                        C2B_LOGS(!regs[ri].sys ? "[c2b] v75: PATCH nr="
+                               : istail ? "[c2b] v77c: PATCH sys-tail nr="
+                                        : "[c2b] v77c: PATCH sys-mid nr=");
                         C2B_LOGD(nr);
                         C2B_LOGS(" site=");
                         c2b_gp_lh64(site);
@@ -31411,6 +31487,97 @@ static void test_raw(void)
         CHECK(c2b_raw_path_sys(s3, (u32)strlen(s3)) == 0,
               "v77: GNS-либа = НЕ системный (v75b-фильтр)");
         CHECK(c2b_raw_path_sys(0, 0) == 0, "v77: NULL = 0");
+    }
+    /* ---- v77c: хвост-дискриминатор (run475/476 rip=1 = мид-сайт) ----
+     * Реальные формы libc 2.35 (run475 libc.node.so, objdump-верифицировано):
+     * ХВОСТ = стаб; 48 3d 00 f0 ff ff; 77 ??; c3 (fast-путь, [rsp]=рет-адрес)
+     * МИД  = стаб; 48 3d 00 f0 ff ff; 77 ??; <НЕ c3> (full-путь, кадр активен) */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 44; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05;
+    buf[7] = 0x48; buf[8] = 0x3d; buf[9] = 0x00; buf[10] = 0xf0;
+    buf[11] = 0xff; buf[12] = 0xff; buf[13] = 0x77; buf[14] = 0x6b;
+    buf[15] = 0xc3;
+    CHECK(c2b_raw_patchable_sys_tail(buf, sizeof buf, &nr) == 7u &&
+          nr == 44u,
+          "v77c: хвост-форма (cmp;ja;ret) = 7B = e9-C-энтри БЕЗОПАСЕН");
+    buf[15] = 0x89;   /* __send full-путь: после ja = mov %ebx,%edi (89 df) */
+    CHECK(c2b_raw_patchable_sys_tail(buf, sizeof buf, &nr) == 0u,
+          "v77c: МИД-форма (нет c3) = 0 => санка, НЕ C-энтри");
+    /* sendmsg real: 0x12c2c4 + ja 77 2d + 44 89 c7 (mov %r8d,%edi) */
+    buf[1] = 46; buf[15] = 0x44;
+    CHECK(c2b_raw_patchable_sys_tail(buf, sizeof buf, &nr) == 0u &&
+          c2b_raw_patchable_sys(buf, sizeof buf, &nr) == 7u && nr == 46u,
+          "v77c: sendmsg-мид = patchable_sys=7 но tail=0 (санка)");
+    /* усечения */
+    CHECK(c2b_raw_patchable_sys_tail(buf, 14u, &nr) == 0u,
+          "v77c: cap=14 < 16 = 0");
+    /* ---- v77c: санка = 112B байт-строгий лэйаут ---- */
+    {
+        u8 th[256];
+        u32 tl;
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk(th, sizeof th, 0x1122334455667788ull, 44u,
+                           0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 112u, "v77c: санка = 112B");
+        CHECK(th[0] == 0x48u && th[1] == 0x83u && th[2] == 0xecu &&
+              th[3] == 0x40u,
+              "v77c: sub rsp,0x40 (rsp mod 16 сохранён)");
+        CHECK(th[4] == 0x48u && th[5] == 0x89u && th[6] == 0x3cu &&
+              th[7] == 0x24u,
+              "v77c: mov [rsp],rdi (fd)");
+        /* УРОК харнесса: 48 89 34/14 24 = БЕЗ disp = [rsp] (слот rdi!
+         * затирается) — только 5B с disp8 = верные слоты */
+        CHECK(th[8] == 0x48u && th[9] == 0x89u && th[10] == 0x74u &&
+              th[11] == 0x24u && th[12] == 0x08u,
+              "v77c: mov [rsp+8],rsi = 48 89 74 24 08 (с disp8!)");
+        CHECK(th[0x0du] == 0x48u && th[0x0eu] == 0x89u &&
+              th[0x0fu] == 0x54u && th[0x10u] == 0x24u &&
+              th[0x11u] == 0x10u,
+              "v77c: mov [rsp+0x10],rdx = 48 89 54 24 10 (с disp8!)");
+        CHECK(th[0x12u] == 0x4cu && th[0x13u] == 0x89u &&
+              th[0x14u] == 0x54u && th[0x15u] == 0x24u &&
+              th[0x16u] == 0x18u,
+              "v77c: mov [rsp+0x18],r10 (flags)");
+        CHECK(th[0x39u] == 0x48u && th[0x3au] == 0xb8u,
+              "v77c: movabs rax,helper @0x39");
+        CHECK(th[0x43u] == 0xffu && th[0x44u] == 0xd0u,
+              "v77c: call rax @0x43 (rsp кратно 16 = C_std)");
+        CHECK(th[0x5bu] == 0xb8u && th[0x5cu] == 44u && th[0x5du] == 0u &&
+              th[0x5eu] == 0u && th[0x5fu] == 0u,
+              "v77c: mov eax,44 @0x5b");
+        CHECK(th[0x60u] == 0x0fu && th[0x61u] == 0x05u,
+              "v77c: syscall в санке @0x60");
+        CHECK(th[0x62u] == 0x4cu && th[0x63u] == 0x8bu &&
+              th[0x64u] == 0x44u && th[0x65u] == 0x24u &&
+              th[0x66u] == 0x20u,
+              "v77c: RESTORE r8 (cancel-type sendmsg!) @0x62");
+        CHECK(th[0x67u] == 0x48u && th[0x68u] == 0x83u &&
+              th[0x69u] == 0xc4u && th[0x6au] == 0x40u,
+              "v77c: add rsp,0x40 @0x67");
+        CHECK(th[0x6bu] == 0xe9u, "v77c: e9 jmp-back @0x6b");
+        /* rel32 = back - (pg+0x70) = 0x1060 - 0x1070 = -0x10 = 0xfffffff0 */
+        CHECK(th[0x6cu] == 0xf0u && th[0x6du] == 0xffu &&
+              th[0x6eu] == 0xffu && th[0x6fu] == 0xffu,
+              "v77c: rel32 = back-(pg+0x70) = -0x10 LE");
+        /* nr46: imm64 + nr байты */
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk(th, sizeof th, 0xaabbccddull, 46u,
+                           0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 112u && th[0x3bu] == 0xddu && th[0x3eu] == 0xaau,
+              "v77c: nr46 санка = imm64 helper46");
+        CHECK(th[0x5cu] == 46u, "v77c: nr46 = mov eax,46");
+        /* чужой nr / кап */
+        CHECK(c2b_raw_thunk(th, sizeof th, 1ull, 45u,
+                            0x1000ull, 0x2000ull) == 0u,
+              "v77c: nr45 = отказ");
+        CHECK(c2b_raw_thunk(th, 64u, 1ull, 44u,
+                            0x1000ull, 0x2000ull) == 0u,
+              "v77c: cap<112 = отказ");
+        /* назад на 2GB+ = отказ */
+        CHECK(c2b_raw_thunk(th, sizeof th, 1ull, 44u,
+                            0x90000000ull, 0x1000ull) == 0u,
+              "v77c: back < pg+0x70 за пределами rel32 = отказ");
     }
 }
 

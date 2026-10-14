@@ -18005,7 +18005,7 @@ static void c2b_k27_maybe_fire(void)
                 kcopy27[14 + z27] = hx39[(val >> (28 - z27 * 4)) & 0xf];
             kcopy27[22] = 0;
             kn27 = 23;
-        } else if (form27 == 4 || form27 == 5 || form27 == 6) {
+        } else if (form27 == 4 || form27 == 5 || form27 == 6 || form27 == 7) {
             /* v44 (run383-вердикт): ВЕРБАТИМ-ЭХО — сервер РОЛЛИРУЕТ токен
              * (run381 echo 'connect0x00000ee0a07' -> run383 'A'#2 'connect0x
              * 00700ee0a07'), а FORM=2/3 отвечают ПЕРЕФОРМАТИРОВАННЫМ

@@ -15486,6 +15486,36 @@ static void c2b_ldd_dsite(u64 rax, u64 rdi, u64 rsi, u64 rdx, u64 rcx,
             C2B_LOGN((u32)(ffd & 0xffffu));
             C2B_LOGS(" len=");
             C2B_LOGN((u32)flen);
+            /* v65: ПОЛНЫЙ ABI + стек-топ = ИМЯ зовущего. ФАКТ-run430:
+             * FIRE-1 smg fd=22 len=0x1de65778 = low-32 СТЕК-АДРЕСА
+             * (0x7fff1de65778 — регион буферов sys_sendto в трейсе) =>
+             * rdx = НЕ len = ABI вызова ЧУЖОЙ sendto; и НОЛЬ событий
+             * fd:22 в kernel-трейсе (трассировка движка ПОЛНАЯ: 20598
+             * csgo-событий, sendto/sendmsg entry-проба = безусловна)
+             * => украденный syscall ПОСЛЕ FIRE = НЕ исполнился/не
+             * дошёл => зовущий = НЕ sendto-путь. buf/fl/ad/al = все
+             * регистры ABI (уже в аргументах, ноль дерефов); st0..3 =
+             * [sp]..[sp+24] = возвраты зовущего (тот же безопасный
+             * класс стека, что HIT st-дамп с v59) = офлайн кросс-реф
+             * против engine_maps/libc-офсетов = КТО исполняет через
+             * сайт. FIRE-кап 3/сайт = объём лога ограничен. */
+            C2B_LOGS(" buf=");
+            c2b_gp_lh64((unsigned long long)rsi);
+            C2B_LOGS(" fl=");
+            c2b_gp_lh64((unsigned long long)r10v);
+            C2B_LOGS(" ad=");
+            c2b_gp_lh64((unsigned long long)r8v);
+            C2B_LOGS(" al=");
+            c2b_gp_lh64((unsigned long long)r9v);
+            C2B_LOGS(" st=");
+            {
+                const u64 *fst = (const u64 *)(uptr)sp;
+                u32 fq;
+                for (fq = 0u; fq < 4u; fq++) {
+                    C2B_LOGS((fq) ? " " : "");
+                    c2b_gp_lh64((unsigned long long)fst[fq]);
+                }
+            }
         }
         C2B_LOGS(" f=");
         C2B_LOGN(g_dsite_fires[tag]);

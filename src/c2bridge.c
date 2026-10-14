@@ -17154,9 +17154,11 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
 #define C2B_RAW_REGIONMAX (256u << 20)
 #define C2B_RAW_LOGCAP    64u
 #define C2B_RAW_PATCHMAX  32u
+#define C2B_RAW_PATCHSYS  8u    /* v77: кап системных (mod=sys) патчей */
 extern i32 munmap(void *, u32);   /* g24-паттерн: блочная extern (.so) */
 static u32 g_raw_init, g_raw_scans, g_raw_busy, g_raw_last;
 static u32 g_raw_sites, g_raw_patched, g_raw_bytes_hi, g_raw_regs;
+static u32 g_raw_patched_sys;   /* v77: патчи mod=sys стабов */
 static u32 g_raw_logn, g_raw_done, g_raw_anon;
 static u64 g_raw_seen[64];
 static u32 g_raw_seen_n;
@@ -17164,14 +17166,64 @@ static char g_raw_self[256];
 static u32 g_raw_selfn;
 
 /* энтри: из raw-стаба -> маркер -> НАШ хук -> маркер сброшен. Возврат
- * = rax (как syscall). rcx/r11 = syscall-колонные = коллер не хранит. */
+ * = rax (как syscall). rcx/r11 = syscall-колонные = коллер не хранит.
+ * v77-ПЕРЕДЕЛКА: энтри = НЕ зовёт наш sendto/sendmsg-хук, а исполняет
+ * syscall НАПРЯМУЮ (inline asm, kernel ABI: arg4 = r10). ПРИЧИНА: с v77
+ * патчатся и mod=sys стабы (c2b_raw_patchable_sys) — passthrough через
+ * g_clp_sendto -> v52-детур -> ra-гвард skip -> оригинальный пролог ->
+ * ... -> ЗАПАТЧЕННЫЙ стаб = e9 = БЕСКОНЕЧНЫЙ ЦИКЛ. Прямой syscall = ци-
+ * кл разорван на всех путях. crt-класс = ЗДЕСЬ (капчер + rewrite в ло-
+ * кальный буфер) = цель всего механизма (нативная 0x22 = переписанная).
+ * Хук-сайд census (g_raw_tls) = сохранён. */
+static long c2b_raw_sys_sendto(long fd, const void *buf, unsigned long len,
+                               long flags, const void *addr, long addrlen)
+{
+    long r;
+    register long r10 __asm__("r10") = flags;
+    register long r8 __asm__("r8") = (long)addr;
+    register long r9 __asm__("r9") = (long)addrlen;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(44L), "D"(fd), "S"(buf), "d"((long)len),
+                       "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
+static long c2b_raw_sys_sendmsg(long fd, const void *msg, long flags)
+{
+    long r;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(46L), "D"(fd), "S"(msg), "d"(flags)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
 static ssize_t c2b_raw_st_entry(int fd, const void *buf, size_t len,
                                 int flags, const struct sockaddr *addr,
                                 socklen_t addrlen)
 {
     ssize_t r;
+    const u8 *p = (const u8 *)buf;
+    u8 crtbuf[600];
+    const void *sbuf = buf;
+    unsigned long slen = len;
     g_raw_tls = 1;
-    r = sendto(fd, buf, len, flags, addr, addrlen);
+    if (!g_crt_inwl && p && len >= 40u && len <= 640u && p[0] == 0x22) {
+        u32 on;
+        if (!g_crt_init) {
+            const char *ec = getenv("C2B_CRTFIX");
+            if (ec && ec[0] == '1') g_crt_fix = 1;
+            g_crt_init = 1;
+        }
+        c2b_crt_maybe_capture(p, (u32)len);
+        on = c2b_crt_maybe_rewrite(p, (u32)len, crtbuf,
+                                   (u32)sizeof crtbuf);
+        if (on) { sbuf = crtbuf; slen = on; }   /* переписанный кадр */
+    }
+    r = (ssize_t)c2b_raw_sys_sendto(fd, sbuf, slen, flags, addr,
+                                    (long)addrlen);
     g_raw_tls = 0;
     return r;
 }
@@ -17181,7 +17233,7 @@ static ssize_t c2b_raw_sm_entry(int fd, const struct c2b_msghdr *msg,
 {
     ssize_t r;
     g_raw_tls = 1;
-    r = sendmsg(fd, msg, flags);
+    r = (ssize_t)c2b_raw_sys_sendmsg(fd, msg, flags);
     g_raw_tls = 0;
     return r;
 }
@@ -17279,7 +17331,8 @@ static void c2b_raw_scan(void)
     i32 mfd, ffd = -1;
     i64 n = 0, r;
     u64 budget = C2B_RAW_BUDGET;
-    static struct { char path[300]; unsigned long lo, hi; u32 rwx, scanned; }
+    u32 syswant = 0;    /* v77: текущая maps-строка = системный класс */
+    static struct { char path[300]; unsigned long lo, hi; u32 rwx, scanned, sys; }
         regs[512];   /* v75d: 256 = МАЛО (run471-сим на живых maps: want =
                       * 359 = 145 anon + 214 файл) — хвост maps (поздние
                       * dlopen/anon-JIT) = ПОТЕРЯН за капом */
@@ -17326,8 +17379,18 @@ static void c2b_raw_scan(void)
         p += linelen;
         if (!(prot & 4u)) continue;                 /* только исполняемые */
         if (pa && (plen == 0u || plen >= 300u)) continue;
-        if (pa && !c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn))
-            continue;
+        {
+            /* v77: СИСТЕМНЫЙ класс (libc/libpthread) = ХОТИМ для патча —
+             * их nr=44/46 стабы с каноничным glibc-хвостом = посылаатель
+             * нативной ланы (run474-вердикт: 3 из 4 стабов не вооружены).
+             * Патч = ТОЛЬКО c2b_raw_patchable_sys (строгий хвост) + энтри
+             * на прямом syscall = цикла с v52-детуром нет. */
+            u32 issys = (pa && c2b_raw_path_sys(pa, plen)) ? 1u : 0u;
+            if (pa && !issys &&
+                !c2b_raw_path_want(pa, plen, g_raw_self, g_raw_selfn))
+                continue;
+            syswant = issys;
+        }
         if (!pa) {                                  /* v75c: ANON = ЖЕЛАЕМ!
                                                      * (run469/470-урок: файл-
                                                      * бэкед исчерпан = 0 ста-
@@ -17358,6 +17421,7 @@ static void c2b_raw_scan(void)
         regs[nregs].hi = hi;
         regs[nregs].rwx = (prot & 2u) ? 1u : 0u;    /* RWX/W-x = mutable */
         regs[nregs].scanned = 0u;
+        regs[nregs].sys = syswant;
         nregs++;
     }
     if (!nregs) return;
@@ -17401,6 +17465,8 @@ static void c2b_raw_scan(void)
                 unsigned long long site;
                 u32 q;
                 pl = c2b_raw_patchable(chunk + i, got - i, &nr);
+                if (!pl && regs[ri].sys)
+                    pl = c2b_raw_patchable_sys(chunk + i, got - i, &nr);
                 if (!pl) continue;
                 site = (unsigned long long)lo + off + i;
                 g_raw_sites++;
@@ -17421,8 +17487,11 @@ static void c2b_raw_scan(void)
                 /* v75c: JIT-регионы = РЕГЕНЕРИРУЮТ байты — патчим ПОВТОРНО
                  * (паттерн совпал = байты не e9 = не запатчено сейчас);
                  * seen[] = только лог-дедуп. Старый трамплин сайта = утечёт
-                 * (4KB), патч-кап связывает. */
-                if (g_raw_patched >= C2B_RAW_PATCHMAX) continue;
+                 * (4KB), патч-кап связывает. v77: sys-патчи = ОТДЕЛЬНЫЙ кап
+                 * 8 (мод=sys = живые системные стабы — осторожность). */
+                if (regs[ri].sys) {
+                    if (g_raw_patched_sys >= C2B_RAW_PATCHSYS) continue;
+                } else if (g_raw_patched >= C2B_RAW_PATCHMAX) continue;
                 {
                     u8 tramp[16];
                     u8 code[8];
@@ -17474,14 +17543,16 @@ static void c2b_raw_scan(void)
                         tbuf[0] == 0xe9u &&
                         tbuf[1] == code[1] && tbuf[2] == code[2] &&
                         tbuf[3] == code[3] && tbuf[4] == code[4]) {
-                        C2B_LOGS("[c2b] v75: PATCH nr=");
+                        C2B_LOGS(regs[ri].sys ? "[c2b] v77: PATCH sys nr="
+                                              : "[c2b] v75: PATCH nr=");
                         C2B_LOGD(nr);
                         C2B_LOGS(" site=");
                         c2b_gp_lh64(site);
                         C2B_LOGS(" tramp=");
                         c2b_gp_lh64((unsigned long long)pg);
                         C2B_LOGS("\n");
-                        g_raw_patched++;
+                        if (regs[ri].sys) g_raw_patched_sys++;
+                        else g_raw_patched++;
                     } else {
                         C2B_LOGS("[c2b] v75: verify-FAIL site=");
                         c2b_gp_lh64(site);
@@ -17503,6 +17574,8 @@ static void c2b_raw_scan(void)
     C2B_LOGD(g_raw_sites);
     C2B_LOGS(" patched=");
     C2B_LOGD(g_raw_patched);
+    C2B_LOGS(" patchedSys=");
+    C2B_LOGD(g_raw_patched_sys);
     C2B_LOGS(" usedMB=");
     C2B_LOGD(g_raw_bytes_hi);
     C2B_LOGS("\n");
@@ -31186,6 +31259,43 @@ static void test_raw(void)
         CHECK(c2b_raw_path_want(p_libc, (u32)strlen(p_libc), 0, 0) == 0,
               "raw: v75b libc = ВСЁ ЕЩЁ НЕТ (рекурсия)");
         CHECK(c2b_raw_path_want(0, 0, 0, 0) == 0, "raw: NULL-путь = нет");
+    }
+    /* ---- v77: системный (glibc) стаб = каноничный errno-хвост ---- */
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 44; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05;
+    buf[7] = 0x48; buf[8] = 0x3d; buf[9] = 0x00; buf[10] = 0xf0;
+    buf[11] = 0xff; buf[12] = 0xff; buf[13] = 0x76; buf[14] = 0x10;
+    CHECK(c2b_raw_pat(buf, sizeof buf, &nr) == 7u && nr == 44u,
+          "v77: форма A = 7B/nr44 (как раньше)");
+    CHECK(c2b_raw_patchable(buf, sizeof buf, &nr) == 0u,
+          "v77: ret-гвард = libc-стаб НЕ ret-хвост = 0 (старый матчер)");
+    CHECK(c2b_raw_patchable_sys(buf, sizeof buf, &nr) == 7u && nr == 44u,
+          "v77: glibc-хвост 48 3d 00 f0 ff ff = патч-пригоден");
+    buf[7] = 0x85; buf[8] = 0xc0;               /* test eax,eax = чужой хвост */
+    CHECK(c2b_raw_patchable_sys(buf, sizeof buf, &nr) == 0u,
+          "v77: НЕ-glibc хвост = 0");
+    memset(buf, 0x90, sizeof buf);
+    buf[0] = 0xb8; buf[1] = 46; buf[2] = 0; buf[3] = 0; buf[4] = 0;
+    buf[5] = 0x0f; buf[6] = 0x05;
+    buf[7] = 0x48; buf[8] = 0x3d; buf[9] = 0x00; buf[10] = 0xf0;
+    buf[11] = 0xff; buf[12] = 0xff;
+    CHECK(c2b_raw_patchable_sys(buf, sizeof buf, &nr) == 7u && nr == 46u,
+          "v77: sendmsg-стаб с glibc-хвостом = 7B/nr46");
+    CHECK(c2b_raw_patchable_sys(buf, 9u, &nr) == 0u,
+          "v77: усечённый хвост (n=9 < 13) = 0");
+    /* path_sys: системный класс = ХОТИМ (v77) */
+    {
+        const char *s1 = "/lib/x86_64-linux-gnu/libc.so.6";
+        const char *s2 = "/lib/x86_64-linux-gnu/libpthread-2.31.so";
+        const char *s3 = "/home/runner/work/c2bridge/c2bridge/csgo-lite/bin/linux64/libsteamnetworkingsockets.so";
+        CHECK(c2b_raw_path_sys(s1, (u32)strlen(s1)) == 1,
+              "v77: libc.so.6 = системный");
+        CHECK(c2b_raw_path_sys(s2, (u32)strlen(s2)) == 1,
+              "v77: libpthread = системный");
+        CHECK(c2b_raw_path_sys(s3, (u32)strlen(s3)) == 0,
+              "v77: GNS-либа = НЕ системный (v75b-фильтр)");
+        CHECK(c2b_raw_path_sys(0, 0) == 0, "v77: NULL = 0");
     }
 }
 

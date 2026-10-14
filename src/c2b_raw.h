@@ -87,6 +87,24 @@ static u32 c2b_raw_patchable(const u8 *p, u32 n, u32 *nr)
     return pl;
 }
 
+/* v77 pure: патч-пригодность СИСТЕМНОГО (glibc) стаба. Хвост libc-стаба
+ * = НЕ ret, а каноничный errno-чек '48 3d 00 f0 ff ff' (cmp $-4096,%rax)
+ * + jae — форма байт-строгая = FP-доказательство. run474-вердикт: 4x
+ * nr=0x2c стаба в mod=sys lib'ax, 3 НЕ вооружены (v52 = только
+ * dlsym-канонический entry), отправитель нативных кадров = один из них. */
+static u32 c2b_raw_patchable_sys(const u8 *p, u32 n, u32 *nr)
+{
+    u32 pl = c2b_raw_pat(p, n, nr);
+    if (!pl || n < pl + 6u) return 0u;
+    if (p[pl] != 0x48u || p[pl + 1u] != 0x3du || p[pl + 2u] != 0x00u ||
+        p[pl + 3u] != 0xf0u || p[pl + 4u] != 0xffu || p[pl + 5u] != 0xffu)
+        return 0u;
+    return pl;
+}
+
+/* v77 pure: СИСТЕМНЫЙ класс путей — определение НИЖЕ (после c2b_raw_has;
+ * вынесено из этого места = ошибка порядка 20261015-0039-раунда). */
+
 /* pure: байты трамплина (16B, пад 0x90). sendto (ядро АБИ: rdi/rsi/rdx/
  * r10/r8/r9 -> C АБИ rdi/rsi/rdx/rcx/r8/r9): 4c 89 d1 = mov rcx,r10;
  * 48 b8 <imm64> = movabs rax,fn; ff e0 = jmp rax. sendmsg (3 аргс =
@@ -130,6 +148,20 @@ static i32 c2b_raw_has(const char *s, u32 n, const char *t)
         for (j = 0u; j < m && s[i + j] == t[j]; j++) { }
         if (j == m) return 1;
     }
+    return 0;
+}
+
+/* v77 pure: СИСТЕМНЫЙ класс путей (libc/libpthread и родня). Эти регионы
+ * = исключены v75b-фильтром (рекурсия-страховка), НО их raw-стабы = посы-
+ * латель нативной ланы (run474). Патчим ТОЛЬКО со строгим glibc-хвостом
+ * (c2b_raw_patchable_sys) — наш g_clp-passthrough = ra-гвард v52 + энтри
+ * на inline-asm syscall = цикла нет. */
+static i32 c2b_raw_path_sys(const char *p, u32 n)
+{
+    if (!p || !n) return 0;
+    if (c2b_raw_has(p, n, "libc.so") || c2b_raw_has(p, n, "libc-") ||
+        c2b_raw_has(p, n, "libpthread"))
+        return 1;
     return 0;
 }
 

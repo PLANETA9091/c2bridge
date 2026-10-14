@@ -99,6 +99,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      crtfix:
+        description: "v82: the crt-rewrite ARM (C2B_CRTFIX=1): the engine's BROKEN 0x22 connreq is rewritten IN-FLIGHT into the accepted modern form. run485 pcap field-walk: the engine's form is now [22][fb 00] 254B WITH the native cert INSIDE (f4=174B = the cert-inject works) but (1) the legacy u16-LE prefix = invalid protobuf under the modern parser (f31/wt3), (2) f2 = wt2 without LEN (the v50 bug lives), (3) f7 unsigned 38B => the server silently re-challenges forever. Rewrite = [22][0d cid][11 chal][19 sid][22 cert][29 ts][30 ping][3a f7-engine] = the exact form the server already 0x23-ConnectOK'd (run485 session ports). '0' (default) = the run479-485 behavior (passive cert capture only)."
+        default: "0"
+        required: false
+        type: choice
+        options: ["0", "1"]
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -172,6 +178,12 @@ jobs:
       # rc=1 verified-on-wire. Default '1' = the run479-484 wait behavior
       # (the single-variable discipline: only krel=1+k21wait=0 changes).
       C2B_K21WAIT_V: ${{ inputs.k21wait || '1' }}
+      # v82: the crt-rewrite arm (crtfix='1' -> C2B_CRTFIX=1 in MODES). The
+      # engine's broken [22][fb 00] connreq (cert inside, but legacy-prefix +
+      # broken-f2 + unsigned-f7 = the silent re-challenge loop) rewritten
+      # in-flight into the accepted modern form. Default '0' = the
+      # run479-485 behavior (the rewrite OFF, the passive capture only).
+      C2B_CRTFIX_V: ${{ inputs.crtfix || '0' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

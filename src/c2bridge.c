@@ -15103,11 +15103,14 @@ static void c2b_crt_maybe_capture(const u8 *p, u32 n)
 
 /* wire-хелпер: попытка переписывания СЛОМАННОГО 0x22 движка. Возврат:
  * длина собранного кадра (buf заполнен) или 0 (не наш/отказ). Лог + кап
- * внутри. buf/cap = стековый буфер вызывающего (>= 600B). */
+ * внутри. buf/cap = стековый буфер вызывающего (>= 600B).
+ * v82: гвард g_crt_certlen==0 СНЯТ — новая форма ([22][fb 00], run485)
+ * несёт серт В ПАКТЕ (f4, 174B) и капчур не нужен; старая ([22][4c 00])
+ * по-прежнему требует капчуренный блоб (отказ внутри билдера). */
 static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
 {
     u32 on;
-    if (!g_crt_fix || g_crt_certlen == 0u || g_crt_n >= C2B_CRT_CAP)
+    if (!g_crt_fix || g_crt_n >= C2B_CRT_CAP)
         return 0;
     if (!c2b_crt_is_eng(p, n)) return 0;
     on = c2b_crt_build(p, n, g_crt_cert, g_crt_certlen, buf, cap);
@@ -15123,7 +15126,9 @@ static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
     g_crt_n++;
     C2B_LOGS("[c2b] crt-fix: 0x22 rewrite #");
     C2B_LOGN(g_crt_n);
-    C2B_LOGS("len=");
+    C2B_LOGS("form=");
+    C2B_LOGS(p[26] == 0x22 ? "fb-own-cert" : "4c-cap-cert");
+    C2B_LOGS(" len=");
     C2B_LOGN(n);
     C2B_LOGS("->");
     C2B_LOGN(on);
@@ -15132,8 +15137,6 @@ static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
              ((u32)p[7] << 24));
     C2B_LOGS("sid=0x");
     C2B_LOGH((u32)(g_crt_n * 0u + ((u32)p[18] | ((u32)p[19] << 8))));
-    C2B_LOGS(" certlen=");
-    C2B_LOGN(g_crt_certlen);
     C2B_LOGS("\n");
     return on;
 }
@@ -30301,6 +30304,75 @@ static void test_crt(void)
         bad[0] = 0x23;      /* не-0x22 класс */
         CHECK(c2b_crt_build(bad, sizeof bad, v50f_cert, 174,
                             out, sizeof out) == 0, "crt: класс!=0x22 = 0");
+    }
+    /* --- v82: НОВАЯ форма [22][fb 00] (run485) — серт В ПАКТЕ --- */
+    {   u8 fb[512];
+        u32 fn, mlen = 251u;
+        /* тело 251B: f1+f2+f3+f4(cert174)+f5+f6+f7(38), значения полей =
+         * v50f_eng (кроме добавленного f4) => вывод обязан совпасть с
+         * v50f_want байт-в-байт (одинаковые cid/chal/sid/ts/ping/crypto). */
+        fb[0] = 0x22; fb[3] = 0x0d;
+        for (i = 0; i < 4; i++) fb[4 + i] = v50f_eng[4 + i];    /* cid */
+        fb[8] = 0x12;
+        for (i = 0; i < 8; i++) fb[9 + i] = v50f_eng[9 + i];    /* chal-8raw */
+        fb[17] = 0x19;
+        for (i = 0; i < 8; i++) fb[18 + i] = v50f_eng[18 + i];  /* sid */
+        fb[26] = 0x22; fb[27] = 0xae; fb[28] = 0x01;
+        for (i = 0; i < 174; i++) fb[29 + i] = v50f_cert[i];    /* cert */
+        fb[203] = 0x29;
+        for (i = 0; i < 8; i++) fb[204 + i] = v50f_eng[27 + i]; /* ts */
+        fb[212] = 0x30; fb[213] = 0x14;                         /* ping=20 */
+        fb[214] = 0x3a; fb[215] = 0x26;
+        for (i = 0; i < 38; i++) fb[216 + i] = v50f_eng[41 + i];/* crypto */
+        fb[1] = (u8)(mlen & 0xff); fb[2] = (u8)(mlen >> 8);
+        fn = 254u;
+        for (i = fn; i < sizeof fb; i++) fb[i] = 0;             /* wire-пад */
+        CHECK(c2b_crt_is_eng(fb, fn) == 1,
+              "crt-v82: fb-форма (254B) сигнатура = 1");
+        CHECK(c2b_crt_is_eng(fb, sizeof fb) == 1,
+              "crt-v82: fb 512B wire-пад сигнатура = 1");
+        CHECK(c2b_crt_is_eng(fb, 100) == 0,
+              "crt-v82: fb обрезанный = 0 (mlen+3>n)");
+        CHECK(c2b_crt_is_eng(v50f_want, sizeof v50f_want) == 0,
+              "crt-v82: ЧИСТАЯ форма моста = 0 (mlen-консистентность)");
+        /* сборка БЕЗ капчуренного серта (cert=NULL, clen=0): серт = из
+         * пакета — v82-контракт новой формы */
+        on = c2b_crt_build(fb, fn, 0, 0, out, (u32)sizeof out);
+        CHECK(on == 252u, "crt-v82: сборка fb (серт из пакета) = 252B");
+        {   u32 z = 0;
+            for (i = 0; i < 252 && on == 252u; i++)
+                if (out[i] != v50f_want[i]) z = 1;
+            CHECK(on != 252u || z == 0,
+                  "crt-v82: вывод байт-в-байт = v50f_want (fb-вход)");
+        }
+        /* негатив: varint-длина серта = 300 (> CERTMAX) */
+        {   u8 bad2[512];
+            u32 q2;
+            for (q2 = 0; q2 < fn; q2++) bad2[q2] = fb[q2];
+            bad2[27] = 0xac; bad2[28] = 0x02;       /* varint 300 */
+            CHECK(c2b_crt_is_eng(bad2, fn) == 0,
+                  "crt-v82: clen=300 сигнатура = 0");
+        }
+        /* слоёные гварды: f6-ключ за сертом бит — is_eng пропускает
+         * (глубина её гвардов = до f5), build ловит ходом */
+        {   u8 bad3[512];
+            u32 q2;
+            for (q2 = 0; q2 < fn; q2++) bad3[q2] = fb[q2];
+            bad3[212] = 0x31;
+            CHECK(c2b_crt_is_eng(bad3, fn) == 1,
+                  "crt-v82: is_eng f6-битый = 1 (гвард глубже в build)");
+            CHECK(c2b_crt_build(bad3, fn, 0, 0, out,
+                                (u32)sizeof out) == 0,
+                  "crt-v82: build f6-битый = 0");
+        }
+        /* негатив: f5-ключ за сертом бит — is_eng ловит (её гвард) */
+        {   u8 bad4[512];
+            u32 q2;
+            for (q2 = 0; q2 < fn; q2++) bad4[q2] = fb[q2];
+            bad4[203] = 0x2a;
+            CHECK(c2b_crt_is_eng(bad4, fn) == 0,
+                  "crt-v82: f5-битый сигнатура = 0");
+        }
     }
 }
 

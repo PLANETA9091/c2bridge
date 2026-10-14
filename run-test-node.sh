@@ -662,14 +662,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # (скип init -> s_hEpoll=-1 -> epoll_ctl EBADF -> ConnectByIPAddress h=0,
   # RE run181); больше не выставлять ни в каких MODES.
   [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=2 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
-  # v72: K27FORM/ANSOLO = dispatch-рычаги (v60/v67 sentinel-дисциплина).
-  # C2B_K27FORM_V: 1..6 = форма (дефолт 6 = v71-состояние run463);
+  # v72/v73: K27FORM/ANSOLO = dispatch-рычаги (v60/v67 sentinel-дисциплина).
+  # C2B_K27FORM_V: 1..7 = форма (дефолт 6 = v71-состояние run463);
   # run464-эксперимент = 5 + ansolo=1 (ответ-без-спроса, байты ответа
   # идентичны run462 = single-variable A/B к run462). Форма-6 в v72 =
   # КОРРЕКТНЫЙ %011x(val) ('00000ee0a07'-класс, UB-перестановка v71 убита).
+  # v73 форма-7 = ответ 'connect-granted0x' (22B, granted-строка движка,
+  # run466 = 7 + ansolo=1 = single-variable A/B к run464).
   case "${C2B_K27FORM_V-6}" in
-    1|2|3|4|5|6) MODES="$MODES C2B_K27FORM=$C2B_K27FORM_V" ;;
-    *)           MODES="$MODES C2B_K27FORM=6" ;;
+    1|2|3|4|5|6|7) MODES="$MODES C2B_K27FORM=$C2B_K27FORM_V" ;;
+    *)             MODES="$MODES C2B_K27FORM=6" ;;
   esac
   # C2B_K27ANSOLO_V: '1' = ответ БЕЗ спроса (k27 ANSOLO); unset/прочее = 0.
   case "${C2B_K27ANSOLO_V-0}" in

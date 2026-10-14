@@ -17613,6 +17613,21 @@ static u32 c2b_k27_ansolo_build(u32 form27, u32 val,
         }
         return 0;
     }
+    if (form27 == 7) {
+        /* v73 ФОРМА-7: 'connect-granted0x' + NUL = 4+17+1 = 22B — СОБСТВЕННАЯ
+         * win-строка движка (g64/fmt-9: strstr-игла "connect-granted"@25d8b5
+         * -> SendConnectPacket 24b520 НАПРЯМУЮ). Логика: серверный in-channel
+         * 'A'-хендлер = ACK-зеркало (run462-постмортем: 2x 'A' байт-идентичны
+         * = ретрансмиссия), ответ-токен axis ЗАКРЫТ (формы 5/6 = терпимы-тихо,
+         * run464/465 = ansolo тоже тихо) => сервер ждёт НЕ токен, а СЛЕДУЮЩУЮ
+         * СТРОКУ ДИАЛОГА — ту самую, которую движок сам бы сказал после
+         * granted-иглы. Единственная неопробованная in-channel строка
+         * (1939-tree (c), 2039-priority (iii)). Тот же unreliable slot-11,
+         * тот же death-stop: A/B = байты ответа, всё остальное = run464/465. */
+        memcpy(buf + 4, "connect-granted0x", 17);
+        buf[21] = 0;
+        return 22;
+    }
     /* форма-6 (и всё остальное): 'connect0x' + %011x(val) + NUL = 25B */
     memcpy(buf + 4, "connect0x", 9);
     buf[13] = '0'; buf[14] = '0'; buf[15] = '0';  /* %011x: 3 старших нуля u32 */
@@ -17900,6 +17915,7 @@ static void c2b_k27_maybe_fire(void)
             else if (ef && ef[0] == '4') g_k27_form = 4;   /* v44: вербатим-эхо */
             else if (ef && ef[0] == '5') g_k27_form = 5;   /* v70: 4 + A-ответ */
             else if (ef && ef[0] == '6') g_k27_form = 6;   /* v71: 4 + ответ %011x(val) */
+            else if (ef && ef[0] == '7') g_k27_form = 7;   /* v73: ответ = granted-строка движка (22B) */
         }
         {   /* v72: ANSOLO — ответ без спроса (см. коммент у g_k27_ansolo) */
             const char *ea72 = getenv("C2B_K27ANSOLO");
@@ -18095,7 +18111,8 @@ static void c2b_k27_maybe_fire(void)
                              : (form27 == 4 ? "[c2b] k27: A-fire form=verbatim-echo #"
                              : (form27 == 5 ? "[c2b] k27: A-fire form=verbatim-echo+ans #"
                              : (form27 == 6 ? "[c2b] k27: A-fire form=verbatim-echo+ans11 #"
-                                            : "[c2b] k27: A-fire form=ascii #")))));
+                             : (form27 == 7 ? "[c2b] k27: A-fire form=granted-ans #"
+                                            : "[c2b] k27: A-fire form=ascii #"))))));
         C2B_LOGN(g_k27_fires);
         C2B_LOGS(" chal=");
         C2B_LOGH(chal);
@@ -18107,7 +18124,7 @@ static void c2b_k27_maybe_fire(void)
             C2B_LOGS((const char *)kcopy27 + 4);
             C2B_LOGS("'");
         }
-        if (form27 == 4 || form27 == 5 || form27 == 6) {
+        if (form27 == 4 || form27 == 5 || form27 == 6 || form27 == 7) {
             C2B_LOGS(" len=");
             C2B_LOGN(kn27);
             C2B_LOGS(" fl=1 live=");
@@ -18133,7 +18150,7 @@ static void c2b_k27_maybe_fire(void)
          * токена = 'connect0x' + %011x(ROLL(val)) = 11-hex VAL-класса!
          * FORM-6 = ответ 'connect0x' + %011x(val ЭТОГО 'A') = val-токен.
          * A/B: форма-5 = verbatim (run462: тихо) vs форма-6 = val-11hex. */
-        if ((form27 == 5 || form27 == 6) && rc27 == 1 && !g_krel_dead &&
+        if ((form27 == 5 || form27 == 6 || form27 == 7) && rc27 == 1 && !g_krel_dead &&
             !g_k27_ansolo) {   /* v72: ANSOLO — ответ уже ушёл главным слотом */
             u32 rle70 = g_k27_Ap->rawlen;
             const volatile unsigned char *rw70 = g_k27_Ap->raw;
@@ -18155,6 +18172,12 @@ static void c2b_k27_maybe_fire(void)
                         if (rw70[e70] == 0) { nul70 = 1; break; }
                     }
                 }
+            } else if (form27 == 7) {
+                /* v73 форма-7: granted-строка движка как ответ (22B) */
+                memcpy(kcopy70 + 4, "connect-granted0x", 17);
+                kcopy70[21] = 0;
+                kn70 = 22;
+                nul70 = 1;
             } else {
                 /* v71 форма-6: 'connect0x' + %011x(val) + NUL = 4+9+11+1 = 25B */
                 memcpy(kcopy70 + 4, "connect0x", 9);
@@ -30465,6 +30488,17 @@ static void test_ansolo(void)
                              buf, (u32)sizeof buf);
     CHECK(n == 25u && memcmp(buf + 13, "000ffffffff", 11) == 0,
           "ansolo: %011x(0xffffffff)='000ffffffff'");
+    for (i = 0; i < sizeof buf; i++) buf[i] = 0xAA;
+    n = c2b_k27_ansolo_build(7, 0, real_a, (u32)sizeof real_a,
+                             buf, (u32)sizeof buf);
+    CHECK(n == 22u, "ansolo: форма-7 = 22B (granted-строка движка, 4+17+1)");
+    CHECK(buf[0] == 0xff && buf[1] == 0xff && buf[2] == 0xff &&
+          buf[3] == 0xff, "ansolo: форма-7 ff×4 сохранены");
+    CHECK(memcmp(buf + 4, "connect-granted0x", 17) == 0,
+          "ansolo: форма-7 = 'connect-granted0x' (needle 25d8b5 -> 24b520)");
+    CHECK(buf[21] == 0, "ansolo: форма-7 NUL @21");
+    CHECK(buf[22] == 0xAA && buf[639] == 0xAA,
+          "ansolo: форма-7 не пишет за 22B (OOB-гейт)");
     {
         /* форма-5: raw БЕЗ connect-эха = 0 (skip+consume) */
         const u8 bad[30] = {0xff, 0xff, 0xff, 0xff, 'A'};
@@ -30614,3 +30648,4 @@ int main(void)
     return fails ? 1 : 0;
 }
 #endif /* C2B_SELFTEST */
+

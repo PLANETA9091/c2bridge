@@ -28861,6 +28861,36 @@ static void tldd_sitelog(unsigned long long ax, unsigned long long d1,
     g_tldd_site_ax = ax;
 }
 
+/* v71-фикстуры семантик-теста префикса (анти-таутология v68-урок:
+ * байты = НЕ семантика — префикс ИСПОЛНЯЕТСЯ с sentinel-регs).
+ * tramp = статик .bss (РЯДОМ с mock = rel32 в диапазоне; mmap = 0x7f..
+ * = ~46TB от PIE-текста = rel32 НЕВОЗМОЖЕН — выбор буфера = критичен);
+ * scratch = управляемый rsp-кадр (rsp = середина: push'ы 104B ВНИЗ
+ * остаются в массиве, asan-redzone не трогается). */
+static unsigned long long g_v71_mock[9];
+/* 4KB-кадр: rsp = &s[256] => push'ы трампа (104B) + кадр mock-логгера
+ * ВСЕ внутри массива (соседние .bss-глобалы/redzone не затрагиваются) */
+static unsigned long long g_v71_scratch[512]
+    __attribute__((aligned(16)));
+static u8 g_v71_tramp[4096] __attribute__((aligned(4096)));
+/* v71: ИСТИННОЕ состояние регистров на выходе трампа — пишется САМИМ
+ * asm-шаблоном (movq reg->mem) = иммунно к GCC-играм с аллокацией
+ * операндов: r8-r15 НЕ имеют однобуквенных constraints => '+r' с
+ * register-asm-local НЕ гарантирует чтение из ТОГО ЖЕ регистра
+ * (репро: реальный r8=0x66, а '+r'(v_r8) читал 0x33). Память, записан-
+ * ная шаблоном = единственный достоверный канал восстановлений. */
+static unsigned long long g_v71_real[8];
+static void v71_mock(unsigned long long a0, unsigned long long a1,
+                     unsigned long long a2, unsigned long long a3,
+                     unsigned long long a4, unsigned long long a5,
+                     unsigned long long a6, unsigned long long a7,
+                     unsigned long long a8)
+{
+    g_v71_mock[0] = a0; g_v71_mock[1] = a1; g_v71_mock[2] = a2;
+    g_v71_mock[3] = a3; g_v71_mock[4] = a4; g_v71_mock[5] = a5;
+    g_v71_mock[6] = a6; g_v71_mock[7] = a7; g_v71_mock[8] = a8;
+}
+
 static void tldd_run(const char *nm, const u8 *c, u32 cl, u32 nr,
                      u32 want)
 {
@@ -29151,48 +29181,63 @@ static void test_lddet(void)
         if (olen == 21u) {
             CHECK(tlen == 75u + 29u + 14u,
                   "v61: csp1 tlen=118 (75 префикс + 27 окно + 2 ERESTART-pad + ff25)");
-            /* префикс байт-точно: 9 push + 6 arg-load + call */
+            /* v74: префикс байт-точно (ГИБРИД = v71-дисциплина + v70-
+             * раскладка): 9 push spill + align-push(10-й) + 3 стек-арг-
+             * push ДО load'ов + 6 load + call */
             CHECK(str[0] == 0x50 && str[1] == 0x51 && str[2] == 0x52 &&
-                  str[3] == 0x56 && str[4] == 0x57 &&
-                  str[5] == 0x41 && str[6] == 0x50 &&
+                  str[3] == 0x56 && str[4] == 0x57,
+                  "v74: push rax rcx rdx rsi rdi = spill ПЕРВЫМ "
+                  "(раскладка = БАЙТ-ТОЧНО v70: [ret][args][ALIGN][regs])");
+            CHECK(str[5] == 0x41 && str[6] == 0x50 &&
                   str[7] == 0x41 && str[8] == 0x51 &&
                   str[9] == 0x41 && str[10] == 0x52 &&
                   str[11] == 0x41 && str[12] == 0x53,
-                  "v59: spill 9 push (rax rcx rdx rsi rdi r8-r11)");
-            CHECK(str[13] == 0x48 && str[14] == 0x8b &&
-                  str[15] == 0x7c && str[16] == 0x24 && str[17] == 0x40,
-                  "v59: arg1 = 0x40(%rsp) (orig rax = nr)");
-            CHECK(str[18] == 0x48 && str[19] == 0x8b &&
-                  str[20] == 0x74 && str[21] == 0x24 && str[22] == 0x20,
-                  "v59: arg2 = 0x20(%rsp) (orig rdi = fd)");
-            CHECK(str[23] == 0x48 && str[24] == 0x8b &&
-                  str[25] == 0x54 && str[26] == 0x24 && str[27] == 0x28,
-                  "v59: arg3 = 0x28(%rsp) (orig rsi = buf)");
-            CHECK(str[28] == 0x48 && str[29] == 0x8b &&
-                  str[30] == 0x4c && str[31] == 0x24 && str[32] == 0x30,
-                  "v59: arg4 = 0x30(%rsp) (orig rdx = len)");
-            CHECK(str[33] == 0x4c && str[34] == 0x8b &&
-                  str[35] == 0x44 && str[36] == 0x24 && str[37] == 0x38,
-                  "v59: arg5 = 0x38(%rsp) (orig rcx)");
-            CHECK(str[38] == 0x4c && str[39] == 0x8d &&
-                  str[40] == 0x4c && str[41] == 0x24 && str[42] == 0x48,
-                  "v68: arg6 = lea r9,[rsp+0x48] (REX=4c: R=1 dest=r9, "
-                  "B=0 base=rsp; BYLO 49 = lea rcx,[r12+0x48] = sp-arg "
-                  "= musor = run433 4/4 smert, v67 st=FAULT 6/6)");
-            CHECK(str[43] == 0xe8,
-                  "v59: call rel32 логгера");
-            rel = 0x7f0000100000ll - (0x7f0000200000ll + 48ll);
+                  "v59: push r8 r9 r10 r11");
+            CHECK(str[13] == 0x50,
+                  "v74: push rax (align) = 10-й push (v70-позиция: "
+                  "A/B run442/443 vs 444 — v71-раскладка [regs][ALIGN] = "
+                  "краш 0x27afe в 0x22-сканере, v70 = здоровый baseline)");
+            CHECK(str[14] == 0x41 && str[15] == 0x52 &&
+                  str[16] == 0x41 && str[17] == 0x51 &&
+                  str[18] == 0x41 && str[19] == 0x50,
+                  "v71: push r10 r9 r8 = СТЕК-АРГИ ДО load'ов — v65-класс "
+                  "клоббера УБИТ: ad/al = живые r8/r9 (run439-ФАКТ: "
+                  "ad=0x212 = исходный rcx при kernel addr=0)");
+            CHECK(str[20] == 0x48 && str[21] == 0x8b &&
+                  str[22] == 0x7c && str[23] == 0x24 && str[24] == 0x60,
+                  "v74: arg1 = 0x60(%rsp) (orig rax = nr; v70-слот rax-"
+                  "spill = вершина 104B-блока)");
+            CHECK(str[25] == 0x48 && str[26] == 0x8b &&
+                  str[27] == 0x74 && str[28] == 0x24 && str[29] == 0x40,
+                  "v74: arg2 = 0x40(%rsp) (orig rdi = fd)");
+            CHECK(str[30] == 0x48 && str[31] == 0x8b &&
+                  str[32] == 0x54 && str[33] == 0x24 && str[34] == 0x48,
+                  "v74: arg3 = 0x48(%rsp) (orig rsi = buf)");
+            CHECK(str[35] == 0x48 && str[36] == 0x8b &&
+                  str[37] == 0x4c && str[38] == 0x24 && str[39] == 0x50,
+                  "v74: arg4 = 0x50(%rsp) (orig rdx = len)");
+            CHECK(str[40] == 0x4c && str[41] == 0x8b &&
+                  str[42] == 0x44 && str[43] == 0x24 && str[44] == 0x58,
+                  "v74: arg5 = 0x58(%rsp) (orig rcx; r8 УЖЕ НА СТЕКЕ)");
+            CHECK(str[45] == 0x4c && str[46] == 0x8d &&
+                  str[47] == 0x4c && str[48] == 0x24 && str[49] == 0x68,
+                  "v74: arg6 = lea r9,[rsp+0x68] (REX=4c: R=1 dest=r9, "
+                  "B=0 base=rsp; r9 УЖЕ НА СТЕКЕ; v68 = 0x48-версия "
+                  "до reorder; БЫЛО 49 = lea rcx,[r12+0x48] = sp-арг "
+                  "= мусор = run433 4/4 смерть, v67 st=FAULT 6/6)");
+            CHECK(str[50] == 0xe8,
+                  "v59: call rel32 логгера @50");
+            rel = 0x7f0000100000ll - (0x7f0000200000ll + 55ll);
             v32 = 0;
             for (q = 0; q < 4u; q++)
-                v32 |= ((unsigned int)str[44u + q]) << (8 * q);
+                v32 |= ((unsigned int)str[51u + q]) << (8 * q);
             CHECK((long long)(int)v32 == rel,
                   "v59: call rel32 пересчитан");
-            /* выравнивание + стек-args pop + restore 9 pop (27 хвост) */
-            CHECK(str[48] == 0x50 &&
-                  str[49] == 0x41 && str[50] == 0x52 &&
-                  str[51] == 0x41 && str[52] == 0x51 &&
-                  str[53] == 0x41 && str[54] == 0x50 &&
-                  str[55] == 0x41 && str[56] == 0x58 &&
+            /* v74-хвост = РЕВЕРС push-порядка 1:1 (v70-хвост): r8 r9 r10
+             * = стек-арги, rax = align-слот, r11 r10 r9 r8 = реверс,
+             * rdi rsi rdx rcx rax = реверс; финальный rax = spill-rax =
+             * ИСХОДНЫЙ (align-мусор перекрывается) */
+            CHECK(str[55] == 0x41 && str[56] == 0x58 &&
                   str[57] == 0x41 && str[58] == 0x59 &&
                   str[59] == 0x41 && str[60] == 0x5a &&
                   str[61] == 0x58 &&
@@ -29203,8 +29248,9 @@ static void test_lddet(void)
                   str[70] == 0x5f && str[71] == 0x5e &&
                   str[72] == 0x5a && str[73] == 0x59 &&
                   str[74] == 0x58,
-                  "v59: push rax (align) + push r10 r9 r8 + pop r8 r9 r10 "
-                  "+ pop rax + restore 9 pop");
+                  "v74: pop r8 r9 r10 (стек-арги) + pop rax (align-слот) "
+                  "+ pop r11 r10 r9 r8 + pop rdi rsi rdx rcx rax (rax = "
+                  "spill = исходный)");
             /* окно @75: 89 d0 | [v61: 66 90 pad] | 0f 05 | eb f8 -> e9 */
             CHECK(str[75] == 0x89 && str[76] == 0xd0,
                   "v59: stolen = mov eax,edx @75");
@@ -29233,6 +29279,103 @@ static void test_lddet(void)
                       "v59: jmp-back = site+olen");
             }
         }
+        /* v71: СЕМАНТИК-ТЕСТ ПРЕФИКСА (ИСПОЛНЕНИЕ, анти-таутология v68-
+         * урок: assert байтов = таутология — байты ловятся, семантика
+         * нет). Префикс строится в RWX .bss-буфер РЯДОМ с mock (rel32!),
+         * дополняется ret; inline-asm ставит sentinel-регистры, переключа-
+         * ет rsp на управляемый кадр и CALL'ит трамп; mock капчурит 9
+         * аргументов => КАЖДЫЙ клоббер-баг класса v65 (ad = исходный rcx
+         * вместо живого r8) / v68 (sp-арг мусор) = КРАСНЫЙ. Плюс рестав-
+         * рация регистров после трампа. */
+#if defined(__x86_64__) && !defined(C2B_NO_EXEC_TEST)
+        {
+            unsigned int plen;
+            CHECK(mprotect(g_v71_tramp, sizeof g_v71_tramp,
+                           PROT_READ | PROT_WRITE | PROT_EXEC) == 0,
+                  "v71: mprotect RWX tramp-буфера");
+            plen = c2b_ldd_site_prefix(g_v71_tramp,
+                (unsigned long long)(uptr)g_v71_tramp,
+                (unsigned long long)(uptr)&v71_mock);
+            CHECK(plen == 75u, "v71: живой префикс = 75B");
+            g_v71_tramp[plen] = 0xc3u;             /* ret */
+            {
+                register unsigned long long r_tramp asm("rbx") =
+                    (unsigned long long)(uptr)g_v71_tramp;
+                register unsigned long long r_scr asm("r15") =
+                    (unsigned long long)(uptr)&g_v71_scratch[256];
+                register unsigned long long v_rax asm("rax") = 0x11ull;
+                register unsigned long long v_rcx asm("rcx") = 0x22ull;
+                register unsigned long long v_rdx asm("rdx") = 0x33ull;
+                register unsigned long long v_rsi asm("rsi") = 0x44ull;
+                register unsigned long long v_rdi asm("rdi") = 0x55ull;
+                register unsigned long long v_r8 asm("r8") = 0x66ull;
+                register unsigned long long v_r9 asm("r9") = 0x77ull;
+                register unsigned long long v_r10 asm("r10") = 0x88ull;
+                __asm__ volatile(
+                    "movq %%rsp, %%r14\n\t"
+                    "movq %9, %%rsp\n\t"
+                    "call *%8\n\t"
+                    "movq %%r14, %%rsp\n\t"
+                    "movq %%rax, %10\n\t"
+                    "movq %%rcx, %11\n\t"
+                    "movq %%rdx, %12\n\t"
+                    "movq %%rsi, %13\n\t"
+                    "movq %%rdi, %14\n\t"
+                    "movq %%r8,  %15\n\t"
+                    "movq %%r9,  %16\n\t"
+                    "movq %%r10, %17\n\t"
+                    : "+a"(v_rax), "+c"(v_rcx), "+d"(v_rdx),
+                      "+S"(v_rsi), "+D"(v_rdi),
+                      "+r"(v_r8), "+r"(v_r9), "+r"(v_r10)
+                    : "r"(r_tramp), "r"(r_scr),
+                      "m"(g_v71_real[0]), "m"(g_v71_real[1]),
+                      "m"(g_v71_real[2]), "m"(g_v71_real[3]),
+                      "m"(g_v71_real[4]), "m"(g_v71_real[5]),
+                      "m"(g_v71_real[6]), "m"(g_v71_real[7])
+                    : "r14", "cc", "memory");
+                CHECK(g_v71_mock[0] == 0x11ull,
+                      "v71: arg1 = orig rax (nr)");
+                CHECK(g_v71_mock[1] == 0x55ull,
+                      "v71: arg2 = orig rdi (fd)");
+                CHECK(g_v71_mock[2] == 0x44ull,
+                      "v71: arg3 = orig rsi (buf)");
+                CHECK(g_v71_mock[3] == 0x33ull,
+                      "v71: arg4 = orig rdx (len)");
+                CHECK(g_v71_mock[4] == 0x22ull,
+                      "v71: arg5 = orig rcx (csp-класс = fd)");
+                CHECK(g_v71_mock[5] ==
+                      (unsigned long long)(uptr)&g_v71_scratch[256] - 8ull,
+                      "v71: arg6 = site rsp (тест = CALL-вход: +8 ret-слот "
+                      "vs реальный JMP-вход сайта; смещение = артефакт "
+                      "теста, НЕ префикса)");
+                CHECK(g_v71_mock[6] == 0x66ull,
+                      "v71: arg7 = ЖИВОЙ r8 (v65-класс: БЫЛО исходный rcx "
+                      "= run439 ad=0x212 при kernel addr=0)");
+                CHECK(g_v71_mock[7] == 0x77ull,
+                      "v71: arg8 = ЖИВОЙ r9 (v65-класс: БЫЛО sp-lea)");
+                CHECK(g_v71_mock[8] == 0x88ull,
+                      "v71: arg9 = живой r10 (fl)");
+                printf("    [v71-restore] rax=%llx rcx=%llx rdx=%llx "
+                       "rsi=%llx rdi=%llx r8=%llx r9=%llx r10=%llx\n",
+                       g_v71_real[0], g_v71_real[1], g_v71_real[2],
+                       g_v71_real[3], g_v71_real[4], g_v71_real[5],
+                       g_v71_real[6], g_v71_real[7]);
+                /* ВОССТАНОВЛЕНИЯ = ТОЛЬКО через g_v71_real (память, записан-
+                 * ная шаблоном): чтение '+r'-операндов v_r8/v_r9/v_r10 =
+                 * НЕНАДЁЖНО (GCC не пинит r8-r15 — репро-урок v71). */
+                CHECK(g_v71_real[0] == 0x11ull, "v71: rax восстановлен");
+                CHECK(g_v71_real[1] == 0x22ull, "v71: rcx восстановлен");
+                CHECK(g_v71_real[2] == 0x33ull, "v71: rdx восстановлен");
+                CHECK(g_v71_real[3] == 0x44ull, "v71: rsi восстановлен");
+                CHECK(g_v71_real[4] == 0x55ull, "v71: rdi восстановлен");
+                CHECK(g_v71_real[5] == 0x66ull, "v71: r8 восстановлен");
+                CHECK(g_v71_real[6] == 0x77ull, "v71: r9 восстановлен");
+                CHECK(g_v71_real[7] == 0x88ull, "v71: r10 восстановлен");
+                (void)v_rax; (void)v_rcx; (void)v_rdx; (void)v_rsi;
+                (void)v_rdi; (void)v_r8; (void)v_r9; (void)v_r10;
+            }
+        }
+#endif
         /* csp3: окно = 2+2+6+2+2 = 14 ровно (граница ДО f7 d8/errno-
          * хвоста — хвост исполняется jmp-back'ом на месте) */
         memset(str, 0, sizeof str);
@@ -29549,6 +29692,26 @@ static void test_lddet(void)
         g_tldd_site_hit = 0; g_tldd_site_ax = 0;
         rv = ((gid_fn)(uptr)pg)();
         CHECK(rv > 0, "v59: rv = getpid (>0)");
+        if (rv <= 0) {
+            /* v71-CI-диагноз: gcc-13-plain = rv<=0 при живом логгере
+             * (gcc-14 локально = PASS). Печатаем ВСЁ: rv, logger-ax,
+             * tramp-байты окна (сдвиг?), повторный вызов. */
+            printf("    [v71-cidbg] rv=%ld ax=%llx hit=%u\n", rv,
+                   (unsigned long long)g_tldd_site_ax, g_tldd_site_hit);
+            printf("    [v71-cidbg] win:");
+            for (q = 75u; q < 98u && q < tlen; q++)
+                printf(" %02x", trx[q]);
+            printf("\n    [v71-cidbg] pre:");
+            for (q = 0u; q < 75u; q++) printf(" %02x", trx[q]);
+            printf("\n");
+            rv = ((gid_fn)(uptr)pg)();
+            printf("    [v71-cidbg] retry rv=%ld\n", rv);
+            g_tldd_site_hit = 0;
+            rv = ((gid_fn)(uptr)pg)();
+            printf("    [v71-cidbg] retry2 rv=%ld hit=%u\n", rv,
+                   g_tldd_site_hit);
+            CHECK(rv > 0, "v59: rv = getpid (>0) [retry2]");
+        }
         CHECK(g_tldd_site_hit == 1, "v59: логгер видел вызов");
         /* rax на входе окна = ЕЩЁ мусор (b8 исполнится ПОСЛЕ логгера):
          * это ДОКУМЕНТИРОВАННО (шапка) — assert = живость, не значение */

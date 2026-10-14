@@ -16841,6 +16841,38 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             if (act == C2B_CL_DROP) return (ssize_t)len;   /* v2: дроп без отправки */
         }
     }
+    /* v74: CRT-FIX НА ГЛАВНОМ sendto-хуке — расконсервация мёртвого с v50
+     * кода. Доказано run467-pcap: 21 нативный [22][4c 00]-кадр движка
+     * (t+59..70, 2/s-ретраи, 512B-пад) прошёл ЭТОТ хук (sendto@plt =
+     * LD_PRELOAD-интерпозиция для всего процесса) и ушёл на wire
+     * НЕПЕРЕПИСАННЫМ: (а) главный хук не звал crt-rewrite ВООБЩЕ (все 3
+     * вызова = v52-детуры), (б) v52-детуры = за ra-гвардом, а ra при
+     * g_clp_sendto-прокладке из ЭТОГО хука = внутри текста моста => skip.
+     * Двойной промах = rewrite = dead code с v50 (ни одного 'crt-fix:'/
+     * 'v52: HIT' за все run). ЗДЕСЬ ra-гвард НЕ нужен: главный хук =
+     * внешний слой; synthetic [22][0d] = is_eng=false естественно нетронуты;
+     * собственные g_clp_sendto вызовы моста = минуют хук (RTLD_NEXT).
+     * Серт = капчурен на t+0 (crt-cap #1, 174B, REAL Steam-CA cert,
+     * 'expires ~48h') ЗАДОЛГО до движковых ретраев (t+59+). Кап 12 =
+     * C2B_CRT_CAP (21 ретраев: первые 12 переписаны, хвост = чисто). */
+    {
+        const u8 *pc74 = (const u8 *)buf;
+        if (pc74 && len >= 79u && len <= 640u && pc74[0] == 0x22) {
+            u8 crtbuf74[600];
+            u32 on74;
+            if (!g_crt_init) {
+                const char *ec74 = getenv("C2B_CRTFIX");
+                if (ec74 && ec74[0] == '1') g_crt_fix = 1;
+                g_crt_init = 1;
+            }
+            c2b_crt_maybe_capture(pc74, (u32)len);
+            on74 = c2b_crt_maybe_rewrite(pc74, (u32)len, crtbuf74,
+                                         (u32)sizeof crtbuf74);
+            if (on74)
+                return ((c2b_sendto_fn)g_clp_sendto)(fd, crtbuf74, on74,
+                                                     flags, addr, addrlen);
+        }
+    }
     /* 43f-g40: diag всех passthrough-отправок (см. комментарий выше) */
     {
         ssize_t r = ((c2b_sendto_fn)g_clp_sendto)(fd, buf, len, flags, addr, addrlen);

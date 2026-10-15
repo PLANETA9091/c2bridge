@@ -16674,6 +16674,12 @@ static void c2b_sn_maybe(void) { }
  * TLS = стабы могут зваться с любого треда GNS (16536/16803/...). Файл-
  * скоуп (по образцу g_crt_inwl); тела raw-машинерии = после sendmsg-хука. */
 __thread int g_raw_tls;
+/* v83: мост-готов-маркер (СТАТИК, не TLS — безопасен на любых тредах,
+ * включая fs=0 raw-clone). Ставится главным sendto-хуком СРАЗУ после
+ * ленивой g_clp-инициализации (см. sendto-хук) — до ЛЮБОЙ санки-вызова
+ * хелпера. До маркера хелперы = чистый passthrough: ноль getenv/TLS/лог
+ * — краш-класс run488 исключён при любом порядке старта. */
+static volatile u32 g_bridge_ready;
 /* v82b: TLS-стейджинг переписанных кадров для мид-хелперов fp44/fp46.
  * КОНТРАКТ санки: хелпер ВОЗВРАЩАЕТ (buf,len)/(msg,flags) = rax:rdx и
  * санка кладёт их в rsi/rdx ПЕРЕД syscall — стек хелпера мёртв к моменту
@@ -16705,6 +16711,13 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
         *__errno_location() = 2;            /* ENOENT */
         return -1;
     }
+    /* v83: мост-готов (СТАТИК, fs-независим) = сразу после ленивой g_clp-
+     * инициализации. Все санки-вызовы хелперов = ПОСЛЕ этой точки в хроно-
+     * логии старта (патч стабов = c2b_raw_maybe = на этом же первом вызо-
+     * ве, но выше по стеку главного хука — его собственный g_clp-вызов =
+     * уже за маркером; чужие треды между патчем и маркером = passthrough
+     * хелперов = краш-класс run488 исключён). */
+    g_bridge_ready = 1u;
     {
         /* 50f-v50: crt-класс ДО ветки addr — run395-урок: compat шлёт 0x22
          * через sendto(fd, buf, 512, 0, NULL, 0) на СОЕДИНЁННОМ сокете —
@@ -17404,6 +17417,11 @@ static c2b_fp2_t c2b_fp44_helper(unsigned long fd, const void *buf,
     const u8 *p = (const u8 *)buf;
     r.a = (unsigned long)buf;           /* passthrough по умолчанию */
     r.b = len;
+    /* v83: гвард мост-готов ДО любых TLS/getenv/лог-касаний (run488-урок:
+     * fs=0-треды/пред-иниц-коллеры = краш-класс; статик-чтение = безопасно
+     * на любом треде). Санка уже отфильтровала не-0x22 asm-гвардом; здесь
+     * = второй пояс (ранние 0x22 до инициализации моста). */
+    if (!g_bridge_ready) return r;
     g_raw_tls = 1;
     if (p && len >= 40ul && len <= 640ul && p[0] == 0x22) {
         u32 on;
@@ -17443,6 +17461,8 @@ static c2b_fp2_t c2b_fp46_helper(unsigned long fd, const void *msg,
     unsigned long blen = 0;
     r.a = (unsigned long)msg;           /* passthrough */
     r.b = flags;                        /* для sendmsg rdx = FLAGS */
+    /* v83: гвард мост-готов (см. fp44) — до любых TLS/лог-касаний. */
+    if (!g_bridge_ready) return r;
     g_raw_tls = 1;
     if (m && m->msg_iov && m->msg_iovlen >= 1ul) {
         if (m->msg_iov[0].iov_base && m->msg_iov[0].iov_len) {
@@ -17736,15 +17756,32 @@ static void c2b_raw_scan(void)
                          * активен) — e9 на C-энтри = ret pops локал =
                          * rip=1 (run475/476). Вместо C-энтри = САНКА:
                          * сэйв аргов -> хелпер (capture/census) ->
-                         * syscall в санке -> restore r8 -> jmp site+7. */
+                         * syscall в санке -> restore r8 -> jmp site+7.
+                         * v83: gap-сайт nr44 = САНКА С АСМ-ГВАРДОМ
+                         * (c2b_raw_thunk_gate): cmp byte [rsi],0x22 ДО
+                         * C-касаний — весь не-connreq трафик = чистый
+                         * passthrough (run488-урок: безусловная санка
+                         * на горячем стабе = крах старта на fs=0-тре-
+                         * дах/пред-иниц-коллерах). nr46-gap = старая
+                         * санка (rsi = msghdr*, байт-гвард невалиден;
+                         * реальных nr46-gap окон в libc = 0). */
                         unsigned long long hfn = (nr == 44u)
                             ? (unsigned long long)(unsigned long)
                               &c2b_fp44_helper
                             : (unsigned long long)(unsigned long)
                               &c2b_fp46_helper;
-                        if (!c2b_raw_thunk((u8 *)pg, 0x1000u, hfn, nr,
-                                           (unsigned long long)pg,
-                                           site + (unsigned long long)pl)) {
+                        u32 tl;
+                        if (isgap && nr == 44u)
+                            tl = c2b_raw_thunk_gate(
+                                (u8 *)pg, 0x1000u, hfn,
+                                (unsigned long long)pg,
+                                site + (unsigned long long)pl);
+                        else
+                            tl = c2b_raw_thunk(
+                                (u8 *)pg, 0x1000u, hfn, nr,
+                                (unsigned long long)pg,
+                                site + (unsigned long long)pl);
+                        if (!tl) {
                             munmap(pg, 0x1000u);
                             continue;
                         }
@@ -31884,6 +31921,47 @@ static void test_raw(void)
         CHECK(c2b_raw_thunk(th, sizeof th, 1ull, 44u,
                             0x90000000ull, 0x1000ull) == 0u,
               "v77c: back < pg+0x70 за пределами rel32 = отказ");
+    }
+    /* ---- v83: санка с асм-гвардом = 120B байт-строгий лэйаут ---- */
+    {
+        u8 th[256];
+        u32 tl;
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk_gate(th, sizeof th, 0x1122334455667788ull,
+                                0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 117u, "v83: гвард-санка = 117B");
+        CHECK(th[0x21u] == 0x80u && th[0x22u] == 0x3eu &&
+              th[0x23u] == 0x22u,
+              "v83: cmp byte [rsi],0x22 @0x21 (80 3e 22)");
+        CHECK(th[0x24u] == 0x75u && th[0x25u] == 0x27u,
+              "v83: jne +0x27 @0x24 (skip до 0x4d, до перезагрузок)");
+        CHECK(th[0x3eu] == 0x48u && th[0x3fu] == 0xb8u &&
+              th[0x40u] == 0x88u && th[0x43u] == 0x55u,
+              "v83: movabs rax,helper @0x3e (imm64 = 0x1122334455667788)");
+        CHECK(th[0x48u] == 0xffu && th[0x49u] == 0xd0u,
+              "v83: call rax @0x48");
+        CHECK(th[0x4au] == 0x48u && th[0x4bu] == 0x89u &&
+              th[0x4cu] == 0xc6u,
+              "v83: mov rsi,rax @0x4a (buf из хелпера)");
+        CHECK(th[0x60u] == 0xb8u && th[0x61u] == 0x2cu &&
+              th[0x62u] == 0u,
+              "v83: mov eax,44 @0x60 (только nr44 — nr46-гвард невалиден)");
+        CHECK(th[0x65u] == 0x0fu && th[0x66u] == 0x05u,
+              "v83: syscall @0x65");
+        CHECK(th[0x70u] == 0xe9u,
+              "v83: e9 jmp-back @0x70");
+        /* rel32 = back - (pg+0x75) = 0x1060 - 0x1075 = -0x15 = 0xffffffeb */
+        CHECK(th[0x71u] == 0xebu && th[0x72u] == 0xffu &&
+              th[0x73u] == 0xffu && th[0x74u] == 0xffu,
+              "v83: rel32 = back-(pg+0x75) = -0x15 LE");
+        /* кап-гвард: 112 < need 117 => отказ (старый кап недостаточен) */
+        CHECK(c2b_raw_thunk_gate(th, 112u, 1ull,
+                                 0x1000ull, 0x2000ull) == 0u,
+              "v83: cap=112 = отказ (нужно 117)");
+        /* назад на 2GB+ = отказ */
+        CHECK(c2b_raw_thunk_gate(th, sizeof th, 1ull,
+                                 0x90000000ull, 0x1000ull) == 0u,
+              "v83: back < pg+0x75 за пределами rel32 = отказ");
     }
 }
 

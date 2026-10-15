@@ -333,6 +333,89 @@ static u32 c2b_raw_thunk(u8 *t, u32 cap, unsigned long long helper, u32 nr,
     return i;
 }
 
+/* v83 pure: САНКА С АСМ-ГВАРДОМ (nr44 ТОЛЬКО). РЕАЛЬНЫЙ УРОК run488:
+ * безусловная санка на ГОРЯЧЕМ sendto-стабе (0x12c375) = крах старта —
+ * С:ЛЮЧАЙНЫЕ ранние/чужие sendto-коллеры (сырые clone-треды с fs=0, пре-
+ * д-инициализационный хук-слой) умирали на TLS/getenv/лог-касаниях хел-
+ * пера (SEGV addr=0xffffffffffffeab8 = fs-относительный доступ при fs=0,
+ * rax=1 = dlsym-fail-сентинел). ФИКС = гвард В САМНЕЙ САНКЕ, чистый asm:
+ *   cmp byte [rsi], 0x22      ; 80 3e 22 — только connreq-класс (движковые
+ *                             ; 0x22 + мостовые 0x22 = GNS/netcode-треды =
+ *                             ; pthreads = fs-валидные) входит в C-слой
+ *   jne .skip                 ; 75 28 — весь остальной трафик = ЧИСТЫЙ
+ *                             ; passthrough (ноль C-касаний = ноль краша)
+ * Контракт хелпера/санки = ИДЕНТИЧЕН 112B-версии (rax:rdx = (buf,len)),
+ * skip-путь = ВСЕ регистры оригинальные (гвард стоит ДО перезагрузок —
+ * rdi/rsi/rdx/r10/r8/r9 не тронуты, reload = те же значения).
+ * Лэйаут (0x75 = 117B):
+ *  00 sub rsp,0x40 | 04..1c сэйвы rdi/rsi/rdx/r10/r8/r9 (disp8!)
+ *  21 80 3e 22 (cmp) | 24 75 27 (jne -> 4d)
+ *  26..3d перезагрузки rdi/rsi/rdx/rcx/r8 | 3e movabs rax,helper
+ *  48 call rax | 4a mov rsi,rax
+ *  4d..5f reload rdi/r10/r8/r9 | 60 mov eax,44 | 65 syscall
+ *  67 restore r8 | 6c add rsp,0x40 | 70 e9 rel32 (next = pg+0x75)
+ * nr46 = ЗАПРЕЩЁН (rsi = msghdr*, первый байт = не пейлоад — гвард неве-
+ * рен): старая 112B-санка. back = site + ПОЛНАЯ длина окна (как v82c). */
+static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
+                              unsigned long long pg, unsigned long long back)
+{
+    u32 i = 0, q;
+    i32 rel;
+    if (!t || cap < 117u) return 0u;
+    {
+        long long d = (long long)(back - (pg + 0x75ull));
+        if (d > 2147483647ll || d < -2147483648ll) return 0u;
+        rel = (i32)d;
+    }
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xecu; t[i++] = 0x40u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    t[i++] = 0x80u; t[i++] = 0x3eu; t[i++] = 0x22u;    /* cmp [rsi],0x22 */
+    t[i++] = 0x75u; t[i++] = 0x27u;                    /* jne -> +0x27 */
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x48u; t[i++] = 0xb8u;
+    for (q = 0; q < 8u; q++) t[i + q] = (u8)((helper >> (q * 8u)) & 0xffu);
+    i += 8u;
+    t[i++] = 0xffu; t[i++] = 0xd0u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0xc6u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    t[i++] = 0xb8u; t[i++] = 0x2cu; t[i++] = 0u; t[i++] = 0u; t[i++] = 0u;
+    t[i++] = 0x0fu; t[i++] = 0x05u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xc4u; t[i++] = 0x40u;
+    t[i++] = 0xe9u;
+    t[i++] = (u8)((u32)rel & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 8) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 16) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 24) & 0xffu);
+    if (i != 117u) return 0u;
+    return i;
+}
+
 /* v77 pure: СИСТЕМНЫЙ класс путей (libc/libpthread и родня). Эти регионы
  * = исключены v75b-фильтром (рекурсия-страховка), НО их raw-стабы = посы-
  * латель нативной ланы (run474). Патчим ТОЛЬКО со строгим glibc-хвостом

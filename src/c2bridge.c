@@ -20534,24 +20534,35 @@ static u32 c2b_cvx_gate(u32 on, u32 fires, u32 val, u32 achal,
     return (achal && a_new && delay_ok) ? 1u : 0u;
 }
 
-/* ---------- v107.0: PCX — ПАРНЫЙ КАДЕНС ГРАНТОВ (0x22 + вербатим-'k') ----
+/* ---------- v107.0→v107.1: PCX — ПАРНЫЙ КАДЕНС ГРАНТОВ (0x22 + 'k') ----
  * ЦЕНЗ run529/530 (census v3 = scripts/run529_grant_context.py): ВСЕ
  * x11/11 серверных 'B.'-грантов (run526 x9, run528 x1, run529 x1) следуют
  * за бэктум-бэктум ПАРОЙ "0x22 + прямой 513B-'k'" в окне ~70 строк;
  * kdr-VAL/0 и cvx-'connect0x' ячейки НИКОГДА не грантованы => ГРАНТ =
  * СОБЫТИЕ ПАРНОГО КАДЕНСА (первый провоцируемый кандидат-рычаг).
- * Эксперимент: ПОСЛЕ kdr A/B (окна ответов чисты) мост сам стреляет
- * парами: элемент #1 = сташ wire-формы 0x22 (пост-crt-fix rewrite),
- * элемент #2 = вербатим g_kfull (identity-чал = c2b_kdr_build с чалом
- * самого фрейма). x6 пар, межпарный гэп 2 тика (тик ≈ 65-150 строк
- * позднего рана; начальный гэп 3 тика после kdr#2 — run528/530-урок:
- * фиксированные большие гэпы = рулетка конца рана). Гонка g_kfull =
- * двойное чтение g_kfull_n (дисциплина k27k). Чал НЕ патчится (v1 =
- * вербатим-ячейка: если пара грантует — свежесть чала 0x22 не обязательна;
- * если тихо — v2 = патч чала 0x22 в живой счётчик 'A'). Кап 6 пар,
+ * v107.0 = вербатим-ячейка (run531: 6/6 пар механически идеальны: сташ
+ * 252B fb-own-cert + вербатим g_kfull, полные send-длины) = ТИХО-НЕГАТИВ:
+ * 0 грантов в post-парном окне при живом сервере (9 g16 recv) => дельта
+ * движковых (грантующих) пар = (а) СВЕЖЕСТЬ: движок несёт живой счётчик-
+ * чал, pcx-'k' — устаревший g_kfull-чал (0xb4eb9d6f к моменту пары), сташ
+ * 0x22 — ТОТ ЖЕ кадр x6 (кандидат replay-подавления); (б) ЭНДПОИНТ
+ * (движок шлёт с своего сокета, pcx — с мостового g_clv2_fd).
+ * v107.1 = ФИКС СВЕЖЕСТИ (дешёвый первый шаг): каждая пара патчится
+ * ЖИВЫМ счётчиком 'A' (g95-сташ g_cvx_achal, стор на нитке recv =
+ * естественная атомарность, дисциплина cstate-slice run519): 'k'
+ * chal@13..16 = LE32 через валидированный c2b_kdr_build; 0x22
+ * chal8@7..14 = МЛАДШИЕ 32 бита = LE32 того же счётчика, СТАРШИЕ 4 байта
+ * СОХРАНЕНЫ (движковый chal8 = полный 64-бит: v50f_want = a9 24 ac f6 |
+ * f1 3a 71 19; сохранение = минимальная дельта от v1-формы = чистый A/B
+ * "свежесть чала"; зануление = новая переменная = загрязнение).
+ * Если v2 тих при грантующих нативных парах => гипотеза ЭНДПОИНТА
+ * усиливается => следующий шаг = реле пары через сокет движка (g130-
+ * путь, более инвазивный класс — дизайн сначала). x6 пар, межпарный
+ * гэп 2 тика, начальный 3 (рулетка конца рана = урок run528/530). Гонка
+ * g_kfull = снап + двойное чтение g_kfull_n (дисциплина k27k). Кап 6,
  * killswitch C2B_PCX=0. Always-остров = selftest-видимость. */
 static u32 c2b_pcx_gate(u32 on, u32 pairs, u32 kdr_done, u32 have22,
-                        u32 klen, u32 gap_ok)
+                        u32 klen, u32 gap_ok, u32 have_chal)
 {
     if (!on) return 0;
     if (pairs >= 6u) return 0;           /* кап 6 пар */
@@ -20559,7 +20570,30 @@ static u32 c2b_pcx_gate(u32 on, u32 pairs, u32 kdr_done, u32 have22,
     if (!have22) return 0;               /* нет wire-формы 0x22 */
     if (klen < 32u || klen > 1200u) return 0;
     if (!gap_ok) return 0;
+    if (!have_chal) return 0;            /* v107.1: нет живого счётчика 'A' */
     return 1;
+}
+
+/* v107.1: свежий 0x22 для pcx-пары = копия сташа + chal8@7..14: младшие
+ * 32 бита = LE32 живого счётчика 'A', старшие 4 байта [11..14] СОХРАНЕНЫ
+ * (см. коммент v107.1). Гвард-форма = голова выхода c2b_crt_build
+ * ([0]=22 [1]=0d [2..5]=cid [6]=11 [7..14]=chal8 [15]=19 [16..23]=sid8
+ * [24]=22=f4-ключ серта). Возврат = длина (slen) или 0 (форма/кап/чал).
+ * Чистая функция (always-остров: selftest-видимость). */
+static u32 c2b_pcx_fresh22(const u8 *src, u32 slen, u32 chal,
+                           u8 *out, u32 cap)
+{
+    u32 i;
+    if (!src || !out) return 0;
+    if (slen < 25u || slen > cap) return 0;
+    if (chal == 0u) return 0;
+    if (src[0] != 0x22u || src[1] != 0x0du ||
+        src[6] != 0x11u || src[24] != 0x22u) return 0;
+    for (i = 0; i < slen; i++) out[i] = src[i];
+    out[7] = (u8)chal; out[8] = (u8)(chal >> 8);
+    out[9] = (u8)(chal >> 16); out[10] = (u8)(chal >> 24);
+    /* out[11..14] = старшие байты сташа — уже скопированы, сохранены */
+    return slen;
 }
 
 /* v106.7: g16-deep-dump длина = clamp(rlen, 0, 72). Чистая функция
@@ -20953,21 +20987,23 @@ static void c2b_cvx_maybe(void)
     C2B_LOGS("\n");
 }
 
-/* v107.0: PCX рантайм — см. блок у always-острова c2b_pcx_gate. Огонь =
- * тик g97 ПОСЛЕ kdr A/B; пара = 0x22 (сташ wire-формы пост-rewrite) затем
- * вербатим-'k' (g_kfull, identity-чал) бэктум-бэктум двумя sendto
- * (b2e/kdr-проверенный путь g_clv2_fd -> 152.233.19.133:28022). x6 пар,
- * межпарный гэп 2 тика, начальный 3 (рулетка конца рана = урок run528/530).
- * Гонка g_kfull = снап + двойное чтение g_kfull_n (дисциплина k27k);
- * identity-чал = c2b_kdr_build с чалом самого фрейма (валидированный билдер
- * + шейп-гвард ff×4+'k' бесплатно). */
+/* v107.0→v107.1: PCX рантайм — см. блок у always-острова c2b_pcx_gate.
+ * Огонь = тик g97 ПОСЛЕ kdr A/B; пара = 0x22 (сташ + ЖИВЫЙ чал v107.1)
+ * затем 'k' (g_kfull + ТОТ ЖЕ живой счётчик через c2b_kdr_build) бэктум-
+ * бэктум двумя sendto (b2e/kdr-проверенный путь g_clv2_fd ->
+ * 152.233.19.133:28022). x6 пар, межпарный гэп 2 тика, начальный 3
+ * (рулетка конца рана = урок run528/530). Гонка g_kfull = снап +
+ * двойное чтение g_kfull_n (дисциплина k27k); v107.1: чал снапится
+ * ОДИН раз до обеих сборок = пара несёт ОДИН консистентный живой чал
+ * ('A'-счётчик; стор только !=0 на нитке recv => значение между гейтом
+ * и чтением может лишь обновиться до нового не-нулевого = консистентно). */
 static u32 g_pcx_init, g_pcx_on = 1, g_pcx_pairs, g_pcx_tick;
 static u32 g_pcx_seen_kdr, g_pcx_delay;
 
 static void c2b_pcx_maybe(void)
 {
-    static u8 snap[1200], kout[1200];
-    u32 klen, chal, i, fl, n1, n2;
+    static u8 snap[1200], kout[1200], buf22[C2B_PCX_22MAX];
+    u32 klen, chal, len22, i, fl, n1, n2;
     const volatile u8 *fp;
     u8 sa[16];
     ssize_t sr22, srk;
@@ -20976,7 +21012,7 @@ static void c2b_pcx_maybe(void)
         if (e && e[0] == '0') g_pcx_on = 0;
         g_pcx_init = 1;
         if (g_pcx_on)
-            C2B_LOGS("[c2b] pcx: ARMED (v107.0 PAIR-CADENCE 0x22+verbatim-k cap 6 gap 2t post-kdr)\n");
+            C2B_LOGS("[c2b] pcx: ARMED (v107.1 FRESH-CHAL pair-cadence 0x22+k chal=A-counter cap 6 gap 2t post-kdr)\n");
     }
     if (!g_pcx_on) return;
     if (g_pcx_pairs >= 6u) return;
@@ -20989,8 +21025,11 @@ static void c2b_pcx_maybe(void)
     if (!c2b_pcx_gate(g_pcx_on, g_pcx_pairs, g_pcx_seen_kdr,
                       g_pcx_22_len, g_kfull_len,
                       (g_pcx_delay >= ((g_pcx_pairs == 0u) ? 3u : 2u))
-                          ? 1u : 0u))
+                          ? 1u : 0u,
+                      (g_cvx_achal != 0u) ? 1u : 0u))
         return;
+    chal = g_cvx_achal;    /* v107.1: живой счётчик 'A' (см. коммент выше) */
+    if (!chal) return;
     /* вербатим-снап g_kfull с гонка-чеком (дисциплина k27k) */
     n1 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
     fl = g_kfull_len;
@@ -21000,20 +21039,27 @@ static void c2b_pcx_maybe(void)
     for (i = 0; i < fl; i++) snap[i] = fp[i];
     n2 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
     if (n2 != n1) return;                     /* гонка — скип, пара позже */
-    chal = (u32)snap[13] | ((u32)snap[14] << 8) |
-           ((u32)snap[15] << 16) | ((u32)snap[16] << 24);
-    /* identity-чал = вербатим через валидированный билдер (шейп-гвард) */
+    /* элемент #2 сборка: 'k' с ЖИВЫМ чалом @13..16 (валидированный
+     * билдер + шейп-гвард ff×4+'k' бесплатно) */
     if (!c2b_kdr_build(snap, fl, chal, kout, (u32)sizeof kout, &klen)) return;
+    /* элемент #1 сборка: 0x22 с ЖИВЫМ чалом (младшие 32 бита chal8;
+     * старшие 4 = сохранённые байты сташа) */
+    len22 = c2b_pcx_fresh22(g_pcx_22, g_pcx_22_len, chal,
+                            buf22, (u32)sizeof buf22);
+    if (!len22) {
+        C2B_LOGS("[c2b] pcx: fresh22 build=0 (форма сташа?) — скип\n");
+        return;                    /* ретрай на следующем тике (гэп стоит) */
+    }
     for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
     sa[0] = 2;                     /* AF_INET (LE) */
     sa[2] = 0x6d; sa[3] = 0x76;    /* порт 28022 BE */
     sa[4] = 152; sa[5] = 233; sa[6] = 19; sa[7] = 133;
-    /* элемент #1: 0x22 (сташ wire-формы) */
+    /* элемент #1: 0x22 (свежий чал) */
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
         sr22 = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd,
-                                             (const void *)g_pcx_22,
-                                             g_pcx_22_len, 0,
+                                             (const void *)buf22,
+                                             len22, 0,
                                              (const struct sockaddr *)sa, 16);
     } else {
         g_probe_active = 0;
@@ -21021,8 +21067,8 @@ static void c2b_pcx_maybe(void)
         return;
     }
     g_probe_active = 0;
-    /* элемент #2: вербатим-'k' — бэктум-бэктум (прецедент: k на +1 строке
-     * после 0x22; у моста = тот же тик, подряд) */
+    /* элемент #2: 'k' (тот же живой чал) — бэктум-бэктум (прецедент: k на
+     * +1 строке после 0x22; у моста = тот же тик, подряд) */
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
         srk = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)kout,
@@ -21038,11 +21084,11 @@ static void c2b_pcx_maybe(void)
     g_pcx_delay = 0;
     C2B_LOGS("[c2b] pcx: pair #");
     C2B_LOGN(g_pcx_pairs);
-    C2B_LOGS(" len22=");
-    C2B_LOGN(g_pcx_22_len);
+    C2B_LOGS(" v2 len22=");
+    C2B_LOGN(len22);
     C2B_LOGS(" lenk=");
     C2B_LOGN(klen);
-    C2B_LOGS(" kchal=");
+    C2B_LOGS(" chal=");
     C2B_LOGH(chal);
     C2B_LOGS(" rc22=");
     C2B_LOGN((u32)(sr22 < 0 ? (u32)-1 : (u32)sr22));
@@ -33683,16 +33729,53 @@ static void test_swr(void)
     CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 1, 0) == 0, "cvx: fire#2 без события 'A' = скип");
     CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 0, 1) == 0, "cvx: fire#2 гэп<10 = скип");
     CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 1, 1) == 1, "cvx: fire#2 ok (событие+гэп)");
-    /* v107.0: pcx gate x9 (парный каденс грантов) */
-    CHECK(c2b_pcx_gate(0, 0, 1, 59, 513, 1) == 0, "pcx: on=0 = скип");
-    CHECK(c2b_pcx_gate(1, 6, 1, 59, 513, 1) == 0, "pcx: кап 6 пар = скип");
-    CHECK(c2b_pcx_gate(1, 0, 0, 59, 513, 1) == 0, "pcx: kdr не доделан = скип");
-    CHECK(c2b_pcx_gate(1, 0, 1, 0, 513, 1) == 0, "pcx: без сташа 0x22 = скип");
-    CHECK(c2b_pcx_gate(1, 0, 1, 59, 16, 1) == 0, "pcx: klen<32 = скип");
-    CHECK(c2b_pcx_gate(1, 0, 1, 59, 1201, 1) == 0, "pcx: klen>1200 = скип");
-    CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 0) == 0, "pcx: гэп не готов = скип");
-    CHECK(c2b_pcx_gate(1, 5, 1, 59, 513, 1) == 1, "pcx: 5-я пара ок (кап 6)");
-    CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 1) == 1, "pcx: пара ok");
+    /* v107.1: pcx gate x10 (парный каденс + живой чал) */
+    CHECK(c2b_pcx_gate(0, 0, 1, 59, 513, 1, 1) == 0, "pcx: on=0 = скип");
+    CHECK(c2b_pcx_gate(1, 6, 1, 59, 513, 1, 1) == 0, "pcx: кап 6 пар = скип");
+    CHECK(c2b_pcx_gate(1, 0, 0, 59, 513, 1, 1) == 0, "pcx: kdr не доделан = скип");
+    CHECK(c2b_pcx_gate(1, 0, 1, 0, 513, 1, 1) == 0, "pcx: без сташа 0x22 = скип");
+    CHECK(c2b_pcx_gate(1, 0, 1, 59, 16, 1, 1) == 0, "pcx: klen<32 = скип");
+    CHECK(c2b_pcx_gate(1, 0, 1, 59, 1201, 1, 1) == 0, "pcx: klen>1200 = скип");
+    CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 0, 1) == 0, "pcx: гэп не готов = скип");
+    CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 1, 0) == 0, "pcx: нет живого чала = скип");
+    CHECK(c2b_pcx_gate(1, 5, 1, 59, 513, 1, 1) == 1, "pcx: 5-я пара ок (кап 6)");
+    CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 1, 1) == 1, "pcx: пара ok");
+    /* v107.1: pcx fresh22 x9 (свежий чал в сташе 0x22) */
+    {
+        /* голова = реальная форма v50f_want (252B) + 5Б хвост-маркеров */
+        static const u8 src22[30] = {
+            0x22, 0x0d, 0xb5, 0x64, 0xc2, 0x69, 0x11, 0xa9, 0x24, 0xac,
+            0xf6, 0xf1, 0x3a, 0x71, 0x19, 0x19, 0xdb, 0x5a, 0xf5, 0x28,
+            0x01, 0x00, 0x10, 0x01, 0x22, 0xae, 0x01, 0xde, 0xad, 0xbe
+        };
+        u8 o22[40], bad22[40];
+        u32 k22;
+        CHECK(c2b_pcx_fresh22(src22, sizeof src22, 0x8ce18b7bu,
+                              o22, sizeof o22) == sizeof src22,
+              "pcx-fresh22: ok = slen");
+        CHECK(o22[7] == 0x7b && o22[8] == 0x8b && o22[9] == 0xe1 &&
+              o22[10] == 0x8c, "pcx-fresh22: chal LE32 @7..10");
+        CHECK(o22[11] == 0xf1 && o22[12] == 0x3a && o22[13] == 0x71 &&
+              o22[14] == 0x19, "pcx-fresh22: старшие 4 байта сохранены");
+        CHECK(o22[0] == 0x22 && o22[1] == 0x0d && o22[6] == 0x11 &&
+              o22[15] == 0x19 && o22[24] == 0x22 && o22[29] == 0xbe,
+              "pcx-fresh22: голова+хвост нетронуты");
+        CHECK(c2b_pcx_fresh22(src22, sizeof src22, 0, o22, sizeof o22) == 0,
+              "pcx-fresh22: chal=0 = 0");
+        CHECK(c2b_pcx_fresh22(src22, 24, 0x8ce18b7bu, o22, sizeof o22) == 0,
+              "pcx-fresh22: slen<25 = 0");
+        CHECK(c2b_pcx_fresh22(src22, sizeof src22, 0x8ce18b7bu,
+                              o22, 20) == 0, "pcx-fresh22: cap<slen = 0");
+        CHECK(c2b_pcx_fresh22(0, 30, 0x8ce18b7bu, o22, sizeof o22) == 0,
+              "pcx-fresh22: NULL src = 0");
+        for (k22 = 0; k22 < 30; k22++) bad22[k22] = src22[k22];
+        bad22[6] = 0x12;
+        CHECK(c2b_pcx_fresh22(bad22, 30, 0x8ce18b7bu, o22, sizeof o22) == 0,
+              "pcx-fresh22: src[6]!=0x11 = 0");
+        bad22[6] = 0x11; bad22[24] = 0x29;
+        CHECK(c2b_pcx_fresh22(bad22, 30, 0x8ce18b7bu, o22, sizeof o22) == 0,
+              "pcx-fresh22: src[24]!=0x22 = 0");
+    }
     /* v106.8: cvx build x6 */
     {
         u8 co8[32];

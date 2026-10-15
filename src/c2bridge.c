@@ -17286,6 +17286,10 @@ static u32 g_raw_gm2;           /* v87b: рычаг C2B_GATEMODE=2 — passthrou
  * 488/491/492/493: зелёный ран = C-слой (хелперы/главный хук/энтри);
  * краш = санка-асм vs контекст окна. Дефолт '0' = хелпер-санка (v84). */
 static u32 g_raw_gm2_logged;    /* v87b: одноразовый лог режима санки */
+static volatile u64 g_gap_undo_site; /* v88: сайт gap-санки для UNDO-экспе-
+ * римента (ставится после верифицированного патча; 0 = нет) */
+static u32 g_undo_ms;           /* v88: задержка отката C2B_UNDO (мс) */
+static u32 g_undo_armed;        /* v88: тред отката = создан (one-shot) */
 static u32 g_raw_logn, g_raw_done, g_raw_anon;
 static u64 g_raw_seen[64];
 static u32 g_raw_seen_n;
@@ -17789,6 +17793,17 @@ static void c2b_raw_scan(void)
                          * (бисект краш-триады; см. c2b_raw_thunk_pass). */
                         eg = getenv("C2B_GATEMODE");
                         if (eg && eg[0] == '2') g_raw_gm2 = 1u;
+                        /* v88: C2B_UNDO=<мс> = откат 6-го патча через <мс
+                         * после скана — (alpha)-теория A/B: анти-тампер
+                         * периодический => выживает при откате; механика
+                         * => смерть независимо. 0 = выкл (дефолт). */
+                        eg = getenv("C2B_UNDO");
+                        if (eg && eg[0] >= '1' && eg[0] <= '9') {
+                            u32 uv = 0;
+                            while (*eg >= '0' && *eg <= '9')
+                                uv = uv * 10u + (u32)(*eg++ - '0');
+                            g_undo_ms = uv;
+                        }
                         g_raw_gap_init = 1u;
                     }
                     if (g_raw_gap_on) {
@@ -18033,6 +18048,11 @@ static void c2b_raw_scan(void)
                         C2B_LOGS("\n");
                         if (regs[ri].sys) g_raw_patched_sys++;
                         else g_raw_patched++;
+                        /* v88: gap-сайт запомнен для UNDO-треда (после
+                         * верифицированного патча; nr44 = b8 2c 00 00 00
+                         * 0f 05 = оригинальные 7Б для отката). */
+                        if (regs[ri].sys && isgap && nr == 44u)
+                            g_gap_undo_site = site;
                     } else {
                         C2B_LOGS("[c2b] v75: verify-FAIL site=");
                         c2b_gp_lh64(site);
@@ -18061,6 +18081,73 @@ static void c2b_raw_scan(void)
     C2B_LOGS("\n");
 }
 
+/* v88: UNDO-тред — (alpha)-теория A/B (run494-урок: смерть движка от
+ * САМОГО ФАКТА 6-го патча при ноль-C-санке; кандидаты: анти-тампер-чек
+ * против механики). Откат = ЗЕРКАЛО v85 rel32-first инсталла (без CC,
+ * без рваных состояний в ЛЮБОЙ момент):
+ *   ф1: 1Б @site+0: e9 -> b8 (АТОМАРНО; imm32 = ЕЩЁ rel32 => промежу-
+ *       точное окно = 'mov eax,<мусорный nr>' = ENOSYS, НИКАКОГО прыжка);
+ *   ф2: 4Б @site+1: <rel32> -> 2c 00 00 00 (оригинальный imm32 nr=44) —
+ *       окно = ПОЛНЫЙ оригинал 'b8 2c 00 00 00 0f 05'.
+ * Верификация преадом; лог с результатом. Тред = один выстрел (site и
+ * задержка фиксированы на момент скана). */
+static void *c2b_raw_undo_thread(void *a)
+{
+    unsigned long long site = (unsigned long long)(unsigned long)a;
+    long long fd, wr;
+    u8 buf[8];
+    /* open/close = блок-скоуп extern (g24-паттерн — как в скане; pread/
+     * pwrite = глобальные декларации, строка 97). */
+    extern i32 open(const char *, i32, ...);
+    extern i32 close(i32);
+    (void)a;
+    usleep(g_undo_ms * 1000u);
+    fd = (long long)open("/proc/self/mem", 2 /*O_RDWR*/);
+    if (fd < 0) {
+        C2B_LOGS("[c2b] v88: undo open-fail\n");
+        return (void *)0;
+    }
+    /* ф1: e9 -> b8 (атомарно) */
+    buf[0] = 0xb8u;
+    wr = pwrite((i32)fd, buf, 1u, (uptr)site);
+    if (wr != 1) {
+        C2B_LOGS("[c2b] v88: undo ф1-fail site=");
+        c2b_gp_lh64(site);
+        C2B_LOGS("\n");
+        close((i32)fd);
+        return (void *)0;
+    }
+    __sync_synchronize();
+    /* ф2: imm32 = 2c 00 00 00 (оригинальный nr 44) */
+    buf[0] = 0x2cu; buf[1] = 0u; buf[2] = 0u; buf[3] = 0u;
+    wr = pwrite((i32)fd, buf, 4u, (uptr)(site + 1ull));
+    if (wr != 4) {
+        C2B_LOGS("[c2b] v88: undo ф2-fail site=");
+        c2b_gp_lh64(site);
+        C2B_LOGS("\n");
+        close((i32)fd);
+        return (void *)0;
+    }
+    __sync_synchronize();
+    /* верификация: полный оригинал b8 2c 00 00 00 0f 05 */
+    if (pread((i32)fd, buf, 7u, (uptr)site) == 7 &&
+        buf[0] == 0xb8u && buf[1] == 0x2cu && buf[2] == 0u &&
+        buf[3] == 0u && buf[4] == 0u && buf[5] == 0x0fu &&
+        buf[6] == 0x05u) {
+        C2B_LOGS("[c2b] v88: gap UNDONE site=");
+        c2b_gp_lh64(site);
+        C2B_LOGS(" delay_ms=");
+        C2B_LOGD(g_undo_ms);
+        C2B_LOGS("\n");
+    } else {
+        C2B_LOGS("[c2b] v88: undo verify-FAIL site=");
+        c2b_gp_lh64(site);
+        C2B_LOGS("\n");
+    }
+    close((i32)fd);
+    return (void *)0;
+}
+
 /* свиньячок: one-shot (8 попыток, шаг 2с, стоп при patched>0). */
 static void c2b_raw_maybe(void)
 {
@@ -18078,6 +18165,23 @@ static void c2b_raw_maybe(void)
     if (__sync_lock_test_and_set(&g_raw_busy, 1u)) return;
     g_raw_scans++;
     c2b_raw_scan();
+    /* v88: UNDO-тред = один выстрел после скана (site = запомнен сканом;
+     * задержка = C2B_UNDO мс). Создание здесь = паттерн v58-супервизора
+     * (pthread_create из ленивого пути главного хука = доказан зелёным). */
+    if (g_gap_undo_site && g_undo_ms && !g_undo_armed) {
+        void *utid = 0;
+        g_undo_armed = 1u;
+        if (pthread_create(&utid, (const void *)0, c2b_raw_undo_thread,
+                           (void *)(unsigned long)g_gap_undo_site) != 0) {
+            C2B_LOGS("[c2b] v88: undo pthread_create failed\n");
+        } else {
+            C2B_LOGS("[c2b] v88: undo thread armed site=");
+            c2b_gp_lh64(g_gap_undo_site);
+            C2B_LOGS(" delay_ms=");
+            C2B_LOGD(g_undo_ms);
+            C2B_LOGS("\n");
+        }
+    }
     if (g_raw_scans >= C2B_RAW_MAXSCANS) {
         g_raw_done = 1;
         C2B_LOGS("[c2b] v75: done scans=");

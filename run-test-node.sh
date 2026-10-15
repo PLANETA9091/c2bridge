@@ -744,6 +744,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     2) MODES="$MODES C2B_GATEMODE=2" ;;
     *) : ;;
   esac
+  # v88: undo (workflow input undo -> C2B_UNDO_V). '<ms>' = UNDO-экспе-
+  # римент: после скана one-shot тред спит <ms> и откатывает 6-й сайт
+  # 2-фазным зеркалом rel32-first (1Б e9->b8 = ENOSYS-промежуток, затем
+  # 4Б imm32=2c000000 = полный оригинал). (alpha)-теория A/B: выживание =
+  # анти-тампер периодический; смерть = механика e9-эпохи. Дефолт '0' =
+  # без отката (патч остаётся). Имеет смысл только с gap=1.
+  case "${C2B_UNDO_V-0}" in
+    0) : ;;
+    *) MODES="$MODES C2B_UNDO=$C2B_UNDO_V" ;;
+  esac
   # v75: raw-syscall стаб-патчер (workflow input gpr -> C2B_GPR_V).
   # Дефолт '1' = ARMED (раунд-эксперимент: сырые GNS-стабы движка
   # редиректятся в хуки = crt-класс получает нативные 0x22). Откат =

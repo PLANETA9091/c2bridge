@@ -111,6 +111,12 @@ on:
         required: false
         type: choice
         options: ["0", "2"]
+      undo:
+        description: "v88: the UNDO experiment (C2B_UNDO=<ms>, needs gap=1): after the scan patches the hot gap window, a one-shot thread sleeps <ms> and restores the ORIGINAL bytes via the 2-phase mirror of the rel32-first install (1B e9->b8 atomic = the ENOSYS intermediate, then 4B imm32=2c000000). run494 = the crash-triad bisect CLOSED (the C-layer exonerated: the passthrough-only sanka = the IDENTICAL crash) and the fault-site = the ENGINE'S OWN anon glibc-wrapper CLONE (a syscall gateway holding &sendto) dying via EFAULT pipe-writes + a NULL-TCB TLS SEGV. This lever tests the ANTI-TAMPER theory: the survival (green run to menu/connect) = the check is periodic/late-epoch and the tamper is only detected while present; the death = the mechanical effect (the e9 epoch itself). '0' (default) = no undo (the patch stays)."
+        default: "0"
+        required: false
+        type: choice
+        options: ["0", "1500", "3000", "6000"]
       crtfix:
         description: "v82: the crt-rewrite ARM (C2B_CRTFIX=1): the engine's BROKEN 0x22 connreq is rewritten IN-FLIGHT into the accepted modern form. run485 pcap field-walk: the engine's form is now [22][fb 00] 254B WITH the native cert INSIDE (f4=174B = the cert-inject works) but (1) the legacy u16-LE prefix = invalid protobuf under the modern parser (f31/wt3), (2) f2 = wt2 without LEN (the v50 bug lives), (3) f7 unsigned 38B => the server silently re-challenges forever. Rewrite = [22][0d cid][11 chal][19 sid][22 cert][29 ts][30 ping][3a f7-engine] = the exact form the server already 0x23-ConnectOK'd (run485 session ports). '0' (default) = the run479-485 behavior (passive cert capture only)."
         default: "0"
@@ -203,6 +209,9 @@ jobs:
       # in MODES = the passthrough-only sanka, zero C-entries). Default '0'
       # = the v84 helper-call sanka. Meaningful only with gap=1.
       C2B_GATEMODE_V: ${{ inputs.gatemode || '0' }}
+      # v88: the UNDO experiment (undo='1500' -> C2B_UNDO=1500 in MODES =
+      # the 6th-site restore after <ms>). Default '0' = no undo.
+      C2B_UNDO_V: ${{ inputs.undo || '0' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

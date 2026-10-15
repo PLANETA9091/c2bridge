@@ -12478,6 +12478,42 @@ static i32 c2b_p2v_gate(u32 on, u32 dead, u32 fires, u32 len)
     return 1;
 }
 
+/* ---------- v102: T2V — IN-CHANNEL TICKET (чистые хелперы, always-регион) ----
+ * 2041-приоритет #2 (фаза B(б) standing): тикет из FUv-интерцептора SteamUser
+ * (g_ticket_buf/g_ticket_len, run99: 252B=0xfc, наш steamid внутри) НИ РАЗУ
+ * не был in-channel стимулом. Матрица (run508-512): все прошлые in-channel
+ * выстрелы = fl=0 UNRELIABLE (k2v/h2v/p2v/k27) = tolerated-silent; RELIABLE-
+ * поток = ЕДИНСТВЕННЫЙ, который сервер реально парсит (v28: ff×4 'k' RELIABLE
+ * = parse-kill 2047 = диалог; UNRELIABLE = тишина). Тикет (БЕЗ ff×4-префикса
+ * = не parse-kill класс) RELIABLE как ОТВЕТ на свежий серверный 'A'
+ * (g_c2b_k27_A->seq, собственный seen; сервер челленджит — клиент отвечает
+ * auth) = самый дешёвый непроверенный legacy-стимул. Форма = len [1..1400] &&
+ * НЕ ff×4 (страховка от битого капчера в kill-классе). */
+#define C2B_T2V_CAP 1
+#define C2B_T2V_MAX 1400
+
+static i32 c2b_t2v_form(const u8 *p, u32 len)
+{
+    if (!p) return 0;
+    if (!len || len > C2B_T2V_MAX) return 0;
+    if (p[0] == 0xff && p[1] == 0xff && p[2] == 0xff && p[3] == 0xff)
+        return 0;
+    return 1;
+}
+
+/* чистый гейт t2v (selftest-покрытие): 1 = стрелять, 0 = скип.
+ * Триггер = свежий серверный 'A' (a_seq != a_seen, a_seq != 0) + тикет
+ * захвачен (tok_ok && 0 < tok_len <= MAX). */
+static i32 c2b_t2v_gate(u32 on, u32 dead, u32 fires, u32 a_seq, u32 a_seen,
+                        u32 tok_ok, u32 tok_len)
+{
+    if (!on || dead) return 0;
+    if (fires >= C2B_T2V_CAP) return 0;
+    if (!a_seq || a_seq == a_seen) return 0;
+    if (!tok_ok || !tok_len || tok_len > C2B_T2V_MAX) return 0;
+    return 1;
+}
+
 /* swap vtable[11] -> det (arm-механика, параметризована картой => e2e-тест).
  * Возврат: 1 = патч применён, 0 = ужеarmed, <0 = код ошибки. */
 static i32 c2b_p2v_vtswap(void **vt, void *det, void **vt_map, void **orig_map,
@@ -19043,6 +19079,7 @@ static void c2b_k2v_maybe(void);       /* v98: вербатим-'k' in-channel (
 static void c2b_h2v_maybe(void);       /* v100: hello 0x80-class in-channel (тело = в runtime-регионе) */
 static void c2b_p2v_arm(void);         /* v101: детур vtable[11] (тело = в runtime-регионе) */
 static void c2b_p2v_maybe(void);       /* v101: plaintext firsts in-channel (тело = в runtime-регионе) */
+static void c2b_t2v_maybe(void);       /* v102: ticket in-channel RELIABLE (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
@@ -19249,6 +19286,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
         c2b_p2v_maybe();       /* v101: plaintext firsts in-channel (new firsts) */
+        c2b_t2v_maybe();       /* v102: ticket in-channel RELIABLE (ответ на 'A') */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
@@ -20615,6 +20653,84 @@ static void c2b_p2v_maybe(void)
     C2B_LOGN((u32)(i32)rc_pv);
     C2B_LOGS("\n");
     /* rc!=1 = ТОЛЬКО телеметрия (rc==3 = dead-флаг) */
+}
+
+/* ---------- v102: T2V — TICKET IN-CHANNEL (тело = runtime-регион) ----------
+ * Одиночный RELIABLE-выстрел тикета (g_ticket_* из FUv-интерцептора SteamUser)
+ * в мост-сессию как ответ на первый свежий серверный 'A'. Гейт = k2v-стиль +
+ * СОБСТВЕННЫЙ seen на g_c2b_k27_A->seq (НЕ конкурирует с a2e/a2eb/k27 — у
+ * каждого консюмера свой seen; seq = общий счётчик продюсера). rc!=1 = только
+ * телеметрия (rc==3 = dead-флаг). Маркеры: 'B'/signon/REL (s2dn) = ПРОРЫВ;
+ * PARSE-close = сервер парсит reliable-поток и отвергает форму (диалог жив →
+ * парсить тикет-зону g70b / S2S1 STEP-3 синтез); тишина = reliable-поток не
+ * для legacy-диалога (кап 1 = осознанный одиночный зонд). */
+static u32 g_t2v_init, g_t2v_on = 1, g_t2v_fires, g_t2v_seen, g_t2v_dead;
+static c2b_k27_A_t *g_t2v_Ap;
+
+static void c2b_t2v_maybe(void)
+{
+    static u8 tv_buf[C2B_T2V_MAX];
+    u32 s_tv, len_tv, live_tv, z_tv, hh;
+    const volatile u8 *fp_tv;
+    void **vt_tv;
+    i32 rc_tv = -997;
+    if (!g_t2v_init) {
+        const char *e2t = getenv("C2B_T2V");
+        if (e2t && e2t[0] == '0') g_t2v_on = 0;
+        g_t2v_init = 1;
+        if (!g_t2v_on) C2B_LOGS("[c2b] t2v: disabled (C2B_T2V=0)\n");
+    }
+    if (!g_gns_conn_iface || !g_gns_conn_h) return;
+    if (!g_t2v_Ap) {
+        g_t2v_Ap = (c2b_k27_A_t *)dlsym((void *)0, "g_c2b_k27_A");
+        if (!g_t2v_Ap) return;         /* хук без сниффа — молча ждём */
+    }
+    s_tv = __atomic_load_n(&g_t2v_Ap->seq, __ATOMIC_ACQUIRE);
+    if (!c2b_t2v_gate(g_t2v_on, g_t2v_dead, g_t2v_fires, s_tv, g_t2v_seen,
+                      g_ticket_ok, g_ticket_len)) return;
+    /* консистентный снепшот тикета (писатель = AUTH-контекст движка; длина
+     * пишется ПОСЛЕ буфера — расхождение = гонка, скип без траты 'A') */
+    len_tv = g_ticket_len;
+    fp_tv = g_ticket_buf;
+    for (z_tv = 0; z_tv < len_tv; z_tv++) tv_buf[z_tv] = fp_tv[z_tv];
+    if (g_ticket_len != len_tv) return;
+    if (!c2b_t2v_form(tv_buf, len_tv)) {
+        g_t2v_seen = s_tv;      /* битый капчер в kill-классе — ждём след. 'A' */
+        C2B_LOGS("[c2b] t2v: ticket form BAD (ff×4?) — скип без капа\n");
+        return;
+    }
+    g_t2v_seen = s_tv;
+    live_tv = c2b_k24_brlive();
+    vt_tv = *(void ***)g_gns_conn_iface;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc_tv = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                          i64 *))vt_tv[11])(
+            g_gns_conn_iface, g_gns_conn_h, tv_buf, len_tv,
+            1 /* RELIABLE = единственный парсящийся сервером поток (v28) */,
+            &g_k27k_out47);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] t2v: send SEGV\n");
+        return;
+    }
+    g_t2v_fires++;
+    if (rc_tv == 3) g_t2v_dead = 1;   /* NoConnection = сессия умерла */
+    C2B_LOGS("[c2b] t2v: ticket in-channel #");
+    C2B_LOGN(g_t2v_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(len_tv);
+    C2B_LOGS(" head=");
+    for (hh = 0; hh < 8 && hh < len_tv; hh++) C2B_LOGH(tv_buf[hh]);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live_tv);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 fl=1(REL) rc=");
+    C2B_LOGN((u32)(i32)rc_tv);
+    C2B_LOGS("\n");
+    /* rc!=1 = ТОЛЬКО телеметрия (rc==3 = dead-флаг; кап 1 = одиночный зонд) */
 }
 
 static void c2b_k27_maybe_fire(void)
@@ -32225,6 +32341,38 @@ static void test_h2v(void)
     CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 1, "h2v: восстановлен = 1");
 }
 
+/* v102: t2v — ticket in-channel RELIABLE (форма/гейт; триггер = свежий 'A' +
+ * тикет захвачен). Кап 1 = одиночный зонд. */
+static void test_t2v(void)
+{
+    u8 tf[300];
+    printf("[t] t2v\n");
+    memset(tf, 0x42, sizeof tf);
+    CHECK(c2b_t2v_form(tf, 252) == 1, "t2v: 252B (0xfc, run99) = 1");
+    CHECK(c2b_t2v_form(tf, 1) == 1, "t2v: len=1 граница = 1");
+    CHECK(c2b_t2v_form(tf, C2B_T2V_MAX) == 1, "t2v: len=MAX граница = 1");
+    CHECK(c2b_t2v_form(tf, 0) == 0, "t2v: len=0 = 0");
+    CHECK(c2b_t2v_form(tf, C2B_T2V_MAX + 1) == 0, "t2v: len>MAX = 0");
+    CHECK(c2b_t2v_form(0, 252) == 0, "t2v: NULL = 0");
+    tf[0] = 0xff; tf[1] = 0xff; tf[2] = 0xff; tf[3] = 0xff;
+    CHECK(c2b_t2v_form(tf, 252) == 0, "t2v: ff×4 kill-класс = 0");
+    /* гейт: on/dead/кап/'A'-триггер/тикет-наличие */
+    CHECK(c2b_t2v_gate(0, 0, 0, 1, 0, 1, 252) == 0, "t2v: on=0 = скип");
+    CHECK(c2b_t2v_gate(1, 1, 0, 1, 0, 1, 252) == 0, "t2v: dead = скип");
+    CHECK(c2b_t2v_gate(1, 0, C2B_T2V_CAP, 1, 0, 1, 252) == 0,
+          "t2v: кап 1 = скип");
+    CHECK(c2b_t2v_gate(1, 0, 0, 0, 0, 1, 252) == 0, "t2v: 'A' ещё не было = скип");
+    CHECK(c2b_t2v_gate(1, 0, 0, 3, 3, 1, 252) == 0, "t2v: 'A' тот же seen = скип");
+    CHECK(c2b_t2v_gate(1, 0, 0, 3, 2, 0, 252) == 0, "t2v: тикет не захвачен = скип");
+    CHECK(c2b_t2v_gate(1, 0, 0, 3, 2, 1, 0) == 0, "t2v: len тикета 0 = скип");
+    CHECK(c2b_t2v_gate(1, 0, 0, 3, 2, 1, C2B_T2V_MAX + 1) == 0,
+          "t2v: len тикета >MAX = скип");
+    CHECK(c2b_t2v_gate(1, 0, 0, 3, 2, 1, 252) == 1,
+          "t2v: свежий 'A' + тикет 252B = огонь");
+    CHECK(c2b_t2v_gate(1, 0, 0, 3, 2, 1, C2B_T2V_MAX) == 1,
+          "t2v: граница len=MAX = огонь");
+}
+
 /* v101: p2v — детур slot-11 (форма/гейт/vtswap e2e на синт-vtable). */
 static i32 p2v_t_orig_calls;
 static uptr p2v_t_orig_h;
@@ -34676,6 +34824,7 @@ int main(void)
     test_k2v();         /* v98: вербатим-'k' in-channel (форма/chal/гейт) */
     test_h2v();         /* v100: hello 0x80-class in-channel (форма/гейт/dst) */
     test_p2v();         /* v101: детур slot-11 (форма/гейт/vtswap e2e) */
+    test_t2v();         /* v102: ticket in-channel RELIABLE (форма/гейт) */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */

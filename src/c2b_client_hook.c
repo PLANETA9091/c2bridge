@@ -237,10 +237,14 @@ void c2b_hook_t3v_register(u32 (*fn)(unsigned char *, unsigned int))
     klog_s("\n");
 }
 
-static void c2b_t3v_hook(const void *out, sz_t len)
+static void c2b_t3v_hook(const void *out, sz_t len, u32 tag32)
 {
     u32 (*fn)(unsigned char *, unsigned int) = g_t3v_fn;
     u32 r;
+    if (tag32 != 1u) return;   /* ТОЛЬКО DEC32 = ctr32 движковой GNS-копии
+                                * (диалог run513-515 жив там); DECL = 0 calls
+                                * (run513 census), DECLSN = libsns = ЧУЖИЕ
+                                * сессии steam-client = инжект ЗАПРЕЩЁН */
     if (!fn || !out || len < 7u || len > 0x800u) return;
     r = fn((unsigned char *)(void *)out, (u32)len);
     if (r) {
@@ -2044,9 +2048,10 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
     /* v27: снифф ДО rate-гейта — 'A'/'B' редкие, пропуск = потеря окна */
     c2b_g126_k27_sniff(gcm, in, out, len);
     /* v105-t3v: инжекция signon-continuation (после сниффа, ДО лога —
-     * DEC32-строка ниже покажет SYNTH = wire-доказательство). len-гейт
-     * внутри (7..0x800); fn=NULL (нет регистрации) = no-op нулевой. */
-    c2b_t3v_hook(out, len);
+     * DEC32-строка ниже покажет SYNTH = wire-доказательство). tag-фильтр
+     * внутри (только DEC32 = движковая сессия); len-гейт (7..0x800);
+     * fn=NULL (нет регистрации) = no-op нулевой. */
+    c2b_t3v_hook(out, len, tag32);
     if (n > 64 && (n & 7) != 0) return;
     {
         /* v23 k23: ОДНОРАЗОВЫЙ снейкшот стека (24 qwords вверх от кадра)

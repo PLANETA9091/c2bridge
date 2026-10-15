@@ -7552,8 +7552,101 @@ static u32 c2b_a2e_patch(const u8 *raw, u32 rl, u8 *out, u32 cap)
     return k;                         /* 59 */
 }
 
+/* v107.2 PCX-RELAY: пенд-пара (0x22 + 'k'), ждущая инжекта в поток
+ * ОТПРАВОК ДВИЖКА. Гипотеза ЭНДПОИНТА = последняя оставшаяся дельта
+ * (v107.0 verbatim + v107.1 fresh-chal с мостового g_clv2_fd = ТИХИ при
+ * живых нативных парах; run531/532). Продюсер = c2b_pcx_maybe (нитка
+ * recv): строит пару как раньше (один снап живого чала) и КЛАДЁТ её в
+ * пенд-очередь (буферы -> длины -> флаг, стор-потом-флаг, x86 TSO).
+ * Консьюмер = c2b_pcxr_pump из g130-хука (нитка движка): на следующем
+ * k-класс send движка С АДРЕСОМ = известный сервер — два sendto
+ * (fd движка, adr движка) ПЕРЕД собственным кадром движка: пара едет
+ * на нативном эндпоинте и в нативной каденции. Пока пара пендит,
+ * продюсер новую не строит (одна пенд-максимум; флаг = volatile,
+ * естественная атомарность u32, дисциплина cstate-slice run519). */
+static u8  g_pcxr_22[640], g_pcxr_k[1200];
+static u32 g_pcxr_22_len, g_pcxr_k_len;
+static volatile u32 g_pcxr_pend;
+static u32 g_pcxr_fired;
+
+/* v107.2: релей-решение (чистый хелпер, самотест-видимый). pend =
+ * пенд-пара есть; kshape = текущий send движка = ff×4+'k'; srv = adr
+ * = известный сервер (порт 28022 + 152.233.19.133, байты 2..7 adr);
+ * ok = транспорт готов (sendto-указатель + обе длины). 1 = инжект. */
+static u32 c2b_pcxr_decide(u32 pend, u32 kshape, u32 srv, u32 ok)
+{
+    if (!pend) return 0;
+    if (!kshape) return 0;
+    if (!srv) return 0;
+    if (!ok) return 0;
+    return 1u;
+}
+
 #ifndef C2B_SELFTEST
 static void c2b_k19_relay(void);       /* определение ниже (не-selftest) */
+
+/* v107.2 PCX-RELAY консьюмер: вызов из c2b_g130_log ДО rate-гейта kn
+ * (пара должна ехать весь ран, не только первые 25 k-сендов). Своя
+ * сигсетjmp-гарда, ПОСЛЕДОВАТЕЛЬНАЯ (не вложена в релей-блок ниже —
+ * урок v19: вложенный sigsetjmp на один jb = коррупт). Фолт = пара
+ * снята, частичный выстрел не страшен (одинокая 0x22 = терпимый
+ * сервером класс; собственный кадр движка всё равно уходит следом). */
+static void c2b_pcxr_pump(u32 fd, uptr adr, uptr bf, u32 len)
+{
+    u8 sa[16];
+    ssize_t sr22, srk;
+    u32 kshape, srv, ok, i;
+    if (!g_pcxr_pend) return;
+    if (len < 380u || !bf || !adr || (i32)fd < 0) return;
+    kshape = (*(volatile const u32 *)bf == 0xffffffffu &&
+              *(volatile const u8 *)(bf + 4) == (u8)'k') ? 1u : 0u;
+    if (!kshape) return;
+    srv = (((volatile const u8 *)adr)[2] == 0x6d &&   /* порт 28022 BE */
+           ((volatile const u8 *)adr)[3] == 0x76 &&
+           ((volatile const u8 *)adr)[4] == 152u &&   /* 152.233.19.133 */
+           ((volatile const u8 *)adr)[5] == 233u &&
+           ((volatile const u8 *)adr)[6] == 19u &&
+           ((volatile const u8 *)adr)[7] == 133u) ? 1u : 0u;
+    ok = (g_clp_sendto && (uptr)g_clp_sendto != 1u &&
+          g_pcxr_22_len > 0u && g_pcxr_k_len > 0u &&
+          g_pcxr_22_len <= sizeof g_pcxr_22 &&
+          g_pcxr_k_len <= sizeof g_pcxr_k) ? 1u : 0u;
+    if (!c2b_pcxr_decide(g_pcxr_pend, kshape, srv, ok)) return;
+    for (i = 0; i < sizeof(sa); i++)
+        sa[i] = ((volatile const u8 *)adr)[i];       /* снап adr движка */
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr22 = ((c2b_sendto_fn)g_clp_sendto)((int)fd, g_pcxr_22,
+                                             g_pcxr_22_len, 0,
+                                             (const struct sockaddr *)sa,
+                                             16);
+        srk = ((c2b_sendto_fn)g_clp_sendto)((int)fd, g_pcxr_k,
+                                            g_pcxr_k_len, 0,
+                                            (const struct sockaddr *)sa,
+                                            16);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        g_pcxr_pend = 0;
+        C2B_LOGS("[c2b] pcx-relay: send FAULT — пара снята\n");
+        return;
+    }
+    g_pcxr_pend = 0;
+    g_pcxr_fired++;
+    C2B_LOGS("[c2b] pcx-relay: FIRED #");
+    C2B_LOGN(g_pcxr_fired);
+    C2B_LOGS(" fd=");
+    C2B_LOGN(fd);
+    C2B_LOGS(" len22=");
+    C2B_LOGN(g_pcxr_22_len);
+    C2B_LOGS(" lenk=");
+    C2B_LOGN(g_pcxr_k_len);
+    C2B_LOGS(" rc22=");
+    C2B_LOGN((u32)(sr22 < 0 ? (u32)-1 : (u32)sr22));
+    C2B_LOGS(" rck=");
+    C2B_LOGN((u32)(srk < 0 ? (u32)-1 : (u32)srk));
+    C2B_LOGS("\n");
+}
 #endif
 
 void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
@@ -7564,6 +7657,10 @@ void c2b_g130_log(u32 fd, uptr adr, uptr bf, u32 len)
         if (e && e[0] == '0') g_g130_relay = 0;
         g_g130_relay_init = 1;
     }
+    /* v107.2 PCX-RELAY: ДО rate-гейта kn (пара едет весь ран) */
+#ifndef C2B_SELFTEST
+    c2b_pcxr_pump(fd, adr, bf, len);
+#endif
     if (len >= 380) {
         if (c2b_g130_kn > 24) return;
         c2b_g130_kn++;
@@ -20987,13 +21084,19 @@ static void c2b_cvx_maybe(void)
     C2B_LOGS("\n");
 }
 
-/* v107.0→v107.1: PCX рантайм — см. блок у always-острова c2b_pcx_gate.
+/* v107.0→v107.2: PCX рантайм — см. блок у always-острова c2b_pcx_gate.
  * Огонь = тик g97 ПОСЛЕ kdr A/B; пара = 0x22 (сташ + ЖИВЫЙ чал v107.1)
- * затем 'k' (g_kfull + ТОТ ЖЕ живой счётчик через c2b_kdr_build) бэктум-
- * бэктум двумя sendto (b2e/kdr-проверенный путь g_clv2_fd ->
- * 152.233.19.133:28022). x6 пар, межпарный гэп 2 тика, начальный 3
- * (рулетка конца рана = урок run528/530). Гонка g_kfull = снап +
- * двойное чтение g_kfull_n (дисциплина k27k); v107.1: чал снапится
+ * затем 'k' (g_kfull + ТОТ ЖЕ живой счётчик через c2b_kdr_build).
+ * v107.2: ТРАНСПОРТ = РЕЛЕЙ (гипотеза ЭНДПОИНТА — последняя дельта;
+ * v107.0/v107.1 с g_clv2_fd тихи при живых нативных парах, run531/532):
+ * пара СТРОИТСЯ и кладётся в пенд-очередь (буферы -> длины -> флаг);
+ * КОНСЬЮМЕР = g130-хук (c2b_pcxr_pump): на следующем k-класс send
+ * движка с адресом = известный сервер — два sendto(fd движка, adr
+ * движка) ПЕРЕД его собственным кадром = пара едет на нативном
+ * эндпоинте в нативной каденции. x6 пар, межпарный гэп 2 тика,
+ * начальный 3 (рулетка конца рана = урок run528/530); пока пара
+ * пендит — продюсер заморожен (одна пенд-максимум). Гонка g_kfull =
+ * снап + двойное чтение g_kfull_n (дисциплина k27k); чал снапится
  * ОДИН раз до обеих сборок = пара несёт ОДИН консистентный живой чал
  * ('A'-счётчик; стор только !=0 на нитке recv => значение между гейтом
  * и чтением может лишь обновиться до нового не-нулевого = консистентно). */
@@ -21005,17 +21108,16 @@ static void c2b_pcx_maybe(void)
     static u8 snap[1200], kout[1200], buf22[C2B_PCX_22MAX];
     u32 klen, chal, len22, i, fl, n1, n2;
     const volatile u8 *fp;
-    u8 sa[16];
-    ssize_t sr22, srk;
     if (!g_pcx_init) {
         const char *e = getenv("C2B_PCX");
         if (e && e[0] == '0') g_pcx_on = 0;
         g_pcx_init = 1;
         if (g_pcx_on)
-            C2B_LOGS("[c2b] pcx: ARMED (v107.1 FRESH-CHAL pair-cadence 0x22+k chal=A-counter cap 6 gap 2t post-kdr)\n");
+            C2B_LOGS("[c2b] pcx: ARMED (v107.2 PCX-RELAY FRESH-CHAL pair-cadence 0x22+k chal=A-counter cap 6 post-kdr; endpoint=engine socket g130)\n");
     }
     if (!g_pcx_on) return;
     if (g_pcx_pairs >= 6u) return;
+    if (g_pcxr_pend) return;      /* v107.2: пара в полёте — не строим новую */
     if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
         (uptr)g_clp_sendto == 1) return;
     if (g_kdr_fires >= 2u) g_pcx_seen_kdr = 1;
@@ -21050,51 +21152,29 @@ static void c2b_pcx_maybe(void)
         C2B_LOGS("[c2b] pcx: fresh22 build=0 (форма сташа?) — скип\n");
         return;                    /* ретрай на следующем тике (гэп стоит) */
     }
-    for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
-    sa[0] = 2;                     /* AF_INET (LE) */
-    sa[2] = 0x6d; sa[3] = 0x76;    /* порт 28022 BE */
-    sa[4] = 152; sa[5] = 233; sa[6] = 19; sa[7] = 133;
-    /* элемент #1: 0x22 (свежий чал) */
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        sr22 = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd,
-                                             (const void *)buf22,
-                                             len22, 0,
-                                             (const struct sockaddr *)sa, 16);
-    } else {
-        g_probe_active = 0;
-        C2B_LOGS("[c2b] pcx: 22-send SEGV\n");
+    /* v107.2: НЕ шлём с мостового fd — кладём пару в пенд-очередь.
+     * Буферы -> длины -> флаг (стор-потом-флаг, x86 TSO; флаг =
+     * release-маркер, консьюмер = g130-хук на нитке движка). */
+    if (len22 > sizeof g_pcxr_22 || klen > sizeof g_pcxr_k) {
+        C2B_LOGS("[c2b] pcx: реле-буфер мал — скип\n");
         return;
     }
-    g_probe_active = 0;
-    /* элемент #2: 'k' (тот же живой чал) — бэктум-бэктум (прецедент: k на
-     * +1 строке после 0x22; у моста = тот же тик, подряд) */
-    g_probe_active = 1;
-    if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        srk = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)kout,
-                                            klen, 0,
-                                            (const struct sockaddr *)sa, 16);
-    } else {
-        g_probe_active = 0;
-        C2B_LOGS("[c2b] pcx: k-send SEGV\n");
-        return;
-    }
-    g_probe_active = 0;
+    for (i = 0; i < len22; i++) g_pcxr_22[i] = buf22[i];
+    for (i = 0; i < klen; i++)  g_pcxr_k[i]  = kout[i];
+    g_pcxr_22_len = len22;
+    g_pcxr_k_len  = klen;
+    g_pcxr_pend   = 1;
     g_pcx_pairs++;
     g_pcx_delay = 0;
-    C2B_LOGS("[c2b] pcx: pair #");
+    C2B_LOGS("[c2b] pcx: arm #");
     C2B_LOGN(g_pcx_pairs);
-    C2B_LOGS(" v2 len22=");
+    C2B_LOGS(" len22=");
     C2B_LOGN(len22);
     C2B_LOGS(" lenk=");
     C2B_LOGN(klen);
     C2B_LOGS(" chal=");
     C2B_LOGH(chal);
-    C2B_LOGS(" rc22=");
-    C2B_LOGN((u32)(sr22 < 0 ? (u32)-1 : (u32)sr22));
-    C2B_LOGS(" rck=");
-    C2B_LOGN((u32)(srk < 0 ? (u32)-1 : (u32)srk));
-    C2B_LOGS("\n");
+    C2B_LOGS(" (пенд-реле: огонь на след. k-send движка)\n");
 }
 
 /* ---------- v98/v99: K2V — 'k' IN-CHANNEL (noff4 + вербатим-чал) ----------
@@ -33740,6 +33820,12 @@ static void test_swr(void)
     CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 1, 0) == 0, "pcx: нет живого чала = скип");
     CHECK(c2b_pcx_gate(1, 5, 1, 59, 513, 1, 1) == 1, "pcx: 5-я пара ок (кап 6)");
     CHECK(c2b_pcx_gate(1, 0, 1, 59, 513, 1, 1) == 1, "pcx: пара ok");
+    /* v107.2: pcx-relay decide x5 (пенд/k-класс/адрес-сервер/транспорт/ok) */
+    CHECK(c2b_pcxr_decide(0, 1, 1, 1) == 0, "pcx-relay: нет пенда = скип");
+    CHECK(c2b_pcxr_decide(1, 0, 1, 1) == 0, "pcx-relay: не k-класс = скип");
+    CHECK(c2b_pcxr_decide(1, 1, 0, 1) == 0, "pcx-relay: adr не сервер = скип");
+    CHECK(c2b_pcxr_decide(1, 1, 1, 0) == 0, "pcx-relay: транспорт не готов = скип");
+    CHECK(c2b_pcxr_decide(1, 1, 1, 1) == 1, "pcx-relay: инжект ok");
     /* v107.1: pcx fresh22 x9 (свежий чал в сташе 0x22) */
     {
         /* голова = реальная форма v50f_want (252B) + 5Б хвост-маркеров */

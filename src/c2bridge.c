@@ -19248,6 +19248,7 @@ static void c2b_swr_maybe(void);       /* v106: SNP-wrapped 'k' in-channel (те
 static void c2b_s2o_maybe(void);       /* v106.1: компакт-S2 out (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
+static void c2b_b2e_maybe(void);       /* v106.3: синт-'B' с живым chal -> движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
 
 
@@ -19458,6 +19459,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_s2o_maybe();       /* v106.1: компакт-S2 out post-'B' (новый хед-эпок) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
+        c2b_b2e_maybe();       /* v106.3: синт-'B' с живым chal -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
         prev = st;
         prev_rc = rc;
@@ -20386,6 +20388,15 @@ static u32 c2b_s2o_build(const u8 *hdr, u8 *out, u32 cap)
     for (z2 = 0; z2 < 17u; z2++) pl2[z2] = 0u;
     pl2[0] = 7u; pl2[1] = 0x08u; pl2[2] = 0x02u;
     return c2b_swr_build(hdr, pl2, 17u, out, cap);
+}
+/* v106.3: b2e_gate = ворота b2e-рычага: on, кап 2, chal!=0 (0x22-чейндж
+ * приземлился @0x4d8 — эхо 'B' обязано совпасть). Always-остров =
+ * selftest-видимость. */
+static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal)
+{
+    if (!on) return 0;
+    if (fires >= 2u) return 0;
+    return chal ? 1u : 0u;
 }
 
 #ifndef C2B_SELFTEST
@@ -21905,6 +21916,65 @@ static void c2b_a2eb_maybe(void)
         C2B_LOGN(g_a2eb_fires);
         C2B_LOGS(" relayed)\n");
     }
+}
+
+/* ---------- v106.3: B2E — синт-'B' с ЖИВЫМ chal@0x4d8 в движок ----------
+ * Гипотеза (0139-раунд): 'B'-парсер сверяет chal 'B' против state+0x4d8
+ * ('A'-хендлер пишет chal 'A' => @0x4d8; локальные g63-'B' проходят, ибо
+ * g42-глобал = @0x4d8 ПО ПОСТРОЕНИЮ). t3v-туннельный 'B' = мёртв по
+ * РОУТИНГУ (SNP-демокс съедает, 2247-вердикт: cstate=0 в момент инжекта),
+ * legacy-loopback = ПРОВЕРЕННЫЙ путь парса (g63/a2e/a2eb).
+ * chal@0x4d8 приземляется ПОЗДНО (0x22-танец: run521 @0x4d8=0 до L15069,
+ * 0xec6d6678 после) => триггер = cw-срез в g97-цикле: chal!=0 => строим
+ * t3v-клон 'B' (explicit chal = ЖИВОЕ значение) и пушим на 127.0.0.1:27005
+ * (тот же g63-канал) с g50-force cstate=1 до парса. A/B: (а) если чал
+ * валидируется — b2e (матч) отличается от g63 (глобал=0 => фолбэк, матч
+ * сломан); (б) если нет — гипотеза чала мертва, т3в-отвержение = чистый
+ * роутинг (ось 'B' закрывается окончательно). Кап 2, killswitch C2B_B2E=0.
+ * На провод НЕ попадает (loopback). */
+static u32 g_b2e_init, g_b2e_on = 1, g_b2e_fires;
+static void c2b_b2e_maybe(void)
+{
+    static u8 b2_buf[48];
+    u32 cs_b2 = 0, ch_b2 = 0, pr_b2 = 0, sb_len, ib2;
+    u8 la[16];
+    ssize_t sr;
+    if (!g_b2e_init) {
+        const char *eb2 = getenv("C2B_B2E");
+        if (eb2 && eb2[0] == '0') g_b2e_on = 0;
+        g_b2e_init = 1;
+        if (g_b2e_on)
+            C2B_LOGS("[c2b] b2e: ARMED (v106.3 synth-'B' live-chal->engine, cap 2)\n");
+    }
+    if (!g_b2e_on) return;
+    if (g_b2e_fires >= 2u) return;
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1) return;
+    (void)c2b_cw_read((uptr)c2b_g49_state, &cs_b2, &ch_b2, &pr_b2);
+    if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2)) return;
+    sb_len = c2b_t3_build_b(b2_buf, 40u, ch_b2);   /* эхо ЖИВОГО чала */
+    if (sb_len != 40u) return;
+    for (ib2 = 0; ib2 < sizeof(la); ib2++) la[ib2] = 0;
+    la[0] = 2;                     /* AF_INET (LE) */
+    la[2] = 0x69; la[3] = 0x7D;    /* порт 27005 BE */
+    la[4] = 127; la[5] = 0; la[6] = 0; la[7] = 1;
+    c2b_g50_force_cstate();        /* ворота cstate=1 ДО парса (=a2e/a2eb) */
+    sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)b2_buf,
+                                       sb_len, 0,
+                                       (const struct sockaddr *)la, 16);
+    g_b2e_fires++;
+    C2B_LOGS("[c2b] b2e: synth-'B' live-chal #");
+    C2B_LOGN(g_b2e_fires);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(ch_b2);
+    C2B_LOGS(" cstate=");
+    C2B_LOGN(cs_b2);
+    C2B_LOGS(" len=");
+    C2B_LOGN(sb_len);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS("\n");
+    /* телеметрия-только: реакцию парсера читаем по g48/g66-классам + cw-срезам */
 }
 
 static void c2b_k19_relay(void)
@@ -33123,6 +33193,13 @@ static void test_swr(void)
     CHECK(c2b_swr_gate2(1, 0, 5, 5, 9, 9) == 0, "swr2: kfull без измен = скип");
     CHECK(c2b_swr_gate2(1, 0, 0, 0, 0, 0) == 0, "swr2: всё нулевое = скип");
     CHECK(c2b_swr_gate2(1, 0, 5, 5, 0, 0) == 0, "swr2: sec_new=0 = скип");
+    /* --- v106.3: b2e-гейт --- */
+    printf("[t] b2e\n");
+    CHECK(c2b_b2e_gate(0, 0, 0xec6d6678u) == 0, "b2e: on=0 = скип");
+    CHECK(c2b_b2e_gate(1, 2, 0xec6d6678u) == 0, "b2e: кап 2 = скип");
+    CHECK(c2b_b2e_gate(1, 0, 0) == 0, "b2e: chal=0 (не приземлился) = скип");
+    CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u) == 1, "b2e: живой chal = 1");
+    CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu) == 1, "b2e: другой живой chal = 1");
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");
     memset(out_swr, 0xAA, sizeof out_swr);

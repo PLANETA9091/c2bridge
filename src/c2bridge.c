@@ -20290,11 +20290,25 @@ static void c2b_k19_relay(void)
     for (z19 = 0; z19 < g_kfull_len; z19++) kcopy[z19] = g_kfull[z19];
     kn = g_kfull_len;
     g_krel_sent++;
-    if (!g_krel_keep && g_g90_A_seq) {
+    /* v93 (run502-урок, THE A/B): g_g90_A_chal = чал из wire-'A' @pd[5..8],
+     * а серверный wire-'A' несёт там 0 (run379/381 декод: "ff×4 'A' chal4(=0)
+     * proto pad5 val4...") — патч НЕЗНАЧАЩИМ нулём УНИЧТОЖАЛ валидный чал,
+     * уже стоящий в захваченном 'k' (движковый A.chal, kch) => сервер парсил
+     * 'k' с chal=0 => GNSLIB "closed by peer (2047):
+     * NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR" => слот-11 труп, релеи #2/#3 =
+     * rc=3 "tgt dead" (run502 23610-23726). КОНТРОЛЬ ЧИСТЫЙ: run500 (k27k 1x,
+     * krel=0) + run501 = НОЛЬ parse-error закрытий; run502 (krel 3x) = 1
+     * закрытие сразу после пары посылок. ФИКС: патч ТОЛЬКО ненулевым чалом;
+     * ноль = ХРАНИМ захваченный kch (он и есть "A.chal verbatim" по контракту
+     * c2b_k27.h — движок сам ставит актуальный A.chal в свой 'k'). */
+    if (!g_krel_keep && g_g90_A_seq && g_g90_A_chal) {
         (void)c2b_krel_patchchal(kcopy, kn, g_g90_A_chal);
-    } else if (!g_krel_keep && g_krel_A_hint_seq) {
+    } else if (!g_krel_keep && g_krel_A_hint_seq && g_krel_A_hint_chal) {
         /* v68c: fallback = чал от a2e-poke (серверный 'A' hook-сайд) */
         (void)c2b_krel_patchchal(kcopy, kn, g_krel_A_hint_chal);
+    } else if (!g_krel_keep && g_g90_A_seq && !g_g90_A_chal) {
+        /* v93: маркер A/B — патч ПРОПУЩЕН, в канал уходит захваченный kch */
+        C2B_LOGS("[c2b] krel: chal-KEEP (A-chal=0, wire-'A' null-field; captured kch stays)\n");
     }
     /* v29: RAW default = 1 — в канал уходит ПОЛНЫЙ 513B (ff×4+'k'+ver u16+6B+chal
      * u32@13; run355-декод). ОСНОВАНИЕ: run366 (v28 unreliable-фикс) — стрипнутый
@@ -30606,6 +30620,15 @@ static void test_krelpatch(void)
     k5[4] = (u8)'j';
     CHECK(c2b_krel_patchchal(k5, 17, 1u) == 0, "krel: не-'k' = 0");
     CHECK(c2b_krel_patchchal(0, 17, 1u) == 0, "krel: null = 0");
+    /* v93: утилита остаётся сырым писателем (0 = валидный аргумент для
+     * явного вызова), ГВАРД нулевого чала = на call-site krel (см. v93
+     * блок: патч только при ненулевом A-chal/hint, иначе kch сохраняется).
+     * Селфтест документирует семантику: patchchal(0) затирает поле. */
+    k5[4] = (u8)'k';
+    k5[13] = 0x4a; k5[14] = 0xcf; k5[15] = 0x83; k5[16] = 0x28;
+    (void)c2b_krel_patchchal(k5, 17, 0u);
+    CHECK(k5[13] == 0 && k5[14] == 0 && k5[15] == 0 && k5[16] == 0,
+          "v93: patchchal(0) затирает поле — гвард обязан быть на call-site");
 }
 
 /* v27: k27-сканер CLV2 'A'/'B' в расшифрованном plaintext (c2b_k27.h). */

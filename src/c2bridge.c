@@ -17880,23 +17880,29 @@ static void c2b_raw_scan(void)
                             : (unsigned long long)(unsigned long)
                               &c2b_fp46_helper;
                         u32 tl;
-                        if (isgap && nr == 44u && g_raw_gm2) {
-                            /* v87b: PASSTHROUGH-ONLY санка (бисект) — ноль
-                             * C-входов из санки; hfn = не используется. */
+                        if (isgap && nr == 44u) {
+                            /* v89: SHADOW-RELOAD санка = РЕШЕНИЕ краш-триа-
+                             * ды (см. c2b_raw.h): перезагрузки rsi/rdx жи-
+                             * вут ВНУТРИ gap-окна (реставрация после
+                             * enable_asynccancel-clobber) — e9-прыжок ДО
+                             * них = релей мусора = EFAULT-смерть IPC. Тень
+                             * = gl байт окна вербатим (rbp жив), гварды
+                             * после тени. gm2 = pass-вариант (helper=0). */
+                            const u8 *gb = chunk + i + 5u;
+                            u32 gl = (pl >= 7u) ? (pl - 7u) : 0u;
                             if (!g_raw_gm2_logged) {
                                 g_raw_gm2_logged = 1u;
-                                C2B_LOGS("[c2b] v87: gap-sanka mode=2 (passthrough-only, zero C-entry)\n");
+                                C2B_LOGS(!g_raw_gm2
+                                    ? "[c2b] v89: gap-sanka shadow-reload (helper)\n"
+                                    : "[c2b] v89: gap-sanka shadow-reload (passthrough, zero C-entry)\n");
                             }
-                            tl = c2b_raw_thunk_pass(
+                            tl = c2b_raw_thunk_gap(
                                 (u8 *)pg, 0x1000u,
+                                g_raw_gm2 ? 0ull : hfn,
+                                gb, gl,
                                 (unsigned long long)pg,
                                 site + (unsigned long long)pl);
-                        } else if (isgap && nr == 44u)
-                            tl = c2b_raw_thunk_gate(
-                                (u8 *)pg, 0x1000u, hfn,
-                                (unsigned long long)pg,
-                                site + (unsigned long long)pl);
-                        else
+                        } else
                             tl = c2b_raw_thunk(
                                 (u8 *)pg, 0x1000u, hfn, nr,
                                 (unsigned long long)pg,
@@ -32262,6 +32268,90 @@ static void test_raw(void)
         CHECK(c2b_raw_thunk_pass(th, sizeof th,
                                  0x90000000ull, 0x1000ull) == 0u,
               "v87: pass back вне rel32 = отказ");
+    }
+    /* ---- v89: SHADOW-RELOAD санка (решение краш-триады) ---- */
+    {
+        u8 th[256];
+        u32 tl;
+        u32 nr2;
+        /* РЕАЛЬНОЕ gap-окно run487 libc.node.so sendto@@GLIBC+0x55:
+         *   b8 2c 00 00 00 48 8b 55 d8 48 8b 75 e0 0f 05 48 3d 00 f0 ff ff
+         * тень = перезагрузки rdx,[rbp-0x28] + rsi,[rbp-0x20] = 7Б */
+        static const u8 win[] = {
+            0xb8u, 0x2cu, 0x00u, 0x00u, 0x00u, 0x48u, 0x8bu, 0x55u, 0xd8u,
+            0x48u, 0x8bu, 0x75u, 0xe0u, 0x0fu, 0x05u, 0x48u, 0x3du, 0x00u,
+            0xf0u, 0xffu, 0xffu };
+        u32 pl = c2b_raw_pat_gap(win, (u32)sizeof win, &nr2);
+        CHECK(pl == 15u && nr2 == 44u, "v89: реальное окно = pl=15 nr=44");
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk_gap(th, sizeof th, 0x1122334455667788ull,
+                               win + 5u, pl - 7u,
+                               0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 128u, "v89: gap-санка = 128B");
+        /* ТЕНЬ @0x21: перезагрузки вербатим + 90-пад до 15 */
+        CHECK(th[0x21u] == 0x48u && th[0x22u] == 0x8bu && th[0x23u] == 0x55u &&
+              th[0x24u] == 0xd8u,
+              "v89: тень mov rdx,[rbp-0x28] @0x21 (вербатим из окна)");
+        CHECK(th[0x25u] == 0x48u && th[0x26u] == 0x8bu && th[0x27u] == 0x75u &&
+              th[0x28u] == 0xe0u,
+              "v89: тень mov rsi,[rbp-0x20] @0x25");
+        CHECK(th[0x29u] == 0x90u && th[0x2fu] == 0x90u,
+              "v89: тень 90-пад @0x29..0x2f (15Б слот)");
+        /* гварды ПОСЛЕ тени @0x30, jcc -> 0x58 */
+        CHECK(th[0x30u] == 0x48u && th[0x31u] == 0x85u && th[0x32u] == 0xf6u,
+              "v89: test rsi,rsi @0x30 (ПОСЛЕ тени = реальные аргументы)");
+        CHECK(th[0x33u] == 0x74u && th[0x34u] == 0x23u,
+              "v89: je -> 0x58 @0x33 (disp 0x23)");
+        CHECK(th[0x35u] == 0x48u && th[0x36u] == 0x83u &&
+              th[0x37u] == 0xfau && th[0x38u] == 0x28u,
+              "v89: cmp rdx,40 @0x35");
+        CHECK(th[0x39u] == 0x72u && th[0x3au] == 0x1du,
+              "v89: jb -> 0x58 @0x39 (disp 0x1d)");
+        CHECK(th[0x3bu] == 0x80u && th[0x3cu] == 0x3eu && th[0x3du] == 0x22u,
+              "v89: cmp [rsi],0x22 @0x3b");
+        CHECK(th[0x3eu] == 0x75u && th[0x3fu] == 0x18u,
+              "v89: jne -> 0x58 @0x3e (disp 0x18)");
+        /* prep: rdi,[rsp] @0x40 + rcx,[rsp+0x18] @0x44; БЕЗ rsi/rdx-reloads! */
+        CHECK(th[0x40u] == 0x48u && th[0x41u] == 0x8bu && th[0x42u] == 0x3cu,
+              "v89: mov rdi,[rsp] @0x40");
+        CHECK(th[0x44u] == 0x48u && th[0x45u] == 0x8bu && th[0x46u] == 0x4cu,
+              "v89: mov rcx,[rsp+0x18] @0x44 (флаги из сэйва r10)");
+        CHECK(th[0x49u] == 0x48u && th[0x4au] == 0xb8u && th[0x4bu] == 0x88u,
+              "v89: movabs rax,helper @0x49");
+        CHECK(th[0x53u] == 0xffu && th[0x54u] == 0xd0u,
+              "v89: call rax @0x53");
+        CHECK(th[0x55u] == 0x48u && th[0x56u] == 0x89u && th[0x57u] == 0xc6u,
+              "v89: mov rsi,rax @0x55 (buf из хелпера)");
+        CHECK(th[0x6bu] == 0xb8u && th[0x6cu] == 0x2cu && th[0x6du] == 0u,
+              "v89: mov eax,44 @0x6b");
+        CHECK(th[0x70u] == 0x0fu && th[0x71u] == 0x05u,
+              "v89: syscall @0x70");
+        CHECK(th[0x7bu] == 0xe9u, "v89: e9 jmp-back @0x7b");
+        CHECK(th[0x7cu] == 0xe0u && th[0x7du] == 0xffu && th[0x7eu] == 0xffu &&
+              th[0x7fu] == 0xffu,
+              "v89: rel32 = back-(pg+0x80) = -0x20 LE");
+        /* pass-вариант (helper=0) = nop-регион 0x49..0x57 */
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk_gap(th, sizeof th, 0ull,
+                               win + 5u, pl - 7u,
+                               0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 128u && th[0x49u] == 0x90u && th[0x57u] == 0x90u,
+              "v89: helper=0 = nop 0x49..0x57 (pass-вариант)");
+        /* gl>15 = отказ; gl=0 (без тени) = 90-пад весь слот */
+        CHECK(c2b_raw_thunk_gap(th, sizeof th, 1ull, win + 5u, 16u,
+                                0x1000ull, 0x2000ull) == 0u,
+              "v89: gl=16 > 15 = отказ");
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk_gap(th, sizeof th, 1ull, (const u8 *)0, 0u,
+                               0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 128u && th[0x21u] == 0x90u && th[0x2fu] == 0x90u,
+              "v89: gl=0 = весь слот 90-пад (смежный-совместимый путь)");
+        CHECK(c2b_raw_thunk_gap(th, 100u, 1ull, win + 5u, 7u,
+                                0x1000ull, 0x2000ull) == 0u,
+              "v89: cap=100 = отказ");
+        CHECK(c2b_raw_thunk_gap(th, sizeof th, 1ull, win + 5u, 7u,
+                                0x90000000ull, 0x1000ull) == 0u,
+              "v89: back вне rel32 = отказ");
     }
 }
 

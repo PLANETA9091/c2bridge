@@ -359,6 +359,7 @@ static u32 c2b_raw_thunk(u8 *t, u32 cap, unsigned long long helper, u32 nr,
  *  72 restore r8 | 77 add rsp,0x40 | 7b e9 rel32 (next = pg+0x80)
  * nr46 = ЗАПРЕЩЁН (rsi = msghdr*, первый байт = не пейлоад — гвард неве-
  * рен): старая 112B-санка. back = site + ПОЛНАЯ длина окна (как v82c). */
+#if defined(C2B_SELFTEST)
 static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
                               unsigned long long pg, unsigned long long back)
 {
@@ -427,6 +428,7 @@ static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
     if (i != 128u) return 0u;
     return i;
 }
+#endif  /* C2B_SELFTEST (v89: в .so-сборке заменена c2b_raw_thunk_gap) */
 
 /* v87b pure: PASSTHROUGH-ONLY санка (GATE_MODE=2, бисект run494). ЛЭЙАУТ =
  * ИДЕНТИЧЕН c2b_raw_thunk_gate (128B: те же гварды/сэйвы/перезагрузки/
@@ -439,6 +441,7 @@ static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
  * КРАШ => санка-асм vs контекст окна (RBX/RBP-интерплей, red zone) =
  * ре-RE. rsi/rdx = НЕ перезагружаются после nop-региона (гварды = только
  * чтение флагов; syscall получает оригинальные (buf,len)). */
+#if defined(C2B_SELFTEST)
 static u32 c2b_raw_thunk_pass(u8 *t, u32 cap, unsigned long long pg,
                               unsigned long long back)
 {
@@ -482,6 +485,107 @@ static u32 c2b_raw_thunk_pass(u8 *t, u32 cap, unsigned long long pg,
     t[i++] = 0x20u;
     /* v87b: 0x49..0x57 = 15 x 0x90 (БЫЛО: movabs+call+mov rsi,rax). */
     for (q = 0; q < 15u; q++) t[i++] = 0x90u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    t[i++] = 0xb8u; t[i++] = 0x2cu; t[i++] = 0u; t[i++] = 0u; t[i++] = 0u;
+    t[i++] = 0x0fu; t[i++] = 0x05u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xc4u; t[i++] = 0x40u;
+    t[i++] = 0xe9u;
+    t[i++] = (u8)((u32)rel & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 8) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 16) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 24) & 0xffu);
+    if (i != 128u) return 0u;
+    return i;
+}
+#endif  /* C2B_SELFTEST (v87b pass-вариант) */
+
+/* v89 pure: SHADOW-RELOAD САНКА ДЛЯ GAP-КЛАССА (nr44 ТОЛЬКО). РЕШЕНИЕ
+ * КРАШ-ТРИАДЫ 488/491/492/493/494/495 (run495-таймлайн + байт-декод):
+ * gap-окно = 'b8 2c 00 00 00 | <перезагрузки rsi/rdx> | 0f 05 | якорь' —
+ * ПЕРЕЗАГРУЗКИ ВНУТРИ ОКНА = реставрация РЕАЛЬНЫХ аргументов после
+ * clobber от call __pthread_enable_asynccancel (вся причина их сущест-
+ * вования в full async-cancel пути!). Патч e9 @site+0 = прыжок ДО переза-
+ * грузок => санка входила с rsi/rdx = МУСОР от enable-колла => релей
+ * sendto(fd, мусор-буф, мусор-len) => EFAULT на каждом send через шлюз =>
+ * смерть IPC-труб движка (CCrossPipe::BWrite: 14) => Fatal assert => SEGV.
+ * Смежные сайты = зелёные с v77 ИМЕННО потому, что их окна БЕЗ перезагру-
+ * зок (вход-арги реальны). ФИКС: ТЕНЬ ОКНА — gl байт перезагрузок копиру-
+ * ются ВЕРБАТИМ внутрь санки (rbp-относительные = валидны: rbp = callee-
+ * saved, жив на мид-сайте, санка его не трогает), гварды = ПОСЛЕ тени
+ * (на УЖЕ РЕАЛЬНЫх rsi/rdx!), rsi/rdx-перезагрузки из сэйв-слотов УДАЛЕНЫ
+ * (они бы ОТМЕНИЛИ тень), helper = получает реальные (buf,len) в rsi/rdx.
+ * ЛЭЙАУТ (128B, jcc-цели = 0x58 как v84):
+ *  00 sub rsp,0x40 | 04..20 сэйвы rdi/rsi/rdx/r10/r8/r9 (disp8!)
+ *  21..2f ТЕНЬ: gl байт окна (gl<=15) + 90-пад до 15
+ *  30 test rsi,rsi | 33 je ->0x58 | 35 cmp rdx,40 | 39 jb ->0x58
+ *  3b cmp [rsi],0x22 | 3e jne ->0x58
+ *  40 mov rdi,[rsp] | 44 mov rcx,[rsp+0x18] (флаги для хелпера)
+ *  49 movabs rax,helper (helper=0 => 15x90 на 0x49..0x57 = pass-вариант)
+ *  53 call rax | 55 mov rsi,rax
+ *  58 (SKIP) mov rdi,[rsp] | 5c mov r10,[rsp+0x18] | 61 mov r8,[rsp+0x20]
+ *  66 mov r9,[rsp+0x28] | 6b mov eax,44 | 70 syscall
+ *  72 restore r8 | 77 add rsp,0x40 | 7b e9 rel32 (next = pg+0x80)
+ * SKIP-путь: тень = выполнена ДО гвардов => rsi/rdx реальны на ЛЮБОМ пу-
+ * ти => syscall корректен для ВСЕГО трафика. back = site + ПОЛНАЯ длина
+ * окна (как v82c). gl > 15 / NULL = отказ. */
+static u32 c2b_raw_thunk_gap(u8 *t, u32 cap, unsigned long long helper,
+                             const u8 *gap, u32 gl,
+                             unsigned long long pg, unsigned long long back)
+{
+    u32 i = 0, q;
+    i32 rel;
+    if (!t || cap < 128u || gl > 15u || (gl && !gap)) return 0u;
+    {
+        long long d = (long long)(back - (pg + 0x80ull));
+        if (d > 2147483647ll || d < -2147483648ll) return 0u;
+        rel = (i32)d;
+    }
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xecu; t[i++] = 0x40u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    /* v89: ТЕНЬ ОКНА 0x21..0x2f = gl байт перезагрузок вербатим + 90-пад */
+    for (q = 0; q < gl; q++) t[i++] = gap[q];
+    while (i < 0x30u) t[i++] = 0x90u;
+    /* гварды v84 — ПОСЛЕ тени: rsi/rdx = УЖЕ РЕАЛЬНЫЕ аргументы */
+    t[i++] = 0x48u; t[i++] = 0x85u; t[i++] = 0xf6u;    /* test rsi,rsi */
+    t[i++] = 0x74u; t[i++] = 0x23u;                    /* je  -> +0x23 (0x58) */
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xfau; t[i++] = 0x28u;
+                                                        /* cmp rdx,40 */
+    t[i++] = 0x72u; t[i++] = 0x1du;                    /* jb  -> +0x1d (0x58) */
+    t[i++] = 0x80u; t[i++] = 0x3eu; t[i++] = 0x22u;    /* cmp [rsi],0x22 */
+    t[i++] = 0x75u; t[i++] = 0x18u;                    /* jne -> +0x18 (0x58) */
+    /* prep хелпера: rdi = fd (реален, reload = безвреден), rcx = флаги
+     * из сэйв-слота r10 (реальны; входной rcx = мусор enable-колла).
+     * rsi/rdx = НЕ перезагружаем — тень уже дала реальные значения! */
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    if (helper) {
+        t[i++] = 0x48u; t[i++] = 0xb8u;
+        for (q = 0; q < 8u; q++) t[i + q] = (u8)((helper >> (q * 8u)) & 0xffu);
+        i += 8u;
+        t[i++] = 0xffu; t[i++] = 0xd0u;
+        t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0xc6u;
+    } else {
+        for (q = 0; q < 15u; q++) t[i++] = 0x90u;
+    }
     t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
     t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
     t[i++] = 0x18u;

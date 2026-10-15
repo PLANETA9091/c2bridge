@@ -123,6 +123,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      crtok:
+        description: "v97: the SDR cert-validator cold-table bypass (tools/patch_crtok.py): the static byte-patch of the 64-bit steamclient.so copies BEFORE the run. The run507 verdict: the engine's GNS rejected the server's 0x23 ConnectOK with 'Bad cert: CA key %llu is not known to us' while the SDR network config was still fetching (HTTP 504 race = the CA table EMPTY); the FIRST channel died pre-config-load and the SECOND connected post-load — BOTH 0x23s carry the IDENTICAL cert => pure config-load race, the CA itself IS in the appid-730 config. Patch = the failure tail ('not known to us' -> xor eax,eax; ret 0) becomes 'mov al,1' => an unknown/cold CA returns VALID; the ed25519 signature verification for KNOWN CAs = a separate return path = stays hard-failing; the Bad-cert spew line still prints (the A/B telemetry). Anchors are verified byte-exact (the format string + the unique rip-relative lea + the tail pattern); any mismatch = the file is SKIPPED, never half-patched. '0' = the rollback lever (no patch, the run507 behavior)."
+        default: "1"
+        required: false
+        type: choice
+        options: ["0", "1"]
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -202,6 +208,8 @@ jobs:
       # in-flight into the accepted modern form. Default '0' = the
       # run479-485 behavior (the rewrite OFF, the passive capture only).
       C2B_CRTFIX_V: ${{ inputs.crtfix || '0' }}
+      # v97: the cert-validator cold-table bypass ('0' = the run507 behavior).
+      C2B_CRTOK_V: ${{ inputs.crtok || '1' }}
       # v82c-d: the gap-stub patcher arm (default OFF = the run487 behavior;
       # the run488 default-on attempt = the startup death, see the input note).
       C2B_GAP_V: ${{ inputs.gap || '0' }}
@@ -455,6 +463,22 @@ jobs:
           # (a session cached from a failed login is worthless and would
           # poison the immutable key).
           echo "login_ok=$ok" >> "$GITHUB_OUTPUT"
+
+      # ---------- v97 crtok: the cert-validator cold-table bypass ----------
+      - name: crtok patch (v97 cold-CA Bad-cert race to valid)
+        run: |
+          if [ "${C2B_CRTOK_V}" = "0" ]; then
+            echo "crtok: OFF (the rollback lever) — restoring the original bytes if the cached bundle = already patched"
+            mapfile -t sos0 < <(find -L ~/.steam ~/.local/share/Steam "$GITHUB_WORKSPACE" /tmp -maxdepth 8 \
+              -type f -name steamclient.so 2>/dev/null | sort -u)
+            [ ${#sos0[@]} -gt 0 ] && python3 tools/patch_crtok.py --restore "${sos0[@]}" || true
+            exit 0
+          fi
+          mapfile -t sos < <(find -L ~/.steam ~/.local/share/Steam "$GITHUB_WORKSPACE" /tmp -maxdepth 8 \
+            -type f -name steamclient.so 2>/dev/null | sort -u)
+          if [ ${#sos[@]} -eq 0 ]; then echo "::warning::crtok: no steamclient.so found"; exit 0; fi
+          echo "crtok: ${#sos[@]} steamclient.so candidate(s)"
+          python3 tools/patch_crtok.py "${sos[@]}" || echo "::warning::crtok: some builds skipped (the anchors = absent = left untouched)"
 
       # ---------- e2e ----------
       - name: run e2e (${{ env.MODE }})

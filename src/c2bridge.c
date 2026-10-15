@@ -12536,12 +12536,17 @@ static i32 c2b_t2v_gate(u32 on, u32 dead, u32 fires, u32 a_seq, u32 a_seen,
  * xx 00 37 01 00 00 00][CLV2-датаграмма 42B от ff×4] — ff×4 = @+12, НЕ @0
  * (k27-raw=42B = подтверждение). Инжект = payload-swap: префикс [0..mo)
  * СОХРАНЯЕТСЯ, 'B' (40B) = в payload [mo..len) 42>=40 фит. 7B SW/ACK =
- * фрейм БЕЗ payload = НЕ носитель netmsg — стадия S2 УДАЛЕНА (SignonState
- * = v106+: нужен netmsg-лейн кадр, в текущем трафике сервера отсутствует).
- * Кап 1/сессию ('B'). Киллисвитч C2B_T3V=0 (дефолт ON). Регистра-
+ * фрейм БЕЗ payload = НЕ носитель netmsg — стадия S2 = v106.1 ВОЗРОЖДЕНА
+ * на ПРАВОМ носителе: 'A'-слот #3+ ПОСЛЕ 'B' => payload = КОМПАКТ 07 08 02
+ * (язык движка, 0011-декод: out SignonState = [t=7][pb{1:2}] БЕЗ 4B n —
+ * [SNP-префикс][07][08 02] = форма netmsg-лейна туннеля), хвост payload =
+ * нули (резюме 'A' не читается демуксом t=7). Капы: 'B' 1/сессию, S2
+ * 2/сессию, S2 стреляет ТОЛЬКО при nB>=1 (accept раньше продолжения).
+ * Киллисвитч C2B_T3V=0 (дефолт ON). Регистра-
  * ция = мост -> c2b_hook_t3v_register (hook = LD_PRELOAD = dlsym(0) видим). */
 static u32 c2b_clv2_client_version(void);      /* fwd (определение @g44-билдере) */
 #define C2B_T3V_CAP_B  1u
+#define C2B_T3V_CAP_S2 2u   /* v106.1: стадия S2 = после 'B' (пост-accept продолжение) */
 
 typedef struct {
     u32 on;      /* C2B_T3V гейт (дефолт 1, =0 kill) */
@@ -12561,6 +12566,18 @@ static u32 c2b_t3_build_s2(u8 *q, u32 cap)
     q[1] = 2u; q[2] = 0u; q[3] = 0u; q[4] = 0u;   /* n=2 LE */
     q[5] = 0x08u; q[6] = 0x02u;                    /* pb field1 varint 2 */
     return 7u;
+}
+
+/* v106.1: КОМПАКТ-форма SignonState = ЯЗЫК ДВИЖКА (0011-декод netmsg-лейна:
+ * out SignonState = 07 08 02 = [t=7][pb field1 varint 2] БЕЗ 4B n-префикса;
+ * 7B-форма [t][n][body] = реликвия REL-лейна run260, НЕ носитель туннеля).
+ * 3B. cap >= 3. */
+static u32 c2b_t3_build_s2c(u8 *q, u32 cap)
+{
+    if (!q || cap < 3u) return 0;
+    q[0] = 7u;
+    q[1] = 0x08u; q[2] = 0x02u;                    /* pb{1:2} = state 2 */
+    return 3u;
 }
 
 /* 'B' kaccept = клон g42-формы с ЯВНЫМ chal (без глобального g_clv2_ch32 —
@@ -12610,6 +12627,16 @@ static u32 c2b_t3_step(u8 *out, u32 len, c2b_t3_st_t *st)
         len - mo >= 40u) {
         c2b_t3_build_b(out + mo, len - mo, chal);
         st->nB++;
+        return 1u;
+    }
+    /* v106.1: стадия S2 — 'A'#3+ ПОСЛЕ 'B' => payload = компакт 07 08 02
+     * (3B) + хвост = нули (демукс t=7 читает pb{1:2}, резюме 'A' = мусор). */
+    if (st->seenA >= 3u && st->nB && st->nS2 < C2B_T3V_CAP_S2 &&
+        len - mo >= 3u) {
+        u32 i2;
+        c2b_t3_build_s2c(out + mo, len - mo);
+        for (i2 = mo + 3u; i2 < len; i2++) out[i2] = 0u;
+        st->nS2++;
         return 1u;
     }
     return 0;
@@ -19218,6 +19245,7 @@ static void c2b_p2v_maybe(void);       /* v101: plaintext firsts in-channel (т�
 static void c2b_t2v_maybe(void);       /* v102: ticket in-channel RELIABLE (тело = в runtime-регионе) */
 static void c2b_cw_maybe(void);        /* v106: cstate-срез 0x1a0 (тело = в runtime-регионе) */
 static void c2b_swr_maybe(void);       /* v106: SNP-wrapped 'k' in-channel (тело = в runtime-регионе) */
+static void c2b_s2o_maybe(void);       /* v106.1: компакт-S2 out (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
@@ -19427,6 +19455,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_t2v_maybe();       /* v102: ticket in-channel RELIABLE (ответ на 'A') */
         c2b_cw_maybe();        /* v106: cstate-срез (флап 0/1/2 виден на таймлайне) */
         c2b_swr_maybe();       /* v106: SNP-wrapped 'k' in-channel (новый хед-эпок) */
+        c2b_s2o_maybe();       /* v106.1: компакт-S2 out post-'B' (новый хед-эпок) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
@@ -20333,6 +20362,19 @@ static u32 c2b_swr_gate(u32 on, u32 fires, u32 n_new, u32 n_seen)
     if (!n_new || n_new == n_seen) return 0;
     return 1;
 }
+/* v106.1: s2o_build = [12B хед-клон (бамп @3/@8)][07 08 02][14B zero-пад]
+ * = 29B. Компакт-SignonState = язык движка (0011-декод out SignonState =
+ * [t=7][pb{1:2}] БЕЗ 4B n-префикса). Пад = нечитаемый хвост pb-демукса
+ * (pb-сообщение завершено на 3B). Always-остров = selftest-видимость. */
+static u32 c2b_s2o_build(const u8 *hdr, u8 *out, u32 cap)
+{
+    u8 pl2[17];
+    u32 z2;
+    if (!hdr || !out) return 0;
+    for (z2 = 0; z2 < 17u; z2++) pl2[z2] = 0u;
+    pl2[0] = 7u; pl2[1] = 0x08u; pl2[2] = 0x02u;
+    return c2b_swr_build(hdr, pl2, 17u, out, cap);
+}
 
 #ifndef C2B_SELFTEST
 /* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
@@ -20921,7 +20963,7 @@ static void c2b_t2v_maybe(void)
  * (б)-кандидат 2247: 'B'-реакция ненаблюдаема => прямой срез гейта.
  * Флап 0/1/2 на таймлайне = ответ на: (1) инжект при cstate!=1 = мёртв;
  * (2) g63-фейк-'B' ставит ли 2; (3) серверные 'A'-рефреши держат ли 1. */
-#define C2B_CW_EVERY 150
+#define C2B_CW_EVERY 20   /* v106.1: 150 = бюджет-промах (g97 ~1s/тик, 137 тиков/ран < 150 => 0 срезов; run519 дал 1 срез только каскадом) */
 #define C2B_CW_LOGLIM 24
 static u32 g_cw_init, g_cw_on = 1, g_cw_ticks, g_cw_logs;
 static void c2b_cw_maybe(void)
@@ -20932,7 +20974,7 @@ static void c2b_cw_maybe(void)
         if (ecw && ecw[0] == '0') g_cw_on = 0;
         g_cw_init = 1;
         if (g_cw_on)
-            C2B_LOGS("[c2b] cw: ARMED (v106 cstate-walk @0x1a0, every 150 ticks)\n");
+            C2B_LOGS("[c2b] cw: ARMED (v106.1 cstate-walk @0x1a0, every 20 ticks)\n");
     }
     if (!g_cw_on) return;
     if (++g_cw_ticks < C2B_CW_EVERY) return;
@@ -20960,7 +21002,7 @@ static void c2b_cw_maybe(void)
  * в канале (диалог жив, форма не та => след: A-answer 25B); тишина =
  * SNP-окно не приняло (след: seq/msg-точность). */
 static u32 g_swr_init, g_swr_on = 1, g_swr_fires, g_swr_epoch, g_swr_gap,
-           g_swr_nohdr, g_swr_have_fn;
+           g_swr_nohdr, g_swr_have_fn, g_swr_nokf;
 static u32 (*g_swr_hdr_fn)(unsigned char *);
 static void c2b_swr_maybe(void)
 {
@@ -20994,9 +21036,51 @@ static void c2b_swr_maybe(void)
     }
     n_kf = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
     if (!c2b_swr_gate(g_swr_on, g_swr_fires, n_hdr, g_swr_epoch)) return;
-    if (!n_kf || !g_kfull_len) { g_swr_epoch = n_hdr; return; }
-    len_swr = c2b_swr_build(hd_swr, g_kfull, g_kfull_len,
-                            sw_buf, (u32)sizeof sw_buf);
+    if (!n_kf || !g_kfull_len) {
+        /* v106.1: kfull-голод (флэйк-эра капчера, 0011-приоритет) — фолбэк
+         * = kcap-синтез (k27-рецепт run366/367: 17B-шаблон ff×4+'k'+ver
+         * 0x3639+proto 3 + chal=0 + g_kcap ticket-зона). Лог = ОДИН раз/ран. */
+        u32 n_kc = __atomic_load_n(&g_kcap_n, __ATOMIC_ACQUIRE);
+        static u8 sw_fb[720];
+        if (!n_kc || g_kcap_len < 400u || g_kcap_len > 640u ||
+            17u + g_kcap_len > sizeof sw_fb) {
+            if (g_swr_nokf < 1) {
+                g_swr_nokf = 1;
+                C2B_LOGS("[c2b] swr: kfull+kcap пусты — ждём (эпок потрачен)\n");
+            }
+            g_swr_epoch = n_hdr;
+            return;
+        }
+        {
+            static const u8 khfb[13] = {
+                0xff, 0xff, 0xff, 0xff, 'k',
+                0x39, 0x36, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00
+            };
+            u32 zf1;
+            for (zf1 = 0; zf1 < 13u; zf1++) sw_fb[zf1] = khfb[zf1];
+            for (zf1 = 13u; zf1 < 17u; zf1++) sw_fb[zf1] = 0u;   /* chal=0 */
+            for (zf1 = 0; zf1 < g_kcap_len; zf1++) sw_fb[17u + zf1] = g_kcap[zf1];
+        }
+        if (__atomic_load_n(&g_kcap_n, __ATOMIC_ACQUIRE) != n_kc) {
+            g_swr_epoch = n_hdr;           /* гонка с капчером — скип */
+            return;
+        }
+        len_swr = c2b_swr_build(hd_swr, sw_fb, 17u + g_kcap_len,
+                                sw_buf, (u32)sizeof sw_buf);
+        if (len_swr && g_swr_nokf < 2) {
+            g_swr_nokf = 2;
+            C2B_LOGS("[c2b] swr: kfull голоден — фолбэк kcap-синтез len=");
+            C2B_LOGN(17u + g_kcap_len);
+            C2B_LOGS("\n");
+        }
+        if (!len_swr) {
+            g_swr_epoch = n_hdr;
+            return;
+        }
+    } else {
+        len_swr = c2b_swr_build(hd_swr, g_kfull, g_kfull_len,
+                                sw_buf, (u32)sizeof sw_buf);
+    }
     if (!len_swr) {
         if (g_swr_nohdr < 4) {
             g_swr_nohdr++;
@@ -21039,6 +21123,88 @@ static void c2b_swr_maybe(void)
     C2B_LOGN((u32)(i32)rc_swr);
     C2B_LOGS("\n");
     /* rc!=1 = ТОЛЬКО телеметрия — НЕТ death-stop (контракт k2v) */
+}
+
+/* ---------- v106.1: S2O — КОМПАКТ-SignonState OUT (язык движка на провод) ----------
+ * 0011-приоритет #2, фаза out: продолжение ПОСЛЕ 'B' (t3v-стадия 2 на ПРОВОДЕ):
+ * [12B SNP-хед (клон трекера, бамп @3/@8)][07 08 02] (17B = 3B-форма + zero-пад
+ * до min-plen build'а). vt[11] = GNS-encrypt сессии = ИСТИННЫЙ in-channel
+ * (ключи живы). Гейт-стадия = g_t3_st.nB>=1 (accept раньше продолжения),
+ * кап 2, эпок-триггер = свежий хед трекера, gap 60 тиков. Killswitch
+ * C2B_S2O=0. rc!=1 = телеметрия (контракт k2v). */
+static u32 g_s2o_init, g_s2o_on = 1, g_s2o_fires, g_s2o_epoch, g_s2o_gap,
+           g_s2o_nohdr, g_s2o_have_fn;
+static u32 (*g_s2o_hdr_fn)(unsigned char *);
+/* s2o_build = в always-острове (рядом со swr_build) — selftest-видимость
+ * (v98-урок); здесь только якорь-комментарий. */
+static void c2b_s2o_maybe(void)
+{
+    static u8 so_buf[64];
+    u8 hd2[12];
+    u32 n_hdr2, len2, z2, live2;
+    i32 rc2 = -998;
+    void **vt2;
+    if (!g_s2o_init) {
+        const char *es2 = getenv("C2B_S2O");
+        if (es2 && es2[0] == '0') g_s2o_on = 0;
+        g_s2o_init = 1;
+        if (g_s2o_on)
+            C2B_LOGS("[c2b] s2o: ARMED (v106.1 compact-SignonState out, cap 2, post-'B')\n");
+    }
+    if (g_s2o_gap) { g_s2o_gap--; return; }
+    if (!g_s2o_on || !g_gns_conn_iface || !g_gns_conn_h) return;
+    if (g_t3_st.nB < 1u) return;               /* стадия: только после 'B' */
+    if (g_s2o_fires >= 2u) return;
+    if (!g_s2o_have_fn) {
+        g_s2o_hdr_fn = (u32 (*)(unsigned char *))
+            dlsym((void *)0, "c2b_hook_sw_hdr");
+        g_s2o_have_fn = 1;
+    }
+    if (!g_s2o_hdr_fn) return;
+    n_hdr2 = g_s2o_hdr_fn(hd2);
+    if (!n_hdr2) {
+        if (g_s2o_nohdr < 2) {
+            g_s2o_nohdr++;
+            C2B_LOGS("[c2b] s2o: нет out-SNP-хедера (трекер пуст) — ждём\n");
+        }
+        return;
+    }
+    if (n_hdr2 == g_s2o_epoch) return;         /* эпок-триггер: хед свежий */
+    len2 = c2b_s2o_build(hd2, so_buf, (u32)sizeof so_buf);
+    if (!len2) {
+        g_s2o_epoch = n_hdr2;
+        return;
+    }
+    g_s2o_epoch = n_hdr2;
+    live2 = c2b_k24_brlive();
+    vt2 = *(void ***)g_gns_conn_iface;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc2 = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                        i64 *))vt2[11])(
+            g_gns_conn_iface, g_gns_conn_h, so_buf, len2,
+            0 /* UNRELIABLE = безопасный класс (run366) */, &g_k27k_out47);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] s2o: send SEGV\n");
+        return;
+    }
+    g_s2o_fires++;
+    g_s2o_gap = 60;
+    C2B_LOGS("[c2b] s2o: compact-S2 out #");
+    C2B_LOGN(g_s2o_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(len2);
+    C2B_LOGS(" hdr=");
+    for (z2 = 0; z2 < 12u; z2++) C2B_LOGH(so_buf[z2]);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live2);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 fl=0 rc=");
+    C2B_LOGN((u32)(i32)rc2);
+    C2B_LOGS("\n");
 }
 
 static void c2b_k27_maybe_fire(void)
@@ -32789,11 +32955,53 @@ static void test_t3v(void)
     CHECK(sl[30] == 2u, "t3v: proto=2 @30 (payload+18)");
     CHECK(sl[36] == 'c' && sl[43] == 0u, "t3v: connect\\0 @36..43");
     CHECK(sl[52] == 0u && sl[53] == 0u, "t3v: пад-хвост нулями (40+2)");
-    /* 'A'#3 (после 'B') = без инж (кап B=1) */
+    /* 'A'#3 (после 'B') = СТАДИЯ S2 v106.1: payload = компакт 07 08 02 */
     memset(sl, 0, sizeof sl);
+    sl[0] = 0x80u; sl[2] = 0x98u; sl[3] = 0x04u;
     sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
-    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'A'#3 = кап B = скип");
-    CHECK(st.seenA == 3u, "t3v: seenA продолжает расти");
+    sl[17] = 0x11u; sl[21] = 3u;
+    CHECK(c2b_t3_step(sl, 54, &st) == 1, "t3v: 'A'#3 post-'B' = S2 инж");
+    CHECK(st.nS2 == 1u && st.nB == 1u, "t3v: nS2=1, nB цел");
+    CHECK(sl[0] == 0x80u && sl[2] == 0x98u && sl[3] == 0x04u,
+          "t3v: SNP-префикс цел при S2");
+    CHECK(sl[12] == 7u && sl[13] == 0x08u && sl[14] == 0x02u,
+          "t3v: S2-компакт 07 08 02 @12..14");
+    CHECK(sl[15] == 0u && sl[16] == 0u && sl[53] == 0u,
+          "t3v: S2-хвост payload = нули");
+    /* 'A'#4 = S2#2 (кап 2) */
+    memset(sl, 0, sizeof sl);
+    sl[0] = 0x80u;
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
+    CHECK(c2b_t3_step(sl, 54, &st) == 1, "t3v: 'A'#4 = S2#2");
+    CHECK(st.nS2 == 2u, "t3v: nS2=2");
+    /* 'A'#5 = кап S2 = скип */
+    memset(sl, 0, sizeof sl);
+    sl[0] = 0x80u;
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
+    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'A'#5 = кап S2 = скип");
+    CHECK(st.seenA == 5u, "t3v: seenA продолжает расти");
+    /* стадийная дисциплина: БЕЗ 'B' (nB=0) S2 НЕ стреляет даже на seenA>=3 */
+    memset(&st, 0, sizeof st);
+    st.on = 1u;
+    memset(sl, 0, sizeof sl);
+    sl[0] = 0x80u;
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
+    sl[17] = 0x11u; sl[21] = 3u;
+    (void)c2b_t3_step(sl, 54, &st);            /* 'A'#1 нотед */
+    (void)c2b_t3_step(sl, 54, &st);            /* 'A'#2: len-mo=42>=40 -> 'B'... */
+    {   /* прямой чек: fresh-стейт с seenA=2, nB=0 => 'A'#3 = 'B' (не S2):
+         * стадийная дисциплина — S2 требует nB>=1 */
+        c2b_t3_st_t st_nb;
+        memset(&st_nb, 0, sizeof st_nb);
+        st_nb.on = 1u; st_nb.seenA = 2u;
+        memset(sl, 0, sizeof sl);
+        sl[0] = 0x80u;
+        sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
+        sl[17] = 0x11u; sl[21] = 3u;
+        CHECK(c2b_t3_step(sl, 54, &st_nb) == 1 && st_nb.nB == 1u &&
+              st_nb.nS2 == 0u,
+              "t3v: seenA=3/nB=0 => 'B' первичен (S2 ждёт nB>=1)");
+    }
     /* junk-слот (не ff×4 нигде) = скип */
     memset(sl, 0x5a, sizeof sl);
     CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: junk = скип");
@@ -32878,6 +33086,21 @@ static void test_swr(void)
     CHECK(c2b_swr_gate(1, 0, 0, 0) == 0, "swr: n=0 = скип");
     CHECK(c2b_swr_gate(1, 0, 5, 5) == 0, "swr: эпок без изменений = скип");
     CHECK(c2b_swr_gate(1, 2, 5, 4) == 1, "swr: валид = 1");
+    /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
+    printf("[t] s2o\n");
+    memset(out_swr, 0xAA, sizeof out_swr);
+    CHECK(c2b_s2o_build(hdr_swr, out_swr, sizeof out_swr) == 12u + 17u,
+          "s2o: build = 12+17 = 29B");
+    CHECK(out_swr[0] == 0x80u && out_swr[3] == 0x08u && out_swr[8] == 0x0bu,
+          "s2o: хед-клон с бампом @3/@8");
+    CHECK(out_swr[12] == 7u && out_swr[13] == 0x08u && out_swr[14] == 0x02u,
+          "s2o: компакт 07 08 02 @12..14");
+    CHECK(out_swr[15] == 0u && out_swr[28] == 0u && out_swr[29] == 0xAAu,
+          "s2o: 14B zero-пад до 29B, за кадром не пишем");
+    CHECK(c2b_s2o_build(0, out_swr, sizeof out_swr) == 0, "s2o: hdr=NULL = 0");
+    CHECK(c2b_s2o_build(badhdr_swr, out_swr, sizeof out_swr) == 0,
+          "s2o: hdr[0]!=0x80 = 0");
+    CHECK(c2b_s2o_build(hdr_swr, out_swr, 28u) == 0, "s2o: cap<29 = 0");
 }
 
 /* v101: p2v — детур slot-11 (форма/гейт/vtswap e2e на синт-vtable). */

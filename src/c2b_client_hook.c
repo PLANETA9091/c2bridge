@@ -261,6 +261,22 @@ static void c2b_t3v_hook(const void *out, sz_t len, u32 tag32)
     }
 }
 
+/* v106-swr: трекер ПОСЛЕДНЕГО out-SNP-хедера — statics ВЫНЕСЕНЫ к getter'у
+ * (определение getter'а = ВЫШЕ enc_capture в файле, объявление = до обоих). */
+static unsigned char g_c2b_sw_hdr[12];
+static volatile u32 g_c2b_sw_n;
+
+__attribute__((visibility("default")))
+u32 c2b_hook_sw_hdr(unsigned char *out12)
+{
+    u32 n, zg;
+    if (!out12) return 0;
+    for (zg = 0; zg < 12u; zg++)
+        out12[zg] = g_c2b_sw_hdr[zg];
+    n = __atomic_load_n(&g_c2b_sw_n, __ATOMIC_ACQUIRE);
+    return n;
+}
+
 /* the shared capture: the dedup by the key, the caps, the log line =
  * [c2b] g110: KEYn len=N key=<64hex> ictx=<32hex> */
 static void c2b_g110_capture(u64 len, const void *key, const void *ictx)
@@ -2169,6 +2185,8 @@ static u32 g126_nencc32;      /* the encrypt_ctr32 calls seen */
 static u32 g126_nenclsn;      /* v104: the libsns encrypt calls seen */
 static u32 g126_prof_ec;      /* the enc-profile lines logged (cap 8) */
 static u32 g126_prof_ecl;     /* the encc32-profile lines logged (cap 8) */
+/* v106-swr: statics трекера = объявлены выше у getter'а c2b_hook_sw_hdr;
+ * здесь только комментарий-якорь (порядок: getter @~L245 < enc_capture). */
 
 static void c2b_g126_enc_capture(void *gcm, const void *in, const void *out,
                                  sz_t len, i32 rc, u32 c32)
@@ -2185,6 +2203,15 @@ static void c2b_g126_enc_capture(void *gcm, const void *in, const void *out,
      * сессии (0x22 x46 => ~46 ticket-encrypts, каждые 8-е = мало). */
     if ((n & 0x03) != 1 && n > 16) return;
     if (len > 0x10000) return;    /* the junk guard */
+    /* v106-swr: трекер ДО rate-гейта — КАЖДЫЙ свежий хед = эпок для свр;
+     * только ENCC32 (c32==1 = движковый OUT ctr32-путь), 0x80-кадры. */
+    if (c32 == 1u && in && len >= 12u &&
+        ((const u8 *)in)[0] == 0x80u) {
+        u32 zw;
+        for (zw = 0; zw < 12u; zw++)
+            g_c2b_sw_hdr[zw] = ((const u8 *)in)[zw];
+        (void)__atomic_add_fetch(&g_c2b_sw_n, 1u, __ATOMIC_RELEASE);
+    }
     memcpy(bo, out, sizeof bo);
     if (*prof < 8) {
         (*prof)++;

@@ -9164,6 +9164,8 @@ static volatile uptr c2b_g49_state;   /* g50: ПОЛНЫЙ 64-бит ptr инс�
                                       * захваченный g49-детуром (обработчик 'A'
                                       * работает на нитке движка ДО cstate-гейта) */
 static u32 c2b_g49_nl;
+/* v106-cw: читатель состояния CLV2 ПЕРЕНЕСЕН в always-остров (у k2v-хелперов,
+ * до #ifndef @20307) — selftest-лега тоже видит (test_cw). */
 /* 58f-g95: refresh челленджа в установенном соединении (run254-dwell):
  * сервер перечелленджит 'A' с СВЕЖИМ chal (0x53f4ddfc/0x2ee0de00) по GNS-
  * каналу (from=127.0.0.1:32105), но connectionless-парсер движка их НЕ видит
@@ -12614,10 +12616,21 @@ static u32 c2b_t3_step(u8 *out, u32 len, c2b_t3_st_t *st)
 }
 
 /* живой инжектор (контекст = decrypt-тред хука); телеметрия = bridge-лог */
+/* v106-cw fwd: определение @~20300 (always-остров), вызов отсюда — прототип
+ * обязателен ВЫШЕ вызова (implicit-decl в .so-леге = конфликт типов, v98-урок) */
+static u32 c2b_cw_read(uptr st, u32 *cs, u32 *chal, u32 *proto);
 static u32 c2b_t3_inject(u8 *out, u32 len)
 {
     u32 r = c2b_t3_step(out, len, &g_t3_st);
     if (r) {
+        u32 cs_t3 = 0, ch_t3 = 0, pr_t3 = 0;
+#ifndef C2B_SELFTEST
+        /* v106-cw: срез cstate В МОМЕНТ инжекции — гейт 'B'-кейса =
+         * cmpl $1,0x1a0: инжект при cstate!=1 = гарантированно мёртвый.
+         * Чтение cross-thread (decrypt-тред), но read-only = безопасно.
+         * (g49-регион = runtime-only => selftest-лега = без среза.) */
+        (void)c2b_cw_read((uptr)c2b_g49_state, &cs_t3, &ch_t3, &pr_t3);
+#endif
         C2B_LOGS("[c2b] t3v: inj nB=");
         C2B_LOGN(g_t3_st.nB);
         C2B_LOGS(" nS2=");
@@ -12628,6 +12641,10 @@ static u32 c2b_t3_inject(u8 *out, u32 len)
         C2B_LOGN(len);
         C2B_LOGS(" chal=");
         C2B_LOGH(g_t3_st.chal);
+        C2B_LOGS(" cstate=");
+        C2B_LOGN(cs_t3);
+        C2B_LOGS(" schal=");
+        C2B_LOGH(ch_t3);
         C2B_LOGS("\n");
     }
     return r;
@@ -19199,6 +19216,8 @@ static void c2b_h2v_maybe(void);       /* v100: hello 0x80-class in-channel (т�
 static void c2b_p2v_arm(void);         /* v101: детур vtable[11] (тело = в runtime-регионе) */
 static void c2b_p2v_maybe(void);       /* v101: plaintext firsts in-channel (тело = в runtime-регионе) */
 static void c2b_t2v_maybe(void);       /* v102: ticket in-channel RELIABLE (тело = в runtime-регионе) */
+static void c2b_cw_maybe(void);        /* v106: cstate-срез 0x1a0 (тело = в runtime-регионе) */
+static void c2b_swr_maybe(void);       /* v106: SNP-wrapped 'k' in-channel (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
@@ -19406,6 +19425,8 @@ static void *c2b_g97_thread(void *arg)
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
         c2b_p2v_maybe();       /* v101: plaintext firsts in-channel (new firsts) */
         c2b_t2v_maybe();       /* v102: ticket in-channel RELIABLE (ответ на 'A') */
+        c2b_cw_maybe();        /* v106: cstate-срез (флап 0/1/2 виден на таймлайне) */
+        c2b_swr_maybe();       /* v106: SNP-wrapped 'k' in-channel (новый хед-эпок) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
@@ -20274,6 +20295,45 @@ static i32 c2b_h2v_gate(u32 on, u32 dead, u32 fires, u32 n_new, u32 n_seen,
     return 1;
 }
 
+/* ---------- v106: ЧИСТЫЕ ХЕЛПЕРЫ CW + SWR (always-остров = до #ifndef
+ * @runtime-границын; selftest-видимость = контракт v98-урока) ----------
+ * cw_read: cstate@0x1a0 = ГЕЙТ 'B'-кейса (0x25a8b0: cmpl $1,0x1a0 — 'B'
+ * парсится ТОЛЬКО при 1; accept ставит 2; g52-форсы мапят 0/2 -> 1).
+ * chal@0x4d8 / proto@0x4dc = пара контекста (g48-паттерн AUTHDIAG). */
+static u32 c2b_cw_read(uptr st, u32 *cs, u32 *chal, u32 *proto)
+{
+    if (!st || !cs || !chal || !proto) return 0;
+    *cs = *(volatile u32 *)(st + 0x1a0);
+    *chal = *(volatile u32 *)(st + 0x4d8);
+    *proto = *(volatile u32 *)(st + 0x4dc);
+    return 1;
+}
+/* swr_build: [12B SNP-хед (клон out-кадра, бамп @3/@8)][payload вербатим].
+ * ff×4+'k' ВНУТРИ payload = СОБСТВЕННАЯ форма сервера (его 'A' = [SNP][ff×4
+ * +'A']). plen 17..1200 (g_kfull=513B класс), cap >= 12+plen, hdr[0]=0x80. */
+static u32 c2b_swr_build(const u8 *hdr, const u8 *payload, u32 plen,
+                         u8 *out, u32 cap)
+{
+    u32 z_swr;
+    if (!hdr || !payload || !out) return 0;
+    if (plen < 17u || plen > 1200u) return 0;
+    if (cap < 12u + plen || hdr[0] != 0x80u) return 0;
+    for (z_swr = 0; z_swr < 12u; z_swr++) out[z_swr] = hdr[z_swr];
+    out[3] = (u8)(out[3] + 1u);    /* seq lo-бамп (наблюдаемый класс 8-бит) */
+    out[8] = (u8)(out[8] + 1u);    /* msg-num LE32 lo-байт (hi = 0 в сессии) */
+    for (z_swr = 0; z_swr < plen; z_swr++) out[12u + z_swr] = payload[z_swr];
+    return 12u + plen;
+}
+/* swr_gate: on/кап 3/эпок-триггер (n_new != n_seen) — len-гейта нет (plen
+ * проверяет build); dead-флага нет (контракт k2v: rc!=1 = телеметрия). */
+static u32 c2b_swr_gate(u32 on, u32 fires, u32 n_new, u32 n_seen)
+{
+    if (!on) return 0;
+    if (fires >= 3u) return 0;
+    if (!n_new || n_new == n_seen) return 0;
+    return 1;
+}
+
 #ifndef C2B_SELFTEST
 /* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
  * что у g97-полла; в run356 он же дал 'End-to-end connection: connected').
@@ -20855,6 +20915,130 @@ static void c2b_t2v_maybe(void)
     C2B_LOGN((u32)(i32)rc_tv);
     C2B_LOGS("\n");
     /* rc!=1 = ТОЛЬКО телеметрия (rc==3 = dead-флаг; кап 1 = одиночный зонд) */
+}
+
+/* ---------- v106: CW — CSTATE WALK (периодический срез) ----------
+ * (б)-кандидат 2247: 'B'-реакция ненаблюдаема => прямой срез гейта.
+ * Флап 0/1/2 на таймлайне = ответ на: (1) инжект при cstate!=1 = мёртв;
+ * (2) g63-фейк-'B' ставит ли 2; (3) серверные 'A'-рефреши держат ли 1. */
+#define C2B_CW_EVERY 150
+#define C2B_CW_LOGLIM 24
+static u32 g_cw_init, g_cw_on = 1, g_cw_ticks, g_cw_logs;
+static void c2b_cw_maybe(void)
+{
+    u32 cs_cw, ch_cw, pr_cw;
+    if (!g_cw_init) {
+        const char *ecw = getenv("C2B_CW");
+        if (ecw && ecw[0] == '0') g_cw_on = 0;
+        g_cw_init = 1;
+        if (g_cw_on)
+            C2B_LOGS("[c2b] cw: ARMED (v106 cstate-walk @0x1a0, every 150 ticks)\n");
+    }
+    if (!g_cw_on) return;
+    if (++g_cw_ticks < C2B_CW_EVERY) return;
+    g_cw_ticks = 0;
+    if (g_cw_logs >= C2B_CW_LOGLIM) return;
+    if (!c2b_cw_read((uptr)c2b_g49_state, &cs_cw, &ch_cw, &pr_cw)) return;
+    g_cw_logs++;
+    C2B_LOGS("[c2b] cw: cstate=");
+    C2B_LOGN(cs_cw);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(ch_cw);
+    C2B_LOGS(" proto=");
+    C2B_LOGN(pr_cw);
+    C2B_LOGS("\n");
+}
+
+/* ---------- v106: SWR — SNP-WRAPPED LEGACY-'k' IN-CHANNEL ----------
+ * МОДЕЛЬ (скан 480-518): серверный SNP-слой роняет ВСЁ без валидного 12B
+ * хедера: k2v-verbatim (ff×4-raw) = PARSE-kill 2047 (ff×4 прочтён КАК хед),
+ * k2v-noff4 ('k'-head) = тихо, h2v-дубли (валидный хед) = тихо. НОВЫЙ ФОРМ:
+ * [12B SNP-хед][g_kfull вербатим] — хедер = клон ПОСЛЕДНЕГО out-SNP-кадра
+ * движка (ENCC32-pt, hook-трекер c2b_hook_sw_hdr) с бампом @3 (seq lo) и
+ * @8 (msg-num lo). Killswitch C2B_SWR=0; кап 3; gap 60 тиков; rc!=1 =
+ * только телеметрия (контракт k2v). PARSE-close = сервер ЧИТАЕТ legacy-'k'
+ * в канале (диалог жив, форма не та => след: A-answer 25B); тишина =
+ * SNP-окно не приняло (след: seq/msg-точность). */
+static u32 g_swr_init, g_swr_on = 1, g_swr_fires, g_swr_epoch, g_swr_gap,
+           g_swr_nohdr, g_swr_have_fn;
+static u32 (*g_swr_hdr_fn)(unsigned char *);
+static void c2b_swr_maybe(void)
+{
+    static u8 sw_buf[1212];
+    u8 hd_swr[12];
+    u32 n_hdr, n_kf, len_swr, z_swr, live_swr;
+    i32 rc_swr = -998;
+    void **vt_swr;
+    if (!g_swr_init) {
+        const char *esw = getenv("C2B_SWR");
+        if (esw && esw[0] == '0') g_swr_on = 0;
+        g_swr_init = 1;
+        if (g_swr_on)
+            C2B_LOGS("[c2b] swr: ARMED (v106 SNP-wrapped 'k' in-channel, cap 3)\n");
+    }
+    if (g_swr_gap) { g_swr_gap--; return; }
+    if (!g_swr_on || !g_gns_conn_iface || !g_gns_conn_h) return;
+    if (!g_swr_have_fn) {
+        g_swr_hdr_fn = (u32 (*)(unsigned char *))
+            dlsym((void *)0, "c2b_hook_sw_hdr");
+        g_swr_have_fn = 1;
+    }
+    if (!g_swr_hdr_fn) return;         /* hook без трекера — молча ждём */
+    n_hdr = g_swr_hdr_fn(hd_swr);
+    if (!n_hdr) {
+        if (g_swr_nohdr < 2) {
+            g_swr_nohdr++;
+            C2B_LOGS("[c2b] swr: нет out-SNP-хедера (трекер пуст) — ждём\n");
+        }
+        return;
+    }
+    n_kf = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+    if (!c2b_swr_gate(g_swr_on, g_swr_fires, n_hdr, g_swr_epoch)) return;
+    if (!n_kf || !g_kfull_len) { g_swr_epoch = n_hdr; return; }
+    len_swr = c2b_swr_build(hd_swr, g_kfull, g_kfull_len,
+                            sw_buf, (u32)sizeof sw_buf);
+    if (!len_swr) {
+        if (g_swr_nohdr < 4) {
+            g_swr_nohdr++;
+            C2B_LOGS("[c2b] swr: build=0 (форма/кап) — эпок потрачен\n");
+        }
+        g_swr_epoch = n_hdr;
+        return;
+    }
+    if (__atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE) != n_kf)
+        return;                        /* гонка с капчером — скип, эпок цел */
+    if (g_swr_hdr_fn(hd_swr) != n_hdr) return;   /* гонка с трекером — скип */
+    g_swr_epoch = n_hdr;
+    live_swr = c2b_k24_brlive();
+    vt_swr = *(void ***)g_gns_conn_iface;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc_swr = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                           i64 *))vt_swr[11])(
+            g_gns_conn_iface, g_gns_conn_h, sw_buf, len_swr,
+            0 /* UNRELIABLE = безопасный класс (run366) */, &g_k27k_out47);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] swr: send SEGV\n");
+        return;
+    }
+    g_swr_fires++;
+    g_swr_gap = 60;
+    C2B_LOGS("[c2b] swr: SNP-wrapped 'k' in-channel #");
+    C2B_LOGN(g_swr_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(len_swr);
+    C2B_LOGS(" hdr=");
+    for (z_swr = 0; z_swr < 12u; z_swr++) C2B_LOGH(sw_buf[z_swr]);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live_swr);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 fl=0 rc=");
+    C2B_LOGN((u32)(i32)rc_swr);
+    C2B_LOGS("\n");
+    /* rc!=1 = ТОЛЬКО телеметрия — НЕТ death-stop (контракт k2v) */
 }
 
 static void c2b_k27_maybe_fire(void)
@@ -32639,6 +32823,63 @@ static void test_t3v(void)
     }
 }
 
+/* ---------- v106: тесты CW + SWR ---------- */
+static void test_cw(void)
+{
+    static u8 st_cw[0x500];
+    u32 cs_cw, ch_cw, pr_cw;
+    printf("[t] cw\n");
+    CHECK(c2b_cw_read(0, &cs_cw, &ch_cw, &pr_cw) == 0, "cw: st=NULL = 0");
+    CHECK(c2b_cw_read((uptr)st_cw, 0, &ch_cw, &pr_cw) == 0, "cw: cs=NULL = 0");
+    memset(st_cw, 0, sizeof st_cw);
+    *(volatile u32 *)(st_cw + 0x1a0) = 1u;
+    *(volatile u32 *)(st_cw + 0x4d8) = 0x12345678u;
+    *(volatile u32 *)(st_cw + 0x4dc) = 3u;
+    CHECK(c2b_cw_read((uptr)st_cw, &cs_cw, &ch_cw, &pr_cw) == 1,
+          "cw: валид = 1");
+    CHECK(cs_cw == 1u, "cw: cstate@0x1a0 = 1");
+    CHECK(ch_cw == 0x12345678u, "cw: chal@0x4d8 = вербатим");
+    CHECK(pr_cw == 3u, "cw: proto@0x4dc = 3");
+}
+
+static void test_swr(void)
+{
+    static const u8 hdr_swr[12] = { 0x80, 0x01, 0x98, 0x07, 0x00, 0xff,
+                                    0xff, 0x37, 0x0a, 0x00, 0x00, 0x00 };
+    static const u8 kf_swr[24] = { 0xff, 0xff, 0xff, 0xff, 'k', 1, 2, 3, 4,
+                                   5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                   16, 17, 18, 19 };
+    u8 out_swr[64];
+    u8 badhdr_swr[12];
+    printf("[t] swr\n");
+    CHECK(c2b_swr_build(hdr_swr, kf_swr, sizeof kf_swr, out_swr,
+                        sizeof out_swr) == 12u + sizeof kf_swr,
+          "swr: build = 12+plen");
+    CHECK(out_swr[0] == 0x80u && out_swr[7] == 0x37u,
+          "swr: хед-маркеры целы");
+    CHECK(out_swr[3] == 0x08u, "swr: seq @3 бамп +1");
+    CHECK(out_swr[8] == 0x0bu, "swr: msg-num @8 бамп +1");
+    CHECK(out_swr[1] == 0x01u && out_swr[5] == 0xffu && out_swr[6] == 0xffu,
+          "swr: хед-поля вербатим");
+    CHECK(memcmp(out_swr + 12, kf_swr, sizeof kf_swr) == 0,
+          "swr: payload вербатим");
+    CHECK(c2b_swr_build(0, kf_swr, sizeof kf_swr, out_swr,
+                        sizeof out_swr) == 0, "swr: hdr=NULL = 0");
+    CHECK(c2b_swr_build(hdr_swr, kf_swr, 16u, out_swr, sizeof out_swr) == 0,
+          "swr: plen<17 = 0");
+    CHECK(c2b_swr_build(hdr_swr, kf_swr, sizeof kf_swr, out_swr, 20u) == 0,
+          "swr: cap<12+plen = 0");
+    memcpy(badhdr_swr, hdr_swr, 12);
+    badhdr_swr[0] = 0x81u;
+    CHECK(c2b_swr_build(badhdr_swr, kf_swr, sizeof kf_swr, out_swr,
+                        sizeof out_swr) == 0, "swr: hdr[0]!=0x80 = 0");
+    CHECK(c2b_swr_gate(0, 0, 5, 4) == 0, "swr: on=0 = скип");
+    CHECK(c2b_swr_gate(1, 3, 5, 4) == 0, "swr: кап 3 = скип");
+    CHECK(c2b_swr_gate(1, 0, 0, 0) == 0, "swr: n=0 = скип");
+    CHECK(c2b_swr_gate(1, 0, 5, 5) == 0, "swr: эпок без изменений = скип");
+    CHECK(c2b_swr_gate(1, 2, 5, 4) == 1, "swr: валид = 1");
+}
+
 /* v101: p2v — детур slot-11 (форма/гейт/vtswap e2e на синт-vtable). */
 static i32 p2v_t_orig_calls;
 static uptr p2v_t_orig_h;
@@ -35090,6 +35331,8 @@ int main(void)
     test_k2v();         /* v98: вербатим-'k' in-channel (форма/chal/гейт) */
     test_h2v();         /* v100: hello 0x80-class in-channel (форма/гейт/dst) */
     test_p2v();         /* v101: детур slot-11 (форма/гейт/vtswap e2e) */
+    test_cw();          /* v106: cstate-walk (читатель 0x1a0/0x4d8/0x4dc) */
+    test_swr();         /* v106: SNP-wrapped 'k' (build-форма/гейт) */
     test_t2v();         /* v102: ticket in-channel RELIABLE (форма/гейт) */
     test_t3v();         /* v105: signon-continuation feed (S2S1 STEP-3) */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */

@@ -2090,7 +2090,11 @@ static void c2b_g126_enc_capture(void *gcm, const void *in, const void *out,
     u8 bo[8];
     u32 n = c32 ? ++g126_nencc32 : ++g126_nenc;
     u32 *prof = c32 ? &g126_prof_ecl : &g126_prof_ec;
-    if ((n & 0x07) != 1 && n > 8) return;
+    /* v103: gate 8/8th -> 16/4th — run513-урок: после in-channel 'A'x2
+     * движок шифрует 28B/63B payload'ы (кандидаты = ticket-inner 0x22 или
+     * in-channel-ответ) — гейт 8/8th их класс не покрывает на длинной
+     * сессии (0x22 x46 => ~46 ticket-encrypts, каждые 8-е = мало). */
+    if ((n & 0x03) != 1 && n > 16) return;
     if (len > 0x10000) return;    /* the junk guard */
     memcpy(bo, out, sizeof bo);
     if (*prof < 8) {

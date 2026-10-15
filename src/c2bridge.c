@@ -16674,6 +16674,15 @@ static void c2b_sn_maybe(void) { }
  * TLS = стабы могут зваться с любого треда GNS (16536/16803/...). Файл-
  * скоуп (по образцу g_crt_inwl); тела raw-машинерии = после sendmsg-хука. */
 __thread int g_raw_tls;
+/* v82b: TLS-стейджинг переписанных кадров для мид-хелперов fp44/fp46.
+ * КОНТРАКТ санки: хелпер ВОЗВРАЩАЕТ (buf,len)/(msg,flags) = rax:rdx и
+ * санка кладёт их в rsi/rdx ПЕРЕД syscall — стек хелпера мёртв к моменту
+ * syscall; TLS-буфер жив (тот же тред, до завершения syscall). 600B =
+ * макс-выход c2b_crt_build (run485-класс: 40 + cert256 + f7 127 + ...). */
+__thread u8 g_crt_stage[600];
+/* v82b: TLS-копия msghdr+iov для sendmsg-переписывания (iovlen==1). */
+__thread struct c2b_msghdr g_crt_sm46;
+__thread struct c2b_iovec g_crt_iov46[1];
 static void c2b_raw_maybe(void);
 static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
                               const struct sockaddr *addr);
@@ -17389,8 +17398,27 @@ static c2b_fp2_t c2b_fp44_helper(unsigned long fd, const void *buf,
     r.b = len;
     g_raw_tls = 1;
     if (p && len >= 40ul && len <= 640ul && p[0] == 0x22) {
+        u32 on;
+        if (!g_crt_init) {
+            const char *ec = getenv("C2B_CRTFIX");
+            if (ec && ec[0] == '1') g_crt_fix = 1;
+            g_crt_init = 1;
+        }
         /* нативный connect-кадр мимо всех хуков — каптурим ВПЕРВЫЕ */
         c2b_crt_maybe_capture(p, (u32)len);
+        /* v82b: REWRITE И ЗДЕСЬ. run486-урок: МИД-сайт = ГОРЯЧИЙ путь
+         * (v77c: multi-threaded => полная ветка асинк-отмены), ВСЕ
+         * sends (мостовую connreq И движковые 0x22) проходят через
+         * fp44-хелпер, а rewrite был ТОЛЬКО на tail/clp-сайтах = НОЛЬ
+         * переписываний на живом прогоне при armе. Буфер = TLS: стек
+         * хелпера мёртв к моменту syscall (санка делает его после
+         * ret), TLS жив (тот же тред). */
+        on = c2b_crt_maybe_rewrite(p, (u32)len, g_crt_stage,
+                                   (u32)sizeof g_crt_stage);
+        if (on) {
+            r.a = (unsigned long)g_crt_stage;   /* переписанный кадр */
+            r.b = on;
+        }
     }
     c2b_raw_lane_note((int)fd, buf, (u32)len, (const struct sockaddr *)addr);
     (void)flags;
@@ -17412,6 +17440,31 @@ static c2b_fp2_t c2b_fp46_helper(unsigned long fd, const void *msg,
         if (m->msg_iov[0].iov_base && m->msg_iov[0].iov_len) {
             base = m->msg_iov[0].iov_base;
             blen = m->msg_iov[0].iov_len;
+        }
+    }
+    /* v82b: crt-класс и на sendmsg-лане (тот же гвард, что в fp44). */
+    if (base != (const void *)msg && blen >= 40ul && blen <= 640ul &&
+        ((const u8 *)base)[0] == 0x22) {
+        u32 on;
+        if (!g_crt_init) {
+            const char *ec = getenv("C2B_CRTFIX");
+            if (ec && ec[0] == '1') g_crt_fix = 1;
+            g_crt_init = 1;
+        }
+        c2b_crt_maybe_capture((const u8 *)base, (u32)blen);
+        on = c2b_crt_maybe_rewrite((const u8 *)base, (u32)blen,
+                                   g_crt_stage, (u32)sizeof g_crt_stage);
+        if (on && m->msg_iovlen == 1ul) {
+            /* TLS-копия msghdr+iov: iov[0] = stage; msg_name/msg_control
+             * = указатели коллера КАК ЕСТЬ (легальны до syscall — тред
+             * тот же, кадр коллера жив). Multi-iov = вне класса, про-
+             * пуск (passthrough). */
+            g_crt_iov46[0].iov_base = g_crt_stage;
+            g_crt_iov46[0].iov_len = on;
+            g_crt_sm46 = *m;
+            g_crt_sm46.msg_iov = g_crt_iov46;
+            g_crt_sm46.msg_iovlen = 1ul;
+            r.a = (unsigned long)&g_crt_sm46;
         }
     }
     c2b_raw_lane_note((int)fd, base, (u32)blen,

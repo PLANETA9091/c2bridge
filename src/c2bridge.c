@@ -59,6 +59,12 @@ typedef unsigned int   uptr;
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+/* v95: единый memmove-эквивалент для обоих билдов (см. #else-ветку) */
+static void c2b_memmove_up(void *d, const void *s, u32 n)
+{
+    u8 *dd = (u8 *)d; const u8 *ss = (const u8 *)s; u32 k;
+    for (k = n; k > 0u; k--) dd[k - 1u] = ss[k - 1u];
+}
 /* v52: udp-сокеты теста = РУЧНЫЕ decls (house = свои sockaddr/socklen_t;
  * sys/socket.h = конфликтует с хуками sendto/recvfrom) */
 /* v18-g77fd: чей-сокет ридеры — объявлены в общем блоке ниже (рядом с
@@ -81,6 +87,13 @@ extern void *memcpy(void *d, const void *s, u32 n);
 extern i32   memcmp(const void *a, const void *b, u32 n);
 extern void *memset(void *d, i32 c, u32 n);
 extern u32   strlen(const char *s);
+/* v95: memmove-эквивалент (raw-decls стиль — string.h только в selftest):
+ * сдвиг окна вправо = dst > src => копия С КОНЦА, перекрытие безопасен */
+static void c2b_memmove_up(void *d, const void *s, u32 n)
+{
+    u8 *dd = (u8 *)d; const u8 *ss = (const u8 *)s; u32 k;
+    for (k = n; k > 0u; k--) dd[k - 1u] = ss[k - 1u];
+}
 /* 50e-v50: РЕАЛЬНАЯ сигнатура (была i32/u32 — конфликтовала с write-ху- ком); единственный call-site = лог-флеш @105, конверсии беззнаковы */
 /* 50e-v50: ABI-сигнатура x86-64 (ssize_t/size_t = недоступны в секции объявлений; long/unsigned long = ABI-эквивалент) */
 extern long write(int fd, const void *buf, unsigned long n);
@@ -19399,6 +19412,153 @@ trunc:
     return fc;
 }
 
+/* ---------- v95: S2S1 STEP-3b — REL-пересборка + экстракция NETMSG +
+ * живой фид в c2b_translate ----------.
+ * Надёжный поток SNP = поток NET-сообщений [t][4B LE n][body] (v94-ходок
+ * даёт rel-фреймы pos/sz/данные). Пересборка = линейное окно [base,
+ * base+CAP): have-байты, watermark next (contiguous от base), сканер
+ * NETMSG от scan. Позади next = old/dup; дыра дальше окна = ресет (дыра
+ * не тянется); backward-fill (pos < base) = сдвиг окна вправо (редко:
+ * rel-позиции монотонны, но первый фрейм может прийти позже соседа).
+ * Каждый ЦЕЛЫЙ msg = reframe в S2-форму [varint t][varint n][body] и
+ * ЖИВОЙ фид в c2b_translate (тот же контракт, что PM-хук: trylock
+ * g_dn_busy, out = g_dn_buf, ст = g_st) => спека транслятора в логе.
+ * unrel-NETMSG (полный кадр в одном пакете) = тот же фид немедленно.
+ * Киллисвитч фида C2B_S2T=0 (сборка/счётчики продолжают работать). */
+#define C2B_RELB_CAP  (128u * 1024u)   /* окно сборки */
+#define C2B_REL_NMAX  (96u * 1024u)    /* sane NETMSG-тело (больше = мусор) */
+#define C2B_RELF_TAIL (4u * 1024u)     /* непарсимый хвост => скан = next */
+static u8  g_rel_buf[C2B_RELB_CAP];
+static u8  g_rel_have[C2B_RELB_CAP];
+static u32 g_rel_base, g_rel_next, g_rel_scan, g_rel_hi, g_rel_init;
+static u32 g_rel_frames, g_rel_bytes, g_rel_dups, g_rel_old, g_rel_back;
+static u32 g_rel_resets, g_rel_drift, g_rel_badn, g_rel_msgs;
+static u32 g_rel_tr, g_rel_tr_ok, g_rel_unr, g_rel_tdis;
+static u8  g_s2t_scr[C2B_REL_NMAX + 16u];
+
+static void c2b_rel_wipe(u32 pos)
+{
+    memset(g_rel_have, 0, sizeof g_rel_have);
+    g_rel_base = pos; g_rel_next = pos; g_rel_scan = pos; g_rel_hi = pos;
+    g_rel_init = 1u;
+}
+
+/* v95: ЦЕЛЫЙ S2-netmsg -> reframe -> c2b_translate (trylock g_dn_busy) */
+static void c2b_rel_feed_msg(u32 t, const u8 *body, u32 n)
+{
+    u32 sl = 0, olen = 0, q, t0 = t;
+    i32 rc;
+    while (t >= 0x80u) { g_s2t_scr[sl++] = (u8)(t | 0x80u); t >>= 7; }
+    g_s2t_scr[sl++] = (u8)t;
+    {   u32 v = n;
+        while (v >= 0x80u) { g_s2t_scr[sl++] = (u8)(v | 0x80u); v >>= 7; }
+        g_s2t_scr[sl++] = (u8)v;
+    }
+    for (q = 0; q < n; q++) g_s2t_scr[sl + q] = body[q];
+    sl += n;
+    g_rel_msgs++;
+    if (g_rel_tdis) return;
+    if (__atomic_exchange_n(&g_dn_busy, 1u, __ATOMIC_ACQ_REL) != 0u) {
+        g_rel_tr++;                                /* PM-хук держит лок */
+        return;
+    }
+    rc = c2b_translate(g_s2t_scr, sl, (u8 *)g_dn_buf, C2B_DN_CAP, &olen, &g_st);
+    __atomic_store_n(&g_dn_busy, 0u, __ATOMIC_RELEASE);
+    g_rel_tr++;
+    if (rc == 0 && olen) g_rel_tr_ok++;
+    if (g_rel_tr <= 8u || (g_rel_tr & 63u) == 0u) {
+        C2B_LOGS("[c2b] s2t: msg #");  C2B_LOGN(g_rel_msgs);
+        C2B_LOGS("t=");  C2B_LOGN(t0);
+        C2B_LOGS("n=");  C2B_LOGN(n);
+        C2B_LOGS("rc="); C2B_LOGN((u32)rc);
+        C2B_LOGS("out="); C2B_LOGN(olen);
+        C2B_LOGS("m=");  C2B_LOGN(g_st.msgs_in);
+        C2B_LOGS("/");   C2B_LOGN(g_st.msgs_out);
+        C2B_LOGS("d=");  C2B_LOGN(g_st.dropped);
+        if (g_rel_tr == 1u && olen) {
+            u32 d32 = olen < 32u ? olen : 32u;
+            C2B_LOGS("head=");
+            for (q = 0; q < d32; q++)
+                C2B_LOGH(((const u8 *)(const void *)g_dn_buf)[q]);
+        }
+        C2B_LOGS("\n");
+    }
+}
+
+/* v95: сканер NETMSG по contiguous-водяному знаку. t=00/ff = не NETMSG
+ * (CLV2-класс) => дрейф 1Б; n > NMAX = мусор => дрейф 1Б; недобрано => ждем */
+static void c2b_rel_scan(void)
+{
+    while (g_rel_scan + 5u <= g_rel_next) {
+        u32 off = g_rel_scan - g_rel_base;
+        u32 n;
+        u8  t = g_rel_buf[off];
+        if (t == 0x00u || t == 0xFFu) { g_rel_scan++; g_rel_drift++; continue; }
+        n = (u32)g_rel_buf[off + 1] | ((u32)g_rel_buf[off + 2] << 8) |
+            ((u32)g_rel_buf[off + 3] << 16) | ((u32)g_rel_buf[off + 4] << 24);
+        if (n > C2B_REL_NMAX) { g_rel_scan++; g_rel_badn++; continue; }
+        if (g_rel_scan + 5u + n > g_rel_next) break;      /* недобрано */
+        c2b_rel_feed_msg(t, g_rel_buf + off + 5, n);
+        g_rel_scan += 5u + n;
+    }
+    if (g_rel_next - g_rel_scan > C2B_RELB_CAP - C2B_RELF_TAIL)
+        g_rel_scan = g_rel_next;                          /* непарсимый хвост */
+}
+
+static void c2b_rel_add(u32 pos, const u8 *d, u32 sz)
+{
+    u32 off, k;
+    if (!d || !sz) return;
+    g_rel_frames++; g_rel_bytes += sz;
+    if (g_rel_frames == 1u)
+        C2B_LOGS("[c2b] s2t: FIRST REL frame (reassembly live)\n");
+    if (!g_rel_init) {
+        c2b_rel_wipe(pos);
+    } else {
+        if (pos + sz >= pos && pos + sz <= g_rel_next) { g_rel_old++; return; }
+        if (pos < g_rel_base) {                           /* backward-fill */
+            u32 sh = g_rel_base - pos, len = g_rel_hi - g_rel_base;
+            if (len + sh > C2B_RELB_CAP) {
+                c2b_rel_wipe(pos); g_rel_resets++;
+            } else {
+                c2b_memmove_up(g_rel_buf + sh, g_rel_buf, len);
+                c2b_memmove_up(g_rel_have + sh, g_rel_have, len);
+                memset(g_rel_buf, 0, sh); memset(g_rel_have, 0, sh);
+                g_rel_base = pos; g_rel_back++;
+            }
+        }
+    }
+    off = pos - g_rel_base;
+    if (off >= C2B_RELB_CAP) {                            /* дыра > окна */
+        c2b_rel_wipe(pos); off = 0; g_rel_resets++;
+        if (g_rel_resets == 1u)
+            C2B_LOGS("[c2b] s2t: rel reset (gap > window)\n");
+    } else if (off + sz > C2B_RELB_CAP) {                 /* хвост за окном */
+        sz = C2B_RELB_CAP - off;
+    }
+    for (k = 0; k < sz; k++) {
+        if (!g_rel_have[off + k]) {
+            g_rel_buf[off + k] = d[k]; g_rel_have[off + k] = 1u;
+        } else g_rel_dups++;
+    }
+    if (pos + sz > g_rel_hi && pos + sz >= pos) g_rel_hi = pos + sz;
+    while (g_rel_next < g_rel_hi && g_rel_have[g_rel_next - g_rel_base])
+        g_rel_next++;
+    c2b_rel_scan();
+}
+
+/* v95: unrel-NETMSG (полный [t][4B n][body] в одном кадре) => фид сразу */
+static void c2b_rel_unrel_try(const u8 *d, u32 sz)
+{
+    u32 n;
+    if (!d || sz < 5u) return;
+    if (d[0] == 0x00u || d[0] == 0xFFu) return;      /* CLV2-туннель */
+    n = (u32)d[1] | ((u32)d[2] << 8) | ((u32)d[3] << 16) | ((u32)d[4] << 24);
+    if (n > C2B_REL_NMAX || n + 5u < 5u || n + 5u > sz) return;
+    g_rel_unr++;
+    c2b_rel_feed_msg(d[0], d + 5, n);
+}
+
 /* v94: feed — разбор пакета + rate-capped spec-строка. Бюджет лога:
  * первые 32 пакета полностью, далее каждый 128-й (линия логов e2e =
  * 35k строк, dance x30 — бюджет s2dn = единицы процентов). */
@@ -19412,6 +19572,14 @@ static void c2b_s2dn_feed(const u8 *p, u32 n, u64 gcm)
     u32 consumed = 0, fc, k;
     fc = c2b_snpw_walk(p, n, fr, C2B_SNPW_MAX, &consumed);
     g_s2dn_pkts++;
+    /* v95: rel-пересборка + unrel-NETMSG-фид — на КАЖДЫЙ пакет (до
+     * rate-гейта): сборка = никогда не гейтится, гейт = только лог. */
+    for (k = 0; k < fc && k < C2B_SNPW_MAX; k++) {
+        if (fr[k].t == C2B_SNPW_REL)
+            c2b_rel_add(fr[k].a, p + fr[k].doff, fr[k].b);
+        else if (fr[k].t == C2B_SNPW_UNREL)
+            c2b_rel_unrel_try(p + fr[k].doff, fr[k].b);
+    }
     if (g_s2dn_logs >= C2B_S2DN_BURST &&
         (g_s2dn_pkts % C2B_S2DN_EVERY) != 0u) return;
     g_s2dn_logs++;
@@ -19488,13 +19656,21 @@ static void c2b_s2dn_maybe(void)
 {
     u32 w1, w2, i;
     if (!g_s2dn_p) {
+        const char *e;
         g_s2dn_p = (c2b_dn_t *)dlsym((void *)0, "g_c2b_dn");
         if (!g_s2dn_p) return;
-        C2B_LOGS("[c2b] s2dn: ARMED (v94 downlink ring consumer, cap 8x2KB)\n");
+        e = getenv("C2B_S2T");
+        g_rel_tdis = (e && e[0] == '0') ? 1u : 0u;   /* v95: killswitch фида */
+        C2B_LOGS("[c2b] s2dn: ARMED (v94 ring + v95 rel-reassembly, cap 8x32KB, feed ");
+        C2B_LOGS(g_rel_tdis ? "OFF)\n" : "ON)\n");
     }
     w1 = __atomic_load_n(&g_s2dn_p->wi, __ATOMIC_ACQUIRE);
     if (w1 == g_s2dn_ri) return;
-    if (w1 - g_s2dn_ri >= C2B_DN_CAP) {         /* overrun: к новейшим */
+    /* v95-фикс (латентный баг v94): капа = КОЛЬЦО (C2B_DNR_CAP 8), не
+     * C2B_DN_CAP (1МБ PM-буфер) — иначе jump-to-newest мёртв, и при
+     * перегоне кольца consumer читает перезаписанные слоты (мусорные len
+     * случайно проходят санити => мусор в ходок/пересборку посреди сигнон) */
+    if (w1 - g_s2dn_ri >= C2B_DNR_CAP) {        /* overrun: к новейшим */
         g_s2dn_ri = w1 - (C2B_DNR_CAP - 1u);
         g_s2dn_miss++;
         if (g_s2dn_miss == 1u)
@@ -31133,6 +31309,136 @@ static void test_s2dn(void)
     CHECK(g_s2dn_p == 0, "s2dn: consumer disarmed без hook");
 }
 
+/* v95: REL-пересборка + экстракция NETMSG + живой фид (STEP-3b).
+ * Ограничение телеметрии-grade (документировано): out-of-order + дрейф
+ * могут найти фантом-сообщение/съесть заголовок — счётчики drift/badn/
+ * resets это экспонируют; in-order лейн (норма SNP rel) = байт-точен.
+ * Типы векторов = 5/6 (без renum-карты: lookup[4]/[7] заняты — 4/7
+ * РЕНУМЯТ payload, byte-exact ожидания только для identity-as-is). */
+static void test_rel(void)
+{
+    static const u8 m1[10]  = {0x06,0x05,0x00,0x00,0x00,0xde,0xad,0xbe,0xef,0x42};
+    static const u8 mbig[14] = {0x06,0x05,0x00,0x00,0x00,0xde,0xad,0xbe,0xef,0x42,
+                                0x11,0x22,0x33,0x44};
+    static const u8 uu[8]   = {0x05,0x03,0x00,0x00,0x00,0x61,0x62,0x63};
+    static const u8 clv[8]  = {0x00,0xff,0xff,0xff,0xff,0x41,0x01,0x02};
+    static const u8 badnp[12] = {0x06,0xff,0xff,0xff,0x0f,0xff,0xff,0xff,
+                                 0xff,0xff,0xff,0xff};
+    static const u8 hole[7] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+    u8 dg[17], dg2[16];
+    u32 f0, od0, dp0, ms0, tr0, to0, un0, bk0, rs0, bn0, dr0, pk0;
+
+    printf("[t] rel (v95 STEP-3b: пересборка + живой фид)\n");
+    /* полный сброс состояния пересборки (wipe на первом add) */
+    g_rel_init = 0;
+    g_rel_frames = g_rel_bytes = g_rel_dups = g_rel_old = g_rel_back = 0;
+    g_rel_resets = g_rel_drift = g_rel_badn = g_rel_msgs = 0;
+    g_rel_tr = g_rel_tr_ok = g_rel_unr = g_rel_tdis = 0;
+
+    /* 1) цельный кадр -> фид -> out = reframe [06 05 de ad be ef 42] */
+    c2b_rel_add(0, m1, sizeof m1);
+    CHECK(g_rel_msgs == 1 && g_rel_tr == 1 && g_rel_tr_ok == 1,
+          "rel: цельный фид msgs=1 tr=1 ok=1");
+    CHECK(((const u8 *)(const void *)g_dn_buf)[0] == 0x06 &&
+          ((const u8 *)(const void *)g_dn_buf)[1] == 0x05 &&
+          ((const u8 *)(const void *)g_dn_buf)[2] == 0xde &&
+          ((const u8 *)(const void *)g_dn_buf)[6] == 0x42,
+          "rel: out reframe байт-в-байт [06 05 de..42]");
+
+    /* 2) повтор цельного = old (позади watermark), не dup, не кормит */
+    f0 = g_rel_frames; od0 = g_rel_old; dp0 = g_rel_dups; ms0 = g_rel_msgs;
+    c2b_rel_add(0, m1, sizeof m1);
+    CHECK(g_rel_frames == f0 + 1 && g_rel_old == od0 + 1 && g_rel_dups == dp0,
+          "rel: повтор = old");
+    CHECK(g_rel_msgs == ms0 && g_rel_tr == 1, "rel: повтор не кормит");
+
+    /* 3) dup: частичное перекрытие уже-имеемых байт (хвост за next) */
+    g_rel_init = 0; dp0 = g_rel_dups; ms0 = g_rel_msgs;
+    c2b_rel_add(0, mbig, 10);
+    c2b_rel_add(8, mbig + 8, 4);            /* 8..10 уже имеют, 10..12 новье */
+    CHECK(g_rel_dups == dp0 + 2, "rel: dup-байты считаются");
+    CHECK(g_rel_msgs == ms0 + 1, "rel: dup-диапазон не ломает сканер");
+
+    /* 4) split: голова без тела = ждёт; добор = фид */
+    g_rel_init = 0; ms0 = g_rel_msgs; tr0 = g_rel_tr; to0 = g_rel_tr_ok;
+    c2b_rel_add(100, m1, 5);
+    CHECK(g_rel_msgs == ms0, "rel: недобранный заголовок ждёт");
+    c2b_rel_add(105, m1 + 5, 5);
+    CHECK(g_rel_msgs == ms0 + 1 && g_rel_tr == tr0 + 1 &&
+          g_rel_tr_ok == to0 + 1, "rel: добор = фид");
+    CHECK(((const u8 *)(const void *)g_dn_buf)[0] == 0x06 &&
+          ((const u8 *)(const void *)g_dn_buf)[6] == 0x42,
+          "rel: сплит-фид out корректен");
+
+    /* 5) backward-fill: сдвиг окна (механизм), без фид-ассерта
+     * (дрейф по хвосту предыдущего msg — телеметрия-grade).
+     * Кадр pos<base ДОЛЖЕН расширять фронтир (pos+sz > next), иначе он
+     * = old (полностью позади watermark) — семантика корректна. */
+    g_rel_init = 0; bk0 = g_rel_back; rs0 = g_rel_resets;
+    c2b_rel_add(10, m1, 3);                 /* anchor base=10 next=13 */
+    c2b_rel_add(7, hole, 7);                /* 7..14: 13..14 новье => сдвиг */
+    CHECK(g_rel_back == bk0 + 1 && g_rel_resets == rs0,
+          "rel: backward-fill = сдвиг (не ресет)");
+    CHECK(g_rel_base == 7, "rel: база сдвинута на 7");
+
+    /* 6) дыра > окна: ресет, состояние живо после */
+    g_rel_init = 0; rs0 = g_rel_resets; ms0 = g_rel_msgs;
+    c2b_rel_add(0, m1, sizeof m1);
+    CHECK(g_rel_msgs == ms0 + 1, "rel: пре-дыра фид");
+    c2b_rel_add(200000, hole, 4);
+    CHECK(g_rel_resets == rs0 + 1, "rel: дыра > окна = ресет");
+    ms0 = g_rel_msgs;
+    c2b_rel_add(200004, m1, sizeof m1);     /* встык к дыре (00-байты = дрейф) */
+    CHECK(g_rel_msgs == ms0 + 1, "rel: фид после ресета жив");
+
+    /* 7) badn: n > NMAX = дрейф 1Б; хвост 0x0f+ffffffff = второй badn;
+     * ff-хвост = CLV2-дрейф; фантом-фида нет */
+    g_rel_init = 0; bn0 = g_rel_badn; dr0 = g_rel_drift; ms0 = g_rel_msgs;
+    c2b_rel_add(0, badnp, sizeof badnp);
+    CHECK(g_rel_badn == bn0 + 2 && g_rel_drift == dr0 + 6,
+          "rel: badn x2 + ff-дрейф");
+    CHECK(g_rel_msgs == ms0, "rel: badn-поток не кормит");
+
+    /* 8) killswitch фида: сборка/счётчики идут, translate нет */
+    g_rel_init = 0; g_rel_tdis = 1; ms0 = g_rel_msgs; tr0 = g_rel_tr;
+    c2b_rel_add(0, m1, sizeof m1);
+    CHECK(g_rel_msgs == ms0 + 1 && g_rel_tr == tr0,
+          "rel: killswitch = msgs да, translate нет");
+    g_rel_tdis = 0;
+
+    /* 9) unrel-NETMSG: полный кадр = фид сразу; CLV2 = скип */
+    g_rel_init = 0; un0 = g_rel_unr; ms0 = g_rel_msgs;
+    to0 = g_rel_tr_ok;
+    c2b_rel_unrel_try(uu, sizeof uu);
+    CHECK(g_rel_unr == un0 + 1 && g_rel_msgs == ms0 + 1 &&
+          g_rel_tr_ok == to0 + 1, "rel: unrel-NETMSG фид");
+    CHECK(((const u8 *)(const void *)g_dn_buf)[0] == 0x05 &&
+          ((const u8 *)(const void *)g_dn_buf)[2] == 0x61,
+          "rel: unrel out [05 03 61 62 63]");
+    un0 = g_rel_unr; ms0 = g_rel_msgs;
+    c2b_rel_unrel_try(clv, sizeof clv);     /* 00+ff×4 = CLV2 */
+    c2b_rel_unrel_try(uu, 3);               /* sz < 5 */
+    CHECK(g_rel_unr == un0 && g_rel_msgs == ms0, "rel: CLV2/короткий скип");
+
+    /* 10) интеграция c2b_s2dn_feed: REL-кадр в датаграмме = фид */
+    g_rel_init = 0; ms0 = g_rel_msgs; pk0 = g_s2dn_pkts;
+    /* SW + rel mm=0 pos=0 sz=10 + m1 */
+    dg[0]=0x80; dg[1]=0x00; dg[2]=0x40; dg[3]=0x00; dg[4]=0x00; dg[5]=0x00;
+    dg[6]=0x0a;
+    for (u32 q = 0; q < 10; q++) dg[7 + q] = m1[q];
+    c2b_s2dn_feed(dg, sizeof dg, 0xfeedfaceull);
+    CHECK(g_s2dn_pkts == pk0 + 1 && g_rel_msgs == ms0 + 1,
+          "rel: s2dn-интеграция REL-кадр = фид");
+    /* SW + unrel m=1 msg=1 sz=8 + uu */
+    g_rel_init = 0; ms0 = g_rel_msgs; pk0 = g_s2dn_pkts;
+    dg2[0]=0x80; dg2[1]=0x00; dg2[2]=0x08; dg2[3]=0x01; dg2[4]=0x00;
+    dg2[5]=0x00; dg2[6]=0x00; dg2[7]=0x08;
+    for (u32 q = 0; q < 8; q++) dg2[8 + q] = uu[q];
+    c2b_s2dn_feed(dg2, sizeof dg2, 0xfeedfaceull);
+    CHECK(g_s2dn_pkts == pk0 + 1 && g_rel_msgs == ms0 + 1,
+          "rel: s2dn-интеграция unrel-NETMSG = фид");
+}
+
 /* v47: k27k-сборщик — 'k' БЕЗ ff×4 (['k'][96\0][proto][chal][тикет]). */
 static void test_k27k(void)
 {
@@ -33534,6 +33840,7 @@ int main(void)
     test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
     test_decx();        /* v46/v47: DEC-X гейт верdict/relay-классов */
     test_s2dn();        /* v94: SNP-фрейм-ходок + даунлинк-ring (STEP-3a) */
+    test_rel();         /* v95: REL-пересборка + живой фид (STEP-3b) */
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */

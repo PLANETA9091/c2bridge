@@ -1948,7 +1948,8 @@ static void c2b_g126_k27_sniff(const void *gcm, const void *in,
 
 /* the decrypt capture: the out = THE PLAINTEXT (post-tramp), the in-head =
  * the direction-proof; the rate = the first 64 + every 8th; the len-gate =
- * the sane SNP range (1..2KB); the log = [c2b] g126: DEC32|DECL n=len= rc=
+ * the LOG path only (v95: ring идёт ДО гейта — 1..32KB, signon-блобы в
+ * пересборку); the log = [c2b] g126: DEC32|DECL n=len= rc=
  * gcm= in=<8hex> out=<24hex> */
 static void c2b_g126_dec_capture(const void *gcm, const void *in,
                                  const void *out, sz_t len, i32 rc,
@@ -1961,10 +1962,12 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
     u8 bi[8], bo[64];   /* v28: 64B — полный хвост 'A' (echo) для декода конверта */
     u32 cl, z;
 
-    if (!out || !len || len > 0x800) return;
-    /* v94: downlink ring ДО rate-гейта — КАЖДЫЙ plaintext (STEP-3a).
-     * Хот-путь безопасен: без логов, cap 0x800 = C2B_DN_MAX. */
+    if (!out || !len) return;
+    /* v95: ring ДО len-гейта — plaintext > 2КБ (signon-блобы REL) =
+     * ЕДИНСТВЕННЫЙ путь в пересборку (гейт push'а = C2B_DNR_MAX 0x8000).
+     * Хот-путь безопасен: без логов, memcpy <= 32КБ. */
     c2b_g126_dn_push(gcm, out, (u32)len);
+    if (len > 0x800) return;
     /* v27: снифф ДО rate-гейта — 'A'/'B' редкие, пропуск = потеря окна */
     c2b_g126_k27_sniff(gcm, in, out, len);
     if (n > 64 && (n & 7) != 0) return;

@@ -42,113 +42,130 @@ def varint(b, i):
 
 
 def decode_frames(pt):
-    """decode one decrypted SNP payload -> the list of the frame dicts."""
-    out, i = [], 0
-    n = len(pt)
+    """decode one decrypted SNP payload -> the list of the frame dicts.
+
+    v95: маски выровнены с ходоком c2bridge.c (wire-сертифицирован run504 —
+    'A' двумя независимыми путями): unrel = (b0 & 0xC0) == 0x00 (0x00-0x3F),
+    rel = (b0 & 0xC0) == 0x40 (0x40-0x7F, mm = (b0>>3)&3, mm=3 = BAD-стоп).
+    Старая unrel-маска (b0 & 0x80) == 0 была 1-битным лидом для 2-битного
+    поля и СЪЕДАЛА 0x40-0x7F (rel-семейство) до rel-ветки. Транкции =
+    consumed-safe (IndexError -> trunc-кадр), как в ходоке."""
+    out, i, n = [], 0, len(pt)
     while i < n:
-        b0 = pt[i]
         f = {"off": i}
-        if b0 < 0x04:  # padding 000000xx = this many bytes total
-            f["t"] = "pad"
-            i += 1 + b0
-        elif (b0 & 0x80) == 0x00:  # unreliable segment 00emosss
-            e = (b0 >> 4) & 1
-            m = (b0 >> 3) & 1
-            o = (b0 >> 2) & 1
-            sss = b0 & 7
-            i += 1
-            if m:
-                num = int.from_bytes(pt[i:i + 4], "little")
-                i += 4
-            else:
-                num = int.from_bytes(pt[i:i + 2], "little")
-                i += 2
-            off = None
-            if o:
-                off, i = varint(pt, i)
-            if sss < 5:
-                sz = ((sss << 8) | pt[i]) if False else None
-                # per the doc: the upper 3 bits append to the lower 8 in the
-                # explicit size field which follows => size = (sss<<8)|b
-                sz = (sss << 8) | pt[i]
-                i += 1
-            else:
-                sz = None  # to the end of the packet
-            data = pt[i:] if sz is None else pt[i:i + sz]
-            i = n if sz is None else min(n, i + sz)
-            f.update(t="unrel", e=e, msg=num, off=off, size=(sz if sz
-                     is not None else len(data)), data=data.hex())
-        elif (b0 & 0xE0) == 0x40:  # reliable segment 010mmsss
-            mm = (b0 >> 3) & 3
-            sss = b0 & 7
-            i += 1
-            if mm == 0:
-                pos = int.from_bytes(pt[i:i + 3], "little")
-                i += 3
-            elif mm == 1:
-                pos = int.from_bytes(pt[i:i + 4], "little")
-                i += 4
-            elif mm == 2:
-                pos = int.from_bytes(pt[i:i + 6], "little")
-                i += 6
-            else:
-                f.update(t="rel-BAD-mm")
-                break
-            if sss < 5:
-                sz = (sss << 8) | pt[i]
-                i += 1
-            else:
-                sz = None
-            data = pt[i:] if sz is None else pt[i:i + sz]
-            i = n if sz is None else min(n, i + sz)
-            f.update(t="rel", pos=pos, size=(sz if sz is not None else
-                     len(data)), data=data.hex())
-        elif (b0 & 0xFC) == STOPW:  # stop waiting 100000ww
-            ww = b0 & 3
-            i += 1
-            nb = 1 if ww == 0 else (2 if ww == 1 else
-                                    (3 if ww == 2 else 8))
-            off = int.from_bytes(pt[i:i + nb], "little")
-            i += nb
-            f.update(t="stopw", off=off)
-        elif (b0 & 0xF0) == ACK:  # ack 1001wnnn
-            w = (b0 >> 3) & 1
-            nblk = b0 & 7
-            i += 1
-            nb = 4 if w == 0 else 2
-            latest = int.from_bytes(pt[i:i + nb], "little")
-            i += nb
-            delay = int.from_bytes(pt[i:i + 2], "little")
-            i += 2
-            blocks = []
-            if nblk == 7:
-                nblk = pt[i]
-                i += 1
-            for _ in range(nblk):
-                bb = pt[i]
-                i += 1
-                a = bb >> 4
-                nk = bb & 0xF
-                if a >= 8:
-                    a, i = ((a & 7), i)
-                    a, i = _vext(pt, i, a)
-                if nk >= 8:
-                    nk, i = ((nk & 7), i)
-                    nk, i = _vext(pt, i, nk)
-                blocks.append((a, nk))
-            f.update(t="ack", latest=latest, delay=delay, blocks=blocks)
-        elif (b0 & 0xF8) == 0x88:  # select lane 10001nnn
-            i += 1
-            if (b0 & 7) == 7:
-                lane, i = varint(pt, i)
-            else:
-                lane = (b0 & 7) + 1
-            f.update(t="lane", lane=lane)
-        else:  # 101xxxxx / 11xxxxxx / 100001xx = reserved
-            f.update(t="reserved", b0=f"{b0:02x}")
-            i += 1
+        try:
+            i = _frame(pt, i, n, pt[i], f)
+        except IndexError:
+            f["t"] = "trunc"          # consumed-safe, как в ходоке
+            out.append(f)
+            break
+        i = min(i, n)
         out.append(f)
     return out
+
+
+def _frame(pt, i, n, b0, f):
+    """parse one frame at i; return the next i (IndexError = truncation)."""
+    if b0 < 0x04:  # padding 000000xx = this many bytes total
+        f["t"] = "pad"
+        return i + 1 + b0
+    if (b0 & 0xC0) == 0x00:  # unreliable segment 00emosss (0x00-0x3F)
+        e = (b0 >> 4) & 1
+        m = (b0 >> 3) & 1
+        o = (b0 >> 2) & 1
+        sss = b0 & 7
+        i += 1
+        if m:
+            num = int.from_bytes(pt[i:i + 4], "little")
+            i += 4
+        else:
+            num = int.from_bytes(pt[i:i + 2], "little")
+            i += 2
+        off = None
+        if o:
+            off, i = varint(pt, i)
+        if sss < 5:
+            # the upper 3 bits append to the lower 8 => size=(sss<<8)|b
+            sz = (sss << 8) | pt[i]
+            i += 1
+        else:
+            sz = None  # to the end of the packet
+        data = pt[i:] if sz is None else pt[i:i + sz]
+        i = n if sz is None else min(n, i + sz)
+        f.update(t="unrel", e=e, msg=num, off=off, size=(sz if sz
+                 is not None else len(data)), data=data.hex())
+        return i
+    if (b0 & 0xC0) == 0x40:  # reliable segment 01mmmsss (0x40-0x7F)
+        mm = (b0 >> 3) & 3
+        sss = b0 & 7
+        i += 1
+        if mm == 0:
+            pos = int.from_bytes(pt[i:i + 3], "little")
+            i += 3
+        elif mm == 1:
+            pos = int.from_bytes(pt[i:i + 4], "little")
+            i += 4
+        elif mm == 2:
+            pos = int.from_bytes(pt[i:i + 6], "little")
+            i += 6
+        else:
+            f.update(t="rel-BAD-mm")
+            return n
+        if sss < 5:
+            sz = (sss << 8) | pt[i]
+            i += 1
+        else:
+            sz = None
+        data = pt[i:] if sz is None else pt[i:i + sz]
+        i = n if sz is None else min(n, i + sz)
+        f.update(t="rel", pos=pos, size=(sz if sz is not None else
+                 len(data)), data=data.hex())
+        return i
+    if (b0 & 0xFC) == STOPW:  # stop waiting 100000ww
+        ww = b0 & 3
+        i += 1
+        nb = 1 if ww == 0 else (2 if ww == 1 else (3 if ww == 2 else 8))
+        off = int.from_bytes(pt[i:i + nb], "little")
+        f.update(t="stopw", off=off)
+        return i + nb
+    if (b0 & 0xF0) == ACK:  # ack 1001wnnn
+        w = (b0 >> 3) & 1
+        nblk = b0 & 7
+        i += 1
+        nb = 4 if w == 0 else 2
+        latest = int.from_bytes(pt[i:i + nb], "little")
+        i += nb
+        delay = int.from_bytes(pt[i:i + 2], "little")
+        i += 2
+        blocks = []
+        if nblk == 7:
+            nblk = pt[i]
+            i += 1
+        for _ in range(nblk):
+            bb = pt[i]
+            i += 1
+            a = bb >> 4
+            nk = bb & 0xF
+            if a >= 8:
+                a, i = ((a & 7), i)
+                a, i = _vext(pt, i, a)
+            if nk >= 8:
+                nk, i = ((nk & 7), i)
+                nk, i = _vext(pt, i, nk)
+            blocks.append((a, nk))
+        f.update(t="ack", latest=latest, delay=delay, blocks=blocks)
+        return i
+    if (b0 & 0xF8) == 0x88:  # select lane 10001nnn
+        i += 1
+        if (b0 & 7) == 7:
+            lane, i = varint(pt, i)
+        else:
+            lane = (b0 & 7) + 1
+        f.update(t="lane", lane=lane)
+        return i
+    # 101xxxxx / 11xxxxxx / 100001xx = reserved
+    f.update(t="reserved", b0=f"{b0:02x}")
+    return i + 1
 
 
 def _vext(pt, i, low3):
@@ -216,8 +233,25 @@ def selftest():
     f = decode_frames(pt)[0]
     assert f["t"] == "ack" and f["latest"] == 4 and f["delay"] == 5 \
         and f["blocks"] == [(3, 0)], f
-    print("SELFTEST PASS (StopWait + Ack + Unrel + the a2 corpus "
-          "byte-exact + the ack-blocks)")
+    # v95: rel-векторы (маска C0) — раньше их съедала unrel-ветка
+    pt = bytes.fromhex("4003020105ddeeff0011")   # rel mm=0 pos=0x010203 sz=5
+    f = decode_frames(pt)[0]
+    assert f["t"] == "rel" and f["pos"] == 0x010203 and f["size"] == 5 \
+        and f["data"] == "ddeeff0011", f
+    pt = bytes.fromhex("4804030201020a0b")       # rel mm=1 pos 4Б sz=2
+    f = decode_frames(pt)[0]
+    assert f["t"] == "rel" and f["pos"] == 0x01020304 and f["size"] == 2, f
+    pt = bytes.fromhex("6804030201020a0b")       # 011-лид тоже rel (как ходок)
+    f = decode_frames(pt)[0]
+    assert f["t"] == "rel" and f["pos"] == 0x01020304, f
+    pt = bytes.fromhex("400302")                 # транкция = consumed-safe
+    f = decode_frames(pt)
+    assert len(f) == 1 and f[0]["t"] == "trunc", f
+    pt = bytes.fromhex("7801020304050607")       # mm=3 = BAD-стоп
+    f = decode_frames(pt)
+    assert len(f) == 1 and f[0]["t"] == "rel-BAD-mm", f
+    print("SELFTEST PASS (StopWait + Ack + Unrel + REL-маска v95 + the a2 "
+          "corpus byte-exact + the ack-blocks)")
 
 
 def main():

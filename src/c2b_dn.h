@@ -1,4 +1,4 @@
-/* c2b_dn.h — v94: DOWNLINK PLAINTEXT RING — общий контракт
+/* c2b_dn.h — v94/v95: DOWNLINK PLAINTEXT RING — общий контракт
  * producer (c2b_client_hook64.so, LD_PRELOAD, g126-dec-tap) =>
  * consumer (c2bridge64.so, g97-тред, c2b_s2dn_maybe).
  *
@@ -6,8 +6,9 @@
  * ЕДИНСТВЕННЫЙ живой источник S2-даунлинка (PM-never-fires: движок на
  * этапе коннекта не зовёт CNetChan::ProcessMessages — факт 496/500/501).
  * Каждый decrypt (site C = ctr32 fast path + site D = 4-arg) отдаёт
- * out = ГОТОВЫЙ plaintext 1..0x800Б — кладём в ring, мост разбирает
- * SNP-кадры (c2b_snpw_walk) и пишет spec-логи (s2dn).
+ * out = ГОТОВЫЙ plaintext (v95: до 0x8000Б — signon-блобы REL идут в
+ * пересборку) — кладём в ring, мост разбирает SNP-кадры (c2b_snpw_walk),
+ * собирает REL-поток (v95) и пишет spec-логи (s2dn/s2t).
  *
  * КОНТРАКТ (тот же стиль, что c2b_k27.h): producer пишет поля записи,
  * ЗАТЕМ bump wi (release-RMW). consumer: load wi (acquire) -> читает
@@ -18,9 +19,10 @@
 #ifndef C2B_DN_H
 #define C2B_DN_H
 
-/* 0x800 = len-гейт c2b_g126_dec_capture (sane SNP range) — совпадают */
+/* v95: 2048 -> 0x8000 — гейт dec_capture (0x800) теперь только на лог-пути;
+ * ring обязана видеть ПОЛНЫЙ plaintext (signon-блобы ClassInfo/FSV > 2КБ). */
 #define C2B_DNR_CAP 8u
-#define C2B_DNR_MAX 2048u
+#define C2B_DNR_MAX 0x8000u
 
 typedef struct c2b_dn_rec {
     volatile unsigned int       len;   /* <= C2B_DNR_MAX; пишется ДО wi-bump */
@@ -34,5 +36,5 @@ typedef struct c2b_dn {
 } c2b_dn_t;
 
 /* Размер структуры = фиксированный ABI (объекта-пару .so не перекосит):
- * 4 + pad4 + 8*(4+pad4+8+2048) = 8 + 8*2064 = 16520Б. */
+ * 4 + pad4 + 8*(4+pad4+8+32768) = 8 + 8*32784 = 262280Б (v95). */
 #endif /* C2B_DN_H */

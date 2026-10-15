@@ -16693,10 +16693,60 @@ static void c2b_raw_maybe(void);
 static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
                               const struct sockaddr *addr);
 
+/* v86/v87a: fs-валидность треда. МЕХАНИКА крашей run488/491/492 (собрана
+ * по крохам): fs=0-тред (raw-clone, без SETTLS) входит в C-слой моста ->
+ * *__errno_location()/TLS/лог = fs-ДОСТУП = SEGV addr = fs+off
+ * (0xffffffffffffeab8 = errno-TLS-оффсет libc при fs=0; rdi=1/rsi=лог/
+ * rdx=0xbf = АРГУМЕНТЫ ЗАСТЯВШЕГО write; rip = внутри детура). ГВАРД =
+ * arch_prctl(ARCH_GETFS) — сырой syscall (БЕЗ TLS/errno/лога), fs==0 =>
+ * passthrough. v87a: определение стоит здесь (ДО главного хука = ДО
+ * ВСЕХ вызовов: хук sendto/sendmsg, st/sm-энтри, fp44/fp46-хелперы) —
+ * run493-урок: сигнатура крашей инвариантна сквозь fs-гейты ХЕЛПЕРОВ
+ * => C-вход ВНЕ хелперов (главный хук = вход ЛЮБОГО sendto@plt-коллера
+ * ВКЛЮЧАЯ fs=0-класс; его ленивые инсталлы + логи = write(1,·,0xbf)-
+ * форма). Определение = __x86_64-only; вызовы = только в __x86_64-
+ * блоках (i386 = гейтов нет = прежнее поведение). */
+#if defined(__x86_64__)
+static u32 c2b_fp_fs_ok(void)
+{
+    unsigned long fsb = 0;
+    long r;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(158L /*arch_prctl*/), "D"(0x1003L /*ARCH_GETFS*/),
+                       "S"((long)(unsigned long)&fsb)
+                     : "rcx", "r11", "memory");
+    if (r != 0) return 0u;              /* экзотика = не рискуем */
+    return fsb != 0ul;
+}
+#endif
+
 __attribute__((visibility("default")))
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen)
 {
+#if defined(__x86_64__)
+    /* v87a: fs-гвард ПЕРВЫМ стейтментом главного хука — ДО ленивых
+     * инсталлов (raw/gp/ldd/ss-maybe), ДО g15-ценза, ДО dlsym, ДО ЛОГОВ.
+     * fs=0-тред = ЧИСТЫЙ passthrough: inline-asm syscall (ядро АБИ:
+     * rdi/rsi/rdx/r10=flags/r8/r9), ноль dlsym/errno/TLS/лог-касаний
+     * (краш-класс run488/491/492/493 исключён на ГЛАВНОМ входе). errno
+     * при ошибке = НЕ ставим (fs=0-тред вне TLS-мира в любом случае;
+     * возврат rax как есть = честнее -1 со стальным errno). Цена = 1
+     * syscall на sendto-вызов. */
+    if (!c2b_fp_fs_ok()) {
+        long r;
+        register long r10 __asm__("r10") = (long)flags;
+        __asm__ volatile("syscall"
+                         : "=a"(r)
+                         : "a"(44L), "D"((long)fd), "S"((long)buf),
+                           "d"((long)len), "r"(r10),
+                           "r"((long)(unsigned long)addr),
+                           "r"((long)(unsigned long)addrlen)
+                         : "rcx", "r11", "memory");
+        return (ssize_t)r;
+    }
+#endif
     c2b_raw_maybe();    /* v75: свиньячок — raw-syscall стаб-патчер */
     c2b_gp_maybe();     /* v51: свиньячок — GOT-патч приватных ns-копий */
     c2b_ldd_maybe();    /* v52: свиньячок — детур прологов libc */
@@ -17099,6 +17149,19 @@ static void *g_clp_sendmsg;
 __attribute__((visibility("default")))
 ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
 {
+#if defined(__x86_64__)
+    /* v87a: fs-гвард — симметрично sendto-хуку (первый стейтмент, ДО
+     * dlsym/инсталлов/логов). sendmsg = 3 аргс (C АБИ = ядро АБИ). */
+    if (!c2b_fp_fs_ok()) {
+        long r;
+        __asm__ volatile("syscall"
+                         : "=a"(r)
+                         : "a"(46L), "D"((long)fd), "S"((long)msg),
+                           "d"((long)flags)
+                         : "rcx", "r11", "memory");
+        return (ssize_t)r;
+    }
+#endif
     if (!g_clp_sendmsg) {
         void *f = dlsym(C2B_CL_RTLD_NEXT, "sendmsg");
         if (!f) f = (void *)1;
@@ -17217,6 +17280,12 @@ static u32 g_raw_gap_on;        /* v82c-д: рычаг C2B_GAP=1 — НЕ-сме
  ный gp/хук-слой. Дефолт ВЫКЛ = поведение run487. Расконсервация = ТОЛЬКО
  с рычагом + отдельным разбором дампа. */
 static u32 g_raw_gap_init;
+static u32 g_raw_gm2;           /* v87b: рычаг C2B_GATEMODE=2 — passthrough-
+ * ONLY санка на gap-окне (c2b_raw_thunk_pass: та же 128B оболочка +
+ * гварды, call-регион = 15B nop = НОЛЬ C-входов). БИСЕКТ краш-триады
+ * 488/491/492/493: зелёный ран = C-слой (хелперы/главный хук/энтри);
+ * краш = санка-асм vs контекст окна. Дефолт '0' = хелпер-санка (v84). */
+static u32 g_raw_gm2_logged;    /* v87b: одноразовый лог режима санки */
 static u32 g_raw_logn, g_raw_done, g_raw_anon;
 static u64 g_raw_seen[64];
 static u32 g_raw_seen_n;
@@ -17267,6 +17336,14 @@ static ssize_t c2b_raw_st_entry(int fd, const void *buf, size_t len,
     u8 crtbuf[600];
     const void *sbuf = buf;
     unsigned long slen = len;
+    /* v87a: fs-гвард ПЕРВЫМ делом — ДО g_raw_tls-TLS-ЗАПИСИ (fs=0-тред =
+     * SEGV на ЛЮБОЙ TLS-касснице нашего .so) и ДО errno-конверсии. Хвост-
+     * сайты (холодные стабы) = трамплин СЮДА = полноценный C-вход = тот же
+     * краш-класс. Passthrough = сырой rax без errno (fs=0-тред вне TLS-
+     * мира; возврат -errno честнее -1 со стальным errno). */
+    if (!c2b_fp_fs_ok())
+        return (ssize_t)c2b_raw_sys_sendto(fd, buf, len, flags, addr,
+                                           (long)addrlen);
     g_raw_tls = 1;
     if (!g_crt_inwl && p && len >= 40u && len <= 640u && p[0] == 0x22) {
         u32 on;
@@ -17294,6 +17371,9 @@ static ssize_t c2b_raw_sm_entry(int fd, const struct c2b_msghdr *msg,
                                 int flags)
 {
     ssize_t r;
+    /* v87a: fs-гвард — симметрично st-энтри (ДО TLS-записи и errno). */
+    if (!c2b_fp_fs_ok())
+        return (ssize_t)c2b_raw_sys_sendmsg(fd, msg, flags);
     g_raw_tls = 1;
     r = (ssize_t)c2b_raw_sys_sendmsg(fd, msg, flags);
     if (r < 0 && r > -4096) {
@@ -17409,27 +17489,10 @@ static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
  * syscall делает САМА санка. */
 typedef struct { unsigned long a, b; } c2b_fp2_t;
 
-/* v86: fs-валидность треда. РЕАЛЬНАЯ МЕХАНИКА крашей run488/491/492
- * (собрана по крохам): fs=0-тред (raw-clone, без SETTLS) шлёт 0x22-класс
- * через gap-санку -> хелпер -> C2B_LOGS -> write -> v52-dwrite-детур ->
- * *__errno_location() = fs-ДОСТУП = SEGV addr = fs+off (0xffffffffffffeab8
- * = errno-TLS-оффсет libc при fs=0; rdi=1/rsi=лог/rdx=0xbf = АРГУМЕНТЫ
- * ЗАСТЯВШЕГО write; rip = внутри детура; строка лога = теряется = ноль
- * crt-строк!). ГВАРД = arch_prctl(ARCH_GETFS) — сырой syscall (БЕЗ TLS/
- * errno/лога), fs==0 => passthrough. Цена = 1 syscall на 0x22-кадр
- * (~40/ран) = бесплатно. Возвращает 1 = fs-валидный (C-слой можно). */
-static u32 c2b_fp_fs_ok(void)
-{
-    unsigned long fsb = 0;
-    long r;
-    __asm__ volatile("syscall"
-                     : "=a"(r)
-                     : "a"(158L /*arch_prctl*/), "D"(0x1003L /*ARCH_GETFS*/),
-                       "S"((long)(unsigned long)&fsb)
-                     : "rcx", "r11", "memory");
-    if (r != 0) return 0u;              /* экзотика = не рискуем */
-    return fsb != 0ul;
-}
+/* c2b_fp_fs_ok = ОПРЕДЕЛЕНИЕ ПЕРЕНЕСЕНО ВЫШЕ главного sendto-хука (v87a:
+ * главный хук и st/sm-энтри = тоже гейтятся — run493-урок: сигнатура
+ * крашей 488/491/492/493 инвариантна сквозь fs-гейты хелперов = C-вход
+ * ВНЕ хелперов; определение должно стоять ДО первого вызова). */
 
 static c2b_fp2_t c2b_fp44_helper(unsigned long fd, const void *buf,
                                  unsigned long len, unsigned long flags,
@@ -17722,6 +17785,10 @@ static void c2b_raw_scan(void)
                     if (!g_raw_gap_init) {
                         const char *eg = getenv("C2B_GAP");
                         if (eg && eg[0] == '1') g_raw_gap_on = 1u;
+                        /* v87b: GATE_MODE=2 = passthrough-only санка
+                         * (бисект краш-триады; см. c2b_raw_thunk_pass). */
+                        eg = getenv("C2B_GATEMODE");
+                        if (eg && eg[0] == '2') g_raw_gm2 = 1u;
                         g_raw_gap_init = 1u;
                     }
                     if (g_raw_gap_on) {
@@ -17798,7 +17865,18 @@ static void c2b_raw_scan(void)
                             : (unsigned long long)(unsigned long)
                               &c2b_fp46_helper;
                         u32 tl;
-                        if (isgap && nr == 44u)
+                        if (isgap && nr == 44u && g_raw_gm2) {
+                            /* v87b: PASSTHROUGH-ONLY санка (бисект) — ноль
+                             * C-входов из санки; hfn = не используется. */
+                            if (!g_raw_gm2_logged) {
+                                g_raw_gm2_logged = 1u;
+                                C2B_LOGS("[c2b] v87: gap-sanka mode=2 (passthrough-only, zero C-entry)\n");
+                            }
+                            tl = c2b_raw_thunk_pass(
+                                (u8 *)pg, 0x1000u,
+                                (unsigned long long)pg,
+                                site + (unsigned long long)pl);
+                        } else if (isgap && nr == 44u)
                             tl = c2b_raw_thunk_gate(
                                 (u8 *)pg, 0x1000u, hfn,
                                 (unsigned long long)pg,
@@ -32032,6 +32110,54 @@ static void test_raw(void)
         CHECK(c2b_raw_thunk_gate(th, sizeof th, 1ull,
                                  0x90000000ull, 0x1000ull) == 0u,
               "v84: back < pg+0x80 за пределами rel32 = отказ");
+    }
+    /* ---- v87b: passthrough-only санка (GATE_MODE=2, бисект) ---- */
+    {
+        u8 th[256];
+        u32 tl, k;
+        memset(th, 0xCC, sizeof th);
+        tl = c2b_raw_thunk_pass(th, sizeof th,
+                                0x7f00001000ull, 0x7f00001060ull);
+        CHECK(tl == 128u, "v87: pass-санка = 128B (лэйаут идентичен gate)");
+        /* гварды = байт-идентичны gate-санке (бисект = ТОЛЬКО call-регион) */
+        CHECK(th[0x21u] == 0x48u && th[0x22u] == 0x85u && th[0x23u] == 0xf6u,
+              "v87: pass test rsi,rsi @0x21 (идентичен gate)");
+        CHECK(th[0x24u] == 0x74u && th[0x25u] == 0x32u,
+              "v87: pass je -> 0x58 @0x24");
+        CHECK(th[0x26u] == 0x48u && th[0x27u] == 0x83u &&
+              th[0x28u] == 0xfau && th[0x29u] == 0x28u,
+              "v87: pass cmp rdx,40 @0x26");
+        CHECK(th[0x2au] == 0x72u && th[0x2bu] == 0x2cu,
+              "v87: pass jb -> 0x58 @0x2a");
+        CHECK(th[0x2cu] == 0x80u && th[0x2du] == 0x3eu &&
+              th[0x2eu] == 0x22u,
+              "v87: pass cmp [rsi],0x22 @0x2c");
+        CHECK(th[0x2fu] == 0x75u && th[0x30u] == 0x27u,
+              "v87: pass jne -> 0x58 @0x2f");
+        /* call-регион 0x49..0x57 = 15 x 0x90 (НЕТ movabs/call/mov rsi) */
+        for (k = 0x49u; k <= 0x57u; k++)
+            CHECK(th[k] == 0x90u,
+                  "v87: pass nop @call-регионе (0x49..0x57, ноль C-входов)");
+        /* перезагрузки/syscall/e9 = идентичны gate-санке */
+        CHECK(th[0x58u] == 0x48u && th[0x59u] == 0x8bu && th[0x5au] == 0x3cu,
+              "v87: pass reload rdi,[rsp] @0x58");
+        CHECK(th[0x5cu] == 0x4cu && th[0x5du] == 0x8bu && th[0x5eu] == 0x54u,
+              "v87: pass reload r10,[rsp+0x18] @0x5c");
+        CHECK(th[0x6bu] == 0xb8u && th[0x6cu] == 0x2cu && th[0x6du] == 0u,
+              "v87: pass mov eax,44 @0x6b");
+        CHECK(th[0x70u] == 0x0fu && th[0x71u] == 0x05u,
+              "v87: pass syscall @0x70");
+        CHECK(th[0x7bu] == 0xe9u, "v87: pass e9 jmp-back @0x7b");
+        /* rel32 = back - (pg+0x80) = 0x1060 - 0x1080 = -0x20 = 0xffffffe0 */
+        CHECK(th[0x7cu] == 0xe0u && th[0x7du] == 0xffu &&
+              th[0x7eu] == 0xffu && th[0x7fu] == 0xffu,
+              "v87: pass rel32 = back-(pg+0x80) = -0x20 LE");
+        /* кап-гвард + 2GB-гвард */
+        CHECK(c2b_raw_thunk_pass(th, 100u, 0x1000ull, 0x2000ull) == 0u,
+              "v87: pass cap=100 = отказ (нужно 128)");
+        CHECK(c2b_raw_thunk_pass(th, sizeof th,
+                                 0x90000000ull, 0x1000ull) == 0u,
+              "v87: pass back вне rel32 = отказ");
     }
 }
 

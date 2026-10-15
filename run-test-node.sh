@@ -733,6 +733,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     1) MODES="$MODES C2B_GAP=1" ;;
     *) : ;;
   esac
+  # v87: gatemode (workflow input gatemode -> C2B_GATEMODE_V). '2' =
+  # PASSTHROUGH-ONLY санка на gap-окне (c2b_raw_thunk_pass: та же 128B
+  # оболочка + гварды, call-регион = 15B nop = НОЛЬ C-входов) = БИСЕКТ
+  # краш-триады 488/491/492/493 (сигнатура инвариантна сквозь fs-гейты
+  # хелперов v86 = C-вход вне хелперов). Дефолт '0' = хелпер-санка (v84,
+  # теперь за v87a fs-гейтами главного хука + st/sm-энтри). Имеет смысл
+  # только с gap=1.
+  case "${C2B_GATEMODE_V-0}" in
+    2) MODES="$MODES C2B_GATEMODE=2" ;;
+    *) : ;;
+  esac
   # v75: raw-syscall стаб-патчер (workflow input gpr -> C2B_GPR_V).
   # Дефолт '1' = ARMED (раунд-эксперимент: сырые GNS-стабы движка
   # редиректятся в хуки = crt-класс получает нативные 0x22). Откат =

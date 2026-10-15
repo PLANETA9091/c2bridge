@@ -428,6 +428,81 @@ static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
     return i;
 }
 
+/* v87b pure: PASSTHROUGH-ONLY санка (GATE_MODE=2, бисект run494). ЛЭЙАУТ =
+ * ИДЕНТИЧЕН c2b_raw_thunk_gate (128B: те же гварды/сэйвы/перезагрузки/
+ * syscall/e9-back), НО call-регион 0x49..0x57 (movabs rax,helper + call +
+ * mov rsi,rax = 15B) = 15 x 0x90: НОЛЬ C-входов из санки — весь трафик
+ * (включая 0x22-класс) = чистый регистро-passthrough через syscall В САМОЙ
+ * санке. НАЗНАЧЕНИЕ = бисект краш-триады 488/491/492/493 (сигнатура =
+ * инвариант сквозь fs-гейты хелперов v86): ЗЕЛЁНЫЙ ран => C-слой (хелперы/
+ * главный хук/энтри) = виновник (затем run495 mode=0 = A/B с v87-гейтами);
+ * КРАШ => санка-асм vs контекст окна (RBX/RBP-интерплей, red zone) =
+ * ре-RE. rsi/rdx = НЕ перезагружаются после nop-региона (гварды = только
+ * чтение флагов; syscall получает оригинальные (buf,len)). */
+static u32 c2b_raw_thunk_pass(u8 *t, u32 cap, unsigned long long pg,
+                              unsigned long long back)
+{
+    u32 i = 0, q;
+    i32 rel;
+    if (!t || cap < 128u) return 0u;
+    {
+        long long d = (long long)(back - (pg + 0x80ull));
+        if (d > 2147483647ll || d < -2147483648ll) return 0u;
+        rel = (i32)d;
+    }
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xecu; t[i++] = 0x40u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;
+    t[i++] = 0x48u; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    /* v84: ПОЛНЫЙ гвард (идентичен gate-санке — бисект = ТОЛЬКО call-
+     * регион меняется): test rsi/je + cmp rdx,40/jb + cmp [rsi]/jne. */
+    t[i++] = 0x48u; t[i++] = 0x85u; t[i++] = 0xf6u;    /* test rsi,rsi */
+    t[i++] = 0x74u; t[i++] = 0x32u;                    /* je  -> +0x32 (0x58) */
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xfau; t[i++] = 0x28u;
+                                                        /* cmp rdx,40 */
+    t[i++] = 0x72u; t[i++] = 0x2cu;                    /* jb  -> +0x2c (0x58) */
+    t[i++] = 0x80u; t[i++] = 0x3eu; t[i++] = 0x22u;    /* cmp [rsi],0x22 */
+    t[i++] = 0x75u; t[i++] = 0x27u;                    /* jne -> +0x27 (0x58) */
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x74u; t[i++] = 0x24u;
+    t[i++] = 0x08u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x10u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    /* v87b: 0x49..0x57 = 15 x 0x90 (БЫЛО: movabs+call+mov rsi,rax). */
+    for (q = 0; q < 15u; q++) t[i++] = 0x90u;
+    t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x54u; t[i++] = 0x24u;
+    t[i++] = 0x18u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x4cu; t[i++] = 0x24u;
+    t[i++] = 0x28u;
+    t[i++] = 0xb8u; t[i++] = 0x2cu; t[i++] = 0u; t[i++] = 0u; t[i++] = 0u;
+    t[i++] = 0x0fu; t[i++] = 0x05u;
+    t[i++] = 0x4cu; t[i++] = 0x8bu; t[i++] = 0x44u; t[i++] = 0x24u;
+    t[i++] = 0x20u;
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xc4u; t[i++] = 0x40u;
+    t[i++] = 0xe9u;
+    t[i++] = (u8)((u32)rel & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 8) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 16) & 0xffu);
+    t[i++] = (u8)(((u32)rel >> 24) & 0xffu);
+    if (i != 128u) return 0u;
+    return i;
+}
+
 /* v77 pure: СИСТЕМНЫЙ класс путей (libc/libpthread и родня). Эти регионы
  * = исключены v75b-фильтром (рекурсия-страховка), НО их raw-стабы = посы-
  * латель нативной ланы (run474). Патчим ТОЛЬКО со строгим glibc-хвостом

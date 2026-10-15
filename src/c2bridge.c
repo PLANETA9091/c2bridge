@@ -12442,6 +12442,82 @@ static volatile u32 c2b_g90_puregns_logged;   /* g90v6: one-shot pure-GNS marker
 static volatile u32 g_g90_A_chal;
 static u32 g_g90_last_seq;
 
+/* ---------- v101: P2V — чистые хелперы + testable vtswap (always-регион) ----------
+ * Захват UPLINK-plaintext движка: детур vtable[11] (SendMessageToConnection,
+ * ABI = (self, h, pData, cb, flags, pOut) — тот же слот, что у k2v/h2v-огней)
+ * ловит СООБЩЕНИЯ ДО шифрования GNS. Матрица-мотивация (run511): 'k' = мёртв,
+ * 0x80/0x81 GNS-crypto in-channel = tolerated-silent => остался game-layer
+ * plaintext. Форма релея = [16..1400] && НЕ ff×4 (run509: ff×4 in-channel =
+ * parse-kill 2047 — кап не жжём). Длина капчера шире: [8..1400]. */
+#define C2B_P2V_CAP 3
+#define C2B_P2V_GAP 60
+#define C2B_P2V_CMIN 8          /* капчер */
+#define C2B_P2V_MAX  1400
+#define C2B_P2V_MIN  16         /* релей-форма */
+
+static i32 c2b_p2v_lenok_cap(u32 len)
+{
+    return (len >= C2B_P2V_CMIN && len <= C2B_P2V_MAX) ? 1 : 0;
+}
+
+static i32 c2b_p2v_form(const u8 *p, u32 len)
+{
+    if (!p) return 0;
+    if (len < C2B_P2V_MIN || len > C2B_P2V_MAX) return 0;
+    if (p[0] == 0xff && p[1] == 0xff && p[2] == 0xff && p[3] == 0xff)
+        return 0;
+    return 1;
+}
+
+/* чистый гейт p2v (selftest-покрытие): 1 = стрелять, 0 = скип */
+static i32 c2b_p2v_gate(u32 on, u32 dead, u32 fires, u32 len)
+{
+    if (!on || dead) return 0;
+    if (fires >= C2B_P2V_CAP) return 0;
+    if (len < C2B_P2V_MIN || len > C2B_P2V_MAX) return 0;
+    return 1;
+}
+
+/* swap vtable[11] -> det (arm-механика, параметризована картой => e2e-тест).
+ * Возврат: 1 = патч применён, 0 = ужеarmed, <0 = код ошибки. */
+static i32 c2b_p2v_vtswap(void **vt, void *det, void **vt_map, void **orig_map,
+                          i32 nmap)
+{
+    i32 k, free_k = -1;
+    void *orig;
+    if (!vt || !det || !vt_map || !orig_map) return -1;
+    for (k = 0; k < nmap; k++) {
+        if (vt_map[k] == (void *)vt) return 0;      /* этот класс уже armed */
+        if (!vt_map[k] && free_k < 0) free_k = k;
+    }
+    if (free_k < 0) return -2;                      /* карта полна */
+    if (vt[11] == det) return 0;                    /* belt: слот уже наш */
+    orig = vt[11];
+    if (!orig) return -3;                           /* пустой слот = не то */
+    if (c2b_page_protect((uptr)&vt[11], 8, 0x07 /*RWX*/) != 0) return -4;
+    orig_map[free_k] = orig;
+    vt_map[free_k] = (void *)vt;
+    vt[11] = det;
+    return 1;
+}
+
+/* restore (тест-гигиена + rollback-рычаг): вернуть vt[11] из карты */
+static i32 c2b_p2v_vtrestore(void **vt, void **vt_map, void **orig_map,
+                             i32 nmap)
+{
+    i32 k;
+    if (!vt || !vt_map || !orig_map) return -1;
+    for (k = 0; k < nmap; k++) {
+        if (vt_map[k] != (void *)vt) continue;
+        if (c2b_page_protect((uptr)&vt[11], 8, 0x07) != 0) return -4;
+        vt[11] = orig_map[k];
+        vt_map[k] = 0;
+        orig_map[k] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 #ifndef C2B_SELFTEST
 /* 58f-g82: ReceiveMessages DETOUR (vtable slot 12 — ИСПРАВЛЕННАЯ карта).
  * run235 (g81) эмпирика: слот 13 = rc=1 + ma[0]=0 = GetConnectionInfo
@@ -12497,6 +12573,90 @@ static i32 c2b_g81_recv_detour(void *self, uptr connH, void **pMsgs, i32 nMax)
         rc = 0;
     }
     return rc;
+}
+
+/* ---------- v101: P2V — ДЕТУР vtable[11] (SendMessageToConnection) ----------
+ * Класс-vtable-механика g82w (пер-vtable карта оригов). Захват = ДЕНЬГИ:
+ * (h, pData, cbData) движковых вызовов ДО шифрования GNS = game-layer
+ * plaintext (run511-вердикт: wire-диалекты in-channel мертвы). Гварды:
+ * g_probe_active (НАШИ огни = bare-forward, вложный setjmp = порча окна),
+ * h == g_gns_conn_h (наш мост — только мы и шлём, все огни guarded),
+ * len [8..1400]. Кольцо firsts = 4 слота (ПЕРВОЕ сообщение на хэндл —
+ * hello-кандидат), эпок = g_p2v_capt, логи кап 16. Форвард = под свежим
+ * probe-окном (run356-a3 урок), наши вызовы = bare (внешнее окно maybe). */
+static void c2b_p2v_arm(void);         /* v101 fwd (тело ниже, у h2v-maybe) */
+static void c2b_p2v_maybe(void);       /* v101 fwd (тело ниже, у h2v-maybe) */
+
+#define C2B_P2V_SLOTS 4
+static void *g_p2v_vt[2];               /* armed class-vtables */
+static void *g_p2v_orig[2];             /* их оригинальные slot-11 */
+static uptr g_p2v_fh[C2B_P2V_SLOTS];    /* firsts: хэндл */
+static u32  g_p2v_flen[C2B_P2V_SLOTS];
+static u8   g_p2v_fbuf[C2B_P2V_SLOTS][C2B_P2V_MAX];
+static u32  g_p2v_frel[C2B_P2V_SLOTS];  /* 1 = отрелеен */
+static volatile u32 g_p2v_capt;         /* капчер-эпок (firsts) */
+static u32  g_p2v_caplogs;
+static u32  g_p2v_fwd;                  /* bare-forward счётчик (движок+мы) */
+
+static i32 c2b_p2v_send_detour(void *self, uptr connH, const void *pData,
+                               u32 cbData, i32 sendFlags, i64 *pOut)
+{
+    void **vt_pv = *(void ***)self;
+    void *orig_pv = 0;
+    i32 k_pv, rc_pv;
+    for (k_pv = 0; k_pv < 2; k_pv++)
+        if (g_p2v_vt[k_pv] == (void *)vt_pv) { orig_pv = g_p2v_orig[k_pv]; break; }
+    if (!orig_pv) return -997;          /* не наш класс (не бывает) */
+    if (g_probe_active) {
+        /* НАШ огонь (внешнее probe-окно maybe) — bare-forward, БЕЗ setjmp */
+        g_p2v_fwd++;
+        return ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))orig_pv)(
+            self, connH, pData, cbData, sendFlags, pOut);
+    }
+    /* движковый вызов: капчер + форвард под СВЕЖИМ probe-окном */
+    if (connH != (uptr)g_gns_conn_h && c2b_p2v_lenok_cap(cbData)) {
+        i32 slot_pv = -1;
+        for (k_pv = 0; k_pv < C2B_P2V_SLOTS; k_pv++)
+            if (g_p2v_fh[k_pv] == connH) { slot_pv = k_pv; break; }
+        if (slot_pv < 0) {
+            /* первый хэндл без слота = firsts-кандидат (hello) */
+            for (k_pv = 0; k_pv < C2B_P2V_SLOTS; k_pv++)
+                if (!g_p2v_fh[k_pv]) { slot_pv = k_pv; break; }
+            if (slot_pv >= 0) {
+                u32 z_pv;
+                for (z_pv = 0; z_pv < cbData; z_pv++)
+                    g_p2v_fbuf[slot_pv][z_pv] = ((const u8 *)pData)[z_pv];
+                g_p2v_flen[slot_pv] = cbData;
+                g_p2v_fh[slot_pv] = connH;
+                g_p2v_frel[slot_pv] = 0;
+                __atomic_fetch_add(&g_p2v_capt, 1, __ATOMIC_ACQ_REL);
+                if (g_p2v_caplogs < 16) {
+                    g_p2v_caplogs++;
+                    C2B_LOGS("[c2b] p2v: firsts cap #");
+                    C2B_LOGN(g_p2v_capt);
+                    C2B_LOGS(" h=0x");
+                    C2B_LOGH((u32)(connH & 0xffffffffu));
+                    C2B_LOGS(" len=");
+                    C2B_LOGN(cbData);
+                    C2B_LOGS(" head=");
+                    for (z_pv = 0; z_pv < 8 && z_pv < cbData; z_pv++)
+                        C2B_LOGH(g_p2v_fbuf[slot_pv][z_pv]);
+                    C2B_LOGS("\n");
+                }
+            }
+        }
+    }
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc_pv = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))orig_pv)(
+            self, connH, pData, cbData, sendFlags, pOut);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] p2v: FAULT send11 orig (degraded rc=0)\n");
+        rc_pv = 0;
+    }
+    return rc_pv;
 }
 
 /* v18-g82W: ReceiveMessagesOnConnection СЛОТ 14 ДЕТУР (g131-класс).
@@ -13515,6 +13675,7 @@ static void c2b_g32_drive(void)
                     }
                 }
             }
+            c2b_p2v_arm();     /* v101: детур vtable[11] (SendMessage) — капчер plaintext */
             /* 43f-g38b: состояние НИЗКОУРОВНЕВОГО слоя ПОСЛЕ коннекта:
              * если AddRef отработал с полным инитом, s_hEpoll != -1 и
              * refcnt вырос; s_hEpoll=-1 при живом refcnt = init был
@@ -18880,6 +19041,8 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 static void c2b_k27_maybe_fire(void);
 static void c2b_k2v_maybe(void);       /* v98: вербатим-'k' in-channel (тело = в runtime-регионе) */
 static void c2b_h2v_maybe(void);       /* v100: hello 0x80-class in-channel (тело = в runtime-регионе) */
+static void c2b_p2v_arm(void);         /* v101: детур vtable[11] (тело = в runtime-регионе) */
+static void c2b_p2v_maybe(void);       /* v101: plaintext firsts in-channel (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
@@ -19085,6 +19248,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_k27_maybe_fire();
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
+        c2b_p2v_maybe();       /* v101: plaintext firsts in-channel (new firsts) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
@@ -20347,6 +20511,110 @@ static void c2b_h2v_maybe(void)
     C2B_LOGN((u32)(i32)rc_hv);
     C2B_LOGS("\n");
     /* v98-контракт: rc!=1 = ТОЛЬКО телеметрия (rc==3 = dead-флаг, кап стоп) */
+}
+
+/* ---------- v101: P2V — ARM (в uno место: g32-success + g97-цикл) ----------
+ * Киллисвитч C2B_P2V=0 = НЕ патчим vtable вообще (инвазивная часть) + релей
+ * выкл. Арм = idempotent (vtswap сам видит already-armed). */
+static u32 g_p2v_init, g_p2v_on = 1;
+
+static void c2b_p2v_arm(void)
+{
+    void **vt_arm;
+    i32 r_arm;
+    if (!g_p2v_init) {
+        const char *e2p = getenv("C2B_P2V");
+        if (e2p && e2p[0] == '0') g_p2v_on = 0;
+        g_p2v_init = 1;
+        if (!g_p2v_on) C2B_LOGS("[c2b] p2v: disabled (C2B_P2V=0)\n");
+    }
+    if (!g_p2v_on || !g_gns_conn_iface) return;
+    vt_arm = *(void ***)g_gns_conn_iface;
+    r_arm = c2b_p2v_vtswap(vt_arm, (void *)&c2b_p2v_send_detour,
+                           g_p2v_vt, g_p2v_orig, 2);
+    if (r_arm == 1) {
+        C2B_LOGS("[c2b] p2v: slot 11 (SendMessage) DETOURED vt=0x");
+        C2B_LOGH((u32)((uptr)vt_arm >> 32));
+        C2B_LOGH((u32)(uptr)vt_arm);
+        C2B_LOGS(" orig=0x");
+        C2B_LOGH((u32)((uptr)g_p2v_orig[0] >> 32));
+        C2B_LOGH((u32)(uptr)g_p2v_orig[0]);
+        C2B_LOGS("\n");
+    } else if (r_arm < 0 && r_arm != -2) {
+        C2B_LOGS("[c2b] p2v: arm fail rc=");
+        C2B_LOGN((u32)(-r_arm));
+        C2B_LOGS("\n");
+    }
+}
+
+/* ---------- v101: P2V — РЕЛЕЙ firsts в мост-сессию (k2v/h2v-стиль) ----------
+ * Огонь = старейший неотрелееный firsts с формой ([16..1400], НЕ ff×4),
+ * slot-11 fl=0 UNRELIABLE на мост (probe-гард = детур видит active=1 =
+ * bare-forward). Кап 3/ран, мин-гэп 60 тиков, rc==3 = dead-флаг. Маркеры:
+ * 'B'/signon/REL (s2dn) = ПРОРЫВ; PARSE-close = контент session-bound
+ * (след. = S2S1 STEP-3 транслятор: патч session-полей каптура на мостовые);
+ * тишина = движковый hello тоже не тот диалект (матрица закрыта целиком =
+ * синтез с нуля). */
+static u32 g_p2v_fires, g_p2v_gap, g_p2v_dead;
+
+static void c2b_p2v_maybe(void)
+{
+    static u8 pv_buf[C2B_P2V_MAX];
+    u32 live_pv, z_pv, hh;
+    i32 slot_pv = -1, rc_pv = -998;
+    void **vt_pv;
+    if (g_p2v_gap) { g_p2v_gap--; return; }
+    if (!g_gns_conn_iface || !g_gns_conn_h) return;
+    if (!c2b_p2v_gate(g_p2v_on, g_p2v_dead, g_p2v_fires, C2B_P2V_MAX))
+        return;     /* гейт без len: len проверяем на слоте ниже */
+    for (z_pv = 0; z_pv < C2B_P2V_SLOTS; z_pv++) {
+        if (!g_p2v_fh[z_pv] || g_p2v_frel[z_pv]) continue;
+        if (!g_p2v_flen[z_pv] ||
+            !c2b_p2v_form(g_p2v_fbuf[z_pv], g_p2v_flen[z_pv])) {
+            g_p2v_frel[z_pv] = 2;   /* не-форма = скип навсегда (не жжём кап) */
+            continue;
+        }
+        slot_pv = (i32)z_pv;
+        break;
+    }
+    if (slot_pv < 0) return;
+    for (z_pv = 0; z_pv < g_p2v_flen[slot_pv]; z_pv++)
+        pv_buf[z_pv] = g_p2v_fbuf[slot_pv][z_pv];
+    live_pv = c2b_k24_brlive();
+    vt_pv = *(void ***)g_gns_conn_iface;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc_pv = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                          i64 *))vt_pv[11])(
+            g_gns_conn_iface, g_gns_conn_h, pv_buf, g_p2v_flen[slot_pv],
+            0 /* UNRELIABLE = безопасный класс (run366) */, &g_k27k_out47);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] p2v: send SEGV\n");
+        return;
+    }
+    g_p2v_frel[slot_pv] = 1;
+    g_p2v_fires++;
+    g_p2v_gap = C2B_P2V_GAP;
+    if (rc_pv == 3) g_p2v_dead = 1;   /* NoConnection = сессия умерла */
+    C2B_LOGS("[c2b] p2v: plaintext in-channel #");
+    C2B_LOGN(g_p2v_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(g_p2v_flen[slot_pv]);
+    C2B_LOGS(" src-h=0x");
+    C2B_LOGH((u32)(g_p2v_fh[slot_pv] & 0xffffffffu));
+    C2B_LOGS(" head=");
+    for (hh = 0; hh < 8 && hh < g_p2v_flen[slot_pv]; hh++)
+        C2B_LOGH(pv_buf[hh]);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live_pv);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 fl=0 rc=");
+    C2B_LOGN((u32)(i32)rc_pv);
+    C2B_LOGS("\n");
+    /* rc!=1 = ТОЛЬКО телеметрия (rc==3 = dead-флаг) */
 }
 
 static void c2b_k27_maybe_fire(void)
@@ -31957,6 +32225,93 @@ static void test_h2v(void)
     CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 1, "h2v: восстановлен = 1");
 }
 
+/* v101: p2v — детур slot-11 (форма/гейт/vtswap e2e на синт-vtable). */
+static i32 p2v_t_orig_calls;
+static uptr p2v_t_orig_h;
+static u32 p2v_t_orig_cb;
+static i32 p2v_t_orig(void *self, uptr h, const void *p, u32 cb, i32 fl,
+                      i64 *out)
+{
+    (void)self; (void)p; (void)fl; (void)out;
+    p2v_t_orig_calls++;
+    p2v_t_orig_h = h;
+    p2v_t_orig_cb = cb;
+    return 42;
+}
+static i32 p2v_t_det(void *self, uptr h, const void *p, u32 cb, i32 fl,
+                     i64 *out)
+{
+    return p2v_t_orig(self, h, p, cb, fl, out);   /* мимикрия форварда */
+}
+static void test_p2v(void)
+{
+    static u8 page_p2v[8192] __attribute__((aligned(4096)));
+    void **vt_p2v = (void **)page_p2v;
+    void *map_vt_p2v[2] = { 0, 0 };
+    void *map_orig_p2v[2] = { 0, 0 };
+    void *dummy11 = (void *)0x11111111u;
+    u8 pl[64];
+    i64 out_t = 0;
+    i32 rc_t;
+    printf("[t] p2v\n");
+    memset(page_p2v, 0, sizeof page_p2v);
+    memset(pl, 0x5a, sizeof pl);
+    /* длина капчера: [8..1400] */
+    CHECK(c2b_p2v_lenok_cap(8) == 1, "p2v: cap len=8 граница = 1");
+    CHECK(c2b_p2v_lenok_cap(7) == 0, "p2v: cap len=7 = 0");
+    CHECK(c2b_p2v_lenok_cap(1400) == 1, "p2v: cap len=MAX = 1");
+    CHECK(c2b_p2v_lenok_cap(1401) == 0, "p2v: cap len>MAX = 0");
+    /* форма релея: [16..1400] && НЕ ff×4 */
+    CHECK(c2b_p2v_form(pl, 32) == 1, "p2v: форма 32B = 1");
+    CHECK(c2b_p2v_form(pl, C2B_P2V_MIN) == 1, "p2v: форма len=MIN = 1");
+    CHECK(c2b_p2v_form(pl, 15) == 0, "p2v: форма len=15 = 0");
+    CHECK(c2b_p2v_form(pl, C2B_P2V_MAX + 1) == 0, "p2v: форма len>MAX = 0");
+    CHECK(c2b_p2v_form(0, 32) == 0, "p2v: форма NULL = 0");
+    pl[0] = pl[1] = pl[2] = pl[3] = 0xff;
+    CHECK(c2b_p2v_form(pl, 32) == 0, "p2v: форма ff×4 = 0 (run509 parse-kill)");
+    pl[0] = 0x5a;
+    /* гейт: on/dead/кап/len */
+    CHECK(c2b_p2v_gate(0, 0, 0, 32) == 0, "p2v: on=0 = скип");
+    CHECK(c2b_p2v_gate(1, 1, 0, 32) == 0, "p2v: dead = скип");
+    CHECK(c2b_p2v_gate(1, 0, C2B_P2V_CAP, 32) == 0, "p2v: кап 3/ран = скип");
+    CHECK(c2b_p2v_gate(1, 0, 0, 15) == 0, "p2v: len<MIN = скип");
+    CHECK(c2b_p2v_gate(1, 0, 0, 32) == 1, "p2v: всё ок = огонь");
+    /* vtswap e2e: синт-vtable на своей странице, dispatch через слот */
+    vt_p2v[11] = dummy11;
+    rc_t = c2b_p2v_vtswap(vt_p2v, (void *)&p2v_t_det, map_vt_p2v,
+                          map_orig_p2v, 2);
+    CHECK(rc_t == 1, "p2v: vtswap = 1 (патч применён)");
+    CHECK(vt_p2v[11] == (void *)&p2v_t_det, "p2v: vt[11] = detour");
+    CHECK(map_orig_p2v[0] == dummy11, "p2v: карта = ориг сохранён");
+    rc_t = ((i32 (*)(void *, uptr, const void *, u32, i32, i64 *))vt_p2v[11])(
+        (void *)vt_p2v, (uptr)0xdeadbeefu, pl, 32, 0, &out_t);
+    CHECK(rc_t == 42, "p2v: dispatch через детур = rc оррига");
+    CHECK(p2v_t_orig_calls == 1 && p2v_t_orig_h == (uptr)0xdeadbeefu &&
+          p2v_t_orig_cb == 32, "p2v: аргументы дошли до оррига");
+    rc_t = c2b_p2v_vtswap(vt_p2v, (void *)&p2v_t_det, map_vt_p2v,
+                          map_orig_p2v, 2);
+    CHECK(rc_t == 0, "p2v: повторный vtswap = 0 (already armed)");
+    CHECK(map_orig_p2v[0] == dummy11, "p2v: повтор не затёр ориг");
+    rc_t = c2b_p2v_vtrestore(vt_p2v, map_vt_p2v, map_orig_p2v, 2);
+    CHECK(rc_t == 1, "p2v: restore = 1");
+    CHECK(vt_p2v[11] == dummy11, "p2v: restore вернул ориг в слот");
+    CHECK(map_vt_p2v[0] == 0 && map_orig_p2v[0] == 0, "p2v: карта очищена");
+    /* edge: NULL/пустой слот/полная карта */
+    CHECK(c2b_p2v_vtswap(0, (void *)&p2v_t_det, map_vt_p2v, map_orig_p2v, 2) == -1,
+          "p2v: vtswap NULL = -1");
+    vt_p2v[11] = 0;
+    CHECK(c2b_p2v_vtswap(vt_p2v, (void *)&p2v_t_det, map_vt_p2v,
+                         map_orig_p2v, 2) == -3, "p2v: пустой слот = -3");
+    vt_p2v[11] = dummy11;
+    map_vt_p2v[0] = map_vt_p2v[1] = vt_p2v;   /* карта полна этим vt */
+    CHECK(c2b_p2v_vtswap(vt_p2v, (void *)&p2v_t_det, map_vt_p2v,
+                         map_orig_p2v, 2) == 0, "p2v: карта полна + тот же vt = 0");
+    map_vt_p2v[0] = (void *)0x2222u; map_vt_p2v[1] = (void *)0x3333u;
+    CHECK(c2b_p2v_vtswap(vt_p2v, (void *)&p2v_t_det, map_vt_p2v,
+                         map_orig_p2v, 2) == -2, "p2v: карта полна чужими = -2");
+    map_vt_p2v[0] = map_vt_p2v[1] = 0;
+}
+
 /* v50: crt-fix — 0x22 движка -> релей-принятая форма (c2b_crt.h).
  * Фикстуры = РЕАЛЬНЫЕ байты run391-pcap (v50_fixture_extract.py):
  * v50f_eng = сломанный 0x22 движка (79B: 0x22 + 4c00 + 76B proto),
@@ -34320,6 +34675,7 @@ int main(void)
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_k2v();         /* v98: вербатим-'k' in-channel (форма/chal/гейт) */
     test_h2v();         /* v100: hello 0x80-class in-channel (форма/гейт/dst) */
+    test_p2v();         /* v101: детур slot-11 (форма/гейт/vtswap e2e) */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */

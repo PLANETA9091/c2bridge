@@ -20657,10 +20657,18 @@ static u32 c2b_b2e_proto(u32 fires, u32 pr_live)
  * fire#1 = VAL, fire#2 = 0. Форма = движковая (валидный тикет/шейп).
  * Ответ сервера = в движковый сокет = движок сам парсит грант 'B'
  * (или 'A'-луп продолжается = обе ячейки мертвы, барьер глубже). */
-static u32 c2b_kdr_gate(u32 on, u32 fires, u32 klen, u32 val)
+static u32 c2b_kdr_gate(u32 on, u32 fires, u32 klen, u32 val, u32 kdb)
 {
     if (!on) return 0;
-    if (fires >= 2u) return 0;
+    if (fires >= 2u) {
+        /* v107.3 KDB: окна-денсити бёрст — ячейки #3..#6 = VAL-форма
+         * на каденции данса (урок run535: kdr-ячейки = в precedes грантов
+         * x4, грант-богатое окно = плотный кластер мостовых сендов ВНУТРИ
+         * данс-окна; гипотеза = плотность отправок в дансе коррелирует
+         * с грантами). Огонь = на новых g_kfull (данс-каденция естественная). */
+        if (!kdb) return 0;
+        if (fires >= 6u) return 0;
+    }
     if (klen < 32u || klen > 1200u) return 0;
     if (fires == 0u && !val) return 0;   /* fire#1 = VAL обязателен */
     return 1;
@@ -20962,6 +20970,7 @@ static i64 g_k27k_out47;   /* vt[11] out-параметр (queued-status) */
 /* v106.6: KDR — см. коммент у always-острова c2b_kdr_gate/c2b_kdr_build
  * (выше); здесь = рантайм-статик: fires/val/on + кап 2 + C2B_KDR=0. */
 static u32 g_kdr_init, g_kdr_on = 1, g_kdr_fires, g_kdr_val;
+static u32 g_kdb_on = 1;   /* v107.3: KDB бёрст (#3..#6 VAL), killswitch C2B_KDB=0 */
 
 /* v47b: попытка k27k-выстрела (вызывается ИЗ form-пути на A-fire, И из
  * кождого тика g97 пока pend — источник 'k' (g70-капчер) часто ПОЗЖЕ
@@ -21061,20 +21070,27 @@ static void c2b_kdr_maybe(void)
     ssize_t sr;
     if (!g_kdr_init) {
         const char *e = getenv("C2B_KDR");
+        const char *ek = getenv("C2B_KDB");
         if (e && e[0] == '0') g_kdr_on = 0;
+        if (ek && ek[0] == '0') g_kdb_on = 0;
         g_kdr_init = 1;
         if (g_kdr_on)
-            C2B_LOGS("[c2b] kdr: ARMED (v106.6 kfull chal-patch direct->server, cap 2: #1=val #2=0)\n");
+            C2B_LOGS(g_kdb_on
+                ? "[c2b] kdr: ARMED (v107.3 kfull chal-patch direct->server, cap 2: #1=val #2=0; KDB burst #3..#6=val dance-cadence)\n"
+                : "[c2b] kdr: ARMED (v106.6 kfull chal-patch direct->server, cap 2: #1=val #2=0)\n");
     }
     if (!g_kdr_on) return;
-    if (g_kdr_fires >= 2u) return;
+    if (g_kdr_fires >= (g_kdb_on ? 6u : 2u)) return;
     if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
         (uptr)g_clp_sendto == 1) return;
     n47 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
     if (!n47) return;
     fl = g_kfull_len;
-    if (!c2b_kdr_gate(g_kdr_on, g_kdr_fires, fl, g_kdr_val)) return;
-    chal = (g_kdr_fires == 0u) ? g_kdr_val : 0u;
+    if (!c2b_kdr_gate(g_kdr_on, g_kdr_fires, fl, g_kdr_val, g_kdb_on)) return;
+    /* v107.3: #1 = VAL (A/B), #2 = chal=0 (A/B), #3..#6 = VAL (KDB
+     * бёрст: одна переменная = плотность; VAL = лучшая ячейка —
+     * kdr#1 = в precedes грантов run535) */
+    chal = (g_kdr_fires == 0u || g_kdr_fires >= 2u) ? g_kdr_val : 0u;
     if (!c2b_kdr_build((const u8 *)g_kfull, fl, chal,
                        kbuf, (u32)sizeof kbuf, &klen)) return;
     for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
@@ -21209,7 +21225,7 @@ static void c2b_cvx_maybe(void)
  * ОДИН раз до обеих сборок = пара несёт ОДИН консистентный живой чал
  * ('A'-счётчик; стор только !=0 на нитке recv => значение между гейтом
  * и чтением может лишь обновиться до нового не-нулевого = консистентно). */
-static u32 g_pcx_init, g_pcx_on = 1, g_pcx_pairs, g_pcx_tick;
+static u32 g_pcx_init, g_pcx_on = 0, g_pcx_pairs, g_pcx_tick;
 static u32 g_pcx_seen_kdr, g_pcx_delay;
 
 /* v107.2.1: сборка+сташ пенд-пары (ОБЩИЙ путь: тик-fallback c2b_pcx_maybe
@@ -21273,7 +21289,11 @@ static void c2b_pcx_maybe(void)
 {
     if (!g_pcx_init) {
         const char *e = getenv("C2B_PCX");
-        if (e && e[0] == '0') g_pcx_on = 0;
+        /* v107.3: PCX = RETIRED (default OFF, opt-in C2B_PCX=1) —
+         * урок run533/534/535: любая ребилд-форма структурно устарела
+         * (живой внутренний state данса нефоргируем), эндпоинт-дельта
+         * не существовала (61b-реле = g_clv2_fd = тот же эндпоинт). */
+        if (e && e[0] == '1') g_pcx_on = 1;
         g_pcx_init = 1;
         if (g_pcx_on)
             C2B_LOGS("[c2b] pcx: ARMED (v107.2 PCX-RELAY FRESH-CHAL pair-cadence 0x22+k chal=A-counter cap 6 post-kdr; endpoint=engine socket g130)\n");
@@ -33879,12 +33899,17 @@ static void test_swr(void)
     CHECK(c2b_b2e_proto(1u, 2u) == 2u, "b2e: fire#2 живой 2 = 2 (честный live)");
     /* --- v106.6: kdr (kfull chal-патч прямой в сервер) --- */
     printf("[t] kdr\n");
-    CHECK(c2b_kdr_gate(0, 0, 513, 0xee0a07u) == 0, "kdr: on=0 = скип");
-    CHECK(c2b_kdr_gate(1, 2, 513, 0xee0a07u) == 0, "kdr: кап 2 = скип");
-    CHECK(c2b_kdr_gate(1, 0, 16, 0xee0a07u) == 0, "kdr: klen<32 = скип");
-    CHECK(c2b_kdr_gate(1, 0, 513, 0) == 0, "kdr: fire#1 без VAL = скип");
-    CHECK(c2b_kdr_gate(1, 1, 513, 0) == 1, "kdr: fire#2 без VAL = 1");
-    CHECK(c2b_kdr_gate(1, 0, 513, 0xee0a07u) == 1, "kdr: fire#1 с VAL = 1");
+    CHECK(c2b_kdr_gate(0, 0, 513, 0xee0a07u, 1) == 0, "kdr: on=0 = скип");
+    CHECK(c2b_kdr_gate(1, 2, 513, 0xee0a07u, 0) == 0, "kdr: кап 2 без KDB = скип");
+    CHECK(c2b_kdr_gate(1, 0, 16, 0xee0a07u, 1) == 0, "kdr: klen<32 = скип");
+    CHECK(c2b_kdr_gate(1, 0, 513, 0, 1) == 0, "kdr: fire#1 без VAL = скип");
+    CHECK(c2b_kdr_gate(1, 1, 513, 0, 1) == 1, "kdr: fire#2 без VAL = 1");
+    CHECK(c2b_kdr_gate(1, 0, 513, 0xee0a07u, 1) == 1, "kdr: fire#1 с VAL = 1");
+    /* v107.3: KDB бёрст x4 (#3..#6 = VAL-форма на данс-каденции) */
+    CHECK(c2b_kdr_gate(1, 2, 513, 0xee0a07u, 1) == 1, "kdr-kdb: ячейка #3 ок");
+    CHECK(c2b_kdr_gate(1, 5, 513, 0xee0a07u, 1) == 1, "kdr-kdb: ячейка #6 ок (кап 6)");
+    CHECK(c2b_kdr_gate(1, 6, 513, 0xee0a07u, 1) == 0, "kdr-kdb: кап 6 = скип");
+    CHECK(c2b_kdr_gate(1, 3, 513, 0, 1) == 1, "kdr-kdb: #4 без VAL (VAL-снап позже) = 1");
     {
         u8 kf6[64], ko6[64]; u32 kn6 = 0, z6;
         for (z6 = 0; z6 < 64; z6++) kf6[z6] = (u8)z6;

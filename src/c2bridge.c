@@ -7568,6 +7568,14 @@ static u8  g_pcxr_22[640], g_pcxr_k[1200];
 static u32 g_pcxr_22_len, g_pcxr_k_len;
 static volatile u32 g_pcxr_pend;
 static u32 g_pcxr_fired;
+/* v107.2.2 (урок run534-tracefs): живой fd движка капчурится на хвосте
+ * главного sendto-хука (все PLT sendto процесса проходят через него;
+ * g130-wrapper = мёртвый путь fd=0 — движковские k/0x22 реально уходят
+ * с другого call-site через живой fd 0x29). engfd/engsa = последний
+ * УСПЕШНЫЙ (rc>=0) k-класс sendto движка в сервер = нативный эндпоинт. */
+static volatile i32 g_pcxr_engfd = -1;
+static u8  g_pcxr_engsa[16];
+static u32 g_pcxr_capn;
 
 /* v107.2: релей-решение (чистый хелпер, самотест-видимый). pend =
  * пенд-пара есть; kshape = текущий send движка = ff×4+'k'; srv = adr
@@ -7593,7 +7601,7 @@ static u32 c2b_pcxr_is_srv(const u8 *nadr, u32 nlen)
             nadr[7] == 133u && nadr[8] == 0x6d && nadr[9] == 0x76) ? 1u : 0u;
 }
 
-/* v107.2.1: netadr_t -> sockaddr_in (чистый хелпер). sa = AF_INET@0..1
+/* v107.2.2: netadr_t -> sockaddr_in (чистый хелпер). sa = AF_INET@0..1
  * (LE), порт@2..3 (BE = байты nadr[8..9]), ip@4..7 = nadr[4..7], пад. */
 static u32 c2b_pcxr_nadr2sa(const u8 *nadr, u32 nlen, u8 *sa)
 {
@@ -7605,6 +7613,18 @@ static u32 c2b_pcxr_nadr2sa(const u8 *nadr, u32 nlen, u8 *sa)
     sa[3] = nadr[9];
     for (i = 0; i < 4; i++) sa[4 + i] = nadr[4 + i];
     return 1u;
+}
+
+/* v107.2.2: syscall-уровень sockaddr_in-чек сервера (чистый хелпер).
+ * tail-хук sendto видит РЕАЛЬНЫЙ sockaddr (не netadr!): family@0..1,
+ * порт@2..3 BE, ip@4..7. */
+static u32 c2b_pcxr_sa_is_srv(const u8 *sa, u32 slen)
+{
+    if (!sa || slen < 16) return 0;
+    return (sa[0] == 2u && sa[1] == 0u &&        /* AF_INET LE */
+            sa[2] == 0x6d && sa[3] == 0x76 &&    /* порт 28022 BE */
+            sa[4] == 152u && sa[5] == 233u &&    /* 152.233.19.133 */
+            sa[6] == 19u && sa[7] == 133u) ? 1u : 0u;
 }
 
 #ifndef C2B_SELFTEST
@@ -7621,45 +7641,56 @@ static void c2b_pcxr_pump(u32 fd, uptr adr, uptr bf, u32 len)
     u8 na[12], sa[16];
     ssize_t sr22, srk;
     u32 kshape, srv, ok, i;
+    i32 sfd;
     if (!g_pcxr_pend) return;
     if (len < 380u || !bf || !adr || (i32)fd < 0) return;
     kshape = (*(volatile const u32 *)bf == 0xffffffffu &&
               *(volatile const u8 *)(bf + 4) == (u8)'k') ? 1u : 0u;
     if (!kshape) return;
-    /* v107.2.1: adr = netadr_t (type@0 ip@4 port@8) — снап 12 байт и
-     * парсинг через чистые хелперы (урок run533) */
-    for (i = 0; i < sizeof(na); i++)
-        na[i] = ((volatile const u8 *)adr)[i];
-    srv = c2b_pcxr_is_srv(na, (u32)sizeof na);
+    /* v107.2.2: приоритет капчуренного живого fd движка (урок run534:
+     * первый арг g130-wrapper = fd=0 = мёртвый путь; живой fd/sockaddr
+     * = капчур на хвосте sendto-хука). Нет капча = старый netadr-путь. */
+    sfd = g_pcxr_engfd;
+    if (sfd >= 0) {
+        for (i = 0; i < 16; i++) sa[i] = g_pcxr_engsa[i];
+        srv = 1u;
+    } else {
+        for (i = 0; i < sizeof(na); i++)
+            na[i] = ((volatile const u8 *)adr)[i];
+        srv = c2b_pcxr_is_srv(na, (u32)sizeof na);
+        if (srv && !c2b_pcxr_nadr2sa(na, (u32)sizeof na, sa)) return;
+    }
     ok = (g_clp_sendto && (uptr)g_clp_sendto != 1u &&
           g_pcxr_22_len > 0u && g_pcxr_k_len > 0u &&
           g_pcxr_22_len <= sizeof g_pcxr_22 &&
           g_pcxr_k_len <= sizeof g_pcxr_k) ? 1u : 0u;
     if (!c2b_pcxr_decide(g_pcxr_pend, kshape, srv, ok)) return;
-    if (!c2b_pcxr_nadr2sa(na, (u32)sizeof na, sa)) return;
+    g_pcxr_pend = 0;          /* v107.2.2: снять ДО огня (санк-огни идут
+                                 через g_clp_sendto = мимо хука, но
+                                 дисциплина единая с tail-огнём) */
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        sr22 = ((c2b_sendto_fn)g_clp_sendto)((int)fd, g_pcxr_22,
+        sr22 = ((c2b_sendto_fn)g_clp_sendto)((int)(sfd >= 0 ? sfd : (i32)fd),
+                                             g_pcxr_22,
                                              g_pcxr_22_len, 0,
                                              (const struct sockaddr *)sa,
                                              16);
-        srk = ((c2b_sendto_fn)g_clp_sendto)((int)fd, g_pcxr_k,
+        srk = ((c2b_sendto_fn)g_clp_sendto)((int)(sfd >= 0 ? sfd : (i32)fd),
+                                            g_pcxr_k,
                                             g_pcxr_k_len, 0,
                                             (const struct sockaddr *)sa,
                                             16);
         g_probe_active = 0;
     } else {
         g_probe_active = 0;
-        g_pcxr_pend = 0;
         C2B_LOGS("[c2b] pcx-relay: send FAULT — пара снята\n");
         return;
     }
-    g_pcxr_pend = 0;
     g_pcxr_fired++;
-    C2B_LOGS("[c2b] pcx-relay: FIRED #");
+    C2B_LOGS("[c2b] pcx-relay: FIRED-g130 #");
     C2B_LOGN(g_pcxr_fired);
     C2B_LOGS(" fd=");
-    C2B_LOGN(fd);
+    C2B_LOGN((u32)(sfd >= 0 ? sfd : (i32)fd));
     C2B_LOGS(" len22=");
     C2B_LOGN(g_pcxr_22_len);
     C2B_LOGS(" lenk=");
@@ -17809,6 +17840,52 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     {
         ssize_t r = ((c2b_sendto_fn)g_clp_sendto)(fd, buf, len, flags, addr, addrlen);
         c2b_g40_sdt_note(fd, (u32)len, addr, r);
+        /* v107.2.2 PCX-RELAY капчур+пост-огонь (урок run534-tracefs:
+         * РЕАЛЬНЫЕ k/0x22 движка проходят ЭТОТ хвост с живым fd и
+         * РЕАЛЬНЫМ sockaddr_in — 54x fd=0x29 против 6x fd=0 мёртвого
+         * g130-пути). Капчур = последний УСПЕШНЫЙ (rc>=0) k-класс send
+         * движка в сервер; пенд-пара = СРАЗУ ПОСЛЕ живого k = точная
+         * нативная каденция (пара adjacent к живому движковскому k).
+         * Наши огни = g_clp_sendto = мимо хука = без самозахвата/ре-огня.
+         * errno сохраняется (лишние send'ы не пачкают движковский errno). */
+        if (r >= 0 && len >= 380u && buf && addr && addrlen >= 16u &&
+            *(volatile const u32 *)buf == 0xffffffffu &&
+            *(volatile const u8 *)((uptr)buf + 4) == (u8)'k' &&
+            c2b_pcxr_sa_is_srv((const u8 *)addr, (u32)addrlen)) {
+            int er = *__errno_location();
+            u32 i;
+            g_pcxr_engfd = fd;
+            for (i = 0; i < 16; i++)
+                g_pcxr_engsa[i] = ((volatile const u8 *)addr)[i];
+            g_pcxr_capn++;
+            if (g_pcxr_pend) {
+                ssize_t r22, rk;
+                g_pcxr_pend = 0;      /* снять ДО огня = без ре-энтри */
+                r22 = ((c2b_sendto_fn)g_clp_sendto)(
+                    fd, g_pcxr_22, g_pcxr_22_len, 0,
+                    (const struct sockaddr *)g_pcxr_engsa, 16);
+                rk = ((c2b_sendto_fn)g_clp_sendto)(
+                    fd, g_pcxr_k, g_pcxr_k_len, 0,
+                    (const struct sockaddr *)g_pcxr_engsa, 16);
+                g_pcxr_fired++;
+                C2B_LOGS("[c2b] pcx-relay: FIRED-post #");
+                C2B_LOGN(g_pcxr_fired);
+                C2B_LOGS(" fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS(" len22=");
+                C2B_LOGN(g_pcxr_22_len);
+                C2B_LOGS(" lenk=");
+                C2B_LOGN(g_pcxr_k_len);
+                C2B_LOGS(" rc22=");
+                C2B_LOGN((u32)(r22 < 0 ? (u32)-1 : (u32)r22));
+                C2B_LOGS(" rck=");
+                C2B_LOGN((u32)(rk < 0 ? (u32)-1 : (u32)rk));
+                C2B_LOGS(" postk=");
+                C2B_LOGN(g_pcxr_capn);
+                C2B_LOGS("\n");
+            }
+            *__errno_location() = er;
+        }
         return r;
     }
 }
@@ -33887,6 +33964,15 @@ static void test_swr(void)
               sa16[15] == 0, "pcx-relay: nadr2sa = sockaddr_in верен");
         CHECK(c2b_pcxr_nadr2sa(nasrv, 9, sa16) == 0,
               "pcx-relay: короткий netadr = 0");
+        /* v107.2.2: syscall-уровень sockaddr_in-чек x2 */
+        CHECK(c2b_pcxr_sa_is_srv(nasrv, sizeof nasrv) == 0,
+              "pcx-relay: netadr НЕ sockaddr_in = 0 (семья@0)");
+        {
+            static const u8 sasrv[16] = {2, 0, 0x6d, 0x76, 152, 233, 19, 133,
+                                         0, 0, 0, 0, 0, 0, 0, 0};
+            CHECK(c2b_pcxr_sa_is_srv(sasrv, sizeof sasrv) == 1,
+                  "pcx-relay: sockaddr_in сервера = ok");
+        }
     }
     /* v107.1: pcx fresh22 x9 (свежий чал в сташе 0x22) */
     {

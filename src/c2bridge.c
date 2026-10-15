@@ -10403,6 +10403,9 @@ void c2b_g16a_log(uptr ret0, uptr dataptr, u32 len)
  * 59Б (первый 40Б), 'I'-beacon = 82Б, 'A' = 59Б — дамп 12Б срезал 19-70Б
  * хвоста = ground-truth следующего фикса (expire/версия/pw-зоны). */
 static u32 c2b_g16_dumplen(i32 rlen);
+static u32 g_cvx_achal;   /* v106.8: живой счётчик-чал последнего 'A' (g95-сташ,
+                           * cvx fire#2); стор на нитке recv = естественная
+                           * атомарность (дисциплина cstate-slice run519) */
 
 void c2b_g16b_log(uptr rlen, uptr frame)
 {
@@ -10429,6 +10432,7 @@ void c2b_g16b_log(uptr rlen, uptr frame)
             uptr st95 = c2b_g49_state;
             if (ch95 != 0 && st95) {
                 *(volatile u32 *)(st95 + 0x4d8) = ch95;
+                g_cvx_achal = ch95;   /* v106.8: сташ живого счётчика 'A' */
                 g_g95_seq++;
                 if ((g_g95_seq & 0x07) == 1) {
                     C2B_LOGS("[c2b] g95: 'A' challenge refreshed chal=0x");
@@ -19257,6 +19261,7 @@ static void c2b_a2e_maybe(void);       /* v43: релей серверного '
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_b2e_maybe(void);       /* v106.3: синт-'B' с живым chal -> движок */
 static void c2b_kdr_maybe(void);       /* v106.6: kfull chal-патч прямой в сервер */
+static void c2b_cvx_maybe(void);       /* v106.8: прямой OOB "connect0x%%08x" в сервер */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
 
 
@@ -19460,6 +19465,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_k27_maybe_fire();
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
         c2b_kdr_maybe();       /* v106.6: kfull chal-патч прямой в сервер (новый кфулл) */
+        c2b_cvx_maybe();       /* v106.8: прямой OOB "connect0x" в сервер (после kdr-пары) */
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
         c2b_p2v_maybe();       /* v101: plaintext firsts in-channel (new firsts) */
         c2b_t2v_maybe();       /* v102: ticket in-channel RELIABLE (ответ на 'A') */
@@ -20461,6 +20467,50 @@ static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
     return 1;
 }
 
+/* ---------- v106.8: CVX — ПРЯМОЙ OOB "connect0x%08x" В СЕРВЕР ----------
+ * ЦЕНЗ run527 (deep-dump v106.7): 'A' сервера = 59B ff×4 'A' chal4(=счётчик:
+ * 0x8ce18b7b -> 0x4f5f8b7c -> ... low16 монотонно растёт) proto4(=3)
+ * pad2 val4(=0x00ee0a07 СТАБИЛЕН во ВСЕХ 17 'A'-кадрах) pad3 0x30 pad2
+ * str18("connect-granted0x\0" x16 | "connect0x00000000\0" x1=машинный эхо)
+ * "96\0\0" ff 00s — сервер = В ГРАНТ-СОСТОЯНИИ В КАЖДОМ 'A' (x9 прямых).
+ * run384-ledger: сервер РАСПАРСИЛ 'qconnect0x<val>' (строковая OOB-команда).
+ * Непроверенная ячейка = СИБЛИНГ-КОМАНДА "connect0x<val>" ПРЯМО (legacy-форма
+ * коннекта; шаблон str18-эха = "connect0x%%08x" = указание формы). A/B в
+ * одном ране: fire#1 = VAL (стабильное поле 'A' @15..18 = g_kdr_val, тот же
+ * источник v49), fire#2 = живой счётчик-чал последнего 'A' (g95-сташ
+ * g_cvx_achal). 22B = ff×4 + "connect0x" + 8 строчных hex + NUL. Путь =
+ * kdr-проверенный sendto (g_clv2_fd -> 152.233.19.133:28022); гэп >= 120
+ * тиков после kdr A/B (окна ответов чистые); кап 2, killswitch C2B_CVX=0.
+ * Always-остров = selftest-видимость. */
+static u32 c2b_cvx_build(u8 *out, u32 cap, u32 val, u32 *outlen)
+{
+    static const u8 pfx[13] = {
+        0xff, 0xff, 0xff, 0xff, 'c', 'o', 'n', 'n', 'e', 'c', 't', '0', 'x'
+    };
+    u32 k, nib;
+    if (!out || !outlen) return 0;
+    if (cap < 22u) return 0;
+    for (k = 0; k < 13u; k++) out[k] = pfx[k];
+    for (k = 0; k < 8u; k++) {
+        nib = (val >> ((7u - k) * 4u)) & 0xfu;
+        out[13 + k] = (u8)(nib < 10u ? ('0' + nib) : ('a' + nib - 10u));
+    }
+    out[21] = 0;
+    *outlen = 22u;
+    return 1;
+}
+
+/* ворота cvx: on, кап 2; fire#1 = VAL + kdr-пара доделана + гэп; fire#2 =
+ * живой счётчик 'A' + гэп. Чистая политика (always-остров). */
+static u32 c2b_cvx_gate(u32 on, u32 fires, u32 val, u32 achal,
+                        u32 kdr_done, u32 delay_ok)
+{
+    if (!on) return 0;
+    if (fires >= 2u) return 0;
+    if (fires == 0u) return (val && kdr_done && delay_ok) ? 1u : 0u;
+    return (achal && delay_ok) ? 1u : 0u;
+}
+
 /* v106.7: g16-deep-dump длина = clamp(rlen, 0, 72). Чистая функция
  * (always-остров: selftest-видимость). 72 = полные 59Б-гранты 'B.'/'A'
  * с запасом + 72% тела 82Б 'I'-beacon; rate-limit g16 не тронут. */
@@ -20766,6 +20816,67 @@ static void c2b_kdr_maybe(void)
     C2B_LOGH(chal);
     C2B_LOGS(" len=");
     C2B_LOGN(klen);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS("\n");
+}
+
+/* v106.8: CVX рантайм — см. блок у always-острова c2b_cvx_build/c2b_cvx_gate.
+ * Огонь = тик g97; fire#1 = первый тик после (kdr-пара доделана AND VAL
+ * готов AND 120 локальных тиков прошло — окна ответов kdr чисты), fire#2 =
+ * fire#1 + 120 тиков с живым счётчиком 'A' (g95-сташ). */
+static u32 g_cvx_init, g_cvx_on = 1, g_cvx_fires, g_cvx_tick;
+static u32 g_cvx_seen_kdr, g_cvx_delay;
+
+static void c2b_cvx_maybe(void)
+{
+    static u8 cbuf[32];
+    u32 val, delay_ok, i, n;
+    u8 sa[16];
+    ssize_t sr;
+    if (!g_cvx_init) {
+        const char *e = getenv("C2B_CVX");
+        if (e && e[0] == '0') g_cvx_on = 0;
+        g_cvx_init = 1;
+        if (g_cvx_on)
+            C2B_LOGS("[c2b] cvx: ARMED (v106.8 direct connect0x-string cap 2: fire1=VAL fire2=A-counter)\n");
+    }
+    if (!g_cvx_on) return;
+    if (g_cvx_fires >= 2u) return;
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1) return;
+    g_cvx_tick++;
+    if (g_kdr_fires >= 2u) g_cvx_seen_kdr = 1;
+    if (!g_cvx_seen_kdr) return;              /* ждём конца kdr A/B */
+    g_cvx_delay++;
+    delay_ok = (g_cvx_delay >= 120u) ? 1u : 0u;
+    if (!c2b_cvx_gate(g_cvx_on, g_cvx_fires, g_kdr_val, g_cvx_achal,
+                      g_cvx_seen_kdr, delay_ok)) return;
+    val = (g_cvx_fires == 0u) ? g_kdr_val : g_cvx_achal;
+    if (!c2b_cvx_build(cbuf, (u32)sizeof cbuf, val, &n)) return;
+    for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
+    sa[0] = 2;                     /* AF_INET (LE) */
+    sa[2] = 0x6d; sa[3] = 0x76;    /* порт 28022 BE */
+    sa[4] = 152; sa[5] = 233; sa[6] = 19; sa[7] = 133;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)cbuf,
+                                           n, 0,
+                                           (const struct sockaddr *)sa, 16);
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] cvx: send SEGV\n");
+        return;
+    }
+    g_probe_active = 0;
+    g_cvx_fires++;
+    g_cvx_delay = 0;
+    C2B_LOGS("[c2b] cvx: direct-'connect0x' #");
+    C2B_LOGN(g_cvx_fires);
+    C2B_LOGS(" val=");
+    C2B_LOGH(val);
+    C2B_LOGS(" len=");
+    C2B_LOGN(n);
     C2B_LOGS(" rc=");
     C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
     C2B_LOGS("\n");
@@ -33392,6 +33503,36 @@ static void test_swr(void)
     CHECK(c2b_g16_dumplen(82) == 72, "dumplen: 82B-beacon = 72");
     CHECK(c2b_g16_dumplen(100) == 72, "dumplen: 100 = кап 72");
     CHECK(c2b_g16_dumplen(2147483647) == 72, "dumplen: max-int = кап 72");
+    /* v106.8: cvx gate x8 */
+    CHECK(c2b_cvx_gate(0, 0, 0xee0a07u, 0, 1, 1) == 0, "cvx: on=0 = скип");
+    CHECK(c2b_cvx_gate(1, 2, 0xee0a07u, 0, 1, 1) == 0, "cvx: кап 2 = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0, 0, 1, 1) == 0, "cvx: fire#1 без VAL = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 0, 1) == 0, "cvx: fire#1 kdr не доделан = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 1, 0) == 0, "cvx: fire#1 гэп не готов = скип");
+    CHECK(c2b_cvx_gate(1, 0, 0xee0a07u, 0, 1, 1) == 1, "cvx: fire#1 ok");
+    CHECK(c2b_cvx_gate(1, 1, 0, 0, 1, 1) == 0, "cvx: fire#2 без achal = скип");
+    CHECK(c2b_cvx_gate(1, 1, 0, 0x8ce18b7bu, 1, 1) == 1, "cvx: fire#2 ok");
+    /* v106.8: cvx build x6 */
+    {
+        u8 co8[32];
+        u32 cn8 = 0;
+        CHECK(c2b_cvx_build(co8, 10, 0xee0a07u, &cn8) == 0, "cvx: cap<22 = 0");
+        CHECK(c2b_cvx_build(co8, sizeof co8, 0xee0a07u, &cn8) == 1 && cn8 == 22 &&
+              co8[0] == 0xff && co8[1] == 0xff && co8[2] == 0xff && co8[3] == 0xff &&
+              co8[4] == 'c' && co8[12] == 'x' && co8[21] == 0 &&
+              co8[13] == '0' && co8[14] == '0' && co8[15] == 'e' &&
+              co8[16] == 'e' && co8[17] == '0' && co8[18] == 'a' &&
+              co8[19] == '0' && co8[20] == '7',
+              "cvx: build VAL = connect0x00ee0a07 NUL");
+        CHECK(c2b_cvx_build(co8, sizeof co8, 0u, &cn8) == 1 && cn8 == 22 &&
+              co8[13] == '0' && co8[20] == '0', "cvx: build 0 = connect0x00000000");
+        CHECK(c2b_cvx_build(co8, sizeof co8, 0xffffffffu, &cn8) == 1 &&
+              co8[13] == 'f' && co8[20] == 'f', "cvx: build max = connect0xffffffff");
+        CHECK(c2b_cvx_build(co8, sizeof co8, 0x8ce18b7bu, &cn8) == 1 &&
+              co8[13] == '8' && co8[14] == 'c' && co8[15] == 'e' &&
+              co8[20] == 'b', "cvx: build счётчик = строчные hex");
+        CHECK(c2b_cvx_build(0, sizeof co8, 1u, &cn8) == 0, "cvx: out=0 = 0");
+    }
 
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");

@@ -1251,7 +1251,10 @@ static const u8 G124_SETIV_SIG[28] = {
 };
 static u8 g124_tramp_a[64] __attribute__((aligned(4096)));
 static u8 g124_tramp_b[64] __attribute__((aligned(4096)));
-static u32 g124_patched;      /* bit0 = the setkey, bit1 = the setiv */
+/* v104: tramp G = the libsns EVP dispatcher (SITE G, 3rd page) */
+static u8 g124_tramp_g[64] __attribute__((aligned(4096)));
+static u32 g124_patched;      /* bit0 = the setkey, bit1 = the setiv,
+                               * bit6 = lsnsite (v104) */
 static u32 g124_nsetkey;      /* the total setkey calls seen */
 static u32 g124_nsetiv;       /* the total setiv calls seen */
 static u32 g124_prof_k;       /* the key-profile lines logged (cap 8) */
@@ -1433,6 +1436,27 @@ static void c2b_g124_patch(u8 *tgt, const u8 *sig, u32 siglen, u8 *tramp,
 }
 
 /* the maps-line match: 'libsteamnetworkingsockets.so' in the path part */
+static i32 line_is_sns(const char *s, i32 n, uptr *out_lo);
+
+/* v104-g124G: THE LIBSNS EVP DISPATCHER SITE (forward decls — the body =
+ * after the g126 capture fns; the site = the g124 family's decrypt/
+ * encrypt tap, the docblock = at the body site). */
+#define G124_LSN_OFF  0x23c720u   /* aes_gcm_cipher (the EVP do_cipher) */
+static const u8 G124_LSN_SIG[26] = {
+    0x41, 0x57,                          /* push %r15 */
+    0x41, 0x56,                          /* push %r14 */
+    0x49, 0x89, 0xd6,                    /* mov %rdx,%r14 (in) */
+    0x41, 0x55,                          /* push %r13 */
+    0x49, 0x89, 0xf5,                    /* mov %rsi,%r13 (out) */
+    0x41, 0x54,                          /* push %r12 */
+    0x49, 0x89, 0xcc,                    /* mov %rcx,%r12 (len) */
+    0x55,                                /* push %rbp */
+    0x48, 0x89, 0xfd,                    /* mov %rdi,%rbp (ctx) */
+    0x53,                                /* push %rbx */
+    0x48, 0x83, 0xec, 0x18               /* sub $0x18,%rsp */
+};
+static i32 c2b_g124_lsn_detour(void *ctx, void *out, const void *in,
+                               sz_t len);
 static i32 line_is_sns(const char *s, i32 n, uptr *out_lo)
 {
     /* "libsteamnetworkingsockets.so" = 28 chars: s[11]='w' (after 'net'),
@@ -1527,6 +1551,15 @@ static void *c2b_g124_watch(void *arg)
             c2b_g124_patch((u8 *)(liblo + G124_SETIV_OFF), G124_SETIV_SIG,
                            sizeof(G124_SETIV_SIG), g124_tramp_b,
                            (uptr)&c2b_g124_setiv_detour, "setiv", 2,
+                           liblo);
+        /* v104: SITE G = the EVP dispatcher (the ONE site = both
+         * directions via [ctx+0x10]) — the decrypt/encrypt taps the g124
+         * family never had; the sig = unique @0x23c720 in all 3 local
+         * lib copies = the build-stable site. */
+        if (!(g124_patched & 64))
+            c2b_g124_patch((u8 *)(liblo + G124_LSN_OFF), G124_LSN_SIG,
+                           sizeof(G124_LSN_SIG), g124_tramp_g,
+                           (uptr)&c2b_g124_lsn_detour, "lsnsite", 64,
                            liblo);
         if ((g124_patched & 3) == 3) return (void *)0;
         /* the sig mismatch = the version drift = NO patch (the log = once
@@ -1663,6 +1696,7 @@ static u32 g126_prof_k;
 static u32 g126_prof_i;
 static u32 g126_ndecc32;      /* the decrypt_ctr32 calls seen */
 static u32 g126_ndecl;        /* the decrypt calls seen */
+static u32 g126_ndeclsn;      /* v104: the libsns decrypt calls seen */
 static u32 g126_prof_dc;      /* the dec-profile lines logged (cap 8) */
 static u32 g126_prof_dcl;     /* the decl-profile lines logged (cap 8) */
 #define G126_KEY_CAP 16
@@ -1955,9 +1989,10 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
                                  const void *out, sz_t len, i32 rc,
                                  u32 tag32)
 {
-    u32 *ctr = tag32 ? &g126_ndecc32 : &g126_ndecl;
+    u32 *ctr = tag32 == 2u ? &g126_ndeclsn :
+               (tag32 ? &g126_ndecc32 : &g126_ndecl);
     u32 *prof = tag32 ? &g126_prof_dc : &g126_prof_dcl;
-    const char *tag = tag32 ? "DEC32" : "DECL";
+    const char *tag = tag32 == 2u ? "DECLSN" : (tag32 ? "DEC32" : "DECL");
     u32 n = __atomic_add_fetch(ctr, 1, __ATOMIC_RELAXED);
     u8 bi[8], bo[64];   /* v28: 64B — полный хвост 'A' (echo) для декода конверта */
     u32 cl, z;
@@ -2080,6 +2115,7 @@ static u8 g126_tramp_e[64] __attribute__((aligned(4096)));
 static u8 g126_tramp_f[64] __attribute__((aligned(4096)));
 static u32 g126_nenc;         /* the encrypt calls seen */
 static u32 g126_nencc32;      /* the encrypt_ctr32 calls seen */
+static u32 g126_nenclsn;      /* v104: the libsns encrypt calls seen */
 static u32 g126_prof_ec;      /* the enc-profile lines logged (cap 8) */
 static u32 g126_prof_ecl;     /* the encc32-profile lines logged (cap 8) */
 
@@ -2088,7 +2124,9 @@ static void c2b_g126_enc_capture(void *gcm, const void *in, const void *out,
 {
     u32 z;
     u8 bo[8];
-    u32 n = c32 ? ++g126_nencc32 : ++g126_nenc;
+    u32 n = c32 == 2u ? __atomic_add_fetch(&g126_nenclsn, 1,
+                                           __ATOMIC_RELAXED) :
+            (c32 ? ++g126_nencc32 : ++g126_nenc);
     u32 *prof = c32 ? &g126_prof_ecl : &g126_prof_ec;
     /* v103: gate 8/8th -> 16/4th — run513-урок: после in-channel 'A'x2
      * движок шифрует 28B/63B payload'ы (кандидаты = ticket-inner 0x22 или
@@ -2099,10 +2137,12 @@ static void c2b_g126_enc_capture(void *gcm, const void *in, const void *out,
     memcpy(bo, out, sizeof bo);
     if (*prof < 8) {
         (*prof)++;
-        klog_s("[c2b] g126: ENC"); if (c32) klog_s("C32");
+        klog_s("[c2b] g126: ENC");
+        if (c32 == 2u) klog_s("LSN"); else if (c32) klog_s("C32");
         klog_s("# prof n="); klog_h(n); klog_s("\n");
     }
-    klog_s("[c2b] g126: ENC"); if (c32) klog_s("C32");
+    klog_s("[c2b] g126: ENC");
+    if (c32 == 2u) klog_s("LSN"); else if (c32) klog_s("C32");
     klog_s(" n="); klog_h(n);
     klog_s(" len="); klog_h((u32)len);
     klog_s(" rc="); klog_h((u32)rc);
@@ -2138,6 +2178,51 @@ static i32 c2b_g126_encc32_detour(void *gcm, const void *in, void *out,
             g126_tramp_f;
     i32 rc = tramp(gcm, in, out, len, ctrfn);
     c2b_g126_enc_capture(gcm, in, out, len, rc, 1);
+    return rc;
+}
+
+/* ---- v104-g126G: THE LIBSNS EVP DISPATCHER TAP (SITE G) ----
+ * THE RE (this round, libsteamnetworkingsockets.so__cb0ca8 objdump + the
+ * sig-scan scripts/sigscan_libsns.py + libsns_re.py): the run513/514 wire
+ * = IN 0x81-46/50/51 data classes (23-28B ct) that the steamclient-tap
+ * decrypts NEVER produced (the coverage = complete: 46/46 pre-gate, DECL
+ * = 0) => those packets = decrypted by a GNS COPY THE TAPS DON'T COVER =
+ * the standalone libsteamnetworkingsockets.so (the STEAM CLIENT layer's
+ * own SDR sessions). THE LIB = the SAME Valve OpenSSL family (the CRYPTO
+ * strings identical) but a DIFFERENT link pass: the g126 site sigs do NOT
+ * match (0 hits) except setkey. THE SINGLE-SITE SOLUTION = the EVP
+ * aes_gcm_cipher dispatcher @0x23c720 — ONE site gives BOTH directions:
+ *   rdi=EVP_CIPHER_CTX, rsi=out, rdx=in, rcx=len;
+ *   the enc flag = [ctx+0x10] (the run485 steamclient RE = the SAME EVP
+ *   layout: "enc flag = [r15+0x10]"); the gcm sub-ctx = +0x100 (verified
+ *   in the dispatcher body: lea 0x100(%rbx),%rbp).
+ * HEAD (26B, UNIQUE in all 3 local lib copies @0x23c720 — the sig-scan):
+ *   push r15; push r14; mov rdx,r14; push r13; mov rsi,r13; push r12;
+ *   mov rcx,r12; push rbp; mov rdi,rbp; push rbx; sub $0x18,%rsp
+ * THE PRIZE: the enc!=0 => in = the STEAM CLIENT's plaintext app msgs;
+ * the enc==0 => out (POST-tramp) = the server's truth = THE 0x81-46
+ * IDENTITY (the ticket-validation conversation hypothesis). The captures
+ * = DECLSN/ENCLSN (own counters g126_ndeclsn/nenclsn = own rate gates;
+ * the k27 sniff + the s2dn ring = shared = the pre-gate logic fires for
+ * the lib too). The patch = the c2b_g124_patch recipe (bit 6) in the
+ * g124 watch (the libsns thread = its natural home — it already parses
+ * the sns maps lines).
+ * Killswitch = shared C2B_G124=0. */
+static i32 c2b_g124_lsn_detour(void *ctx, void *out, const void *in,
+                               sz_t len)
+{
+    i32 (*tramp)(void *, void *, const void *, sz_t) =
+        (i32 (*)(void *, void *, const void *, sz_t))g124_tramp_g;
+    u32 enc;
+    i32 rc;
+    if (g124_tramp_g[sizeof(G124_LSN_SIG)] != 0xff)
+        return -2;                       /* the tramp not built = passthru err */
+    enc = *(const volatile u32 *)((const u8 *)ctx + 0x10);
+    rc = tramp(ctx, out, in, len);
+    if (enc)
+        c2b_g126_enc_capture(ctx, in, out, len, rc, 2u);
+    else
+        c2b_g126_dec_capture(ctx, in, out, len, rc, 2u);
     return rc;
 }
 

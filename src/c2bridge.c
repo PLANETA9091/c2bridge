@@ -20362,6 +20362,18 @@ static u32 c2b_swr_gate(u32 on, u32 fires, u32 n_new, u32 n_seen)
     if (!n_new || n_new == n_seen) return 0;
     return 1;
 }
+/* v106.2: gate2 = ВТОРИЧНЫЙ триггер swr = прибытие kfull (sec_new !=
+ * sec_seen) при молчащей первичке (n_new == n_seen или n_new=0 — иначе
+ * уже сработало бы первичное). Кап 3 общий, on общий. sec_new=0 = скип
+ * (нет прибытия). Always-компилируемый остров = selftest-видимость. */
+static u32 c2b_swr_gate2(u32 on, u32 fires, u32 n_new, u32 n_seen,
+                         u32 sec_new, u32 sec_seen)
+{
+    if (!on) return 0;
+    if (fires >= 3u) return 0;
+    if (n_new && n_new != n_seen) return 0;   /* первичка жива — она главная */
+    return (sec_new && sec_new != sec_seen) ? 1u : 0u;
+}
 /* v106.1: s2o_build = [12B хед-клон (бамп @3/@8)][07 08 02][14B zero-пад]
  * = 29B. Компакт-SignonState = язык движка (0011-декод out SignonState =
  * [t=7][pb{1:2}] БЕЗ 4B n-префикса). Пад = нечитаемый хвост pb-демукса
@@ -21002,7 +21014,8 @@ static void c2b_cw_maybe(void)
  * в канале (диалог жив, форма не та => след: A-answer 25B); тишина =
  * SNP-окно не приняло (след: seq/msg-точность). */
 static u32 g_swr_init, g_swr_on = 1, g_swr_fires, g_swr_epoch, g_swr_gap,
-           g_swr_nohdr, g_swr_have_fn, g_swr_nokf;
+           g_swr_nohdr, g_swr_have_fn, g_swr_nokf, g_swr_last_nkf,
+           g_swr_sec_fires;
 static u32 (*g_swr_hdr_fn)(unsigned char *);
 static void c2b_swr_maybe(void)
 {
@@ -21035,7 +21048,23 @@ static void c2b_swr_maybe(void)
         return;
     }
     n_kf = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
-    if (!c2b_swr_gate(g_swr_on, g_swr_fires, n_hdr, g_swr_epoch)) return;
+    if (!c2b_swr_gate(g_swr_on, g_swr_fires, n_hdr, g_swr_epoch)) {
+        /* v106.2: вторичный триггер = ПРИБЫТИЕ kfull (sec_new != sec_seen) при
+         * молчащей первичке. Голод хед-эпоков (7B-эра: len<12 не бампит
+         * трекер) не должен хоронить свежий kfull (run520: капчуры = L24036+,
+         * эпоки кончились к L15432). Хед = последний известный (стейл =
+         * принятый риск: свр A/B показала — SNP-окно терпит клоны хедов). */
+        if (!c2b_swr_gate2(g_swr_on, g_swr_fires, n_hdr, g_swr_epoch,
+                           n_kf, g_swr_last_nkf))
+            return;
+        if (g_swr_sec_fires < 2) {
+            C2B_LOGS("[c2b] swr: вторичный триггер kfull_n=");
+            C2B_LOGN(n_kf);
+            C2B_LOGS(" (эпок-голод, хед-клон)\n");
+        }
+        g_swr_sec_fires++;
+    }
+    g_swr_last_nkf = n_kf;         /* любой выстрел потребляет прибытие */
     if (!n_kf || !g_kfull_len) {
         /* v106.1: kfull-голод (флэйк-эра капчера, 0011-приоритет) — фолбэк
          * = kcap-синтез (k27-рецепт run366/367: 17B-шаблон ff×4+'k'+ver
@@ -33086,6 +33115,14 @@ static void test_swr(void)
     CHECK(c2b_swr_gate(1, 0, 0, 0) == 0, "swr: n=0 = скип");
     CHECK(c2b_swr_gate(1, 0, 5, 5) == 0, "swr: эпок без изменений = скип");
     CHECK(c2b_swr_gate(1, 2, 5, 4) == 1, "swr: валид = 1");
+    /* --- v106.2: gate2 (вторичный kfull_n-триггер) --- */
+    CHECK(c2b_swr_gate2(0, 0, 5, 5, 9, 4) == 0, "swr2: on=0 = скип");
+    CHECK(c2b_swr_gate2(1, 3, 5, 5, 9, 4) == 0, "swr2: кап 3 = скип");
+    CHECK(c2b_swr_gate2(1, 0, 5, 4, 9, 4) == 0, "swr2: первичка жива = главная");
+    CHECK(c2b_swr_gate2(1, 0, 5, 5, 9, 4) == 1, "swr2: прибытие kfull = 1");
+    CHECK(c2b_swr_gate2(1, 0, 5, 5, 9, 9) == 0, "swr2: kfull без измен = скип");
+    CHECK(c2b_swr_gate2(1, 0, 0, 0, 0, 0) == 0, "swr2: всё нулевое = скип");
+    CHECK(c2b_swr_gate2(1, 0, 5, 5, 0, 0) == 0, "swr2: sec_new=0 = скип");
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");
     memset(out_swr, 0xAA, sizeof out_swr);

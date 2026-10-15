@@ -12514,6 +12514,127 @@ static i32 c2b_t2v_gate(u32 on, u32 dead, u32 fires, u32 a_seq, u32 a_seen,
     return 1;
 }
 
+/* ---------- v105: T3V — THE SIGNON-CONTINUATION FEED (S2S1 STEP-3) ----------
+ * 2218-приоритет #1: ин-чэннел матрица ЗАКРЫТА (4 мёртвых оси, run508-513);
+ * legacy-полоса CLV2 0x21/0x23 = мертва в текущую эру (run515: НОЛЬ g58/g42
+ * строк) => 'B'-accept + SignonState feed = ЧЕРЕЗ ТУННЕЛЬ (g126-dec-tap =
+ * единственный живой инжекционный сайт). Диалог run513/514/515 = qconnect
+ * OUT -> 'A' IN -> SetConVar OUT; сервер ДЕРЖИТ signon => мост ИГРАЕТ РОЛЬ
+ * сервера: (стадия 1) слот 'A'#2 (54B, straggler-дубль — chal идентичен
+ * 'A'#1, run513: consecutive = byte-identical retries) => ПОЛНЫЙ 'B'
+ * kaccept (g42-форма, RE 0x25a8b0: '.'+8hex+chal+proto2+"connect\0"+ver ->
+ * win-путь 25d6b6 -> SendConnectPacket 24b520 = 'k' движка — капчер уже
+ * стоит); (стадия 2) следующие 7B SW/ACK-слоты => net_SignonState(state=2)
+ * [07][02 00 00 00][08 02] = 7B = точный фит 7B-слота. t=7 = S1/S2 identity
+ * (g_renum_7, 21933: "body asis-valid"), run260: форма [1B t][4B LE n][body]
+ * сервером принята; движковый unrel-фрейм = та же форма (c2b_rel_unrel_try).
+ * Инжекция = plaintext-swap ПОСЛЕ tramp (SNP/ACK слой = пакетный, не задет);
+ * замена ТОЛЬКО при synth_len <= реальной len = zero-overflow-risk.
+ * Кап 3/сессию (1 'B' + 2 S2). Киллисвитч C2B_T3V=0 (дефолт ON). Регистра-
+ * ция = мост -> c2b_hook_t3v_register (hook = LD_PRELOAD = dlsym(0) видим). */
+static u32 c2b_clv2_client_version(void);      /* fwd (определение @g44-билдере) */
+#define C2B_T3V_CAP_B  1u
+#define C2B_T3V_CAP_S2 2u
+
+typedef struct {
+    u32 on;      /* C2B_T3V гейт (дефолт 1, =0 kill) */
+    u32 seenA;   /* расшифрованных ff×4+'A' слотов */
+    u32 nB;      /* инжекций 'B' kaccept */
+    u32 nS2;     /* инжекций SignonState */
+    u32 chal;    /* chal из последнего 'A'-слота */
+} c2b_t3_st_t;
+
+static c2b_t3_st_t g_t3_st;
+
+/* SignonState(state=2): [t=7][n=2 LE u32][body 08 02 = pb{1:2}] = 7B */
+static u32 c2b_t3_build_s2(u8 *q, u32 cap)
+{
+    if (!q || cap < 7u) return 0;
+    q[0] = 7u;
+    q[1] = 2u; q[2] = 0u; q[3] = 0u; q[4] = 0u;   /* n=2 LE */
+    q[5] = 0x08u; q[6] = 0x02u;                    /* pb field1 varint 2 */
+    return 7u;
+}
+
+/* 'B' kaccept = клон g42-формы с ЯВНЫМ chal (без глобального g_clv2_ch32 —
+ * эра туннеля: legacy-стейт может быть нулев/чужой). 40B + zero-пад до cap. */
+static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32)
+{
+    static const char hxk[] = "0123456789ABCDEF";
+    u32 sh, i, ver;
+    if (!q || cap < 40u) return 0;
+    if (!ch32) ch32 = 0x12345678u;                 /* sscanf требует nonzero */
+    q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
+    q[4] = 'B';
+    q[5] = '.';                                    /* [@25a943] байт 0x2e */
+    for (sh = 0; sh < 8; sh++)
+        q[6 + sh] = (u8)hxk[(ch32 >> (28 - sh * 4)) & 0xF];
+    q[14] = (u8)ch32; q[15] = (u8)(ch32 >> 8);
+    q[16] = (u8)(ch32 >> 16); q[17] = (u8)(ch32 >> 24);
+    q[18] = 2u; q[19] = 0u; q[20] = 0u; q[21] = 0u;  /* proto32=2 (25ab14) */
+    q[22] = 8u; q[23] = 0u;                        /* strlen "connect\0" = 8 */
+    q[24] = 'c'; q[25] = 'o'; q[26] = 'n'; q[27] = 'n';
+    q[28] = 'e'; q[29] = 'c'; q[30] = 't'; q[31] = 0;
+    ver = c2b_clv2_client_version();               /* g44: server==client */
+    q[32] = (u8)ver; q[33] = (u8)(ver >> 8);
+    q[34] = (u8)(ver >> 16); q[35] = (u8)(ver >> 24);
+    q[36] = 0u; q[37] = 0u; q[38] = 0u; q[39] = 0u;  /* b1..b4=0 -> WIN */
+    for (i = 40u; i < cap; i++) q[i] = 0u;         /* хвост не читается */
+    return cap;
+}
+
+/* чистая стад-машина (selftest-покрытие): 1 = слот ЗАМЕНЁН synth'ом.
+ * 'A'-слот (ff×4+'A', mo==0): seenA++; #2 => 'B' (chal = из СВОЕГО слота —
+ * свежий серверный chal, без стейт-зависимости). 7B SW/ACK (out[0]==0x80)
+ * после 'B' => SignonState. Всё остальное = 0. */
+static u32 c2b_t3_step(u8 *out, u32 len, c2b_t3_st_t *st)
+{
+    unsigned char cls;
+    unsigned int chal, proto, val, mo;
+    if (!st || !st->on || !out || !len) return 0;
+    if (len >= 14u &&
+        c2b_k27_scan_clv2(out, len, 0, &cls, &chal, &proto, &val, &mo) &&
+        mo == 0u) {
+        if (cls != (unsigned char)'A') return 0;
+        st->seenA++;
+        st->chal = chal;
+        if (st->seenA >= 2u && !st->nB && st->nB < C2B_T3V_CAP_B &&
+            len >= 40u) {
+            c2b_t3_build_b(out, len, chal);
+            st->nB++;
+            return 1u;
+        }
+        return 0;
+    }
+    if (st->nB && st->nS2 < C2B_T3V_CAP_S2 && len == 7u && out[0] == 0x80u) {
+        if (c2b_t3_build_s2(out, len) == 7u) {
+            st->nS2++;
+            return 1u;
+        }
+    }
+    return 0;
+}
+
+/* живой инжектор (контекст = decrypt-тред хука); телеметрия = bridge-лог */
+static u32 c2b_t3_inject(u8 *out, u32 len)
+{
+    u32 r = c2b_t3_step(out, len, &g_t3_st);
+    if (r) {
+        C2B_LOGS("[c2b] t3v: inj nB=");
+        C2B_LOGN(g_t3_st.nB);
+        C2B_LOGS(" nS2=");
+        C2B_LOGN(g_t3_st.nS2);
+        C2B_LOGS(" seenA=");
+        C2B_LOGN(g_t3_st.seenA);
+        C2B_LOGS(" len=");
+        C2B_LOGN(len);
+        C2B_LOGS(" chal=");
+        C2B_LOGH(g_t3_st.chal);
+        C2B_LOGS("\n");
+    }
+    return r;
+}
+
 /* swap vtable[11] -> det (arm-механика, параметризована картой => e2e-тест).
  * Возврат: 1 = патч применён, 0 = ужеarmed, <0 = код ошибки. */
 static i32 c2b_p2v_vtswap(void **vt, void *det, void **vt_map, void **orig_map,
@@ -27065,6 +27186,26 @@ i32 c2b_main(void)
          * ван (дедлок-фри). Гейт C2B_SECCOMP=1; отказы = пассивные. */
         c2b_sn_maybe();
     }
+    {   /* v105-t3v: регистрация инжектора signon-continuation в хук
+         * (детур g126-dec = там; мост = стейт + билдеры). Киллисвитч
+         * C2B_T3V=0; дефолт = ON (кап 3/сессию — см. блок T3V). dlsym(0)
+         * = hook LD_PRELOAD = глобальный скоуп (контракт c2b_k27.h). */
+        const char *e3 = getenv("C2B_T3V");
+        void (*t3reg)(u32 (*)(u8 *, u32));
+        if (e3 && e3[0] == '0') {
+            C2B_LOGS("[c2b] t3v: disabled by env\n");
+        } else {
+            t3reg = (void (*)(u32 (*)(u8 *, u32)))
+                dlsym((void *)0, "c2b_hook_t3v_register");
+            if (t3reg) {
+                g_t3_st.on = 1u;
+                t3reg(c2b_t3_inject);
+                C2B_LOGS("[c2b] t3v: registered (cap 1B+2S2, killswitch C2B_T3V=0)\n");
+            } else {
+                C2B_LOGS("[c2b] t3v: hook register not found (standalone)\n");
+            }
+        }
+    }
     {   /* аплинк v1: 0=observe (по умолчанию), 1=translate */
         const char *e = getenv("C2B_UPLINK");
         if (e && e[0] == '1') {
@@ -32378,6 +32519,127 @@ static void test_t2v(void)
           "t2v: граница len=MAX = огонь");
 }
 
+/* v105: t3v — signon-continuation feed (билдеры/стад-машина/капы).
+ * Формы: SignonState = [07][02 00 00 00][08 02] = 7B (точный фит 7B
+ * SW/ACK-слота); 'B' = 40B g42-клон (байт-паритет с c2b_clv2_build_
+ * kaccept при том же chal). Стадия: 'A'#1 = нот, 'A'#2 = 'B'-инж, 7B
+ * SW/ACK после 'B' = S2-инж (кап 2), без 'B' = скип. */
+static void test_t3v(void)
+{
+    u8 sl[64];
+    u8 s1[64];
+    c2b_t3_st_t st;
+    printf("[t] t3v\n");
+    /* --- SignonState-билдер: байты + границы --- */
+    memset(sl, 0x5a, sizeof sl);
+    CHECK(c2b_t3_build_s2(sl, 7) == 7, "t3v: s2 cap=7 = 7B (точный фит SW/ACK)");
+    CHECK(sl[0] == 7u && sl[1] == 2u && sl[2] == 0u && sl[3] == 0u &&
+          sl[4] == 0u, "t3v: s2 [t=7][n=2 LE]");
+    CHECK(sl[5] == 0x08u && sl[6] == 0x02u, "t3v: s2 body 08 02 = pb{state:2}");
+    CHECK(c2b_t3_build_s2(sl, 6) == 0, "t3v: s2 cap=6 = 0");
+    CHECK(c2b_t3_build_s2(0, 7) == 0, "t3v: s2 NULL = 0");
+    /* --- 'B'-билдер: байт-паритет с g42-билдером (тот же chal) ---
+     * g42-билдер = chal32 @14..17 берёт из ГЛОБАЛА g_clv2_ch32 (не из hx!),
+     * потому паритет = при синхронном стейте (set -> parity -> restore). */
+    {
+        u32 ch_save = g_clv2_ch32;
+        g_clv2_ch32 = 0xB0AA4BD7u;
+        memset(sl, 0x11, sizeof sl);
+        memset(s1, 0x22, sizeof s1);
+        CHECK(c2b_t3_build_b(sl, 40, 0xB0AA4BD7u) == 40, "t3v: b cap=40 = 40B");
+        CHECK(c2b_clv2_build_kaccept(s1, 40, 0xB0AA4BD7u) == 40,
+              "t3v: g42-билдер 40B (паритет-реф)");
+        CHECK(memcmp(sl, s1, 40) == 0, "t3v: 'B' = байт-паритет с g42-формой");
+        memset(sl, 0x11, sizeof sl);
+        memset(s1, 0x22, sizeof s1);
+        CHECK(c2b_t3_build_b(sl, 54, 0xB0AA4BD7u) == 54,
+              "t3v: b cap=54 = 54B (пад)");
+        CHECK(c2b_clv2_build_kaccept(s1, 40, 0xB0AA4BD7u) == 40,
+              "t3v: g42 40B ref#2");
+        CHECK(memcmp(sl, s1, 40) == 0,
+              "t3v: 'B' первые 40B = паритет при паде");
+        g_clv2_ch32 = ch_save;
+    }
+    CHECK(sl[40] == 0u && sl[53] == 0u, "t3v: 'B' пад-хвост = нули");
+    CHECK(c2b_t3_build_b(sl, 39, 1u) == 0, "t3v: b cap=39 = 0");
+    CHECK(c2b_t3_build_b(0, 54, 1u) == 0, "t3v: b NULL = 0");
+    CHECK(c2b_t3_build_b(sl, 54, 0) == 54, "t3v: b chal=0 -> fallback 12345678");
+    CHECK(sl[6] == '1' && sl[13] == '8', "t3v: b fallback hex = 12345678");
+    /* --- стад-машина --- */
+    memset(&st, 0, sizeof st);
+    memset(sl, 0, sizeof sl);
+    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
+    sl[5] = 0x11u; sl[6] = 0x22u; sl[7] = 0x33u; sl[8] = 0x44u;
+    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: off = 0");
+    st.on = 1u;
+    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'A'#1 = без инж");
+    CHECK(st.seenA == 1u && st.chal == 0x44332211u,
+          "t3v: 'A'#1 нотед (seenA=1, chal)");
+    /* 7B SW/ACK ДО 'B' = скип (порядок стадий) */
+    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
+    CHECK(c2b_t3_step(sl, 7, &st) == 0, "t3v: s2 до 'B' = скип");
+    /* 'A'#2 = жертвенный слот -> 'B' */
+    memset(sl, 0, sizeof sl);
+    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
+    sl[5] = 0x11u; sl[6] = 0x22u; sl[7] = 0x33u; sl[8] = 0x44u;
+    CHECK(c2b_t3_step(sl, 54, &st) == 1, "t3v: 'A'#2 = 'B' инж");
+    CHECK(st.nB == 1u, "t3v: nB=1");
+    CHECK(sl[4] == 'B' && sl[5] == '.', "t3v: слот = 'B.'-форма");
+    CHECK(sl[6] == '4' && sl[7] == '4' && sl[8] == '3' && sl[9] == '3' &&
+          sl[10] == '2' && sl[11] == '2' && sl[12] == '1' && sl[13] == '1',
+          "t3v: hex-chal 44332211 (big-endian hex, uppercase)");
+    CHECK(sl[14] == 0x11u && sl[15] == 0x22u && sl[16] == 0x33u &&
+          sl[17] == 0x44u, "t3v: chal LE @14..17");
+    CHECK(sl[18] == 2u, "t3v: proto=2");
+    CHECK(sl[24] == 'c' && sl[31] == 0u, "t3v: connect\\0 @24..31");
+    CHECK(sl[40] == 0u && sl[53] == 0u, "t3v: пад-хвост нулями");
+    /* 'A'#3 (после 'B') = без инж (кап B=1) */
+    memset(sl, 0, sizeof sl);
+    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
+    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'A'#3 = кап B = скип");
+    CHECK(st.seenA == 3u, "t3v: seenA продолжает расти");
+    /* 7B SW/ACK после 'B' -> SignonState x2 (кап), 3-й = скип */
+    memset(sl, 0, sizeof sl);
+    sl[0] = 0x80u; sl[1] = 0x00u; sl[2] = 0x98u; sl[3] = 0x0au;
+    sl[4] = 0x00u; sl[5] = 0x1du; sl[6] = 0x06u;
+    CHECK(c2b_t3_step(sl, 7, &st) == 1, "t3v: s2#1 инж");
+    CHECK(st.nS2 == 1u, "t3v: nS2=1");
+    CHECK(sl[0] == 7u && sl[1] == 2u && sl[2] == 0u && sl[3] == 0u &&
+          sl[4] == 0u && sl[5] == 0x08u && sl[6] == 0x02u,
+          "t3v: слот = [07][02000000][0802]");
+    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
+    CHECK(c2b_t3_step(sl, 7, &st) == 1 && st.nS2 == 2u, "t3v: s2#2 инж");
+    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
+    CHECK(c2b_t3_step(sl, 7, &st) == 0, "t3v: s2 кап 2 = скип");
+    /* не-7B слоты после 'B' = скип (форма-гейт) */
+    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
+    CHECK(c2b_t3_step(sl, 8, &st) == 0, "t3v: len=8 = скип");
+    CHECK(c2b_t3_step(sl, 6, &st) == 0, "t3v: len=6 = скип");
+    /* junk-слот (не ff×4, не 7B/0x80) = скип */
+    memset(sl, 0x5a, sizeof sl);
+    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: junk = скип");
+    /* 'B'-вхождение в сканере = скип (cls-гейт) */
+    memset(sl, 0, sizeof sl);
+    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'B'; sl[5] = '.';
+    CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'B'-слот = скип");
+    /* NULL-стейт/out = скип */
+    CHECK(c2b_t3_step(sl, 54, 0) == 0, "t3v: NULL st = скип");
+    CHECK(c2b_t3_step(0, 54, &st) == 0, "t3v: NULL out = скип");
+    /* живой инжектор смоук: глобал off = 0, слот не тронут (стейт сохранён) */
+    {
+        c2b_t3_st_t sv = g_t3_st;
+        g_t3_st.on = 0u;
+        memset(sl, 0, sizeof sl);
+        sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
+        sl[5] = 0x11u; sl[6] = 0x22u; sl[7] = 0x33u; sl[8] = 0x44u;
+        CHECK(c2b_t3_inject(sl, 54) == 0, "t3v: live inject (off) = 0");
+        CHECK(sl[4] == 'A' && sl[5] == 0x11u, "t3v: live inject slot untouched");
+        CHECK(g_t3_st.seenA == 0u && g_t3_st.nB == 0u,
+              "t3v: live inject (off) стейт не растёт");
+        g_t3_st = sv;
+    }
+}
+
 /* v101: p2v — детур slot-11 (форма/гейт/vtswap e2e на синт-vtable). */
 static i32 p2v_t_orig_calls;
 static uptr p2v_t_orig_h;
@@ -34830,6 +35092,7 @@ int main(void)
     test_h2v();         /* v100: hello 0x80-class in-channel (форма/гейт/dst) */
     test_p2v();         /* v101: детур slot-11 (форма/гейт/vtswap e2e) */
     test_t2v();         /* v102: ticket in-channel RELIABLE (форма/гейт) */
+    test_t3v();         /* v105: signon-continuation feed (S2S1 STEP-3) */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */

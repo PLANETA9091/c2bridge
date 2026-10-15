@@ -215,6 +215,44 @@ static void klog_x(const u8 *p, u32 n)
     klog(b, 2 * n);
 }
 
+static void klog_p(uptr v);
+
+/* ---------- v105-t3v: МОСТ-РЕГИСТРИРУЕМЫЙ ИНЖЕКТОР (signon-continuation) ----
+ * Приоритет 2218 #1 (S2S1 STEP-3): сервер держит signon => мост играет роль
+ * сервера ВНУТРИ туннеля. Детур g126-dec = ЗДЕСЬ (plaintext-swap после tramp
+ * = SNP/ACK слой не задет; замена только при synth<=len = no-overflow).
+ * Регистрация = мост в ctor: dlsym(0,"c2b_hook_t3v_register") -> fn.
+ * Гейт-мастер = мост (C2B_T3V=0 => регистрации нет => g_t3v_fn = 0 = скип).
+ * Вызов = c2b_g126_dec_capture ПОСЛЕ k27-сниффа, ДО hex-лога: DEC32-строка
+ * в forensics показывает SYNTH = чистейшее wire-доказательство инжекции. */
+static u32 (*g_t3v_fn)(unsigned char *, unsigned int);
+static u32 g_t3v_inj;
+
+__attribute__((visibility("default")))
+void c2b_hook_t3v_register(u32 (*fn)(unsigned char *, unsigned int))
+{
+    g_t3v_fn = fn;
+    klog_s("[c2b] t3v: hook registered fn=");
+    klog_p((uptr)(uintptr_t)(const void *)fn);
+    klog_s("\n");
+}
+
+static void c2b_t3v_hook(const void *out, sz_t len)
+{
+    u32 (*fn)(unsigned char *, unsigned int) = g_t3v_fn;
+    u32 r;
+    if (!fn || !out || len < 7u || len > 0x800u) return;
+    r = fn((unsigned char *)(void *)out, (u32)len);
+    if (r) {
+        u32 n = __atomic_add_fetch(&g_t3v_inj, 1u, __ATOMIC_RELAXED);
+        klog_s("[c2b] t3v: hook inj#");
+        klog_h(n);
+        klog_s(" len=");
+        klog_h((u32)len);
+        klog_s("\n");
+    }
+}
+
 /* the shared capture: the dedup by the key, the caps, the log line =
  * [c2b] g110: KEYn len=N key=<64hex> ictx=<32hex> */
 static void c2b_g110_capture(u64 len, const void *key, const void *ictx)
@@ -2005,6 +2043,10 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
     if (len > 0x800) return;
     /* v27: снифф ДО rate-гейта — 'A'/'B' редкие, пропуск = потеря окна */
     c2b_g126_k27_sniff(gcm, in, out, len);
+    /* v105-t3v: инжекция signon-continuation (после сниффа, ДО лога —
+     * DEC32-строка ниже покажет SYNTH = wire-доказательство). len-гейт
+     * внутри (7..0x800); fn=NULL (нет регистрации) = no-op нулевой. */
+    c2b_t3v_hook(out, len);
     if (n > 64 && (n & 7) != 0) return;
     {
         /* v23 k23: ОДНОРАЗОВЫЙ снейкшот стека (24 qwords вверх от кадра)

@@ -721,6 +721,11 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # run479-485 (переписывание ВЫКЛ, только пассивный капчер серта).
   case "${C2B_CRTFIX_V-0}" in
     1) MODES="$MODES C2B_CRTFIX=1" ;;
+    # v106.9 FIX (run529-ценз): '0' = РЕАЛЬНЫЙ rollback-рычаг. Базовые MODES
+    # (строка сборки full-моды) ХАРДКОДЯТ C2B_CRTFIX=1, прежний no-op кейс
+    # оставлял флаг включённым => инпут crtfix=0 молча игнорился (run529:
+    # 12 crt-fix переписей при диспатче crtfix=0). '0' = вырезать флаг.
+    0) MODES="${MODES/ C2B_CRTFIX=1/}" ;;
     *) : ;;
   esac
   # v82c-d: gap (workflow input gap -> C2B_GAP_V). '1' = патч НЕ-смежных

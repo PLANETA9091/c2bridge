@@ -44,6 +44,7 @@ typedef unsigned int   uptr;
  * Инсанс живёт в c2b_client_hook64.so (LD_PRELOAD = глобальный скоуп);
  * мост резолвит dlsym(0, "g_c2b_k27_A") на первом тике g97. */
 #include "c2b_k27.h"
+#include "c2b_dn.h"    /* v94: downlink plaintext ring (STEP-3a, hook=>мост) */
 #include "c2b_crt.h"
 #include "c2b_lddet.h"
 #include "c2b_raw.h"
@@ -18750,6 +18751,9 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 static void c2b_k27_maybe_fire(void);
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
+static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
+
+
 
 /* v28 (run365-декод SNP_WIRE_FORMAT.md): серверный in-channel 'A' = UNRELIABLE
  * message (0x37-сегмент, msg_num 1, payload = raw ff×4 'A'). Надёжный поток =
@@ -18950,6 +18954,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_k27_maybe_fire();
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
+        c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -19212,6 +19217,299 @@ static void *c2b_g66_thread(void *arg)
     return (void *)0;
 }
 #endif
+
+/* ---------- v94: S2S1 STEP-3a — SNP-фрейм-ходок + даунлинк-ring ----------
+ * ЗЕМЛЯ ТРАНСЛЯТОРА (даун-сторона): каждый расшифрованный серверный
+ * SNP-plaintext (hook g126-dec-tap => ring c2b_dn.h) разбирается ходоком
+ * по Valve SNP_WIRE_FORMAT.md (декодер = scripts/snp_frames.py, верифи-
+ * цирован a2-корпусом run341 + v28-ноутом run365: in-channel 'A' = 0x37-
+ * UNRELIABLE msg_num=1 payload=raw ff×4; НАДЁЖНЫЙ поток = поток NET-
+ * сообщений). Лог (rate-capped) = ЖИВАЯ спека даунлинка: инвентарь фрей-
+ * мов + unrel-сообщения (ff×4-CLV2 или [1B t][4B LE n][body] = вход
+ * c2b_translate) + rel-стрим (позиции = сшивка STEP-3b). Ходок = чистая
+ * ф-я (selftest векторы = байт-в-байт корпус a2 + синтетика + транкции). */
+#define C2B_SNPW_MAX 24u
+#define C2B_SNPW_PAD   0u
+#define C2B_SNPW_STOPW 1u
+#define C2B_SNPW_ACK   2u
+#define C2B_SNPW_LANE  3u
+#define C2B_SNPW_UNREL 4u
+#define C2B_SNPW_REL   5u
+#define C2B_SNPW_RESV  6u
+struct c2b_snpw_f { u8 t; u32 a, b, c, doff; };
+/* pad: a=b0; stopw: a=off; ack: a=latest b=delay c=nblk; lane: a=lane;
+ * unrel: a=msg b=sz c=off(0xffffffff=нет) doff=смещение данных;
+ * rel: a=pos b=sz doff; resv: a=b0. */
+
+static u32 c2b_snpw_varint(const u8 *p, u32 n, u32 i, u32 *out)
+{
+    u32 v = 0, sh = 0;
+    for (;;) {
+        u32 c;
+        if (i >= n || sh > 28u) return n + 1u;      /* OOB-маркер */
+        c = p[i++];
+        v |= (c & 0x7Fu) << sh;
+        sh += 7;
+        if (!(c & 0x80u)) break;
+    }
+    *out = v;
+    return i;
+}
+
+/* vext (ack-блоки): low3 = младшие 3 бита, группы по 7 с бита 3 */
+static u32 c2b_snpw_vext(const u8 *p, u32 n, u32 i, u32 low3, u32 *out)
+{
+    u32 v = low3, sh = 0;
+    for (;;) {
+        u32 c;
+        if (i >= n || sh > 28u) return n + 1u;
+        c = p[i++];
+        v |= (c & 0x7Fu) << (3u + sh);
+        sh += 7;
+        if (!(c & 0x80u)) break;
+    }
+    *out = v;
+    return i;
+}
+
+static u32 c2b_snpw_walk(const u8 *p, u32 n, struct c2b_snpw_f *out,
+                         u32 max, u32 *consumed)
+{
+    u32 i = 0, fc = 0;
+    while (i < n) {
+        u8 b0 = p[i];
+        u32 a = 0, b = 0, c = 0, doff = 0, t = C2B_SNPW_RESV;
+        if (fc >= max) break;
+        if (b0 < 0x04u) {                       /* pad 000000xx */
+            t = C2B_SNPW_PAD; a = b0;
+            i += 1u + b0;
+            if (i > n) i = n;                   /* pad за краем = резать */
+        } else if ((b0 & 0xC0u) == 0u) {        /* unrel 00emosss (0x00-0x3F;
+             * 2-битный лид — 1-битная маска съела бы 0x40-0x7F = rel;
+             * снп_frames.py-родитель маску не проверял — rel-векторов
+             * в его selftest не было, ловим здесь) */
+            u32 m = (b0 >> 3) & 1u, o = (b0 >> 2) & 1u, sss = b0 & 7u;
+            u32 msg, off = 0, sz;
+            i++;
+            if (m) {
+                if (i + 4u > n) goto trunc;
+                msg = (u32)p[i] | ((u32)p[i+1] << 8) |
+                      ((u32)p[i+2] << 16) | ((u32)p[i+3] << 24);
+                i += 4u;
+            } else {
+                if (i + 2u > n) goto trunc;
+                msg = (u32)p[i] | ((u32)p[i+1] << 8);
+                i += 2u;
+            }
+            if (o) {
+                i = c2b_snpw_varint(p, n, i, &off);
+                if (i > n) goto trunc;
+            }
+            if (sss < 5u) {
+                if (i >= n) goto trunc;
+                sz = ((u32)sss << 8) | (u32)p[i];
+                i++;
+            } else {
+                sz = n - i;                     /* до конца пакета */
+            }
+            if (i + sz > n) sz = n - i;         /* резать, не валиться */
+            t = C2B_SNPW_UNREL; a = msg; b = sz;
+            c = o ? off : 0xFFFFFFFFu; doff = i;
+            i += sz;
+        } else if ((b0 & 0xC0u) == 0x40u) {     /* rel 010mmsss (0x40-0x7F) */
+            u32 mm = (b0 >> 3) & 3u, sss = b0 & 7u, pos, sz;
+            i++;
+            if (mm == 3u) goto trunc;           /* BAD-mm = стоп (python) */
+            if (i + (mm == 0u ? 3u : (mm == 1u ? 4u : 6u)) > n) goto trunc;
+            pos = 0;
+            {   u32 q, nb = (mm == 0u ? 3u : (mm == 1u ? 4u : 6u));
+                for (q = 0; q < nb; q++) pos |= (u32)p[i + q] << (8u * q);
+                i += nb;
+            }
+            if (sss < 5u) {
+                if (i >= n) goto trunc;
+                sz = ((u32)sss << 8) | (u32)p[i];
+                i++;
+            } else {
+                sz = n - i;
+            }
+            if (i + sz > n) sz = n - i;
+            t = C2B_SNPW_REL; a = pos; b = sz; doff = i;
+            i += sz;
+        } else if ((b0 & 0xFCu) == 0x80u) {     /* stopw 100000ww */
+            u32 ww = b0 & 3u;
+            u32 nb = (ww == 0u) ? 1u : (ww == 1u) ? 2u : (ww == 2u) ? 3u : 8u;
+            u32 off = 0, q;
+            i++;
+            if (i + nb > n) goto trunc;
+            for (q = 0; q < nb; q++) off |= (u32)p[i + q] << (8u * q);
+            i += nb;
+            t = C2B_SNPW_STOPW; a = off;
+        } else if ((b0 & 0xF0u) == 0x90u) {     /* ack 1001wnnn */
+            u32 w = (b0 >> 3) & 1u, nblk = b0 & 7u;
+            u32 nb = w ? 2u : 4u, latest = 0, delay, q, k;
+            i++;
+            if (i + nb + 2u > n) goto trunc;
+            for (q = 0; q < nb; q++) latest |= (u32)p[i + q] << (8u * q);
+            i += nb;
+            delay = (u32)p[i] | ((u32)p[i+1] << 8);
+            i += 2u;
+            if (nblk == 7u) {
+                if (i >= n) goto trunc;
+                nblk = p[i]; i++;
+            }
+            for (k = 0; k < nblk; k++) {
+                u32 bb, ba, nk;
+                if (i >= n) goto trunc;
+                bb = p[i]; i++;
+                ba = bb >> 4; nk = bb & 0xFu;
+                if (ba >= 8u) {
+                    i = c2b_snpw_vext(p, n, i, ba & 7u, &ba);
+                    if (i > n) goto trunc;
+                }
+                if (nk >= 8u) {
+                    i = c2b_snpw_vext(p, n, i, nk & 7u, &nk);
+                    if (i > n) goto trunc;
+                }
+            }
+            t = C2B_SNPW_ACK; a = latest; b = delay; c = nblk;
+        } else if ((b0 & 0xF8u) == 0x88u) {     /* lane 10001nnn */
+            u32 lane;
+            i++;
+            if ((b0 & 7u) == 7u) {
+                i = c2b_snpw_varint(p, n, i, &lane);
+                if (i > n) goto trunc;
+            } else {
+                lane = (b0 & 7u) + 1u;
+            }
+            t = C2B_SNPW_LANE; a = lane;
+        } else {
+            i++;                                /* reserved: 1 байт */
+        }
+        if (fc < max) {
+            out[fc].t = (u8)t; out[fc].a = a; out[fc].b = b;
+            out[fc].c = c; out[fc].doff = doff;
+        }
+        fc++;
+    }
+    *consumed = i;
+    return fc;
+trunc:
+    *consumed = i <= n ? i : n;                     /* OOB-маркер не пускаем */
+    return fc;
+}
+
+/* v94: feed — разбор пакета + rate-capped spec-строка. Бюджет лога:
+ * первые 32 пакета полностью, далее каждый 128-й (линия логов e2e =
+ * 35k строк, dance x30 — бюджет s2dn = единицы процентов). */
+#define C2B_S2DN_BURST  32u
+#define C2B_S2DN_EVERY  128u
+static u32 g_s2dn_pkts, g_s2dn_logs;
+
+static void c2b_s2dn_feed(const u8 *p, u32 n, u64 gcm)
+{
+    struct c2b_snpw_f fr[C2B_SNPW_MAX];
+    u32 consumed = 0, fc, k;
+    fc = c2b_snpw_walk(p, n, fr, C2B_SNPW_MAX, &consumed);
+    g_s2dn_pkts++;
+    if (g_s2dn_logs >= C2B_S2DN_BURST &&
+        (g_s2dn_pkts % C2B_S2DN_EVERY) != 0u) return;
+    g_s2dn_logs++;
+    C2B_LOGS("[c2b] s2dn: pkt #");
+    C2B_LOGN(g_s2dn_pkts);
+    C2B_LOGS("len="); C2B_LOGN(n);
+    C2B_LOGS("gcm="); C2B_LOGH((u32)(uptr)gcm);
+    C2B_LOGS("f="); C2B_LOGN(fc);
+    for (k = 0; k < fc && k < C2B_SNPW_MAX; k++) {
+        u32 q, d16;
+        if (fr[k].t == C2B_SNPW_PAD) continue;  /* шум: не печатаем */
+        if (fr[k].t == C2B_SNPW_STOPW) {
+            C2B_LOGS(" | SW(off="); C2B_LOGN(fr[k].a); C2B_LOGS(")");
+        } else if (fr[k].t == C2B_SNPW_ACK) {
+            C2B_LOGS(" | ACK(lat="); C2B_LOGN(fr[k].a);
+            C2B_LOGS("d="); C2B_LOGN(fr[k].b);
+            if (fr[k].b == 0xFFFFu) C2B_LOGS("=inv");
+            C2B_LOGS("blk="); C2B_LOGN(fr[k].c); C2B_LOGS(")");
+        } else if (fr[k].t == C2B_SNPW_LANE) {
+            C2B_LOGS(" | LANE("); C2B_LOGN(fr[k].a); C2B_LOGS(")");
+        } else if (fr[k].t == C2B_SNPW_UNREL) {
+            C2B_LOGS(" | U(m="); C2B_LOGN(fr[k].a);
+            if (fr[k].c != 0xFFFFFFFFu) {
+                C2B_LOGS("off="); C2B_LOGN(fr[k].c);
+            }
+            C2B_LOGS("sz="); C2B_LOGN(fr[k].b);
+            d16 = fr[k].doff + fr[k].b <= n ? fr[k].b : n - fr[k].doff;
+            d16 = d16 < 16u ? d16 : 16u;
+            C2B_LOGS("d=");
+            for (q = 0; q < d16; q++) C2B_LOGH(p[fr[k].doff + q]);
+            if (fr[k].b >= 6u && fr[k].doff + 6u <= n &&
+                p[fr[k].doff] == 0x00u && p[fr[k].doff+1] == 0xFFu &&
+                p[fr[k].doff+2] == 0xFFu && p[fr[k].doff+3] == 0xFFu &&
+                p[fr[k].doff+4] == 0xFFu) {
+                /* a2-корпус (run341, байт-в-байт): in-channel CLV2 = 00-префикс
+                 * + ff×4 + cls (v28-ноут: 'A' = unrel msg_num=1) */
+                C2B_LOGS("CLV2(cls=");
+                C2B_LOGH(p[fr[k].doff + 5]);
+                C2B_LOGS(")");
+            } else if (fr[k].b >= 5u && fr[k].doff + 5u <= n &&
+                       p[fr[k].doff] != 0x00u && p[fr[k].doff] != 0xFFu) {
+                u32 nl = (u32)p[fr[k].doff+1] | ((u32)p[fr[k].doff+2] << 8) |
+                         ((u32)p[fr[k].doff+3] << 16) | ((u32)p[fr[k].doff+4] << 24);
+                if (nl + 5u <= fr[k].b) {
+                    C2B_LOGS("NETMSG(t=");
+                    C2B_LOGN(p[fr[k].doff]);
+                    C2B_LOGS("n="); C2B_LOGN(nl); C2B_LOGS(")");
+                }
+            }
+        } else if (fr[k].t == C2B_SNPW_REL) {
+            C2B_LOGS(" | R(pos="); C2B_LOGN(fr[k].a);
+            C2B_LOGS("sz="); C2B_LOGN(fr[k].b);
+            d16 = fr[k].doff + fr[k].b <= n ? fr[k].b : n - fr[k].doff;
+            d16 = d16 < 16u ? d16 : 16u;
+            C2B_LOGS("d=");
+            for (q = 0; q < d16; q++) C2B_LOGH(p[fr[k].doff + q]);
+            C2B_LOGS(")");
+        } else {
+            C2B_LOGS(" | RESV(0x"); C2B_LOGH(fr[k].a); C2B_LOGS(")");
+        }
+    }
+    if (consumed < n) {
+        C2B_LOGS(" +");
+        C2B_LOGN(n - consumed);
+        C2B_LOGS("B");
+    }
+    C2B_LOGS("\n");
+}
+
+/* v94: consumer — дренаж ring'а в g97-треде (тот же паттерн, что a2e). */
+static u32 g_s2dn_ri, g_s2dn_miss;
+static c2b_dn_t *g_s2dn_p;
+static void c2b_s2dn_maybe(void)
+{
+    u32 w1, w2, i;
+    if (!g_s2dn_p) {
+        g_s2dn_p = (c2b_dn_t *)dlsym((void *)0, "g_c2b_dn");
+        if (!g_s2dn_p) return;
+        C2B_LOGS("[c2b] s2dn: ARMED (v94 downlink ring consumer, cap 8x2KB)\n");
+    }
+    w1 = __atomic_load_n(&g_s2dn_p->wi, __ATOMIC_ACQUIRE);
+    if (w1 == g_s2dn_ri) return;
+    if (w1 - g_s2dn_ri >= C2B_DN_CAP) {         /* overrun: к новейшим */
+        g_s2dn_ri = w1 - (C2B_DNR_CAP - 1u);
+        g_s2dn_miss++;
+        if (g_s2dn_miss == 1u)
+            C2B_LOGS("[c2b] s2dn: OVERRUN (consumer behind, jump-to-newest)\n");
+    }
+    w2 = __atomic_load_n(&g_s2dn_p->wi, __ATOMIC_ACQUIRE);
+    if (w2 != w1) return;                       /* продюсер двинулся — скип */
+    for (i = g_s2dn_ri; i < w2; i++) {
+        c2b_dn_rec_t *r = &g_s2dn_p->rec[i & (C2B_DNR_CAP - 1u)];
+        u32 ln = r->len;
+        if (ln == 0u || ln > C2B_DNR_MAX) continue;
+        c2b_s2dn_feed(r->data, ln, r->gcm);
+    }
+    g_s2dn_ri = w2;
+}
 
 /* ---------- v72: ANSOLO-билдер ответа (чистая функция, selftest) ----------
  * Те же байты, что форм-5/6 второй посыл (run462: len=22 вербатим
@@ -30707,6 +31005,134 @@ static void test_decx(void)
     CHECK(c2b_decx_want(0, 0x23) == 0, "decx: len=0 = мимо");
 }
 
+/* v94: SNP-фрейм-ходок (S2S1 STEP-3a) — векторы = a2-корпус run341
+ * (байт-в-байт из scripts/snp_frames.py selftest) + синтетика + транкции. */
+static void test_s2dn(void)
+{
+    static const u8 v1[] = {
+        0x80,0x01,0x98,0x01,0x00,0xff,0xff,0x37,0x01,0x00,0x00,0x00,
+        0xff,0xff,0xff,0xff,0x71,0x63,0x6f,0x6e,0x6e,0x65,0x63,0x74,
+        0x30,0x78,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x00};
+    static const u8 v2[] = {
+        0x80,0x00,0x98,0x02,0x00,0x05,0x00,0x37,0x01,0x00,0x00,0x00,
+        0xff,0xff,0xff,0xff,0x41,0x00,0x00,0x00,0x00,0x03,0x00,0x00,
+        0x00,0x00,0x00,0x07,0x0a,0xee,0x00,0x00,0x00,0x30,0x01,0x01,
+        0x63,0x6f,0x6e,0x6e,0x65,0x63,0x74,0x30,0x78,0x30,0x30,0x30,
+        0x30,0x30,0x30,0x30,0x30,0x00};
+    static const u8 v3[] = { 0x80,0x00,0x98,0x04,0x00,0x23,0x06 };
+    static const u8 v4[] = {
+        0x80,0x01,0x98,0x03,0x00,0x08,0x1d,0x37,0x03,0x00,0x00,0x00,
+        0x07,0x02,0x00,0x00,0x00,0x08,0x02 };
+    static const u8 vb[] = { 0x99,0x04,0x00,0x05,0x00,0x30 };
+    static const u8 vr[] = { 0x40,0x03,0x02,0x01,0x05,0xdd,0xee,0xff,0x00,0x11 };
+    static const u8 vr1[] = { 0x48,0x04,0x03,0x02,0x01,0x02,0x0a,0x0b };
+    static const u8 vlm[] = { 0x8a };
+    static const u8 vlv[] = { 0x8f,0x41 };
+    static const u8 vsw2[] = { 0x82,0x0a,0x0b,0x0c };
+    static const u8 vtr[] = { 0x40,0x03,0x02 };
+    static const u8 vtr2[] = { 0x37,0x01,0x00 };
+    static const u8 vtr3[] = { 0x9a,0x05,0x00 };
+    static const u8 vres[] = { 0xa5 };
+    static const u8 vpad[] = { 0x03,0xff };
+    static const u8 vnm[] = {
+        0x37,0x01,0x00,0x00,0x06,0x05,0x00,0x00,0x00,0x0a,0x0b,0x0c,0x0d,0x0e };
+    struct c2b_snpw_f fr[C2B_SNPW_MAX];
+    u32 cons = 0, fc, pk0;
+
+    printf("[t] s2dn/snpw (v94 STEP-3a)\n");
+    /* корпус #1: qconnect-проба ('q' = 0x71) — SW+ACK+U, consumed=все */
+    fc = c2b_snpw_walk(v1, sizeof v1, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 3 && cons == sizeof v1, "snpw: корпус#1 fc=3 consumed=35");
+    CHECK(fr[0].t == C2B_SNPW_STOPW && fr[0].a == 1, "snpw: корпус#1 SW(off=1)");
+    CHECK(fr[1].t == C2B_SNPW_ACK && fr[1].a == 1 && fr[1].b == 0xFFFF,
+          "snpw: корпус#1 ACK(lat=1,d=ffff)");
+    CHECK(fr[2].t == C2B_SNPW_UNREL && fr[2].a == 1 && fr[2].b == 24 &&
+          fr[2].c == 0 && fr[2].doff == 11, "snpw: корпус#1 U(m=1,off=0,sz=24,doff=11)");
+    CHECK(v1[fr[2].doff] == 0x00 && v1[fr[2].doff+1] == 0xFF &&
+          v1[fr[2].doff+5] == 0x71, "snpw: корпус#1 CLV2 00+ff×4+cls='q'");
+
+    /* корпус #2: серверный 'A' (chal=0 proto=3 val=0x00ee0a07 @+15) */
+    fc = c2b_snpw_walk(v2, sizeof v2, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 3 && cons == sizeof v2, "snpw: корпус#2 fc=3 consumed=54");
+    CHECK(fr[1].t == C2B_SNPW_ACK && fr[1].a == 2 && fr[1].b == 5,
+          "snpw: корпус#2 ACK(lat=2,d=5)");
+    CHECK(fr[2].t == C2B_SNPW_UNREL && fr[2].b == 43 && fr[2].doff == 11,
+          "snpw: корпус#2 U(m=1,sz=43,doff=11)");
+    CHECK(v2[fr[2].doff+5] == 0x41 && v2[fr[2].doff+10] == 0x03 &&
+          v2[fr[2].doff+16] == 0x07 && v2[fr[2].doff+17] == 0x0a &&
+          v2[fr[2].doff+18] == 0xee, "snpw: корпус#2 'A' chal0 proto3 val=0x00ee0a07");
+
+    /* корпус #3: чистый транспортный (SW+ACK без данных) */
+    fc = c2b_snpw_walk(v3, sizeof v3, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 2 && cons == sizeof v3 && fr[1].a == 4 && fr[1].b == 0x0623,
+          "snpw: корпус#3 ACK(lat=4,d=0x623)");
+
+    /* корпус #4: unrel msg_num=3 */
+    fc = c2b_snpw_walk(v4, sizeof v4, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 3 && cons == sizeof v4 && fr[2].t == C2B_SNPW_UNREL &&
+          fr[2].a == 3 && fr[2].b == 8, "snpw: корпус#4 U(m=3,sz=8)");
+
+    /* ack с блоком (a=3,nk=0 => 0x30) — байт-в-байт из snp_frames.py */
+    fc = c2b_snpw_walk(vb, sizeof vb, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && cons == sizeof vb && fr[0].t == C2B_SNPW_ACK &&
+          fr[0].a == 4 && fr[0].b == 5 && fr[0].c == 1,
+          "snpw: ack-blocks lat=4 d=5 blk=1");
+
+    /* rel mm=0 (pos 3Б) + явный sz; rel mm=1 (pos 4Б) */
+    fc = c2b_snpw_walk(vr, sizeof vr, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && cons == sizeof vr && fr[0].t == C2B_SNPW_REL &&
+          fr[0].a == 0x010203u && fr[0].b == 5 && fr[0].doff == 5,
+          "snpw: rel mm0 pos=0x010203 sz=5");
+    fc = c2b_snpw_walk(vr1, sizeof vr1, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && cons == sizeof vr1 && fr[0].t == C2B_SNPW_REL &&
+          fr[0].a == 0x01020304u && fr[0].b == 2 && fr[0].doff == 6,
+          "snpw: rel mm1 pos=0x01020304 sz=2");
+
+    /* lane: короткая (nnn+1) и varint-форма (nnn=7) */
+    fc = c2b_snpw_walk(vlm, sizeof vlm, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && fr[0].t == C2B_SNPW_LANE && fr[0].a == 3,
+          "snpw: lane 0x8a -> 3");
+    fc = c2b_snpw_walk(vlv, sizeof vlv, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && cons == 2 && fr[0].t == C2B_SNPW_LANE && fr[0].a == 65,
+          "snpw: lane 0x8f varint -> 65");
+
+    /* stopw ww=2 (nb=3) */
+    fc = c2b_snpw_walk(vsw2, sizeof vsw2, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && fr[0].t == C2B_SNPW_STOPW && fr[0].a == 0x0c0b0au,
+          "snpw: stopw ww2 off=0x0c0b0a");
+
+    /* транкции: rel-голова, unrel-varint, ack-delay — без OOB, consumed< n */
+    fc = c2b_snpw_walk(vtr2, sizeof vtr2, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 0 && cons == 3, "snpw: trunc unrel-varint fc=0 cons=3");
+    fc = c2b_snpw_walk(vtr, sizeof vtr, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 0 && cons == 1, "snpw: trunc rel-голова fc=0 cons=1");
+    fc = c2b_snpw_walk(vtr3, sizeof vtr3, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 0 && cons == 1, "snpw: trunc ack-delay fc=0 cons=1");
+
+    /* reserved + pad-клэмп */
+    fc = c2b_snpw_walk(vres, sizeof vres, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && fr[0].t == C2B_SNPW_RESV && cons == 1, "snpw: resv 0xa5");
+    fc = c2b_snpw_walk(vpad, sizeof vpad, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && fr[0].t == C2B_SNPW_PAD && cons == 2, "snpw: pad клэмп к n");
+
+    /* NETMSG-классификатор: [t=6][n=5][тело] = CConVar-класс формы */
+    fc = c2b_snpw_walk(vnm, sizeof vnm, fr, C2B_SNPW_MAX, &cons);
+    CHECK(fc == 1 && cons == sizeof vnm && fr[0].t == C2B_SNPW_UNREL &&
+          fr[0].b == 10, "snpw: netmsg-форма fc=1 sz=10");
+    CHECK(vnm[fr[0].doff] == 0x06 &&
+          (u32)vnm[fr[0].doff+1] == 0x05, "snpw: netmsg t=6 n=5");
+
+    /* feed-счётчик: pkts инкремент на вызов */
+    pk0 = g_s2dn_pkts;
+    c2b_s2dn_feed(v1, sizeof v1, 0xdeadbeefull);
+    CHECK(g_s2dn_pkts == pk0 + 1, "s2dn: feed pkts инкремент");
+
+    /* consumer без hook'а: dlsym(0,"g_c2b_dn") в selftest-бинарнике = 0 =>
+     * молчаливый возврат, g_s2dn_p остаётся 0 (disarmed-путь безопасен) */
+    c2b_s2dn_maybe();
+    CHECK(g_s2dn_p == 0, "s2dn: consumer disarmed без hook");
+}
+
 /* v47: k27k-сборщик — 'k' БЕЗ ff×4 (['k'][96\0][proto][chal][тикет]). */
 static void test_k27k(void)
 {
@@ -33107,6 +33533,7 @@ int main(void)
     test_krelpatch();   /* v19: krel-patchchal (chal в копии 'k') */
     test_k27scan();     /* v27: k27-сканер CLV2 'A'/'B' (in-channel sniff) */
     test_decx();        /* v46/v47: DEC-X гейт верdict/relay-классов */
+    test_s2dn();        /* v94: SNP-фрейм-ходок + даунлинк-ring (STEP-3a) */
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */

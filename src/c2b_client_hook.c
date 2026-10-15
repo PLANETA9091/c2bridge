@@ -55,6 +55,7 @@
  * hook = LD_PRELOAD = глобальный скоуп => мост видит через dlsym(0,...). */
 #include "c2b_k27.h"
 
+
 /* v27: экспортируемый инсанс-ноут 'A' (заполняет g126-dec-снифф).
  * Порядок записи: поля, ЗАТЕМ seq bump (release). См. c2b_k27.h. */
 __attribute__((visibility("default")))
@@ -64,6 +65,41 @@ typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int32_t  i32;
+
+/* v94: downlink plaintext ring (S2S1 STEP-3a) — тот же контракт-стиль:
+ * producer (этот hook, dec-тапы) пишет rec, ЗАТЕМ bump wi (release).
+ * Consumer = мост (g97-тред) через dlsym(0, "g_c2b_dn"). См. c2b_dn.h. */
+#include "c2b_dn.h"
+
+/* v94: экспортируемый ring. Продюсер = c2b_g126_dn_push (dec_capture,
+ * до rate-гейта — КАЖДЫЙ расшифрованный plaintext 1..0x800Б). */
+__attribute__((visibility("default")))
+c2b_dn_t g_c2b_dn;
+
+/* v94: producer — размещение в slot (wi & (CAP-1)), потом release-bump wi.
+ * Хот-путь (каждый decrypt): без логов, без getenv, один memcpy <= 2КБ.
+ * Киллисвитч C2B_DNRING=0 (переопределяет даже установленное). */
+static u32 g_dn_en;
+static u32 g_dn_init;
+extern void *getenv(const char *);   /* файл = raw-decls стиль (без stdlib.h) */
+static void c2b_g126_dn_push(const void *gcm, const void *out, u32 len)
+{
+    u32 w;
+    if (!g_dn_init) {
+        const char *e = (const char *)getenv("C2B_DNRING");
+        g_dn_en = (e && e[0] == '0') ? 0u : 1u;
+        g_dn_init = 1;
+    }
+    if (!g_dn_en || !out || !len || len > C2B_DNR_MAX) return;
+    w = g_c2b_dn.wi;
+    {
+        c2b_dn_rec_t *r = &g_c2b_dn.rec[w & (C2B_DNR_CAP - 1u)];
+        r->gcm = (unsigned long long)(uintptr_t)gcm;
+        memcpy((void *)r->data, out, len);
+        r->len = len;                       /* len — последним (контракт) */
+    }
+    __atomic_store_n(&g_c2b_dn.wi, w + 1u, __ATOMIC_RELEASE);
+}
 typedef uint64_t u64;
 typedef int64_t  i64;
 typedef uintptr_t uptr;
@@ -1926,6 +1962,9 @@ static void c2b_g126_dec_capture(const void *gcm, const void *in,
     u32 cl, z;
 
     if (!out || !len || len > 0x800) return;
+    /* v94: downlink ring ДО rate-гейта — КАЖДЫЙ plaintext (STEP-3a).
+     * Хот-путь безопасен: без логов, cap 0x800 = C2B_DN_MAX. */
+    c2b_g126_dn_push(gcm, out, (u32)len);
     /* v27: снифф ДО rate-гейта — 'A'/'B' редкие, пропуск = потеря окна */
     c2b_g126_k27_sniff(gcm, in, out, len);
     if (n > 64 && (n & 7) != 0) return;

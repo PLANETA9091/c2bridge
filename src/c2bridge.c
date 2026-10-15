@@ -12429,6 +12429,14 @@ static u8  g_kfull[1200];
 static u32 g_kfull_len;
 static volatile u32 g_kfull_n;
 static volatile u32 g_kfull_rel;
+/* v100: h2v — захваченный hello-класс движка (0x80, не-connectionless, К
+ * РЕЛЕЮ) из sendmsg-пути. Ринг = 1 слот (последний побеждает), эпок =
+ * g_hello_n. run508-доказательство класса: fd=0x34 len=0x220 (544B)
+ * dst=98e91385:6d76 = RAW-путь движка, НЕ GNS-сессия. */
+static u8  g_hello[1400];
+static u32 g_hello_len;
+static volatile u32 g_hello_n;
+static volatile u32 g_hello_logs;   /* кап лог-строк (ретрансмиты шумят) */
 static volatile u32 g_g90_A_seq;
 static volatile u32 c2b_g90_puregns_logged;   /* g90v6: one-shot pure-GNS marker */
 static volatile u32 g_g90_A_chal;
@@ -17297,6 +17305,50 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     }
 }
 
+/* v100: h2v-капчер — ungated захват hello-класса движка (не-connectionless,
+ * К РЕЛЕЮ, len [64..1400]) из sendmsg-пути. Порядок фильтров = дешёвые
+ * вперёд: dst-матч (g_gns_dst) -> iov-конкат -> форма. Конкат = до 8 чанков
+ * (run392-урок: GNS дробит iov). Эпок = g_hello_n (memcpy ДО инкремента —
+ * читатель (h2v-maybe) снепшотит n, копирует, ре-читает n). */
+static i32 c2b_h2v_dst_ok(const u8 *nm, u32 nl, const u8 *dst, u32 dl);
+static i32 c2b_h2v_form(const u8 *p, u32 len);
+static void c2b_h2v_capture(int fd, const struct c2b_msghdr *msg, ssize_t r)
+{
+    u8 cat[1400];
+    u32 tot = 0, k, hn, h98;
+    (void)r;
+    if (!msg || !msg->msg_iov || !msg->msg_iovlen || msg->msg_iovlen > 8)
+        return;
+    if (!c2b_h2v_dst_ok((const u8 *)msg->msg_name,
+                        (u32)msg->msg_namelen, g_gns_dst,
+                        (u32)g_gns_dstlen))
+        return;
+    for (k = 0; k < (u32)msg->msg_iovlen; k++) {
+        u32 cl = (u32)msg->msg_iov[k].iov_len;
+        if (!msg->msg_iov[k].iov_base || cl > 1400u) { tot = 0; break; }
+        if (tot + cl > sizeof cat) { tot = 0; break; }
+        memcpy(cat + tot, msg->msg_iov[k].iov_base, cl);
+        tot += cl;
+    }
+    if (!tot || !c2b_h2v_form(cat, tot)) return;
+    memcpy(g_hello, cat, tot);
+    g_hello_len = tot;
+    g_hello_n++;
+    hn = g_hello_n;
+    if (g_hello_logs < 24) {
+        g_hello_logs++;
+        C2B_LOGS("[c2b] h2v: hello captured #");
+        C2B_LOGN(hn);
+        C2B_LOGS(" fd=");
+        C2B_LOGN((u32)fd);
+        C2B_LOGS(" len=");
+        C2B_LOGN(tot);
+        C2B_LOGS(" head=");
+        for (h98 = 0; h98 < 16 && h98 < tot; h98++) C2B_LOGH(cat[h98]);
+        C2B_LOGS("\n");
+    }
+}
+
 /* 58f-g98a2: sendmsg-хук КАНАЛЬНЫЙ дамп — run260-урок: 37 loopback
  * датаграмм движка (127.0.0.1:27005) на wire, sendto-дамп = НОЛЬ —
  * сигнон-стрим движка идёт через sendmsg (netchan-путь). Дамп = тот же
@@ -17497,6 +17549,7 @@ ssize_t sendmsg(int fd, const struct c2b_msghdr *msg, int flags)
         }
         c2b_g40_sdt_note(fd, tot ? tot : 1u, msg ? msg->msg_name : 0, r);
         c2b_g98_sendmsg_dump(fd, msg, r);
+        c2b_h2v_capture(fd, msg, r);   /* v100: hello-капчер к релею */
         {
             /* 352-g109: ungated dst-перепись (SDR-отправитель: игра vs
              * сырой/packet-сокет). fd + msg_name + первый iov-базис. */
@@ -18826,6 +18879,7 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 /* v27: A-driven 'k'-fire — объявление (тело = после c2b_k24_brlive) */
 static void c2b_k27_maybe_fire(void);
 static void c2b_k2v_maybe(void);       /* v98: вербатим-'k' in-channel (тело = в runtime-регионе) */
+static void c2b_h2v_maybe(void);       /* v100: hello 0x80-class in-channel (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
@@ -19030,6 +19084,7 @@ static void *c2b_g97_thread(void *arg)
          * Тот же тред = проверенный контекст отправки. См. блок у brlive. */
         c2b_k27_maybe_fire();
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
+        c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
@@ -19852,6 +19907,47 @@ static i32 c2b_k2v_gate(u32 on, u32 dead, u32 fires, u32 n_new, u32 n_seen,
     return 1;
 }
 
+/* ---------- v100: H2V — чистые хелперы (форма/гейт/dst-матчер) ----------
+ * selftest-покрытие (всегда компилируются). Форма = hello-класс движка:
+ * НЕ-connectionless (без ff×4) + len [64..1400] (run508: 544B 0x220 = да,
+ * 30/33/58B keepalive/0x80-noise = нет). Dst-матчер = family 2 + порт BE +
+ * ip против g_gns_dst (8B-префикс sockaddr_in) — мусор главного 27005-
+ * линка в мост-сессию НЕ релеится. */
+#define C2B_H2V_CAP 4
+#define C2B_H2V_GAP 60
+#define C2B_H2V_MIN 64
+#define C2B_H2V_MAX 1400
+
+static i32 c2b_h2v_form(const u8 *p, u32 len)
+{
+    if (!p) return 0;
+    if (len < C2B_H2V_MIN || len > C2B_H2V_MAX) return 0;
+    if (p[0] == 0xff && p[1] == 0xff && p[2] == 0xff && p[3] == 0xff)
+        return 0;
+    return 1;
+}
+
+static i32 c2b_h2v_dst_ok(const u8 *nm, u32 nl, const u8 *dst, u32 dl)
+{
+    if (!nm || nl < 8 || !dst || dl < 8) return 0;
+    if (nm[0] != 2 || nm[1] != 0) return 0;          /* AF_INET */
+    if (nm[2] != dst[2] || nm[3] != dst[3]) return 0; /* sin_port BE */
+    if (nm[4] != dst[4] || nm[5] != dst[5] ||
+        nm[6] != dst[6] || nm[7] != dst[7]) return 0; /* sin_addr */
+    return 1;
+}
+
+/* чистый гейт h2v (selftest-покрытие): 1 = стрелять, 0 = скип */
+static i32 c2b_h2v_gate(u32 on, u32 dead, u32 fires, u32 n_new, u32 n_seen,
+                        u32 len)
+{
+    if (!on || dead) return 0;
+    if (fires >= C2B_H2V_CAP) return 0;
+    if (!n_new || n_new == n_seen) return 0;
+    if (len < C2B_H2V_MIN || len > C2B_H2V_MAX) return 0;
+    return 1;
+}
+
 #ifndef C2B_SELFTEST
 /* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
  * что у g97-полла; в run356 он же дал 'End-to-end connection: connected').
@@ -20180,6 +20276,77 @@ static void c2b_k2v_maybe(void)
     C2B_LOGN((u32)(i32)rc_kv);
     C2B_LOGS("\n");
     /* v98-контракт: rc!=1 = ТОЛЬКО телеметрия — НЕТ death-stop */
+}
+
+/* ---------- v100: H2V — HELLO IN-CHANNEL (0x80-класс движка в мост-сессию) ----------
+ * 2009-приоритет (= 1909 #1): движковый game-layer connect УЖЕ ЭМИТИТ —
+ * g98 chn-sendm капчит netchan-сенды (run508: 544B 0x80-class к релею на
+ * fd=0x34 = RAW-путь, НЕ GNS-сессия). Релей = proven slot-11 на мостовой
+ * сессии (тот же probe-гард-паттерн, k2v-стиль гейта: эпок-триггер нового
+ * капчура, кап 4, мин-гэп 60 тиков, killswitch C2B_H2V=0, rc!=1 = только
+ * телеметрия). Диалект = движковый собственный = лучший in-channel
+ * кандидат. Маркеры: 'B'/signon/REL-frame (s2dn) = ПРОРЫВ; тишина = 0x80
+ * SDR-crypto session-bound (двойное обёртывание = чужой канал => мусор),
+ * след. = S2 ConnectRequest-protobuf как первый REL (синтез); PARSE-close
+ * = сервер парсит и ЯВНО отвергает (диалог жив, форма не та). */
+static u32 g_h2v_init, g_h2v_on = 1, g_h2v_fires, g_h2v_epoch, g_h2v_gap,
+           g_h2v_dead;
+
+static void c2b_h2v_maybe(void)
+{
+    static u8 hv_buf[C2B_H2V_MAX];
+    u32 n_hv, len_hv, live_hv, z_hv, hh;
+    const volatile u8 *fp_hv;
+    void **vt_hv;
+    i32 rc_hv = -998;
+    if (!g_h2v_init) {
+        const char *e2h = getenv("C2B_H2V");
+        if (e2h && e2h[0] == '0') g_h2v_on = 0;
+        g_h2v_init = 1;
+        if (!g_h2v_on) C2B_LOGS("[c2b] h2v: disabled (C2B_H2V=0)\n");
+    }
+    if (g_h2v_gap) { g_h2v_gap--; return; }
+    if (!g_gns_conn_iface || !g_gns_conn_h) return;
+    n_hv = __atomic_load_n(&g_hello_n, __ATOMIC_ACQUIRE);
+    len_hv = g_hello_len;
+    if (!c2b_h2v_gate(g_h2v_on, g_h2v_dead, g_h2v_fires,
+                      n_hv, g_h2v_epoch, len_hv)) return;
+    fp_hv = g_hello;
+    for (z_hv = 0; z_hv < len_hv; z_hv++) hv_buf[z_hv] = fp_hv[z_hv];
+    if (__atomic_load_n(&g_hello_n, __ATOMIC_ACQUIRE) != n_hv)
+        return;                 /* гонка с капчером — скип, эпок не тратим */
+    g_h2v_epoch = n_hv;
+    live_hv = c2b_k24_brlive();
+    vt_hv = *(void ***)g_gns_conn_iface;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc_hv = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                          i64 *))vt_hv[11])(
+            g_gns_conn_iface, g_gns_conn_h, hv_buf, len_hv,
+            0 /* UNRELIABLE = безопасный класс (run366) */, &g_k27k_out47);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] h2v: send SEGV\n");
+        return;
+    }
+    g_h2v_fires++;
+    g_h2v_gap = C2B_H2V_GAP;
+    if (rc_hv == 3) g_h2v_dead = 1;   /* NoConnection = сессия умерла */
+    C2B_LOGS("[c2b] h2v: hello in-channel #");
+    C2B_LOGN(g_h2v_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(len_hv);
+    C2B_LOGS(" head=");
+    for (hh = 0; hh < 8 && hh < len_hv; hh++) C2B_LOGH(hv_buf[hh]);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live_hv);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 fl=0 rc=");
+    C2B_LOGN((u32)(i32)rc_hv);
+    C2B_LOGS("\n");
+    /* v98-контракт: rc!=1 = ТОЛЬКО телеметрия (rc==3 = dead-флаг, кап стоп) */
 }
 
 static void c2b_k27_maybe_fire(void)
@@ -31744,6 +31911,52 @@ static void test_k2v(void)
           "k2v: длинный len = скип");
 }
 
+/* v100: h2v — hello-капчер/форма/гейт/dst (релей движкового 0x80-класса
+ * in-channel). Фикстура формы = 544B (run508 fd=0x34 len=0x220), граница
+ * MIN = 64 (58B 0x80-noise = скип), MAX = 1400. */
+static void test_h2v(void)
+{
+    u8 hf[600], nm[16], dd[16];
+    printf("[t] h2v\n");
+    memset(hf, 0x41, sizeof hf);
+    hf[0] = 0x80;
+    CHECK(c2b_h2v_form(hf, 544) == 1, "h2v: 544B 0x80-класс = 1 (run508)");
+    CHECK(c2b_h2v_form(hf, C2B_H2V_MIN) == 1, "h2v: len=MIN(64) граница = 1");
+    CHECK(c2b_h2v_form(hf, C2B_H2V_MAX) == 1, "h2v: len=MAX граница = 1");
+    CHECK(c2b_h2v_form(hf, 58) == 0, "h2v: 58B keepalive-noise = 0");
+    CHECK(c2b_h2v_form(hf, 63) == 0, "h2v: len<MIN = 0");
+    CHECK(c2b_h2v_form(hf, C2B_H2V_MAX + 1) == 0, "h2v: len>MAX = 0");
+    CHECK(c2b_h2v_form(0, 544) == 0, "h2v: NULL = 0");
+    hf[0] = 0xff; hf[1] = 0xff; hf[2] = 0xff; hf[3] = 0xff;
+    CHECK(c2b_h2v_form(hf, 544) == 0, "h2v: ff×4 connectionless = 0");
+    /* гейт: та же семантика, что k2v (on/dead/кап/эпок/len) */
+    CHECK(c2b_h2v_gate(0, 0, 0, 1, 0, 544) == 0, "h2v: on=0 = скип");
+    CHECK(c2b_h2v_gate(1, 1, 0, 1, 0, 544) == 0, "h2v: dead = скип");
+    CHECK(c2b_h2v_gate(1, 0, C2B_H2V_CAP, 1, 0, 544) == 0,
+          "h2v: кап 4/ран = скип");
+    CHECK(c2b_h2v_gate(1, 0, 0, 0, 0, 544) == 0, "h2v: n_new=0 = скип");
+    CHECK(c2b_h2v_gate(1, 0, 0, 7, 7, 544) == 0, "h2v: эпок тот же = скип");
+    CHECK(c2b_h2v_gate(1, 0, 0, 7, 6, 58) == 0, "h2v: len вне диапазона = скип");
+    CHECK(c2b_h2v_gate(1, 0, 0, 7, 6, 544) == 1, "h2v: всё ок = огонь");
+    /* dst-матчер: family 2 + порт BE + ip против g_gns_dst-формы */
+    memset(nm, 0, sizeof nm); memset(dd, 0, sizeof dd);
+    nm[0] = 2; nm[1] = 0; nm[2] = 0x6d; nm[3] = 0x76;   /* 28022 BE */
+    nm[4] = 0x98; nm[5] = 0xe9; nm[6] = 0x13; nm[7] = 0x85; /* релей */
+    memcpy(dd, nm, 8);
+    CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 1, "h2v: dst-матч = 1");
+    CHECK(c2b_h2v_dst_ok(nm, 4, dd, 16) == 0, "h2v: namelen<8 = 0");
+    CHECK(c2b_h2v_dst_ok(nm, 16, dd, 4) == 0, "h2v: dstlen<8 = 0");
+    CHECK(c2b_h2v_dst_ok(0, 16, dd, 16) == 0, "h2v: NULL-name = 0");
+    dd[7] = 0x86;
+    CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 0, "h2v: ip-промах = 0");
+    dd[7] = 0x85; dd[2] = 0x6e;
+    CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 0, "h2v: порт-промах = 0");
+    dd[2] = 0x6d; nm[0] = 10;
+    CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 0, "h2v: не-AF_INET = 0");
+    nm[0] = 2;
+    CHECK(c2b_h2v_dst_ok(nm, 16, dd, 16) == 1, "h2v: восстановлен = 1");
+}
+
 /* v50: crt-fix — 0x22 движка -> релей-принятая форма (c2b_crt.h).
  * Фикстуры = РЕАЛЬНЫЕ байты run391-pcap (v50_fixture_extract.py):
  * v50f_eng = сломанный 0x22 движка (79B: 0x22 + 4c00 + 76B proto),
@@ -34106,6 +34319,7 @@ int main(void)
     test_rel();         /* v95: REL-пересборка + живой фид (STEP-3b) */
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
     test_k2v();         /* v98: вербатим-'k' in-channel (форма/chal/гейт) */
+    test_h2v();         /* v100: hello 0x80-class in-channel (форма/гейт/dst) */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */

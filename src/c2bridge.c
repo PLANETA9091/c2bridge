@@ -17812,12 +17812,48 @@ static void c2b_raw_scan(void)
                     code[5] = 0x90u;
                     code[6] = 0x90u;
                     code[7] = 0x90u;   /* форма B (9B): пад до pl */
-                    if (regs[ri].sys) {
+                    if (regs[ri].sys && isgap) {
+                        /* v85: REL32-FIRST УСТАНОВКА для gap-сайта — БЕЗ
+                         * int3/CC-окна. run491-урок: CC-окно на ГОРЯЧЕМ
+                         * sendto-стабе = любой тред бьёт в CC в фазе ф1-ф3
+                         * -> SIGTRAP-хендлер (C-код моста: TLS/лог) на
+                         * fs=0-треде = SEGV (класс run488/491: addr =
+                         * fs-относительный, write(1,·,0xbf)-форма — хенд-
+                         * лерный лог). ПОРЯДОК: (1) rel32 4Б в слот imm32
+                         * окна (site+1..4): между фазами окно = 'b8 <мусор-
+                         * ный nr>' = syscall = ENOSYS (НИКАКОГО прыжка —
+                         * e9 ещё не стоит; рваный imm32 = тоже только мусор-
+                         * ный nr, безопасно); (2) 1Б АТОМАРНО b8->e9 @site+0
+                         * = атомарный коммутатор на готовый rel32. Ни в один
+                         * момент нет ни рваного e9, ни CC-входа в хендлер. */
+                        long long wr2;
+                        wr2 = pwrite(mfd, code + 1, 4u, (uptr)(site + 1));
+                        if (wr2 != 4) {
+                            C2B_LOGS("[c2b] v85: rel32-fail site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                        __sync_synchronize();
+                        wr2 = pwrite(mfd, code, 1u, (uptr)site);
+                        if (wr2 != 1) {
+                            C2B_LOGS("[c2b] v85: e9-fail site=");
+                            c2b_gp_lh64(site);
+                            C2B_LOGS("\n");
+                            munmap(pg, 0x1000u);
+                            continue;
+                        }
+                        __sync_synchronize();
+                    } else if (regs[ri].sys) {
                         /* v77b: АТОМАРНЫЙ int3-двухфазный патч живого стаба
                          * (run475: односайтовый pwrite 7B = torn-write =
                          * SEGV rip=1 на горячем libc-стабе). ф1 = CC (1Б),
                          * ф2 = e9 rel32 @+1 (входы = CC-хендлер), ф3 = e9
-                         * @0 (1Б). Ни в один момент нет рваного состояния. */
+                         * @0 (1Б). Ни в один момент нет рваного состояния.
+                         * v85: ТОЛЬКО смежные сайты (send/sendmsg = pthread-
+                         * коллеры, CC-риска нет); gap-сайт = rel32-first
+                         * выше (sendto = fs=0-коллеры существуют!). */
                         u32 slot;
                         u8 c1;
                         long long wr2;

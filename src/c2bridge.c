@@ -17409,6 +17409,28 @@ static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
  * syscall делает САМА санка. */
 typedef struct { unsigned long a, b; } c2b_fp2_t;
 
+/* v86: fs-валидность треда. РЕАЛЬНАЯ МЕХАНИКА крашей run488/491/492
+ * (собрана по крохам): fs=0-тред (raw-clone, без SETTLS) шлёт 0x22-класс
+ * через gap-санку -> хелпер -> C2B_LOGS -> write -> v52-dwrite-детур ->
+ * *__errno_location() = fs-ДОСТУП = SEGV addr = fs+off (0xffffffffffffeab8
+ * = errno-TLS-оффсет libc при fs=0; rdi=1/rsi=лог/rdx=0xbf = АРГУМЕНТЫ
+ * ЗАСТЯВШЕГО write; rip = внутри детура; строка лога = теряется = ноль
+ * crt-строк!). ГВАРД = arch_prctl(ARCH_GETFS) — сырой syscall (БЕЗ TLS/
+ * errno/лога), fs==0 => passthrough. Цена = 1 syscall на 0x22-кадр
+ * (~40/ран) = бесплатно. Возвращает 1 = fs-валидный (C-слой можно). */
+static u32 c2b_fp_fs_ok(void)
+{
+    unsigned long fsb = 0;
+    long r;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(158L /*arch_prctl*/), "D"(0x1003L /*ARCH_GETFS*/),
+                       "S"((long)(unsigned long)&fsb)
+                     : "rcx", "r11", "memory");
+    if (r != 0) return 0u;              /* экзотика = не рискуем */
+    return fsb != 0ul;
+}
+
 static c2b_fp2_t c2b_fp44_helper(unsigned long fd, const void *buf,
                                  unsigned long len, unsigned long flags,
                                  const void *addr)
@@ -17422,6 +17444,8 @@ static c2b_fp2_t c2b_fp44_helper(unsigned long fd, const void *buf,
      * на любом треде). Санка уже отфильтровала не-0x22 asm-гвардом; здесь
      * = второй пояс (ранние 0x22 до инициализации моста). */
     if (!g_bridge_ready) return r;
+    /* v86: fs-гвард — fs=0-тред = НЕ входит в C-слой (ни TLS, ни лог). */
+    if (!c2b_fp_fs_ok()) return r;
     /* v84: g_raw_tls-касания УДАЛЕНЫ из хелперов — run488-краш-класс
      * (fs=0-тред: TLS-запись = SEGV addr=fs+off): хелпер зовётся только
      * для 0x22-класса (асм-гвард санки), но TLS = не нужен вовсе (пост-
@@ -17466,6 +17490,8 @@ static c2b_fp2_t c2b_fp46_helper(unsigned long fd, const void *msg,
     r.b = flags;                        /* для sendmsg rdx = FLAGS */
     /* v83: гвард мост-готов (см. fp44). v84: TLS-касания удалены. */
     if (!g_bridge_ready) return r;
+    if (!c2b_fp_fs_ok()) return r;      /* v86: fs-гвард */
+    
     if (m && m->msg_iov && m->msg_iovlen >= 1ul) {
         if (m->msg_iov[0].iov_base && m->msg_iov[0].iov_len) {
             base = m->msg_iov[0].iov_base;

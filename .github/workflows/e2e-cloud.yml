@@ -76,7 +76,7 @@ on:
         type: choice
         options: ["0", "1"]
       krel:
-        description: "v79: the FULL-ff×4 engine-'k' relay in-channel (C2B_KREL=1): the mirror of the server's own ff×4-'A' framing (run481 decrypt: the server itself sends ff×4-prefixed packets in-channel => the noff4-only rationale void); chal = A.chal verbatim. Default 0 = krel OFF (the run479-481 behavior)"
+        description: "v79: the FULL-ff×4 engine-'k' relay in-channel (C2B_KREL=1): the mirror of the server's own ff×4-'A' framing (run481 decrypt: the server itself sends ff×4-prefixed packets in-channel => the noff4-only rationale void); chal = A.chal verbatim. RETIRED by the run502/503 A/B (v93): the in-channel ff×4 'k' = NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR + the slot-11 session death BOTH with chal=0 (run502, the v92-era patch bug) AND with the valid captured chal kept verbatim (run503, chal-KEEP byte-perfect) => the in-channel ff×4 routing = server->client only (the client 'k' lives on the connless lane = the CLV2 fwd = the standing correct path). Default 0 = krel OFF (the run479-481 behavior)"
         default: "0"
         required: false
         type: choice

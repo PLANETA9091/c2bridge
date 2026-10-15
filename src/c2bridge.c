@@ -19249,6 +19249,7 @@ static void c2b_s2o_maybe(void);       /* v106.1: компакт-S2 out (тел�
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_b2e_maybe(void);       /* v106.3: синт-'B' с живым chal -> движок */
+static void c2b_kdr_maybe(void);       /* v106.6: kfull chal-патч прямой в сервер */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
 
 
@@ -19451,6 +19452,7 @@ static void *c2b_g97_thread(void *arg)
          * Тот же тред = проверенный контекст отправки. См. блок у brlive. */
         c2b_k27_maybe_fire();
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
+        c2b_kdr_maybe();       /* v106.6: kfull chal-патч прямой в сервер (новый кфулл) */
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
         c2b_p2v_maybe();       /* v101: plaintext firsts in-channel (new firsts) */
         c2b_t2v_maybe();       /* v102: ticket in-channel RELIABLE (ответ на 'A') */
@@ -20411,6 +20413,47 @@ static u32 c2b_b2e_proto(u32 fires, u32 pr_live)
     return pr_live;
 }
 
+/* ---------- v106.6: KDR — KFULL CHAL-ПАТЧ ПРЯМОЙ ОТПРАВКА В СЕРВЕР ----------
+ * ЦЕНЗ run525 (г90-хеды): движковый СОБСТВЕННЫЙ 'k' = 513B ff×4+'k'+'96\0'+
+ * 00+03(proto=3)+chal@13..16+тикет, чал = СВЕЖИЙ (0xc3b47d08 = cwB
+ * cstate@0x4d8; капчуры #6+ = чал данс-раунда-2 = движок ПЕРЕСОБИРАЕТ 'k'
+ * по дансу) x13 ПРЯМЫХ отправок на сервер; сервер отвечает 'A' x27 ПРЯМО
+ * (g16 recv from 152.233.19.133:28022) = ре-челлендж, НЕ грант.
+ * ВЫВОД: современный чал в legacy-'k' = НЕ то, что ждёт legacy-валидатор;
+ * прямой путь = ДВУСТОРОННИЙ (не blackhole). Непроверенные ячейки =
+ * chal=VAL (0x00ee0a07, run389-ledger: "real challenge = the val field")
+ * и chal=0 (форма 'A' chal4=0) НА ПРЯМОМ пути. In-channel = закрыт
+ * (k27k noff4 = тихо run509, k2v verbatim = 2047). A/B в одном ране:
+ * fire#1 = VAL, fire#2 = 0. Форма = движковая (валидный тикет/шейп).
+ * Ответ сервера = в движковый сокет = движок сам парсит грант 'B'
+ * (или 'A'-луп продолжается = обе ячейки мертвы, барьер глубже). */
+static u32 c2b_kdr_gate(u32 on, u32 fires, u32 klen, u32 val)
+{
+    if (!on) return 0;
+    if (fires >= 2u) return 0;
+    if (klen < 32u || klen > 1200u) return 0;
+    if (fires == 0u && !val) return 0;   /* fire#1 = VAL обязателен */
+    return 1;
+}
+
+/* вербатим-копия g_kfull + патч chal u32 LE @13..16 (протo@9..12 НЕ трогаем) */
+static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
+                         u8 *out, u32 cap, u32 *outlen)
+{
+    u32 i;
+    if (!kfull || !out || !outlen) return 0;
+    if (klen < 32u || klen > 1200u) return 0;
+    if (cap < klen) return 0;
+    if (kfull[0] != 0xff || kfull[1] != 0xff ||
+        kfull[2] != 0xff || kfull[3] != 0xff) return 0;
+    if (kfull[4] != (u8)'k') return 0;
+    for (i = 0; i < klen; i++) out[i] = kfull[i];
+    out[13] = (u8)chal; out[14] = (u8)(chal >> 8);
+    out[15] = (u8)(chal >> 16); out[16] = (u8)(chal >> 24);
+    *outlen = klen;
+    return 1;
+}
+
 #ifndef C2B_SELFTEST
 /* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
  * что у g97-полла; в run356 он же дал 'End-to-end connection: connected').
@@ -20566,6 +20609,10 @@ static i64 g_k27k_out47;   /* vt[11] out-параметр (queued-status) */
 #define C2B_K27_CAP 6
 #define C2B_K27_WAIT_TICKS 600   /* v30: ~5 мин на 'A'; дальше — consumed+skip */
 
+/* v106.6: KDR — см. коммент у always-острова c2b_kdr_gate/c2b_kdr_build
+ * (выше); здесь = рантайм-статик: fires/val/on + кап 2 + C2B_KDR=0. */
+static u32 g_kdr_init, g_kdr_on = 1, g_kdr_fires, g_kdr_val;
+
 /* v47b: попытка k27k-выстрела (вызывается ИЗ form-пути на A-fire, И из
  * кождого тика g97 пока pend — источник 'k' (g70-капчер) часто ПОЗЖЕ
  * первого 'A' (run387: A@L6643 < g70@L7016 => скип без пенда = потеря).
@@ -20650,6 +20697,61 @@ static i32 c2b_k27k_try(u32 chal, i32 *rc_out)
         return 0;
     }
     return 1;
+}
+
+/* v106.6: KDR рантайм — см. блок у k27k-дефайнов. Огонь = первый тик g97
+ * после капчера g_kfull (рано = свежий данс); sendto = b2e-проверенный
+ * путь (g_clv2_fd = сокет моста, сервер видит легальный UDP-источник;
+ * ответ сервера = в этот сокет = g71/g90-машина моста читает). */
+static void c2b_kdr_maybe(void)
+{
+    static u8 kbuf[1200];
+    u32 klen, chal, i, fl, n47;
+    u8 sa[16];
+    ssize_t sr;
+    if (!g_kdr_init) {
+        const char *e = getenv("C2B_KDR");
+        if (e && e[0] == '0') g_kdr_on = 0;
+        g_kdr_init = 1;
+        if (g_kdr_on)
+            C2B_LOGS("[c2b] kdr: ARMED (v106.6 kfull chal-patch direct->server, cap 2: #1=val #2=0)\n");
+    }
+    if (!g_kdr_on) return;
+    if (g_kdr_fires >= 2u) return;
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1) return;
+    n47 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+    if (!n47) return;
+    fl = g_kfull_len;
+    if (!c2b_kdr_gate(g_kdr_on, g_kdr_fires, fl, g_kdr_val)) return;
+    chal = (g_kdr_fires == 0u) ? g_kdr_val : 0u;
+    if (!c2b_kdr_build((const u8 *)g_kfull, fl, chal,
+                       kbuf, (u32)sizeof kbuf, &klen)) return;
+    for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
+    sa[0] = 2;                     /* AF_INET (LE) */
+    sa[2] = 0x6d; sa[3] = 0x76;    /* порт 28022 BE */
+    sa[4] = 152; sa[5] = 233; sa[6] = 19; sa[7] = 133;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)kbuf,
+                                           klen, 0,
+                                           (const struct sockaddr *)sa, 16);
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] kdr: send SEGV\n");
+        return;
+    }
+    g_probe_active = 0;
+    g_kdr_fires++;
+    C2B_LOGS("[c2b] kdr: direct-'k' #");
+    C2B_LOGN(g_kdr_fires);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(chal);
+    C2B_LOGS(" len=");
+    C2B_LOGN(klen);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS("\n");
 }
 
 /* ---------- v98/v99: K2V — 'k' IN-CHANNEL (noff4 + вербатим-чал) ----------
@@ -21637,6 +21739,7 @@ static void c2b_k27_maybe_fire(void)
              * roll-stop = сервер распарсил 'qconnect0x<val>'. Единственный
              * непроверенный гель = 'k' с chal=VAL (0x00ee0a07), не 0. */
             i32 v47 = c2b_k27k_try(val, &rk47);
+            g_kdr_val = val;   /* v106.6: VAL для kdr fire#1 (тот же источник) */
             if (v47 == -1) {
                 g_k27k_pend = 1;
                 g_k27k_chal = val;
@@ -33232,6 +33335,36 @@ static void test_swr(void)
     CHECK(c2b_b2e_proto(1u, 0u) == 3u, "b2e: fire#2 live=0 = фолбэк 3");
     CHECK(c2b_b2e_proto(1u, 99u) == 3u, "b2e: fire#2 мусор 99 = фолбэк 3");
     CHECK(c2b_b2e_proto(1u, 2u) == 2u, "b2e: fire#2 живой 2 = 2 (честный live)");
+    /* --- v106.6: kdr (kfull chal-патч прямой в сервер) --- */
+    printf("[t] kdr\n");
+    CHECK(c2b_kdr_gate(0, 0, 513, 0xee0a07u) == 0, "kdr: on=0 = скип");
+    CHECK(c2b_kdr_gate(1, 2, 513, 0xee0a07u) == 0, "kdr: кап 2 = скип");
+    CHECK(c2b_kdr_gate(1, 0, 16, 0xee0a07u) == 0, "kdr: klen<32 = скип");
+    CHECK(c2b_kdr_gate(1, 0, 513, 0) == 0, "kdr: fire#1 без VAL = скип");
+    CHECK(c2b_kdr_gate(1, 1, 513, 0) == 1, "kdr: fire#2 без VAL = 1");
+    CHECK(c2b_kdr_gate(1, 0, 513, 0xee0a07u) == 1, "kdr: fire#1 с VAL = 1");
+    {
+        u8 kf6[64], ko6[64]; u32 kn6 = 0, z6;
+        for (z6 = 0; z6 < 64; z6++) kf6[z6] = (u8)z6;
+        kf6[0] = kf6[1] = kf6[2] = kf6[3] = 0xff; kf6[4] = (u8)'k';
+        memset(ko6, 0, sizeof ko6);
+        CHECK(c2b_kdr_build(kf6, 64, 0x00ee0a07u, ko6, sizeof ko6, &kn6) == 1,
+              "kdr: build 64B = 1");
+        CHECK(kn6 == 64, "kdr: len = klen");
+        CHECK(ko6[0] == 0xff && ko6[1] == 0xff && ko6[2] == 0xff &&
+              ko6[3] == 0xff && ko6[4] == (u8)'k', "kdr: ff×4+'k' сохранён");
+        CHECK(ko6[13] == 0x07 && ko6[14] == 0x0a && ko6[15] == 0xee &&
+              ko6[16] == 0x00, "kdr: chal @13..16 = 0x00ee0a07 LE");
+        CHECK(ko6[5] == 5 && ko6[63] == 63, "kdr: остальные байты вербатим");
+        CHECK(c2b_kdr_build(kf6, 64, 0x11223344u, ko6, 32, &kn6) == 0,
+              "kdr: cap<klen = 0");
+        kf6[2] = 0x41;
+        CHECK(c2b_kdr_build(kf6, 64, 1u, ko6, sizeof ko6, &kn6) == 0,
+              "kdr: не ff×4 = 0");
+        kf6[2] = 0xff; kf6[4] = (u8)'B';
+        CHECK(c2b_kdr_build(kf6, 64, 1u, ko6, sizeof ko6, &kn6) == 0,
+              "kdr: не 'k' = 0");
+    }
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");
     memset(out_swr, 0xAA, sizeof out_swr);

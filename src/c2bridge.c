@@ -20398,16 +20398,17 @@ static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal)
     if (fires >= 2u) return 0;
     return chal ? 1u : 0u;
 }
-/* v106.4: proto-нормализация b2e-формы: ЖИВОЕ значение cstate@0x4dc.
- * 0 (слот ещё не писан) / мусор >16 = фолбэк 3 (наблюдаемый мир движка:
- * g49 proto=3, cw proto=3, серверная 'A' proto=3; v105-форма несла 2).
- * A/B v106.3 vs v106.4: парс-путь (g48..g66 Bsuccess) уже пройден с 2 —
- * теперь проверяется ПОСТ-акцепт-гейт: если движок копирует proto формы
- * в состояние коннекта, 2 vs 3 = рассинхрон downstream-машины. */
-static u32 c2b_b2e_proto(u32 pr_raw)
+/* v106.5: proto-пик = ДВУХСТОРОННИЙ A/B В ОДНОМ РАНЕ: fire#1 = 2 (v105-форма;
+ * run522 = полный ходок g48..g66), fire#2 = живой cstate@0x4dc (фолбэк 3;
+ * run524 v106.4 = g48-вход БЕЗ g62 = тихий бейл). Одинаковый chal, тик-окно
+ * и носитель — дельта форм = ТОЛЬКО байт @18. walk#1 vs бейл#2 = чистый
+ * вердикт: proto = поле-валидатор 'B'-формы (2 = обязателен) ИЛИ
+ * chal/тайминг-конфаунд убит самим раном. */
+static u32 c2b_b2e_proto(u32 fires, u32 pr_live)
 {
-    if (pr_raw == 0u || pr_raw > 16u) return 3u;
-    return pr_raw;
+    if (fires == 0u) return 2u;
+    if (pr_live == 0u || pr_live > 16u) return 3u;
+    return pr_live;
 }
 
 #ifndef C2B_SELFTEST
@@ -21972,7 +21973,7 @@ static void c2b_b2e_maybe(void)
     if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2)) return;
     sb_len = c2b_t3_build_b(b2_buf, 40u, ch_b2);   /* эхо ЖИВОГО чала */
     if (sb_len != 40u) return;
-    pr_b2 = c2b_b2e_proto(pr_b2);       /* v106.4: ЖИВОЙ proto в форме */
+    pr_b2 = c2b_b2e_proto(g_b2e_fires, pr_b2);  /* v106.5: A/B #1=2, #2=живой */
     b2_buf[18] = (u8)pr_b2;
     for (ib2 = 0; ib2 < sizeof(la); ib2++) la[ib2] = 0;
     la[0] = 2;                     /* AF_INET (LE) */
@@ -33223,12 +33224,14 @@ static void test_swr(void)
     CHECK(c2b_b2e_gate(1, 0, 0) == 0, "b2e: chal=0 (не приземлился) = скип");
     CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u) == 1, "b2e: живой chal = 1");
     CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu) == 1, "b2e: другой живой chal = 1");
-    /* --- v106.4: b2e proto-нормализация --- */
+    /* --- v106.5: b2e proto-пик (двухсторонний A/B) --- */
     printf("[t] b2e-proto\n");
-    CHECK(c2b_b2e_proto(0u) == 3u, "b2e: proto=0 (слот не писан) = фолбэк 3");
-    CHECK(c2b_b2e_proto(3u) == 3u, "b2e: proto=3 живой = 3");
-    CHECK(c2b_b2e_proto(2u) == 2u, "b2e: proto=2 живой = 2 (A/B честный)");
-    CHECK(c2b_b2e_proto(99u) == 3u, "b2e: proto=99 мусор = фолбэк 3");
+    CHECK(c2b_b2e_proto(0u, 0u) == 2u, "b2e: fire#1 (любой live) = 2 (контроль v105)");
+    CHECK(c2b_b2e_proto(0u, 3u) == 2u, "b2e: fire#1 live=3 всё равно 2");
+    CHECK(c2b_b2e_proto(1u, 3u) == 3u, "b2e: fire#2 живой 3 = 3");
+    CHECK(c2b_b2e_proto(1u, 0u) == 3u, "b2e: fire#2 live=0 = фолбэк 3");
+    CHECK(c2b_b2e_proto(1u, 99u) == 3u, "b2e: fire#2 мусор 99 = фолбэк 3");
+    CHECK(c2b_b2e_proto(1u, 2u) == 2u, "b2e: fire#2 живой 2 = 2 (честный live)");
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");
     memset(out_swr, 0xAA, sizeof out_swr);

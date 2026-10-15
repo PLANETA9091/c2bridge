@@ -20093,24 +20093,24 @@ static i32 c2b_k27k_try(u32 chal, i32 *rc_out)
     return 1;
 }
 
-/* ---------- v98: K2V — ВЕРБАТИМ-'k' IN-CHANNEL ----------
- * run508-вердикт: k27k (noff4 509B, chal=val фейка 0x00ee0a07, UNRELIABLE)
- * в 0x23-коннектед мост-сессию = ТИХОЕ ГЛОТАНИЕ (rc=1, ноль реакции,
- * SW/ACK дальше; scp-цепочка = независимо, НЕ реакция). Две ошибки формы:
- * (1) chal = val ФЕЙК-сервера — релей свой val не выдавал (его счётчик =
- * 0x3d87055f-класс, движок сам принимает его в scp/'k'); (2) стрипнутый
- * noff4-репак — wire-правда in-channel = ff×4-формы ('A' 42B с ff×4).
- * V98: ОДИН рычаг — ВЕРБАТИМ g_kfull (движковый 513B ff×4+'k', chal =
- * принятый релеем счётчик, тикет самосогласован) в МОСТ-сессию (известный
- * iface, проверенный слот 11, run360/364-контекст), UNRELIABLE (fl=0,
- * run366-урок). Триггер = НОВЫЙ эпок g_kfull (движок пересобирает 'k' со
- * свежим chal на каждый ретрай — каждое значение счётчика релея = свой
- * эпок, run508: 0x0550..0x0568). Кап 3/ран, мин-гэп 60 тиков (~30с),
- * killswitch C2B_K2V=0. rc!=1 = ТОЛЬКО телеметрия (НЕ death-stop — health
- * моста независим; krel/k27k-стопы = их собственные контракты).
- * Реакции-маркеры: 'B'/signon/REL-frame (s2dn) = ПРОРЫВ; PARSE_ERROR-close
- * (run460-класс) = форма-ответ; тишина = вопрос session-биндинга остаётся
- * (след. шаг = layout-проба чужого iface движка). */
+/* ---------- v98/v99: K2V — 'k' IN-CHANNEL (noff4 + вербатим-чал) ----------
+ * run509-ВЕРДИКТ (идеально контролируемая пара на ОДНОЙ сессии, 2 сек):
+ * k27k noff4+фейк-чал (L24357, chal=0x00ee0a07) = rc=1, ТИХО (нуль
+ * реакции); k2v ВЕРБАТИМ с ff×4 (L24359, chal=0x4b6d11e2 = счётчик
+ * релея) = rc=1 → L24366 «closed by peer (2047):
+ * NETWORK_DISCONNECT_MESSAGE_PARSE_ERROR», GNS state 3→4, след. выстрел
+ * rc=3 (NoConnection). ВНУТРИКАНАЛЬНЫЙ ДИАЛОГ ОТКРЫТ: релей АКТИВНО
+ * парсит наш in-channel payload и ВЫНЕС ВЕРДИКТ — ff×4 (connectionless-
+ * маркер) в канале = парс-ошибка. noff4-фрейминг = tolerable (run508/509).
+ * V99: синтез = noff4-СТРИП ВЕРБАТИМ-ЧАЛ: kv_buf = g_kfull[4..] (509B,
+ * байт-в-байт без репака), chal = движковый собственный (счётчик релея,
+ * @13 LE полной формы = @9 LE стрипнутой). Остальное без изменений:
+ * триггер = новый эпок g_kfull, кап 3/ран, мин-гэп 60 тиков, killswitch
+ * C2B_K2V=0, rc!=1 = только телеметрия (НЕ death-stop).
+ * Реакции-маркеры v99: 'B'/signon/REL-frame (s2dn) = ПРОРЫВ; тишина =
+ * чал/биндинг-вопрос остаётся (след. = чужой iface движка / NETMSG-форма
+ * S2-hello); PARSE_ERROR на noff4 = контент-'k' не тот для in-channel
+ * (след. = S2 ConnectRequest-protobuf как первый REL). */
 static u32 g_k2v_init, g_k2v_on = 1, g_k2v_fires, g_k2v_epoch, g_k2v_gap,
            g_k2v_skip;
 
@@ -20142,11 +20142,13 @@ static void c2b_k2v_maybe(void)
         g_k2v_epoch = n_kv;     /* эпок всё равно потреблён */
         return;
     }
-    for (z_kv = 0; z_kv < len_kv; z_kv++) kv_buf[z_kv] = fp_kv[z_kv];
+    /* v99: noff4-СТРИП — in-channel БЕЗ ff×4 (run509: с ff×4 = закрытие 2047); чал = движковый вербатим (@13 полной = @9 стрипнутой) */
+    ch_kv = c2b_k2v_chal((const u8 *)fp_kv, len_kv);
+    len_kv -= 4;
+    for (z_kv = 0; z_kv < len_kv; z_kv++) kv_buf[z_kv] = fp_kv[z_kv + 4];
     if (__atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE) != n_kv)
         return;                 /* гонка с капчером — скип, эпок не тратим */
     g_k2v_epoch = n_kv;
-    ch_kv = c2b_k2v_chal(kv_buf, len_kv);
     live_kv = c2b_k24_brlive();
     vt_kv = *(void ***)g_gns_conn_iface;
     g_probe_active = 1;
@@ -20163,12 +20165,13 @@ static void c2b_k2v_maybe(void)
     }
     g_k2v_fires++;
     g_k2v_gap = C2B_K2V_GAP;
-    C2B_LOGS("[c2b] k2v: verbatim-'k' in-channel #");
+    C2B_LOGS("[c2b] k2v: noff4-vchal 'k' in-channel #");
     C2B_LOGN(g_k2v_fires);
     C2B_LOGS(" len=");
     C2B_LOGN(len_kv);
     C2B_LOGS(" chal=");
     C2B_LOGH(ch_kv);
+    C2B_LOGS(" chal-src=verbatim-k-v99");
     C2B_LOGS(" live=");
     C2B_LOGN(live_kv);
     C2B_LOGS(" tgt=");
@@ -31709,6 +31712,11 @@ static void test_k2v(void)
     CHECK(c2b_k2v_form(kf, sizeof kf) == 1, "k2v: ff×4+'k' форма = 1");
     CHECK(c2b_k2v_chal(kf, sizeof kf) == 0x3d87055fu,
           "k2v: chal LE32 @13 (run508 scp-класс)");
+    /* v99-инвариант: стрипнутая форма — чал теперь @9 (LE) стрипнутой;
+     * c2b_k2v_chal читает @13 относительного буфера — потому прямое LE-чтение */
+    CHECK((((u32)kf[13] | ((u32)kf[14] << 8) | ((u32)kf[15] << 16) |
+            ((u32)kf[16] << 24)) == 0x3d87055fu) && kf[4] == 'k',
+          "k2v: стрипнутая форма: [0]='k', чал @9 LE = движковому — v99-стрип");
     kf[13] = 0x68; kf[14] = 0x05; kf[15] = 0xf0; kf[16] = 0xff;
     CHECK(c2b_k2v_chal(kf, sizeof kf) == 0xfff00568u,
           "k2v: tail-chal run508 = 0xfff00568 (счётчик релея)");

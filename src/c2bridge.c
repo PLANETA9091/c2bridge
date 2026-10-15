@@ -12530,11 +12530,16 @@ static i32 c2b_t2v_gate(u32 on, u32 dead, u32 fires, u32 a_seq, u32 a_seen,
  * сервером принята; движковый unrel-фрейм = та же форма (c2b_rel_unrel_try).
  * Инжекция = plaintext-swap ПОСЛЕ tramp (SNP/ACK слой = пакетный, не задет);
  * замена ТОЛЬКО при synth_len <= реальной len = zero-overflow-risk.
- * Кап 3/сессию (1 'B' + 2 S2). Киллисвитч C2B_T3V=0 (дефолт ON). Регистра-
+ * RUN517-УРОК (первый A/B): реальные слоты = [SNP-фрейм 12B: 80 00 98 xx 00
+ * xx 00 37 01 00 00 00][CLV2-датаграмма 42B от ff×4] — ff×4 = @+12, НЕ @0
+ * (k27-raw=42B = подтверждение). Инжект = payload-swap: префикс [0..mo)
+ * СОХРАНЯЕТСЯ, 'B' (40B) = в payload [mo..len) 42>=40 фит. 7B SW/ACK =
+ * фрейм БЕЗ payload = НЕ носитель netmsg — стадия S2 УДАЛЕНА (SignonState
+ * = v106+: нужен netmsg-лейн кадр, в текущем трафике сервера отсутствует).
+ * Кап 1/сессию ('B'). Киллисвитч C2B_T3V=0 (дефолт ON). Регистра-
  * ция = мост -> c2b_hook_t3v_register (hook = LD_PRELOAD = dlsym(0) видим). */
 static u32 c2b_clv2_client_version(void);      /* fwd (определение @g44-билдере) */
 #define C2B_T3V_CAP_B  1u
-#define C2B_T3V_CAP_S2 2u
 
 typedef struct {
     u32 on;      /* C2B_T3V гейт (дефолт 1, =0 kill) */
@@ -12584,33 +12589,26 @@ static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32)
 }
 
 /* чистая стад-машина (selftest-покрытие): 1 = слот ЗАМЕНЁН synth'ом.
- * 'A'-слот (ff×4+'A', mo==0): seenA++; #2 => 'B' (chal = из СВОЕГО слота —
- * свежий серверный chal, без стейт-зависимости). 7B SW/ACK (out[0]==0x80)
- * после 'B' => SignonState. Всё остальное = 0. */
+ * 'A'-слот: скан ff×4+'A' ПО ВСЕМУ слоту (run517: ff×4 = @+12, SNP-фрейм-
+ * префикс 12B впереди — mo==0 правило = НОЛЬ выстрелов). Префикс [0..mo)
+ * сохраняется (SNP-фрейминг цел!), synth = payload [mo..len). 'A'#2 =>
+ * 'B' (chal = из СВОЕГО слота). 7B SW/ACK = НЕ трогаем (фрейм без payload
+ * = неверный носитель). Всё остальное = 0. */
 static u32 c2b_t3_step(u8 *out, u32 len, c2b_t3_st_t *st)
 {
     unsigned char cls;
     unsigned int chal, proto, val, mo;
-    if (!st || !st->on || !out || !len) return 0;
-    if (len >= 14u &&
-        c2b_k27_scan_clv2(out, len, 0, &cls, &chal, &proto, &val, &mo) &&
-        mo == 0u) {
-        if (cls != (unsigned char)'A') return 0;
-        st->seenA++;
-        st->chal = chal;
-        if (st->seenA >= 2u && !st->nB && st->nB < C2B_T3V_CAP_B &&
-            len >= 40u) {
-            c2b_t3_build_b(out, len, chal);
-            st->nB++;
-            return 1u;
-        }
+    if (!st || !st->on || !out || len < 14u) return 0;
+    if (!c2b_k27_scan_clv2(out, len, 0, &cls, &chal, &proto, &val, &mo))
         return 0;
-    }
-    if (st->nB && st->nS2 < C2B_T3V_CAP_S2 && len == 7u && out[0] == 0x80u) {
-        if (c2b_t3_build_s2(out, len) == 7u) {
-            st->nS2++;
-            return 1u;
-        }
+    if (cls != (unsigned char)'A') return 0;
+    st->seenA++;
+    st->chal = chal;
+    if (st->seenA >= 2u && !st->nB && st->nB < C2B_T3V_CAP_B &&
+        len - mo >= 40u) {
+        c2b_t3_build_b(out + mo, len - mo, chal);
+        st->nB++;
+        return 1u;
     }
     return 0;
 }
@@ -32565,64 +32563,65 @@ static void test_t3v(void)
     CHECK(c2b_t3_build_b(0, 54, 1u) == 0, "t3v: b NULL = 0");
     CHECK(c2b_t3_build_b(sl, 54, 0) == 54, "t3v: b chal=0 -> fallback 12345678");
     CHECK(sl[6] == '1' && sl[13] == '8', "t3v: b fallback hex = 12345678");
-    /* --- стад-машина --- */
+    /* --- стад-машина (run517-реалистичные слоты: [SNP-фрейм 12B]
+     *     [ff×4+'A' @12 + chal + proto]) --- */
     memset(&st, 0, sizeof st);
     memset(sl, 0, sizeof sl);
-    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
-    sl[5] = 0x11u; sl[6] = 0x22u; sl[7] = 0x33u; sl[8] = 0x44u;
+    sl[0] = 0x80u; sl[2] = 0x98u; sl[3] = 0x02u; sl[7] = 0x37u; sl[8] = 0x01u;
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
+    sl[17] = 0x11u; sl[18] = 0x22u; sl[19] = 0x33u; sl[20] = 0x44u;
+    sl[21] = 3u;                               /* proto=3 (run513) */
     CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: off = 0");
     st.on = 1u;
     CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'A'#1 = без инж");
     CHECK(st.seenA == 1u && st.chal == 0x44332211u,
-          "t3v: 'A'#1 нотед (seenA=1, chal)");
-    /* 7B SW/ACK ДО 'B' = скип (порядок стадий) */
+          "t3v: 'A'#1 нотед (seenA=1, chal с @+12+5)");
+    /* 7B SW/ACK (фрейм без payload) = ВСЕГДА скип (v105.3: неверный
+     * носитель — стадия S2 удалена) */
     memset(sl, 0, sizeof sl); sl[0] = 0x80u;
-    CHECK(c2b_t3_step(sl, 7, &st) == 0, "t3v: s2 до 'B' = скип");
-    /* 'A'#2 = жертвенный слот -> 'B' */
+    CHECK(c2b_t3_step(sl, 7, &st) == 0, "t3v: 7B SW/ACK = скип");
+    CHECK(st.nB == 0u && st.nS2 == 0u, "t3v: 7B ничего не меняет");
+    /* 'A'#2 = жертвенный слот -> 'B' В PAYLOAD (@mo), префикс цел */
     memset(sl, 0, sizeof sl);
-    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
-    sl[5] = 0x11u; sl[6] = 0x22u; sl[7] = 0x33u; sl[8] = 0x44u;
+    sl[0] = 0x80u; sl[1] = 0x00u; sl[2] = 0x98u; sl[3] = 0x03u;
+    sl[4] = 0x00u; sl[5] = 0xd8u; sl[6] = 0x00u; sl[7] = 0x37u;
+    sl[8] = 0x02u;
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
+    sl[17] = 0x11u; sl[18] = 0x22u; sl[19] = 0x33u; sl[20] = 0x44u;
+    sl[21] = 3u;
     CHECK(c2b_t3_step(sl, 54, &st) == 1, "t3v: 'A'#2 = 'B' инж");
     CHECK(st.nB == 1u, "t3v: nB=1");
-    CHECK(sl[4] == 'B' && sl[5] == '.', "t3v: слот = 'B.'-форма");
-    CHECK(sl[6] == '4' && sl[7] == '4' && sl[8] == '3' && sl[9] == '3' &&
-          sl[10] == '2' && sl[11] == '2' && sl[12] == '1' && sl[13] == '1',
-          "t3v: hex-chal 44332211 (big-endian hex, uppercase)");
-    CHECK(sl[14] == 0x11u && sl[15] == 0x22u && sl[16] == 0x33u &&
-          sl[17] == 0x44u, "t3v: chal LE @14..17");
-    CHECK(sl[18] == 2u, "t3v: proto=2");
-    CHECK(sl[24] == 'c' && sl[31] == 0u, "t3v: connect\\0 @24..31");
-    CHECK(sl[40] == 0u && sl[53] == 0u, "t3v: пад-хвост нулями");
+    CHECK(sl[0] == 0x80u && sl[2] == 0x98u && sl[3] == 0x03u,
+          "t3v: SNP-префикс [0..12) СОХРАНЁН");
+    CHECK(sl[12] == 0xffu && sl[13] == 0xffu && sl[14] == 0xffu &&
+          sl[15] == 0xffu && sl[16] == 'B' && sl[17] == '.',
+          "t3v: payload @12 = ff×4+'B.'");
+    CHECK(sl[18] == '4' && sl[19] == '4' && sl[20] == '3' &&
+          sl[21] == '3' && sl[22] == '2' && sl[23] == '2' &&
+          sl[24] == '1' && sl[25] == '1',
+          "t3v: hex-chal 44332211 @18..25 (payload+6)");
+    CHECK(sl[26] == 0x11u && sl[27] == 0x22u && sl[28] == 0x33u &&
+          sl[29] == 0x44u, "t3v: chal LE @26..29 (payload+14)");
+    CHECK(sl[30] == 2u, "t3v: proto=2 @30 (payload+18)");
+    CHECK(sl[36] == 'c' && sl[43] == 0u, "t3v: connect\\0 @36..43");
+    CHECK(sl[52] == 0u && sl[53] == 0u, "t3v: пад-хвост нулями (40+2)");
     /* 'A'#3 (после 'B') = без инж (кап B=1) */
     memset(sl, 0, sizeof sl);
-    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'A';
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
     CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'A'#3 = кап B = скип");
     CHECK(st.seenA == 3u, "t3v: seenA продолжает расти");
-    /* 7B SW/ACK после 'B' -> SignonState x2 (кап), 3-й = скип */
-    memset(sl, 0, sizeof sl);
-    sl[0] = 0x80u; sl[1] = 0x00u; sl[2] = 0x98u; sl[3] = 0x0au;
-    sl[4] = 0x00u; sl[5] = 0x1du; sl[6] = 0x06u;
-    CHECK(c2b_t3_step(sl, 7, &st) == 1, "t3v: s2#1 инж");
-    CHECK(st.nS2 == 1u, "t3v: nS2=1");
-    CHECK(sl[0] == 7u && sl[1] == 2u && sl[2] == 0u && sl[3] == 0u &&
-          sl[4] == 0u && sl[5] == 0x08u && sl[6] == 0x02u,
-          "t3v: слот = [07][02000000][0802]");
-    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
-    CHECK(c2b_t3_step(sl, 7, &st) == 1 && st.nS2 == 2u, "t3v: s2#2 инж");
-    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
-    CHECK(c2b_t3_step(sl, 7, &st) == 0, "t3v: s2 кап 2 = скип");
-    /* не-7B слоты после 'B' = скип (форма-гейт) */
-    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
-    CHECK(c2b_t3_step(sl, 8, &st) == 0, "t3v: len=8 = скип");
-    CHECK(c2b_t3_step(sl, 6, &st) == 0, "t3v: len=6 = скип");
-    /* junk-слот (не ff×4, не 7B/0x80) = скип */
+    /* junk-слот (не ff×4 нигде) = скип */
     memset(sl, 0x5a, sizeof sl);
     CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: junk = скип");
     /* 'B'-вхождение в сканере = скип (cls-гейт) */
     memset(sl, 0, sizeof sl);
-    sl[0] = sl[1] = sl[2] = sl[3] = 0xffu; sl[4] = 'B'; sl[5] = '.';
+    sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'B'; sl[17] = '.';
     CHECK(c2b_t3_step(sl, 54, &st) == 0, "t3v: 'B'-слот = скип");
+    /* короткий слот (<14) = скип */
+    memset(sl, 0, sizeof sl); sl[0] = 0x80u;
+    CHECK(c2b_t3_step(sl, 8, &st) == 0, "t3v: len=8 = скип");
     /* NULL-стейт/out = скип */
+    memset(sl, 0, sizeof sl); sl[12] = 0xffu; sl[16] = 'A';
     CHECK(c2b_t3_step(sl, 54, 0) == 0, "t3v: NULL st = скип");
     CHECK(c2b_t3_step(0, 54, &st) == 0, "t3v: NULL out = скип");
     /* живой инжектор смоук: глобал off = 0, слот не тронут (стейт сохранён) */

@@ -6578,6 +6578,22 @@ static u64 g_clv2_ch64;          /* challenge сервера */
 static u32 g_clv2_ch32;          /* что отдали движку в 'A' */
 static u32 g_clv2_sent_req, g_clv2_got_ch, g_clv2_cap_connect, g_clv2_badreply;
 static u32 g_clv2_fwdk, g_clv2_fwd_k;   /* g30: 'k'->target raw-forward exp */
+/* v96 kwire: ПРОВОД-путь капчуренного 'k'. Вердикт run505 (pcap): легаси-fwd
+ * выстрелил 38 раз — НОЛЬ 513B-кадров на проводе за весь pcap (все >=200B
+ * пакеты = sdping к Valve-релеям). Причины: (а) engine addr-блоб = НЕ
+ * sockaddr_in: 02 00 | 00 | 6d 76 | 98 e9 13 85 — порт 28022/IP присутствуют,
+ * но с ЛИШНИМ 00 на [2] (kernel парсит sin_port=109 @ 118.152.233.19 = чёрная
+ * дыра); (б) fd хук-сайта = не обязательно реальный UDP-сокет. Путь v96 =
+ * РЕАЛЬНЫЙ сокет g_clv2_fd (self-loop push run72/189 = провод-пруф) +
+ * ПРАВИЛЬНЫЙ sockaddr_in g_gns_dst (env-сборка g32). Содержание = VERBATIM
+ * (движковый свой 'k' = контрактная форма, chal/тикет не трогаем).
+ * C2B_KWIRE=0 = киллисвитч; кап 12/сессия (анти-спам сервера). ret/errno =
+ * обязательная телеметрия (легаси-fwd слал в пустоту МОЛЧА 5 ранов). */
+static u32 g_kwire_on = 1, g_kwire_init;
+static volatile u32 g_kwire_sent;
+#define C2B_KWIRE_CAP 12
+static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
+static socklen_t g_gns_dstlen;          /* 0 = не собран */
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
 static u32 g_clv2_phase;         /* 0=idle 1='A' 2=ждём reply для 'i' 3='i' доставлен
@@ -7478,6 +7494,17 @@ static i32 c2b_krel_patchchal(u8 *k, u32 len, u32 chal)
     k[14] = (u8)(chal >> 8);
     k[15] = (u8)(chal >> 16);
     k[16] = (u8)(chal >> 24);
+    return 1;
+}
+
+/* v96: чек dst-формы (чистая фн = selftest). Эвристика урока run505: family=2
+ * (LE) + старший байт порта != 0 (игровые порты >= 1024; engine-блоб даёт
+ * kernel-порт 109 => [2]=0x00 = отбраковка). */
+static i32 c2b_kwire_sa_ok(const u8 *sa, u32 l)
+{
+    if (!sa || l < 8) return 0;
+    if (sa[0] != 0x02 || sa[1] != 0x00) return 0;
+    if (sa[2] == 0) return 0;
     return 1;
 }
 
@@ -8595,8 +8622,9 @@ static uptr  g_gns_conn_h;              /* g71: хэндл GNS-соединен�
 static u32   g_gns_walk_slot;           /* g84: слот-приёмник, найденный походом 14..27 (0=нет) */
 static u8    g_gns_stbuf[4352];         /* g84: буфер detailed-status текста (4KB + запас) */
 static u32   g_c2b_signon_seen;         /* g85: движок провёл SNM t=7 (SignonState) = канал жив */
-static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
-static socklen_t g_gns_dstlen;          /* 0 = не собран */
+/* v96: декларация поднята в общий регион (kwire-путь в on_s1_connect =
+ * common-регион зовёт c2b_kwire_sa_ok(g_gns_dst,...)); env-сборка (g32)
+ * остаётся в real-only регионе ниже. */
 
 /* 41f-g32a: fwd decl — драйвер определяется ниже, зовётся из auth-потока */
 static void c2b_g32_drive(void);
@@ -15199,19 +15227,54 @@ static i32 c2b_clv2_on_s1_connect(i32 fd, const u8 *p, u32 len, i32 flags,
          * dst = цель по построению), g_clv2_dst как fallback. */
         const void *da = 0;
         u32 dl = 0;
+        if (!g_kwire_init) {
+            const char *e96 = getenv("C2B_KWIRE");
+            if (e96 && e96[0] == '0') g_kwire_on = 0;
+            g_kwire_init = 1;
+            C2B_LOGS("[c2b] kwire: ");
+            C2B_LOGN(g_kwire_on);
+            C2B_LOGS(" (v96: 'k'->провод = реальный g_clv2_fd + sockaddr_in"
+                     " g_gns_dst, verbatim, кап 12; C2B_KWIRE=0 = выкл)\n");
+        }
         if (addr && addrlen && addrlen <= 28) {
             da = addr; dl = (u32)addrlen;
         } else if (g_clv2_dstlen >= 6) {
             da = (const void *)g_clv2_dst; dl = g_clv2_dstlen;
         }
-        if (da && dl) {
-            ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
-                                          da, dl);
+        if (da && dl && g_clp_sendto && (uptr)g_clp_sendto != 1) {
+            i32 r95 = ((c2b_sendto_fn)g_clp_sendto)(fd, p, (u32)len, flags,
+                                                    da, dl);
             g_clv2_fwd_k++;
             C2B_LOGS("[c2b] CLV2 'k'->target fwd #");
             C2B_LOGN(g_clv2_fwd_k);
             C2B_LOGS(" len=");
             C2B_LOGN((u32)len);
+            C2B_LOGS(" ret=");
+            C2B_LOGN((u32)(i64)r95);
+            C2B_LOGS(" errno=");
+            C2B_LOGN((u32)*__errno_location());
+            C2B_LOGS("\n");
+        }
+        /* v96 KWIRE: второй, ПРОВОД-путь — реальный сокет + чистый
+         * sockaddr_in. Содержание 'k' = VERBATIM. Отдельный счётчик/кап. */
+        if (g_kwire_on && g_kwire_sent < C2B_KWIRE_CAP &&
+            g_clv2_fd > 0 && g_clp_sendto &&
+            (uptr)g_clp_sendto != 1 &&
+            c2b_kwire_sa_ok(g_gns_dst, (u32)g_gns_dstlen)) {
+            i32 r96 = ((c2b_sendto_fn)g_clp_sendto)(
+                g_clv2_fd, p, (u32)len, flags,
+                (const void *)g_gns_dst, g_gns_dstlen);
+            g_kwire_sent++;
+            C2B_LOGS("[c2b] kwire: 'k'->wire #");
+            C2B_LOGN(g_kwire_sent);
+            C2B_LOGS(" len=");
+            C2B_LOGN((u32)len);
+            C2B_LOGS(" fd=");
+            C2B_LOGN((u32)(i32)g_clv2_fd);
+            C2B_LOGS(" ret=");
+            C2B_LOGN((u32)(i64)r96);
+            C2B_LOGS(" errno=");
+            C2B_LOGN((u32)*__errno_location());
             C2B_LOGS("\n");
         }
     }
@@ -31044,6 +31107,35 @@ static void test_g130_relay(void)
     c2b_g130_log(9u, (uptr)kf, (uptr)kf, 513u);
     CHECK(g_kfull_n == kfn0 && g_clv2_fwd_k == fw0 && c2b_g130_kn == kn0 + 1,
           "g130-relay: не-'k' шейп = релей НЕ звался, kn живёт");
+    /* v96 kwire: провод-путь. Базовые тесты выше шли с g_gns_dst=0 =>
+     * sa_ok=0 => kwire молчал (дефолты не тронуты — проверено счётчиками). */
+    {
+        const u8 gd96[8] = { 2, 0, 0x6d, 0x76, 0x98, 0xe9, 0x13, 0x85 };
+        const u8 bl96[9] = { 2, 0, 0x00, 0x6d, 0x76, 0x98, 0xe9, 0x13, 0x85 };
+        u32 kw0, q96;
+        CHECK(c2b_kwire_sa_ok(gd96, 8) == 1,
+              "kwire: sockaddr_in 152.233.19.133:28022 = валидна");
+        CHECK(c2b_kwire_sa_ok(bl96, 9) == 0,
+              "kwire: run505 engine-блоб (лишний 00@2 => kernel-порт 109) = отбракован");
+        CHECK(c2b_kwire_sa_ok(gd96, 7) == 0, "kwire: короткий sa = отбракован");
+        CHECK(c2b_kwire_sa_ok(0, 8) == 0, "kwire: NULL = отбракован");
+        memcpy(g_gns_dst, gd96, 8); g_gns_dstlen = 8;
+        kf[4] = (u8)'k';
+        kn0 = c2b_g130_kn; kfn0 = g_kfull_n; fst0 = c2b_st_fst_n;
+        kw0 = g_kwire_sent;
+        c2b_g130_log(9u, (uptr)kf, (uptr)kf, 513u);
+        CHECK(g_kwire_sent == kw0 + 1, "kwire: провод-посылка выстрелила (+1)");
+        CHECK(c2b_st_fst_n >= fst0 + 2,
+              "kwire: ДВА вызова sendto (легаси-fwd + kwire)");
+        /* кап 12/сессию: докидываем 20 'k' — счётчик замирает на cap */
+        for (q96 = 0; q96 < 20; q96++)
+            c2b_g130_log(9u, (uptr)kf, (uptr)kf, 513u);
+        CHECK(g_kwire_sent == kw0 + C2B_KWIRE_CAP,
+              "kwire: кап 12/сессию (счётчик замирает)");
+        CHECK(g_clv2_fwd_k >= fw0 + 21,
+              "kwire: легаси-fwd живёт независимо (своего капа нет)");
+        memset(g_gns_dst, 0, sizeof g_gns_dst); g_gns_dstlen = 0;
+    }
     /* гигиена */
     g_clv2_fwdk = 0;
     g_clv2_fd = -1;

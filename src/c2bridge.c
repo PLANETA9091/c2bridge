@@ -20398,6 +20398,17 @@ static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal)
     if (fires >= 2u) return 0;
     return chal ? 1u : 0u;
 }
+/* v106.4: proto-нормализация b2e-формы: ЖИВОЕ значение cstate@0x4dc.
+ * 0 (слот ещё не писан) / мусор >16 = фолбэк 3 (наблюдаемый мир движка:
+ * g49 proto=3, cw proto=3, серверная 'A' proto=3; v105-форма несла 2).
+ * A/B v106.3 vs v106.4: парс-путь (g48..g66 Bsuccess) уже пройден с 2 —
+ * теперь проверяется ПОСТ-акцепт-гейт: если движок копирует proto формы
+ * в состояние коннекта, 2 vs 3 = рассинхрон downstream-машины. */
+static u32 c2b_b2e_proto(u32 pr_raw)
+{
+    if (pr_raw == 0u || pr_raw > 16u) return 3u;
+    return pr_raw;
+}
 
 #ifndef C2B_SELFTEST
 /* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
@@ -20987,25 +20998,32 @@ static void c2b_t2v_maybe(void)
  * Флап 0/1/2 на таймлайне = ответ на: (1) инжект при cstate!=1 = мёртв;
  * (2) g63-фейк-'B' ставит ли 2; (3) серверные 'A'-рефреши держат ли 1. */
 #define C2B_CW_EVERY 20   /* v106.1: 150 = бюджет-промах (g97 ~1s/тик, 137 тиков/ран < 150 => 0 срезов; run519 дал 1 срез только каскадом) */
-#define C2B_CW_LOGLIM 24
-static u32 g_cw_init, g_cw_on = 1, g_cw_ticks, g_cw_logs;
+#define C2B_CW_LOGLIM 40  /* v106.4: 24 = впритык (14 базовых + burst 12x2) */
+#define C2B_CW_BURST 12   /* v106.4: пер-тик срезов после b2e-файра (окно
+                           * перехода: парс loopback-'B' = тик T, пост-акцепт
+                           * машина = T+1.. — флап 0/1/2 теперь РАЗЛИЧИМ) */
+static u32 g_cw_init, g_cw_on = 1, g_cw_ticks, g_cw_logs, g_cw_burst;
 static void c2b_cw_maybe(void)
 {
-    u32 cs_cw, ch_cw, pr_cw;
+    u32 cs_cw, ch_cw, pr_cw, burst;
     if (!g_cw_init) {
         const char *ecw = getenv("C2B_CW");
         if (ecw && ecw[0] == '0') g_cw_on = 0;
         g_cw_init = 1;
         if (g_cw_on)
-            C2B_LOGS("[c2b] cw: ARMED (v106.1 cstate-walk @0x1a0, every 20 ticks)\n");
+            C2B_LOGS("[c2b] cw: ARMED (v106.4 cstate-walk @0x1a0, every 20 ticks + burst 12 after b2e)\n");
     }
     if (!g_cw_on) return;
-    if (++g_cw_ticks < C2B_CW_EVERY) return;
-    g_cw_ticks = 0;
+    burst = 0;
+    if (g_cw_burst) { g_cw_burst--; burst = 1; }
+    else {
+        if (++g_cw_ticks < C2B_CW_EVERY) return;
+        g_cw_ticks = 0;
+    }
     if (g_cw_logs >= C2B_CW_LOGLIM) return;
     if (!c2b_cw_read((uptr)c2b_g49_state, &cs_cw, &ch_cw, &pr_cw)) return;
     g_cw_logs++;
-    C2B_LOGS("[c2b] cw: cstate=");
+    C2B_LOGS(burst ? "[c2b] cwB: cstate=" : "[c2b] cw: cstate=");
     C2B_LOGN(cs_cw);
     C2B_LOGS(" chal=");
     C2B_LOGH(ch_cw);
@@ -21954,6 +21972,8 @@ static void c2b_b2e_maybe(void)
     if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2)) return;
     sb_len = c2b_t3_build_b(b2_buf, 40u, ch_b2);   /* эхо ЖИВОГО чала */
     if (sb_len != 40u) return;
+    pr_b2 = c2b_b2e_proto(pr_b2);       /* v106.4: ЖИВОЙ proto в форме */
+    b2_buf[18] = (u8)pr_b2;
     for (ib2 = 0; ib2 < sizeof(la); ib2++) la[ib2] = 0;
     la[0] = 2;                     /* AF_INET (LE) */
     la[2] = 0x69; la[3] = 0x7D;    /* порт 27005 BE */
@@ -21963,12 +21983,15 @@ static void c2b_b2e_maybe(void)
                                        sb_len, 0,
                                        (const struct sockaddr *)la, 16);
     g_b2e_fires++;
+    g_cw_burst = C2B_CW_BURST;  /* v106.4: пер-тик срезы окна перехода */
     C2B_LOGS("[c2b] b2e: synth-'B' live-chal #");
     C2B_LOGN(g_b2e_fires);
     C2B_LOGS(" chal=");
     C2B_LOGH(ch_b2);
     C2B_LOGS(" cstate=");
     C2B_LOGN(cs_b2);
+    C2B_LOGS(" proto=");
+    C2B_LOGN(pr_b2);
     C2B_LOGS(" len=");
     C2B_LOGN(sb_len);
     C2B_LOGS(" rc=");
@@ -33200,6 +33223,12 @@ static void test_swr(void)
     CHECK(c2b_b2e_gate(1, 0, 0) == 0, "b2e: chal=0 (не приземлился) = скип");
     CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u) == 1, "b2e: живой chal = 1");
     CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu) == 1, "b2e: другой живой chal = 1");
+    /* --- v106.4: b2e proto-нормализация --- */
+    printf("[t] b2e-proto\n");
+    CHECK(c2b_b2e_proto(0u) == 3u, "b2e: proto=0 (слот не писан) = фолбэк 3");
+    CHECK(c2b_b2e_proto(3u) == 3u, "b2e: proto=3 живой = 3");
+    CHECK(c2b_b2e_proto(2u) == 2u, "b2e: proto=2 живой = 2 (A/B честный)");
+    CHECK(c2b_b2e_proto(99u) == 3u, "b2e: proto=99 мусор = фолбэк 3");
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");
     memset(out_swr, 0xAA, sizeof out_swr);

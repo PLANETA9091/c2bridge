@@ -18825,6 +18825,7 @@ static u32 g97_slot = 13;   /* v6: СТАТИЧЕСКАЯ карта (run336-у�
 
 /* v27: A-driven 'k'-fire — объявление (тело = после c2b_k24_brlive) */
 static void c2b_k27_maybe_fire(void);
+static void c2b_k2v_maybe(void);       /* v98: вербатим-'k' in-channel (тело = в runtime-регионе) */
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
@@ -19028,6 +19029,7 @@ static void *c2b_g97_thread(void *arg)
          * + сохраненный движковый 'k' (g_kfull) => RAW=1 513B с chal из 'A'.
          * Тот же тред = проверенный контекст отправки. См. блок у brlive. */
         c2b_k27_maybe_fire();
+        c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
@@ -19815,6 +19817,41 @@ static u32 c2b_k27_ansolo_build(u32 form27, u32 val,
  * Определяем ЗДЕСЬ (все декларации видны: g_gns_conn_h/ver 8076-78,
  * g_g90_A_seq/chal 11838-40, g_kfull 11834). Зовётся из c2b_g130_log
  * после S1-кора; в selftest НЕ собирается (GNS-декларации garded). */
+/* ---------- v98: K2V — ВЕРБАТИМ-'k' IN-CHANNEL (чистые хелперы) ----------
+ * Полная теория = у c2b_k2v_maybe (runtime-регион ниже). Здесь только
+ * чистые формы/гейт — общий код боевого пути и selftest'а. */
+#define C2B_K2V_CAP 3
+#define C2B_K2V_GAP 60
+#define C2B_K2V_MAX 1200
+
+/* форма-валидатор вербатима: ff×4 + 'k' (всё остальное = скип) */
+static u32 c2b_k2v_form(const u8 *k, u32 len)
+{
+    if (!k || len < 17) return 0;
+    if (k[0] != 0xff || k[1] != 0xff || k[2] != 0xff || k[3] != 0xff)
+        return 0;
+    return k[4] == 'k' ? 1u : 0u;
+}
+
+/* chal из вербатим-'k' (LE32 @13; wire-форма: ff×4+'k'+"96\0"+00+proto) */
+static u32 c2b_k2v_chal(const u8 *k, u32 len)
+{
+    if (!k || len < 17) return 0;
+    return (u32)k[13] | ((u32)k[14] << 8) |
+           ((u32)k[15] << 16) | ((u32)k[16] << 24);
+}
+
+/* чистый гейт k2v (selftest-покрытие): 1 = стрелять, 0 = скип */
+static i32 c2b_k2v_gate(u32 on, u32 dead, u32 fires, u32 n_new, u32 n_seen,
+                        u32 len)
+{
+    if (!on || dead) return 0;
+    if (fires >= C2B_K2V_CAP) return 0;
+    if (!n_new || n_new == n_seen) return 0;
+    if (len < 17 || len > C2B_K2V_MAX) return 0;
+    return 1;
+}
+
 #ifndef C2B_SELFTEST
 /* v21: СКАН хэндлов на общем iface (чистые slot-13 чтения — тот же слот,
  * что у g97-полла; в run356 он же дал 'End-to-end connection: connected').
@@ -20054,6 +20091,92 @@ static i32 c2b_k27k_try(u32 chal, i32 *rc_out)
         return 0;
     }
     return 1;
+}
+
+/* ---------- v98: K2V — ВЕРБАТИМ-'k' IN-CHANNEL ----------
+ * run508-вердикт: k27k (noff4 509B, chal=val фейка 0x00ee0a07, UNRELIABLE)
+ * в 0x23-коннектед мост-сессию = ТИХОЕ ГЛОТАНИЕ (rc=1, ноль реакции,
+ * SW/ACK дальше; scp-цепочка = независимо, НЕ реакция). Две ошибки формы:
+ * (1) chal = val ФЕЙК-сервера — релей свой val не выдавал (его счётчик =
+ * 0x3d87055f-класс, движок сам принимает его в scp/'k'); (2) стрипнутый
+ * noff4-репак — wire-правда in-channel = ff×4-формы ('A' 42B с ff×4).
+ * V98: ОДИН рычаг — ВЕРБАТИМ g_kfull (движковый 513B ff×4+'k', chal =
+ * принятый релеем счётчик, тикет самосогласован) в МОСТ-сессию (известный
+ * iface, проверенный слот 11, run360/364-контекст), UNRELIABLE (fl=0,
+ * run366-урок). Триггер = НОВЫЙ эпок g_kfull (движок пересобирает 'k' со
+ * свежим chal на каждый ретрай — каждое значение счётчика релея = свой
+ * эпок, run508: 0x0550..0x0568). Кап 3/ран, мин-гэп 60 тиков (~30с),
+ * killswitch C2B_K2V=0. rc!=1 = ТОЛЬКО телеметрия (НЕ death-stop — health
+ * моста независим; krel/k27k-стопы = их собственные контракты).
+ * Реакции-маркеры: 'B'/signon/REL-frame (s2dn) = ПРОРЫВ; PARSE_ERROR-close
+ * (run460-класс) = форма-ответ; тишина = вопрос session-биндинга остаётся
+ * (след. шаг = layout-проба чужого iface движка). */
+static u32 g_k2v_init, g_k2v_on = 1, g_k2v_fires, g_k2v_epoch, g_k2v_gap,
+           g_k2v_skip;
+
+static void c2b_k2v_maybe(void)
+{
+    static u8 kv_buf[C2B_K2V_MAX];
+    u32 n_kv, len_kv, z_kv, live_kv, ch_kv;
+    const volatile u8 *fp_kv;
+    void **vt_kv;
+    i32 rc_kv = -998;
+    if (!g_k2v_init) {
+        const char *e2v = getenv("C2B_K2V");
+        if (e2v && e2v[0] == '0') g_k2v_on = 0;
+        g_k2v_init = 1;
+        if (!g_k2v_on) C2B_LOGS("[c2b] k2v: disabled (C2B_K2V=0)\n");
+    }
+    if (g_k2v_gap) { g_k2v_gap--; return; }
+    if (!g_gns_conn_iface || !g_gns_conn_h) return;
+    n_kv = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+    len_kv = g_kfull_len;
+    if (!c2b_k2v_gate(g_k2v_on, g_krel_dead, g_k2v_fires,
+                      n_kv, g_k2v_epoch, len_kv)) return;
+    fp_kv = g_kfull;
+    if (!c2b_k2v_form((const u8 *)fp_kv, len_kv)) {
+        if (g_k2v_skip < 3) {
+            g_k2v_skip++;
+            C2B_LOGS("[c2b] k2v: форма g_kfull не ff×4+'k' — скип\n");
+        }
+        g_k2v_epoch = n_kv;     /* эпок всё равно потреблён */
+        return;
+    }
+    for (z_kv = 0; z_kv < len_kv; z_kv++) kv_buf[z_kv] = fp_kv[z_kv];
+    if (__atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE) != n_kv)
+        return;                 /* гонка с капчером — скип, эпок не тратим */
+    g_k2v_epoch = n_kv;
+    ch_kv = c2b_k2v_chal(kv_buf, len_kv);
+    live_kv = c2b_k24_brlive();
+    vt_kv = *(void ***)g_gns_conn_iface;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc_kv = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                          i64 *))vt_kv[11])(
+            g_gns_conn_iface, g_gns_conn_h, kv_buf, len_kv,
+            0 /* UNRELIABLE = безопасный класс (run366) */, &g_k27k_out47);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] k2v: send SEGV\n");
+        return;
+    }
+    g_k2v_fires++;
+    g_k2v_gap = C2B_K2V_GAP;
+    C2B_LOGS("[c2b] k2v: verbatim-'k' in-channel #");
+    C2B_LOGN(g_k2v_fires);
+    C2B_LOGS(" len=");
+    C2B_LOGN(len_kv);
+    C2B_LOGS(" chal=");
+    C2B_LOGH(ch_kv);
+    C2B_LOGS(" live=");
+    C2B_LOGN(live_kv);
+    C2B_LOGS(" tgt=");
+    C2B_LOGN((u32)g_gns_conn_h);
+    C2B_LOGS(" slot=11 fl=0 rc=");
+    C2B_LOGN((u32)(i32)rc_kv);
+    C2B_LOGS("\n");
+    /* v98-контракт: rc!=1 = ТОЛЬКО телеметрия — НЕТ death-stop */
 }
 
 static void c2b_k27_maybe_fire(void)
@@ -31573,6 +31696,46 @@ static void test_k27k(void)
           "k27k: NULL-источник = 0");
 }
 
+/* v98: k2v — вербатим-'k' in-channel (форма/chal/гейт-матрица) */
+static void test_k2v(void)
+{
+    u8 kf[513];
+    u32 i;
+    for (i = 0; i < sizeof kf; i++) kf[i] = (u8)(i & 0xff);
+    kf[0] = kf[1] = kf[2] = kf[3] = 0xff;
+    kf[4] = 'k';
+    kf[5] = 0x39; kf[6] = 0x36; kf[7] = 0x00;      /* '96\0' */
+    kf[13] = 0x5f; kf[14] = 0x05; kf[15] = 0x87; kf[16] = 0x3d;
+    CHECK(c2b_k2v_form(kf, sizeof kf) == 1, "k2v: ff×4+'k' форма = 1");
+    CHECK(c2b_k2v_chal(kf, sizeof kf) == 0x3d87055fu,
+          "k2v: chal LE32 @13 (run508 scp-класс)");
+    kf[13] = 0x68; kf[14] = 0x05; kf[15] = 0xf0; kf[16] = 0xff;
+    CHECK(c2b_k2v_chal(kf, sizeof kf) == 0xfff00568u,
+          "k2v: tail-chal run508 = 0xfff00568 (счётчик релея)");
+    /* негативы формы */
+    kf[4] = 'x';
+    CHECK(c2b_k2v_form(kf, sizeof kf) == 0, "k2v: не-'k' = 0");
+    kf[4] = 'k'; kf[0] = 0xfe;
+    CHECK(c2b_k2v_form(kf, sizeof kf) == 0, "k2v: без ff×4 = 0");
+    CHECK(c2b_k2v_form(kf, 16) == 0, "k2v: короткий = 0");
+    CHECK(c2b_k2v_form(0, 100) == 0, "k2v: NULL = 0");
+    /* гейт-матрица (чистый c2b_k2v_gate) */
+    CHECK(c2b_k2v_gate(1, 0, 0, 5, 4, 513) == 1,
+          "k2v: новый эпок = стрелять");
+    CHECK(c2b_k2v_gate(1, 0, 0, 5, 5, 513) == 0,
+          "k2v: тот же эпок = скип (без ре-огня)");
+    CHECK(c2b_k2v_gate(1, 0, 0, 0, 4, 513) == 0, "k2v: n=0 = скип");
+    CHECK(c2b_k2v_gate(0, 0, 0, 5, 4, 513) == 0,
+          "k2v: killswitch C2B_K2V=0 = скип");
+    CHECK(c2b_k2v_gate(1, 1, 0, 5, 4, 513) == 0,
+          "k2v: krel-dead = скип");
+    CHECK(c2b_k2v_gate(1, 0, C2B_K2V_CAP, 5, 4, 513) == 0,
+          "k2v: кап 3/ран = скип");
+    CHECK(c2b_k2v_gate(1, 0, 0, 5, 4, 16) == 0, "k2v: короткий len = скип");
+    CHECK(c2b_k2v_gate(1, 0, 0, 5, 4, C2B_K2V_MAX + 1) == 0,
+          "k2v: длинный len = скип");
+}
+
 /* v50: crt-fix — 0x22 движка -> релей-принятая форма (c2b_crt.h).
  * Фикстуры = РЕАЛЬНЫЕ байты run391-pcap (v50_fixture_extract.py):
  * v50f_eng = сломанный 0x22 движка (79B: 0x22 + 4c00 + 76B proto),
@@ -33934,6 +34097,7 @@ int main(void)
     test_s2dn();        /* v94: SNP-фрейм-ходок + даунлинк-ring (STEP-3a) */
     test_rel();         /* v95: REL-пересборка + живой фид (STEP-3b) */
     test_k27k();        /* v47: 'k'-без-ff×4 сборщик */
+    test_k2v();         /* v98: вербатим-'k' in-channel (форма/chal/гейт) */
     test_crt();         /* v50: crt-fix (0x22 движка -> принятая форма) */
     test_gp();          /* v51: GOT-патч (хелперы + синт-ELF end-to-end) */
     test_lddet();       /* v52: libc-prologue detour (формы+синт-e2e) */

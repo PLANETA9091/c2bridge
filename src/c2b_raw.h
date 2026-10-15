@@ -342,18 +342,21 @@ static u32 c2b_raw_thunk(u8 *t, u32 cap, unsigned long long helper, u32 nr,
  *   cmp byte [rsi], 0x22      ; 80 3e 22 — только connreq-класс (движковые
  *                             ; 0x22 + мостовые 0x22 = GNS/netcode-треды =
  *                             ; pthreads = fs-валидные) входит в C-слой
- *   jne .skip                 ; 75 28 — весь остальной трафик = ЧИСТЫЙ
- *                             ; passthrough (ноль C-касаний = ноль краша)
+ *   v84: test rsi,rsi; je .skip; cmp rdx,40; jb .skip (БУФ = МОЖЕТ БЫТЬ
+ *   NULL: run490 = sendto(fd18, NULL, 2) = реальный коллер; len<40 = вне
+ *   класса) + cmp [rsi],0x22; jne .skip — весь не-connreq трафик = ЧИСТЫЙ
+ *   passthrough (ноль C-касаний = ноль краша)
  * Контракт хелпера/санки = ИДЕНТИЧЕН 112B-версии (rax:rdx = (buf,len)),
  * skip-путь = ВСЕ регистры оригинальные (гвард стоит ДО перезагрузок —
  * rdi/rsi/rdx/r10/r8/r9 не тронуты, reload = те же значения).
- * Лэйаут (0x75 = 117B):
+ * Лэйаут (0x80 = 128B, v84):
  *  00 sub rsp,0x40 | 04..1c сэйвы rdi/rsi/rdx/r10/r8/r9 (disp8!)
- *  21 80 3e 22 (cmp) | 24 75 27 (jne -> 4d)
- *  26..3d перезагрузки rdi/rsi/rdx/rcx/r8 | 3e movabs rax,helper
- *  48 call rax | 4a mov rsi,rax
- *  4d..5f reload rdi/r10/r8/r9 | 60 mov eax,44 | 65 syscall
- *  67 restore r8 | 6c add rsp,0x40 | 70 e9 rel32 (next = pg+0x75)
+ *  21 test rsi,rsi | 24 je ->58 | 26 cmp rdx,40 | 2a jb ->58
+ *  2c cmp [rsi],0x22 | 2f jne ->58
+ *  31..48 перезагрузки rdi/rsi/rdx/rcx/r8 | 49 movabs rax,helper
+ *  53 call rax | 55 mov rsi,rax
+ *  58..6f reload rdi/r10/r8/r9 | 6b mov eax,44 | 70 syscall
+ *  72 restore r8 | 77 add rsp,0x40 | 7b e9 rel32 (next = pg+0x80)
  * nr46 = ЗАПРЕЩЁН (rsi = msghdr*, первый байт = не пейлоад — гвард неве-
  * рен): старая 112B-санка. back = site + ПОЛНАЯ длина окна (как v82c). */
 static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
@@ -361,9 +364,9 @@ static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
 {
     u32 i = 0, q;
     i32 rel;
-    if (!t || cap < 117u) return 0u;
+    if (!t || cap < 128u) return 0u;
     {
-        long long d = (long long)(back - (pg + 0x75ull));
+        long long d = (long long)(back - (pg + 0x80ull));
         if (d > 2147483647ll || d < -2147483648ll) return 0u;
         rel = (i32)d;
     }
@@ -379,8 +382,17 @@ static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
     t[i++] = 0x20u;
     t[i++] = 0x4cu; t[i++] = 0x89u; t[i++] = 0x4cu; t[i++] = 0x24u;
     t[i++] = 0x28u;
+    /* v84: ПОЛНЫЙ гвард — run490-урок: БУФ МОЖЕТ БЫТЬ NULL (sendto(fd18,
+     * NULL, 2) = реальный коллер: rsi=0 => cmp [rsi] = SEGV addr=0) и
+     * len < 40 = вне crt-класса. test rsi/je + cmp rdx,40/jb + cmp [rsi]/jne
+     * = 16B гварда, .skip = перезагрузка rdi @0x58. */
+    t[i++] = 0x48u; t[i++] = 0x85u; t[i++] = 0xf6u;    /* test rsi,rsi */
+    t[i++] = 0x74u; t[i++] = 0x32u;                    /* je  -> +0x32 (0x58) */
+    t[i++] = 0x48u; t[i++] = 0x83u; t[i++] = 0xfau; t[i++] = 0x28u;
+                                                        /* cmp rdx,40 */
+    t[i++] = 0x72u; t[i++] = 0x2cu;                    /* jb  -> +0x2c (0x58) */
     t[i++] = 0x80u; t[i++] = 0x3eu; t[i++] = 0x22u;    /* cmp [rsi],0x22 */
-    t[i++] = 0x75u; t[i++] = 0x27u;                    /* jne -> +0x27 */
+    t[i++] = 0x75u; t[i++] = 0x27u;                    /* jne -> +0x27 (0x58) */
     t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x3cu; t[i++] = 0x24u;
     t[i++] = 0x48u; t[i++] = 0x8bu; t[i++] = 0x74u; t[i++] = 0x24u;
     t[i++] = 0x08u;
@@ -412,7 +424,7 @@ static u32 c2b_raw_thunk_gate(u8 *t, u32 cap, unsigned long long helper,
     t[i++] = (u8)(((u32)rel >> 8) & 0xffu);
     t[i++] = (u8)(((u32)rel >> 16) & 0xffu);
     t[i++] = (u8)(((u32)rel >> 24) & 0xffu);
-    if (i != 117u) return 0u;
+    if (i != 128u) return 0u;
     return i;
 }
 

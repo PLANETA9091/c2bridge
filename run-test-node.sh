@@ -723,6 +723,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     1) MODES="$MODES C2B_CRTFIX=1" ;;
     *) : ;;
   esac
+  # v82c-d: gap (workflow input gap -> C2B_GAP_V). '1' = патч НЕ-смежных
+  # (gap) sys-окон libc (b8 nr; перезагрузки; syscall; errno-якорь) — ГОРЯЧИЙ
+  # sendto-стаб multi-threaded libc. run488: ДЕФОЛТНЫЙ gap-патч = крах старта
+  # (SEGV foreign в anon-GOT-стабе, rax=1 = dlsym-fail-сентинел) => дефолт '0'
+  # = поведение run487 (только смежные окна). Расконсервация = после разбора
+  # г90a-дампа (worklog cron-30min-202610150739).
+  case "${C2B_GAP_V-0}" in
+    1) MODES="$MODES C2B_GAP=1" ;;
+    *) : ;;
+  esac
   # v75: raw-syscall стаб-патчер (workflow input gpr -> C2B_GPR_V).
   # Дефолт '1' = ARMED (раунд-эксперимент: сырые GNS-стабы движка
   # редиректятся в хуки = crt-класс получает нативные 0x22). Откат =

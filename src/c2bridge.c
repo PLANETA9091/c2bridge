@@ -17196,6 +17196,14 @@ extern i32 munmap(void *, u32);   /* g24-паттерн: блочная extern (
 static u32 g_raw_init, g_raw_scans, g_raw_busy, g_raw_last;
 static u32 g_raw_sites, g_raw_patched, g_raw_bytes_hi, g_raw_regs;
 static u32 g_raw_patched_sys;   /* v77: патчи mod=sys стабов */
+static u32 g_raw_gap_on;        /* v82c-д: рычаг C2B_GAP=1 — НЕ-смежные
+ * (gap) sys-окна. run488-урок: gap-патч ГОРЯЧЕГО sendto-стаба (0x12c375)
+ = ДЕТСКИЙ СМЕРТЬ клиента на старте (SEGV foreign rip=в anon-GOT-стабе,
+ rax=1 = dlsym-fail-сентинел, write-форма rdi=1/rdx=0xbf, [rsp]=sendto+0
+ — г90a-дамп в worklog): early-sendto коллеры бьют в недоинициализирован-
+ ный gp/хук-слой. Дефолт ВЫКЛ = поведение run487. Расконсервация = ТОЛЬКО
+ с рычагом + отдельным разбором дампа. */
+static u32 g_raw_gap_init;
 static u32 g_raw_logn, g_raw_done, g_raw_anon;
 static u64 g_raw_seen[64];
 static u32 g_raw_seen_n;
@@ -17659,10 +17667,20 @@ static void c2b_raw_scan(void)
                  * multi-threaded libc = форма b8 2c.. 48 8b 55 d8 48 8b
                  * 75 e0 0f 05 48 3d.. = v77c-смежный скан ПРОПУСТИЛ =
                  * движковые 0x22 мимо всех хуков. Класс = ВСЕГДА сере-
-                 * дина (кадр активен: leave;ret-эпилог) => санка. */
+                 * дина (кадр активен: leave;ret-эпилог) => санка.
+                 * v82c-д (run488-урок): ТОЛЬКО по рычагу C2B_GAP=1 —
+                 * дефолтный gap-патч = крах старта (SEGV foreign, rax=1
+                 * = dlsym-fail-сентинел в anon-GOT-стабе). */
                 if (!pl && regs[ri].sys) {
-                    pl = c2b_raw_pat_gap(chunk + i, got - i, &nr);
-                    if (pl) isgap = 1u;
+                    if (!g_raw_gap_init) {
+                        const char *eg = getenv("C2B_GAP");
+                        if (eg && eg[0] == '1') g_raw_gap_on = 1u;
+                        g_raw_gap_init = 1u;
+                    }
+                    if (g_raw_gap_on) {
+                        pl = c2b_raw_pat_gap(chunk + i, got - i, &nr);
+                        if (pl) isgap = 1u;
+                    }
                 }
                 if (!pl) continue;
                 site = (unsigned long long)lo + off + i;

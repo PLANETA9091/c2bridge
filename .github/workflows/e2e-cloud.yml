@@ -99,6 +99,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      gap:
+        description: "v82c-d: the NON-ADJACENT (gap) sys-stub patcher arm (C2B_GAP=1): libc's HOT sendto stub in a multithreaded process = the non-adjacent window (mov eax,44; mov rdx/[rbp]; mov rsi/[rbp]; syscall; errno-check) that the v77c adjacent-only scan MISSED (run487 proof: the engine's raw sends bypassed every hook). run488 = the default-on attempt: INSTANT startup death (SEGV foreign in an anon GOT-stub, rax=1 = the dlsym-fail sentinel) => default '0' = the run487 behavior (adjacent windows only). Re-arm ONLY after the g90a dump analysis (worklog cron-30min-202610150739)."
+        default: "0"
+        required: false
+        type: choice
+        options: ["0", "1"]
       crtfix:
         description: "v82: the crt-rewrite ARM (C2B_CRTFIX=1): the engine's BROKEN 0x22 connreq is rewritten IN-FLIGHT into the accepted modern form. run485 pcap field-walk: the engine's form is now [22][fb 00] 254B WITH the native cert INSIDE (f4=174B = the cert-inject works) but (1) the legacy u16-LE prefix = invalid protobuf under the modern parser (f31/wt3), (2) f2 = wt2 without LEN (the v50 bug lives), (3) f7 unsigned 38B => the server silently re-challenges forever. Rewrite = [22][0d cid][11 chal][19 sid][22 cert][29 ts][30 ping][3a f7-engine] = the exact form the server already 0x23-ConnectOK'd (run485 session ports). '0' (default) = the run479-485 behavior (passive cert capture only)."
         default: "0"
@@ -184,6 +190,9 @@ jobs:
       # in-flight into the accepted modern form. Default '0' = the
       # run479-485 behavior (the rewrite OFF, the passive capture only).
       C2B_CRTFIX_V: ${{ inputs.crtfix || '0' }}
+      # v82c-d: the gap-stub patcher arm (default OFF = the run487 behavior;
+      # the run488 default-on attempt = the startup death, see the input note).
+      C2B_GAP_V: ${{ inputs.gap || '0' }}
       # v63: the g94 post-marker dwell knob. NOTE the sentinel discipline:
       # inputs.x || default eats the EMPTY string ('' -> 90), but '0' (the
       # legacy no-dwell) arrives as the STRING "0" = truthy in the GH

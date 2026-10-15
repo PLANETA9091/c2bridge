@@ -10398,6 +10398,12 @@ void c2b_g16a_log(uptr ret0, uptr dataptr, u32 len)
     g_probe_active = 0;
 }
 
+/* v106.7: deep-dump — определение в always-острове (рядом с kdr-build);
+ * здесь прототип (region 7804+ = runtime-only). run526-ценз: грант 'B.' =
+ * 59Б (первый 40Б), 'I'-beacon = 82Б, 'A' = 59Б — дамп 12Б срезал 19-70Б
+ * хвоста = ground-truth следующего фикса (expire/версия/pw-зоны). */
+static u32 c2b_g16_dumplen(i32 rlen);
+
 void c2b_g16b_log(uptr rlen, uptr frame)
 {
     static volatile u32 n;
@@ -10459,8 +10465,9 @@ void c2b_g16b_log(uptr rlen, uptr frame)
     sp = *(volatile uptr *)(frame - 0x140);  /* sockobj */
     data = sp ? (const u8 *)(sp + 4) : (const u8 *)0;
     if (data && (i32)rlen > 0) {
+        u32 dl = c2b_g16_dumplen((i32)rlen);   /* v106.7: 12 -> 72Б */
         C2B_LOGS("d=");
-        for (i = 0; i < 12 && (u32)i < (u32)rlen; i++)
+        for (i = 0; i < dl; i++)
             C2B_LOGH(data[i]);
     }
     C2B_LOGS("\n");
@@ -20452,6 +20459,16 @@ static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
     out[15] = (u8)(chal >> 16); out[16] = (u8)(chal >> 24);
     *outlen = klen;
     return 1;
+}
+
+/* v106.7: g16-deep-dump длина = clamp(rlen, 0, 72). Чистая функция
+ * (always-остров: selftest-видимость). 72 = полные 59Б-гранты 'B.'/'A'
+ * с запасом + 72% тела 82Б 'I'-beacon; rate-limit g16 не тронут. */
+static u32 c2b_g16_dumplen(i32 rlen)
+{
+    if (rlen <= 0) return 0;
+    if (rlen > 72) return 72u;
+    return (u32)rlen;
 }
 
 #ifndef C2B_SELFTEST
@@ -33365,6 +33382,17 @@ static void test_swr(void)
         CHECK(c2b_kdr_build(kf6, 64, 1u, ko6, sizeof ko6, &kn6) == 0,
               "kdr: не 'k' = 0");
     }
+    /* --- v106.7: g16-deep-dump длина (clamp 0..72) --- */
+    printf("[t] g16-dumplen\n");
+    CHECK(c2b_g16_dumplen(0) == 0, "dumplen: 0 = 0");
+    CHECK(c2b_g16_dumplen(-1) == 0, "dumplen: -1 = 0");
+    CHECK(c2b_g16_dumplen(-2147483647) == 0, "dumplen: INT_MIN+1 = 0");
+    CHECK(c2b_g16_dumplen(5) == 5, "dumplen: 5 = 5");
+    CHECK(c2b_g16_dumplen(59) == 59, "dumplen: 59B-грант = весь");
+    CHECK(c2b_g16_dumplen(82) == 72, "dumplen: 82B-beacon = 72");
+    CHECK(c2b_g16_dumplen(100) == 72, "dumplen: 100 = кап 72");
+    CHECK(c2b_g16_dumplen(2147483647) == 72, "dumplen: max-int = кап 72");
+
     /* --- v106.1: s2o-билдер (компакт-S2 out) --- */
     printf("[t] s2o\n");
     memset(out_swr, 0xAA, sizeof out_swr);

@@ -5885,6 +5885,35 @@ u64 c2b_up_dispatch(const void *blk)
     return (u64)(u32)rv;
 }
 
+/* ---------- v92: S2S1 STEP-2 — одноразовый дамп голов PM (спека даунлинка) ----------
+ * PM (CNetChan::ProcessMessages) = точка, где движок ПОТРЕБЛЯЕТ серверный
+ * даунлинк-поток. Прогон 496: ARMED напечатан, но НОЛЬ "[c2b] PM" линий за
+ * весь лог — движок на этапе коннекта легаси-фреймы не ест (стена). Первый
+ * живой вызов PM = эпоха начала потребления (свой трек или S2S1-подкормка)
+ * — головы этих вызовов = формат даунлинка, который движок ОЖИДАЕТ = спека
+ * транслятора. Дамп первых N вызовов БЕЗУСЛОВНЫЙ (не гейт vlevel): спека
+ * должна быть поймана даже при C2B_VERBOSE=0. Счётчик = атомарный инкремент
+ * на каждый вызов (дёшево), дамп капится C2B_PM92_CAP (один-шот). */
+#define C2B_PM92_CAP 6u
+static volatile u32 g_pm92_obs;   /* x86_64 боевой тап (c2b_obs64) */
+static volatile u32 g_pm92_dn;    /* C-хук/селфтест (c2b_hook_process_messages) */
+static void c2b_pm92_head(const char *tag, const bf_read_t *br, u32 shot)
+{
+    C2B_LOGS("[c2b] PM92 "); C2B_LOGS(tag);
+    C2B_LOGS("#");   C2B_LOGN(shot);
+    C2B_LOGS("bytes="); C2B_LOGN(br ? (u32)br->m_nDataBytes : 0);
+    C2B_LOGS("bits=");  C2B_LOGN(br ? (u32)br->m_nDataBits : 0);
+    C2B_LOGS("cur=");   C2B_LOGN(br ? br->m_iCurBit : 0);
+    C2B_LOGS("ovf=");   C2B_LOGN((br && br->m_bOverflow) ? 1u : 0u);
+    if (br && br->m_pBuffer && br->m_nDataBytes) {
+        const u8 *d = (const u8 *)br->m_pBuffer;
+        u32 n = br->m_nDataBytes < 48u ? br->m_nDataBytes : 48u;
+        C2B_LOGS("head:");
+        for (u32 i = 0; i < n; i++) C2B_LOGH(d[i]);
+    }
+    C2B_LOGS("\n");
+}
+
 /* ---------- hook: v0 OBSERVER ---------- */
 #if defined(__x86_64__) && !defined(C2B_SELFTEST)
 /* Боевой x86_64 (SysV): this=rdi, bf_read=rsi, flag=dl. Stolen-байты (16) включают
@@ -5900,6 +5929,10 @@ void c2b_obs64(const void *blk)
     u32         flag = (u32)b[2];            /* [blk+0x10] = rdx */
     (void)self; (void)flag;
     g_st.calls++;
+    {   /* v92: безусловный один-шот дамп голов (S2S1 STEP-2, спека даунлинка) */
+        u32 sh = __atomic_fetch_add(&g_pm92_obs, 1u, __ATOMIC_RELAXED);
+        if (sh < C2B_PM92_CAP) c2b_pm92_head("obs", br, sh + 1u);
+    }
     /* R30: дамп первых 8 вызовов + каждый 1024-й; head-hex только первые 4
      * (level 2 = как раньше, на каждый вызов). */
     if (c2b_vlog_hit(g_vlevel, g_st.calls, 8, 1024)) {
@@ -6029,6 +6062,10 @@ i32 c2b_hook_process_messages(uptr chan, uptr brd_i, u32 flag)
 
     g_st.calls++;
     g_dn_stats.calls++;
+    {   /* v92: безусловный один-шот дамп голов (S2S1 STEP-2, спека даунлинка) */
+        u32 sh = __atomic_fetch_add(&g_pm92_dn, 1u, __ATOMIC_RELAXED);
+        if (sh < C2B_PM92_CAP) c2b_pm92_head("dn", br, sh + 1u);
+    }
     {   /* R29: tid первого входа (гонка на флаге безвредна — двойной лог) */
         static u32 s_tid_seen = 0;
         if (!s_tid_seen) {
@@ -29202,6 +29239,20 @@ static void test_downlink(void)
     CHECK(st_dn_last_brd == (uptr)&br, "dn: observe — passthrough исходного br");
     CHECK(st_dn_cap_len == ip && memcmp(st_dn_cap, in, ip) == 0,
           "dn: observe — CS2-поток не тронут");
+
+    /* v92: одноразовый дамп голов PM (S2S1 STEP-2). Счётчик g_pm92_dn к этому
+     * месту уже накручен ранними dn-вызовами (>=1). Проверки: (1) счётчик
+     * инкрементируется каждым вызовом; (2) дамп капится (хелпер можно звать
+     * напрямую на любом shot — без краша); (3) obs-счётчик в селфтесте не
+     * трогается (c2b_obs64 не компилируется под C2B_SELFTEST). */
+    {   u32 dn0 = g_pm92_dn;
+        rv = c2b_hook_process_messages(0x11, (uptr)&br, 7);
+        CHECK(rv == 42 && g_pm92_dn == dn0 + 1, "v92: счётчик dn инкремент на вызов");
+        c2b_pm92_head("st", &br, 1u);   /* смоук: прямой вызов хелпера безопасен */
+        c2b_pm92_head("st", NULL, 2u);  /* смоук: br=NULL — нулевые поля, без краша */
+        CHECK(g_pm92_obs == 0, "v92: obs-счётчик в селфтесте не тронут");
+        CHECK(C2B_PM92_CAP == 6u, "v92: кап = 6 вызовов");
+    }
 
     /* trunc: len за границей буфера -> passthrough исходного потока */
     g_dn_mode = 1;

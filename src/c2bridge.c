@@ -5499,6 +5499,119 @@ static u32 g_g99_len[C2B_G99_RCAP];
 static u8  g_g99_body[C2B_G99_RCAP][1024];
 static u32 g_g99_last_t, g_g99_last_len;   /* дедуп лога тапа */
 
+/* ---------- v90: мини-protobuf-парсер тел g99-тапа (S2S1 STEP-1) ----------
+ * ЗЕМЛЯ ТРАНСЛЯТОРА: движковые сигнон-сообщения (t=6 SetConVar / t=7
+ * SignonState / t=15 LoadingProgress) в S1-protobuf-форме как есть из
+ * ser() (g_up_sbuf). Парсер = БЕЗ классовых допущений: поля (fn, wt, v,
+ * off) до C2B_G99_PFMAX; consumed = сколько байт разобрано чисто; не-
+ * гнатные хвосты/транкции = потреблённое-столько-то (best-effort). WT:
+ * 0=varint, 1=fixed64, 2=LEN (v=длина, off=смещение тела), 5=fixed32;
+ * 3/4/6/7 и fn=0 = ОТКАЗ (не в наших классах). varint-переполнение
+ * (>10Б) и LEN за телом = стоп. Самопроверка v90: S2-SignonState-форма,
+ * РЕАЛЬНОЕ тело t=6 run496, транкции, wt-отказы, PFMAX-кэп. */
+#define C2B_G99_PFMAX 10u
+struct c2b_g99_f { u32 fn; u8 wt; u64 v; u32 off; };
+
+static u32 c2b_g99_pbparse(const u8 *p, u32 n, struct c2b_g99_f *out,
+                           u32 max, u32 *consumed)
+{
+    u32 off = 0, fc = 0;
+    while (off < n) {
+        u32 tag, fn, wt, sh;
+        u64 v;
+        if (fc >= max) break;                       /* кэп: остальное = хвост */
+        tag = p[off++];
+        fn = tag >> 3;
+        wt = tag & 7u;
+        if (fn == 0u) break;                        /* invalid field 0 */
+        if (wt == 0u) {                             /* varint */
+            v = 0;
+            sh = 0;
+            for (;;) {
+                if (off >= n || sh > 63u) goto trunc;
+                v |= (u64)(p[off] & 0x7Fu) << sh;
+                sh += 7;
+                if (!(p[off++] & 0x80u)) break;
+            }
+        } else if (wt == 1u) {                      /* fixed64 LE */
+            u32 q;
+            if (off + 8u > n) goto trunc;
+            v = 0;
+            for (q = 0; q < 8u; q++) v |= (u64)p[off + q] << (8u * q);
+            off += 8u;
+        } else if (wt == 2u) {                      /* LEN */
+            u32 l;
+            l = 0;
+            sh = 0;
+            for (;;) {
+                if (off >= n || sh > 28u) goto trunc;
+                l |= (u32)(p[off] & 0x7Fu) << sh;
+                sh += 7;
+                if (!(p[off++] & 0x80u)) break;
+            }
+            if (off + l > n) goto trunc;
+            if (fc < max) {                         /* тело-смещение для wt=2 */
+                out[fc].off = off;
+            }
+            off += l;
+            v = l;
+        } else if (wt == 5u) {                      /* fixed32 LE */
+            u32 q;
+            if (off + 4u > n) goto trunc;
+            v = 0;
+            for (q = 0; q < 4u; q++) v |= (u64)p[off + q] << (8u * q);
+            off += 4u;
+        } else break;                               /* wt 3/4/6/7 = отказ */
+        if (fc < max) {
+            out[fc].fn = fn;
+            out[fc].wt = (u8)wt;
+            out[fc].v = v;
+        }
+        fc++;
+    }
+    *consumed = off;
+    return fc;
+trunc:
+    *consumed = off;
+    return fc;
+}
+
+/* v90: однострочный dec-лог тапа (рядом с head-строкой, тот же дедуп
+ * (t,len)): "[c2b] g99: dec t=T f1=.. f2=.. fN:len=hex..". LEN-тела =
+ * до 16Б hex (формат лога = установившийся LOGH). */
+static void c2b_g99_pbdec(u32 t, const u8 *p, u32 n)
+{
+    struct c2b_g99_f pf[C2B_G99_PFMAX];
+    u32 consumed = 0, fc, i;
+    fc = c2b_g99_pbparse(p, n, pf, C2B_G99_PFMAX, &consumed);
+    C2B_LOGS("[c2b] g99: dec t=");
+    C2B_LOGN(t);
+    for (i = 0; i < fc && i < C2B_G99_PFMAX; i++) {
+        if (pf[i].wt == 2u) {
+            u32 q, l = (u32)pf[i].v;
+            C2B_LOGS(" f");
+            C2B_LOGN(pf[i].fn);
+            C2B_LOGS(":");
+            C2B_LOGN(l);
+            C2B_LOGS("=");
+            for (q = 0; q < l && q < 16u; q++) C2B_LOGH(p[pf[i].off + q]);
+            if (l > 16u) C2B_LOGS("...");
+        } else {
+            C2B_LOGS(" f");
+            C2B_LOGN(pf[i].fn);
+            C2B_LOGS("=0x");
+            C2B_LOGH((u32)pf[i].v);
+            if (pf[i].v > 0xFFFFFFFFull) C2B_LOGH((u32)(pf[i].v >> 32));
+        }
+    }
+    if (consumed < n) {
+        C2B_LOGS(" +");
+        C2B_LOGN(n - consumed);
+        C2B_LOGS("B");
+    }
+    C2B_LOGS("\n");
+}
+
 struct c2b_forge_t { uptr vt; i32 t; u32 rel; u32 len; const u8 *data; };
 
 static void c2b_fg_dtor(uptr a, u32 b) { (void)a; (void)b; }
@@ -5728,6 +5841,10 @@ u64 c2b_up_dispatch(const void *blk)
                                 C2B_LOGH(g_up_sbuf[q99]);
                         }
                         C2B_LOGS("\n");
+                        /* v90: расшифровка полей тела (SignonState state/
+                         * spawn, SetConVar cvars, LoadingProgress) =
+                         * ЗЕМЛЯ S2S1-транслятора в живом логе */
+                        c2b_g99_pbdec((u32)t, g_up_sbuf, n);
                     }
                 }
             }
@@ -32352,6 +32469,104 @@ static void test_raw(void)
         CHECK(c2b_raw_thunk_gap(th, sizeof th, 1ull, win + 5u, 7u,
                                 0x90000000ull, 0x1000ull) == 0u,
               "v89: back вне rel32 = отказ");
+    }
+
+    /* ---- v90: g99 мини-protobuf-парсер (S2S1 STEP-1 = земля транслятора) ---- */
+    {
+        struct c2b_g99_f pf[C2B_G99_PFMAX];
+        u32 consumed = 0, fc;
+        /* S2-форма CNETMsg_SignonState: {1: state=3, 2: spawn=1,
+         * 3: fixed32 0x12345678, 5: LEN4 deadbeef} = 15Б, чисто */
+        {
+            static const u8 s7[] = {
+                0x08u, 0x03u,             /* f1 varint 3 */
+                0x10u, 0x01u,             /* f2 varint 1 */
+                0x1du, 0x78u, 0x56u, 0x34u, 0x12u,   /* f5? нет: tag 0x1d
+                                       = f3 wt5 fixed32 0x12345678 */
+                0x2au, 0x04u, 0xdeu, 0xadu, 0xbeu, 0xefu }; /* f5 LEN4 */
+            fc = c2b_g99_pbparse(s7, (u32)sizeof s7, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 4u && consumed == (u32)sizeof s7,
+                  "v90: S2-SignonState = 4 поля, потреблено 15Б");
+            CHECK(pf[0].fn == 1u && pf[0].wt == 0u && pf[0].v == 3u,
+                  "v90: s7 f1 varint = 3 (state)");
+            CHECK(pf[1].fn == 2u && pf[1].wt == 0u && pf[1].v == 1u,
+                  "v90: s7 f2 varint = 1 (spawn_count)");
+            CHECK(pf[2].fn == 3u && pf[2].wt == 5u && pf[2].v == 0x12345678ull,
+                  "v90: s7 f3 fixed32 = 0x12345678 (server_count)");
+            CHECK(pf[3].fn == 5u && pf[3].wt == 2u && pf[3].v == 4u &&
+                  pf[3].off == 11u,
+                  "v90: s7 f5 LEN=4 @off=11 (replay/тело)");
+        }
+        /* РЕАЛЬНОЕ тело t=6 run496 (S1-форма): 08 d0 8f 9c e8 0c 10 00
+         * = f1 varint (cvar-hash 5Б) + f2 varint 0 */
+        {
+            static const u8 s6[] = {
+                0x08u, 0xd0u, 0x8fu, 0x9cu, 0xe8u, 0x0cu, 0x10u, 0x00u };
+            fc = c2b_g99_pbparse(s6, (u32)sizeof s6, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 2u && consumed == 8u,
+                  "v90: run496 t=6 S1-тело = 2 поля, потреблено 8Б");
+            CHECK(pf[0].fn == 1u && pf[0].wt == 0u &&
+                  pf[0].v == 0xCD0707D0ull,
+                  "v90: t=6 f1 = 5Б varint = 0xCD0707D0 (cvar-hash)");
+            CHECK(pf[1].fn == 2u && pf[1].wt == 0u && pf[1].v == 0u,
+                  "v90: t=6 f2 varint = 0");
+        }
+        /* Транкции: обрыв varint / обрыв varint-LEN / LEN за телом */
+        {
+            static const u8 t1[] = { 0x08u, 0x80u };
+            fc = c2b_g99_pbparse(t1, (u32)sizeof t1, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 0u && consumed == 2u,
+                  "v90: обрыв varint = 0 полей, consumed=2 (tag+1Б скан)");
+            static const u8 t2[] = { 0x0au, 0x05u, 0x01u, 0x02u, 0x03u };
+            fc = c2b_g99_pbparse(t2, (u32)sizeof t2, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 0u && consumed == 2u,
+                  "v90: LEN 5 > остаток 3 = отказ, consumed=2");
+        }
+        /* wt 3/4/6/7 и fn=0 = отказ */
+        {
+            static const u8 w3[] = { 0x03u, 0x01u, 0x02u };
+            fc = c2b_g99_pbparse(w3, (u32)sizeof w3, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 0u && consumed == 1u,
+                  "v90: wt=3 = отказ (tag=fn0wt3, consumed=1 скан)");
+            static const u8 f0[] = { 0x00u };
+            fc = c2b_g99_pbparse(f0, (u32)sizeof f0, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 0u && consumed == 1u,
+                  "v90: fn=0 = отказ (consumed=1 скан)");
+        }
+        /* fixed64 wt=1 + кэп PFMAX=10 на потоке varint-f1 */
+        {
+            static const u8 f64[] = {
+                0x09u, 0xefu, 0xbeu, 0xadu, 0xdeu, 0x01u, 0x00u, 0x00u, 0x00u };
+            fc = c2b_g99_pbparse(f64, (u32)sizeof f64, pf, C2B_G99_PFMAX,
+                                 &consumed);
+            CHECK(fc == 1u && consumed == 9u &&
+                  pf[0].wt == 1u && pf[0].v == 0x00000001deadbeefull,
+                  "v90: wt=1 fixed64 LE = 0x1deadbeef");
+            {
+                u8 many[32];
+                u32 i;
+                for (i = 0; i < 22u; i += 2u) {   /* 11 varint-полей f1 */
+                    many[i] = 0x08u;
+                    many[i + 1u] = (u8)(i / 2u + 1u);
+                }
+                fc = c2b_g99_pbparse(many, 22u, pf, C2B_G99_PFMAX, &consumed);
+                CHECK(fc == C2B_G99_PFMAX && consumed == 20u,
+                      "v90: 11 полей > PFMAX=10 = кэп, consumed=20");
+            }
+        }
+        /* dec-лог = смоук (не падает на S2-форме) */
+        {
+            static const u8 s7[] = {
+                0x08u, 0x03u, 0x10u, 0x01u, 0x1du, 0x78u, 0x56u, 0x34u,
+                0x12u, 0x2au, 0x04u, 0xdeu, 0xadu, 0xbeu, 0xefu };
+            c2b_g99_pbdec(7u, s7, (u32)sizeof s7);
+        }
     }
 }
 

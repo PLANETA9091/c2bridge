@@ -6751,6 +6751,17 @@ static i32 c2b_ver_pfx(const char *ver, const char *pfx)
  * (харнесс декодирует точный слот из wrapper'а SteamAPI_ISteamUser_*
  * libsteam_api.so, если найдёт её на раннере; дефолт 11).
  * В selftest-сборке (настоящие libc-хедеры) блок стабится. */
+/* v91: байт-сигнатур death-3 для селфтеста (cmp byte [rdx],0x22 = 80 3a 22
+ * — ВНЕ selftest-гарда = компилируется в обеих сборках, юзается хэндлером
+ * и v91-чеками) */
+static inline u32 c2b_g94_match(const volatile u8 *ip)
+{
+    return (u32)(ip[0] == 0x80u && ip[1] == 0x3au && ip[2] == 0x22u);
+}
+static const volatile u8 g94_b22 = 0x22; /* 58f-g94: статический 0x22-байт —
+                               * курсор 0x22-скана после ремонта death-3
+                               * (rdx := сюда; cmp byte[rdx],0x22 = EQUAL ->
+                               * скан выходит вперёд) */
 #ifndef C2B_SELFTEST
 struct c2b_sigaction {          /* glibc x86-64 layout */
     uptr handler;               /* sa_handler / sa_sigaction (union @0) */
@@ -6768,6 +6779,7 @@ static volatile u8 g92_rescued;   /* 58f-g92: one-shot лог спасения s
 static volatile u8 g93_rescued;   /* 58f-g93: one-shot лог спасения death-2 */
 static const volatile u8 g93_nul; /* 58f-g93: статический NUL-байт — курсор
                                * CRC-цикла после ремонта death-2 (rbx := сюда) */
+static volatile u8 g94_rescued;   /* 58f-g94: one-shot лог спасения death-3 */
 static volatile uptr g_true_empty_rep; /* 58f-g92: истинный &_S_empty_rep
                                * libstdc++ (dlsym в инсталляторе хэндлера) */
 static volatile uptr g_lg_lo, g_lg_hi; /* 58f-g90a: регион фолта из maps */
@@ -6835,6 +6847,32 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                     C2B_LOGH((u32)rip93);
                     C2B_LOGS("\n");
                 }
+            }
+        }
+    }
+    /* 58f-g94: death-3 RESCUE (runs 497/498 a1-a4 = 8/8 pre-menu смертей:
+     * rip = anon-gateway-клон @+0x23a0e, insn = cmp byte [rdx],0x22 =
+     * 80 3a 22 (SCAN-цикл чужого кода), rdx = мусор (fault addr=
+     * 0x200246), rdi=2, rsi=валидный. Родство с run494-классом (cmp
+     * byte [rbx],0x22 @0x2d6a4 = тот же клон, другой регистр/копия).
+     * g93-паттерн не матчится (rdi=2 != 0, rbx != 0) => смерть без
+     * спасения. РЕМОНТ (по образцу g93, который в run496 довёл процесс
+     * до PASS): RDX := &g94_b22 (статический байт 0x22) -> sigreturn
+     * реэзекьютит ТОТ ЖЕ RIP -> cmp = EQUAL -> jne (0f 85, назад) не
+     * берётся -> скан-цикл выходит вперёд. БАЙТ-ПАТТЕРН = маппинг-
+     * независимый (клон = анон). Патч ДО last-gasp дампа. */
+    if (uc) {
+        volatile uptr *gr94 = (volatile uptr *)((u8 *)uc + 0x28);
+        uptr rip94 = gr94[16];
+        if (c2b_g94_match((const volatile u8 *)rip94)) {
+            gr94[12] = (uptr)(unsigned long)&g94_b22;   /* RDX */
+            if (!g94_rescued) {
+                g94_rescued = 1;
+                C2B_LOGS("[c2b] g94: death-3 RESCUED (gateway 0x22-scan "
+                         "rdx) rip=0x");
+                C2B_LOGH((u32)(rip94 >> 32));
+                C2B_LOGH((u32)rip94);
+                C2B_LOGS("\n");
             }
         }
     }
@@ -32567,6 +32605,31 @@ static void test_raw(void)
                 0x12u, 0x2au, 0x04u, 0xdeu, 0xadu, 0xbeu, 0xefu };
             c2b_g99_pbdec(7u, s7, (u32)sizeof s7);
         }
+    }
+
+    /* ---- v91: g94 death-3 rescue сигнатур (cmp byte [rdx],0x22) ---- */
+    {
+        /* РЕАЛЬНЫЕ байты @rip из run498 a1 (g89 CODE-32@rip): 80 3a 22
+         * 0f 85 bc fd ff ff = cmp byte [rdx],0x22; jne -0x244 */
+        static const u8 rip498[] = {
+            0x80u, 0x3au, 0x22u, 0x0fu, 0x85u, 0xbcu, 0xfdu, 0xffu, 0xffu };
+        CHECK(c2b_g94_match(rip498) == 1u,
+              "v91: run498 insn = cmp byte[rdx],0x22 = ПОДХОДИТ");
+        /* НЕ-сигнатуры: g93-класс (movzx edi,byte[rbx] = 0f b6 3b),
+         * v89-санка-гвард (cmp byte [rsi],0x22 = 80 3e 22), усечка */
+        {
+            static const u8 g93c[] = { 0x0fu, 0xb6u, 0x3bu };
+            static const u8 gward[] = { 0x80u, 0x3eu, 0x22u };
+            static const u8 sh[] = { 0x80u, 0x3au, 0x00u }; /* 3-й != 0x22 */
+            CHECK(c2b_g94_match(g93c) == 0u,
+                  "v91: g93-класс (0f b6 3b) = НЕ матчится");
+            CHECK(c2b_g94_match(gward) == 0u,
+                  "v91: v89-гвард (80 3e 22) = НЕ матчится");
+            CHECK(c2b_g94_match(sh) == 0u,
+                  "v91: 3-й байт != 0x22 = НЕ матчится");
+        }
+        /* байт-курсор = 0x22 (компаре должен быть EQUAL) */
+        CHECK(g94_b22 == 0x22u, "v91: g94_b22 = 0x22 (cmp EQUAL = выход)");
     }
 }
 

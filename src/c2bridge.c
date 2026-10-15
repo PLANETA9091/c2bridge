@@ -17648,12 +17648,22 @@ static void c2b_raw_scan(void)
             got = (u32)r;
             budget -= (u64)got;
             for (i = 0; i + 10u <= got; i++) {
-                u32 nr = 0, pl;
+                u32 nr = 0, pl, isgap = 0;
                 unsigned long long site;
                 u32 q;
                 pl = c2b_raw_patchable(chunk + i, got - i, &nr);
                 if (!pl && regs[ri].sys)
                     pl = c2b_raw_patchable_sys(chunk + i, got - i, &nr);
+                /* v82c: не-смежное окно (mov nr; перезагрузки; syscall;
+                 * errno-якорь) — run487-урок: ГОРЯЧИЙ sendto-стаб
+                 * multi-threaded libc = форма b8 2c.. 48 8b 55 d8 48 8b
+                 * 75 e0 0f 05 48 3d.. = v77c-смежный скан ПРОПУСТИЛ =
+                 * движковые 0x22 мимо всех хуков. Класс = ВСЕГДА сере-
+                 * дина (кадр активен: leave;ret-эпилог) => санка. */
+                if (!pl && regs[ri].sys) {
+                    pl = c2b_raw_pat_gap(chunk + i, got - i, &nr);
+                    if (pl) isgap = 1u;
+                }
                 if (!pl) continue;
                 site = (unsigned long long)lo + off + i;
                 g_raw_sites++;
@@ -17696,9 +17706,12 @@ static void c2b_raw_scan(void)
                     }
                     if (regs[ri].sys) {
                         u32 tnr = 0;
-                        istail = c2b_raw_patchable_sys_tail(chunk + i,
-                                                            got - i,
-                                                            &tnr) ? 1u : 0u;
+                        /* v82c: gap-окно = ВСЕГДА мид-класс (leave;ret
+                         * эпилог => хвост-дискриминатор неприменим) */
+                        istail = isgap ? 0u :
+                            (c2b_raw_patchable_sys_tail(chunk + i,
+                                                        got - i,
+                                                        &tnr) ? 1u : 0u);
                     }
                     if (regs[ri].sys && !istail) {
                         /* v77c: МИД-САЙТ (full-путь асинк-отмены, кадр
@@ -31741,6 +31754,52 @@ static void test_raw(void)
     /* усечения */
     CHECK(c2b_raw_patchable_sys_tail(buf, 14u, &nr) == 0u,
           "v77c: cap=14 < 16 = 0");
+    /* ---- v82c: ТОЛЕРАНТНАЯ не-смежная форма (run487-урок) ---- */
+    /* РЕАЛЬНЫЕ байты libc.node.so sendto@@GLIBC+0x55 (0x12c375), ГОРЯЧИЙ
+     * путь многопоточного процесса: mov $44,%eax; mov -0x28(%rbp),%rdx;
+     * mov -0x20(%rbp),%rsi; syscall; cmp $-4096,%rax; ja +0x34 */
+    {
+        static const u8 gapwin[22] = {
+            0xb8, 0x2c, 0x00, 0x00, 0x00,             /* mov eax,44   */
+            0x48, 0x8b, 0x55, 0xd8,                   /* mov rdx,[rbp-0x28] */
+            0x48, 0x8b, 0x75, 0xe0,                   /* mov rsi,[rbp-0x20] */
+            0x0f, 0x05,                               /* syscall      */
+            0x48, 0x3d, 0x00, 0xf0, 0xff, 0xff        /* cmp -4096    */
+        };
+        u8 g2[32];
+        u32 gn;
+        memset(g2, 0x90, sizeof g2);
+        for (gn = 0; gn < sizeof gapwin; gn++) g2[gn] = gapwin[gn];
+        CHECK(c2b_raw_pat(g2, sizeof g2, &nr) == 0u,
+              "v82c: смежный матчер на gap-окне = 0 (почему v77c пропустил)");
+        CHECK(c2b_raw_patchable_sys(g2, sizeof g2, &nr) == 0u,
+              "v82c: patchable_sys на gap-окне = 0");
+        CHECK(c2b_raw_pat_gap(g2, sizeof g2, &nr) == 15u && nr == 44u,
+              "v82c: gap-окно = 15B (mov+2 перезагрузки+syscall), nr=44");
+        /* nr46-вариант (та же форма, только nr) */
+        g2[1] = 46;
+        CHECK(c2b_raw_pat_gap(g2, sizeof g2, &nr) == 15u && nr == 46u,
+              "v82c: gap nr46 = 15B (та же форма)");
+        g2[1] = 44;
+        /* негативы: ret/call в гэпе (на ПРЕФИКСЕ второй перезагрузки);
+         * errno-якорь битый */
+        g2[9] = 0xc3;
+        CHECK(c2b_raw_pat_gap(g2, sizeof g2, &nr) == 0u,
+              "v82c: ret в гэпе = 0");
+        g2[9] = 0xe8;
+        CHECK(c2b_raw_pat_gap(g2, sizeof g2, &nr) == 0u,
+              "v82c: call в гэпе = 0");
+        g2[9] = 0x0f; g2[10] = 0x05;
+        g2[15] = 0x48; g2[16] = 0x3d; g2[17] = 0x00;
+        g2[18] = 0x00; g2[19] = 0x00; g2[20] = 0x00;
+        CHECK(c2b_raw_pat_gap(g2, sizeof g2, &nr) == 0u,
+              "v82c: errno-якорь битый = 0 (FP-гвард)");
+        CHECK(c2b_raw_pat_gap(0, 16u, &nr) == 0u, "v82c: NULL = 0");
+        /* усечение: буфер короче окна */
+        memset(g2, 0, sizeof g2);
+        for (gn = 0; gn < sizeof gapwin; gn++) g2[gn] = gapwin[gn];
+        CHECK(c2b_raw_pat_gap(g2, 14u, &nr) == 0u, "v82c: cap=14 = 0");
+    }
     /* ---- v77c: санка = 112B байт-строгий лэйаут ---- */
     {
         u8 th[256];

@@ -173,6 +173,67 @@ static u32 c2b_raw_patchable_sys_tail(const u8 *p, u32 n, u32 *nr)
     return pl;
 }
 
+/* v82c pure: ТОЛЕРАНТНАЯ форма СИСТЕМНОГО стаба — НЕ-СМЕЖное окно:
+ *   b8 <nr> 00 00 00 [gap 0..15B: перезагрузки регистров 48/4c/44/41 8b
+ *   ...] 0f 05 48 3d 00 f0 ff ff
+ * РЕАЛЬНЫЙ КЛАСС (run487-libc.node.so sendto@@GLIBC+0x55 = 0x12c375):
+ *   b8 2c 00 00 00 48 8b 55 d8 48 8b 75 e0 0f 05 48 3d 00 f0 ff ff 77 34
+ *   (mov $44,%eax; mov -0x28(%rbp),%rdx; mov -0x20(%rbp),%rsi; syscall;
+ *    cmp $-4096,%rax; ja) — ГОРЯЧИЙ путь многопоточного процесса
+ *   (__libc_single_threaded=0), v77c-смежный скан = ПРОПУСТИЛ его
+ *   (0x12c330 = холодное смежное окно запатчено, горячее = raw syscall
+ *   мимо ВСЕХ хуков = ноль rewrite в runs 486/487).
+ * КЛАСС САЙТА = СЕРЕДИНА (кадр активен: sub rsp + call до окна, эпилог
+ * = leave; ret) => патч = ТОЛЬКО санка (v77c-контракт, back = site+len).
+ * Гвард против FP: (а) nr строго 44/46; (б) gap = ТОЛЬКО байты переза-
+ * грузок mov r64,[rbp-x]/mov r64,reg (префикс 48/4c/44/41 + 8b/89), БЕЗ
+ * 0f (syscall), БЕЗ c3 (ret), БЕЗ e8/e9 (call/jmp); (в) errno-якорь
+ * 48 3d 00 f0 ff ff СТРОГО после syscall. Возврат = ПОЛНАЯ длина окна
+ * (mov..syscall, 7..22), 0 = мимо. */
+static u32 c2b_raw_pat_gap(const u8 *p, u32 n, u32 *nr)
+{
+    u32 k, gap;
+    if (!p || !nr || n < 16u) return 0u;
+    *nr = 0;
+    if (p[0] != 0xb8u || p[2] != 0u || p[3] != 0u || p[4] != 0u ||
+        (p[1] != 44u && p[1] != 46u))
+        return 0u;
+    *nr = (u32)p[1];
+    /* gap: до 15 байт перезагрузок до syscall */
+    for (k = 5u; k < 20u && k < n; ) {
+        u8 b = p[k];
+        if (b == 0x0fu) {                       /* syscall */
+            gap = k - 5u;
+            if (k + 1u >= n || p[k + 1u] != 0x05u) return 0u;
+            k += 2u;
+            /* errno-якорь строго после syscall */
+            if (n < k + 6u || p[k] != 0x48u || p[k + 1u] != 0x3du ||
+                p[k + 2u] != 0x00u || p[k + 3u] != 0xf0u ||
+                p[k + 4u] != 0xffu || p[k + 5u] != 0xffu)
+                return 0u;
+            return 5u + gap + 2u;               /* mov..syscall */
+        }
+        if (b == 0xc3u || b == 0xe8u || b == 0xe9u || b == 0xebu)
+            return 0u;                          /* ret/call/jmp в гэпе = мимо */
+        /* перезагрузка: префикс 48/4c/44/41/45/49/4d + 8b/89 (+ modrm/disp) */
+        if ((b == 0x48u || b == 0x4cu || b == 0x44u || b == 0x41u ||
+             b == 0x45u || b == 0x49u || b == 0x4du) &&
+            k + 1u < n && (p[k + 1u] == 0x8bu || p[k + 1u] == 0x89u)) {
+            u8 modrm = (k + 2u < n) ? p[k + 2u] : 0u;
+            u32 len = 2u;                       /* prefix + opcode */
+            u8 mod = (u8)(modrm >> 6);
+            len += 1u;                          /* modrm */
+            if (mod == 1u) len += 1u;           /* disp8 */
+            else if (mod == 2u) len += 4u;      /* disp32 */
+            if (mod == 0u && (modrm & 0xc7u) == 0x05u) len += 4u; /* rip-rel */
+            k += len;
+            continue;
+        }
+        return 0u;                              /* чужой байт в гэпе = мимо */
+    }
+    return 0u;
+}
+
 /* v77c pure: САНКА мид-сайта (регистро-сохраняющая, БЕЗ кадра).
  * Контракт на входе: rsp кратно 16 (проверено: __send rbp-0x30, sendmsg
  * rbp-0x20 — оба кратно 0 mod 16); живы kernel-арги rdi/rsi/rdx/r10/r8/r9

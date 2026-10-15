@@ -215,7 +215,7 @@ static void klog_x(const u8 *p, u32 n)
     klog(b, 2 * n);
 }
 
-static void klog_p(uptr v);
+static void klog_h(u32 v);
 
 /* ---------- v105-t3v: МОСТ-РЕГИСТРИРУЕМЫЙ ИНЖЕКТОР (signon-continuation) ----
  * Приоритет 2218 #1 (S2S1 STEP-3): сервер держит signon => мост играет роль
@@ -233,7 +233,11 @@ void c2b_hook_t3v_register(u32 (*fn)(unsigned char *, unsigned int))
 {
     g_t3v_fn = fn;
     klog_s("[c2b] t3v: hook registered fn=");
-    klog_p((uptr)(uintptr_t)(const void *)fn);
+    /* klog_h x2 (hi/lo) вместо klog_p: klog_p = x86_64-only регион (g124,
+     * #if @1269) — hook32 (i386, LD_PRELOAD в 32-битный steam) = undefined
+     * symbol -> run516 failure. klog_h = общий регион (обе арки). */
+    klog_h((u32)(((uptr)(uintptr_t)(const void *)fn) >> 32));
+    klog_h((u32)(uptr)(uintptr_t)(const void *)fn);
     klog_s("\n");
 }
 

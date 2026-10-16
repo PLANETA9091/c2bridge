@@ -20754,6 +20754,14 @@ static u32 c2b_s2o_build(const u8 *hdr, u8 *out, u32 cap)
     pl2[0] = 7u; pl2[1] = 0x08u; pl2[2] = 0x02u;
     return c2b_swr_build(hdr, pl2, 17u, out, cap);
 }
+/* v108.7: b2e event-wire — грант-чейндж (g58 kaccept) = второй живой
+ * источник чалла для синт-'B'. Мотив (run541-перечитка deep-dive):
+ * ворота @0x4d8 никогда не проходят (движковый chal = 0 на записи) =>
+ * рычаг молчит даже в грант-богатых ранах. Грант-чейндж = chal
+ * СЕРВЕРНОГО accept'а = точный «эхо-проб» W2-стены в момент гранта.
+ * Глобалы = ВСЕГДА-компилируемый скоуп (g58-сайт вне #ifndef-регионов;
+ * сам b2e_maybe = real-build только, #ifndef C2B_SELFTEST @21316). */
+static u32 g_b2e_grant_chal, g_b2e_grant_seen;
 /* v106.3: b2e_gate = ворота b2e-рычага: on, кап 2, chal!=0 (0x22-чейндж
  * приземлился @0x4d8 — эхо 'B' обязано совпасть). Always-остров =
  * selftest-видимость. */
@@ -20762,6 +20770,15 @@ static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal)
     if (!on) return 0;
     if (fires >= 2u) return 0;
     return chal ? 1u : 0u;
+}
+/* v108.7: b2e_chal = двух-источник чалла (always-остров, selftest-виден):
+ * движковый @0x4d8 выигрывает (живое состояние), грант-чейндж = фолбэк
+ * (обе нули = 0 = ворота скиппают). Чистая функция без побочек. */
+static u32 c2b_b2e_chal(u32 eng, u32 grant_seen, u32 grant_chal)
+{
+    if (eng) return eng;
+    if (grant_seen) return grant_chal;
+    return 0;
 }
 /* v106.5: proto-пик = ДВУХСТОРОННИЙ A/B В ОДНОМ РАНЕ: fire#1 = 2 (v105-форма;
  * run522 = полный ходок g48..g66), fire#2 = живой cstate@0x4dc (фолбэк 3;
@@ -23329,7 +23346,7 @@ static u32 g_b2e_init, g_b2e_on = 1, g_b2e_fires;
 static void c2b_b2e_maybe(void)
 {
     static u8 b2_buf[48];
-    u32 cs_b2 = 0, ch_b2 = 0, pr_b2 = 0, sb_len, ib2;
+    u32 cs_b2 = 0, ch_b2 = 0, pr_b2 = 0, sb_len, ib2, ch_eng;
     u8 la[16];
     ssize_t sr;
     if (!g_b2e_init) {
@@ -23344,6 +23361,9 @@ static void c2b_b2e_maybe(void)
     if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
         (uptr)g_clp_sendto == 1) return;
     (void)c2b_cw_read((uptr)c2b_g49_state, &cs_b2, &ch_b2, &pr_b2);
+    /* v108.7: двух-источник — движковый chal выигрывает, грант = фолбэк */
+    ch_eng = ch_b2;
+    ch_b2 = c2b_b2e_chal(ch_b2, g_b2e_grant_seen, g_b2e_grant_chal);
     if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2)) return;
     sb_len = c2b_t3_build_b(b2_buf, 40u, ch_b2);   /* эхо ЖИВОГО чала */
     if (sb_len != 40u) return;
@@ -23358,11 +23378,14 @@ static void c2b_b2e_maybe(void)
                                        sb_len, 0,
                                        (const struct sockaddr *)la, 16);
     g_b2e_fires++;
+    g_b2e_grant_seen = 0;       /* v108.7: грант-источник тратится файром */
     g_cw_burst = C2B_CW_BURST;  /* v106.4: пер-тик срезы окна перехода */
     C2B_LOGS("[c2b] b2e: synth-'B' live-chal #");
     C2B_LOGN(g_b2e_fires);
     C2B_LOGS(" chal=");
     C2B_LOGH(ch_b2);
+    C2B_LOGS(" src=");
+    C2B_LOGS(ch_eng ? "eng" : "grant");
     C2B_LOGS(" cstate=");
     C2B_LOGN(cs_b2);
     C2B_LOGS(" proto=");
@@ -27808,6 +27831,14 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                             C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
                             C2B_LOGS(" ver="); C2B_LOGN(c2b_clv2_client_version());
                             C2B_LOGS("\n");
+                            /* v108.7: b2e event-wire — грант-чейндж = живой
+                             * источник для синт-'B' (b2e_maybe след-щего
+                             * тика = файр AT гранте). */
+                            g_b2e_grant_chal = g_clv2_ch32;
+                            g_b2e_grant_seen = 1;
+                            C2B_LOGS("[c2b] b2e: grant chal=");
+                            C2B_LOGN(g_clv2_ch32);
+                            C2B_LOGS(" armed (fire on the next tick)\n");
                             return (ssize_t)pl;
                         }
                         C2B_LOGS("[c2b] g58: kaccept cap too small, fallback to dumb bait\n");
@@ -34609,6 +34640,16 @@ static void test_swr(void)
     CHECK(c2b_b2e_proto(1u, 0u) == 3u, "b2e: fire#2 live=0 = фолбэк 3");
     CHECK(c2b_b2e_proto(1u, 99u) == 3u, "b2e: fire#2 мусор 99 = фолбэк 3");
     CHECK(c2b_b2e_proto(1u, 2u) == 2u, "b2e: fire#2 живой 2 = 2 (честный live)");
+    /* --- v108.7: b2e двух-источник чалла (грант event-wire) --- */
+    printf("[t] b2e-chal\n");
+    CHECK(c2b_b2e_chal(0xec6d6678u, 1, 0x3ad660ceu) == 0xec6d6678u,
+          "b2e-chal: движковый выигрывает грант-фолбэк");
+    CHECK(c2b_b2e_chal(0, 1, 0x3ad660ceu) == 0x3ad660ceu,
+          "b2e-chal: грант-чейндж = живой источник при движковом 0");
+    CHECK(c2b_b2e_chal(0, 0, 0x3ad660ceu) == 0,
+          "b2e-chal: гранта нет = 0 = ворота скиппают");
+    CHECK(c2b_b2e_chal(0, 1, 0) == 0,
+          "b2e-chal: грант-флаг без чалла = 0 (нечем стрелять)");
     /* --- v106.6: kdr (kfull chal-патч прямой в сервер) --- */
     printf("[t] kdr\n");
     CHECK(c2b_kdr_gate(0, 0, 513, 0xee0a07u, 1) == 0, "kdr: on=0 = скип");

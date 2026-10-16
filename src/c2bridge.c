@@ -19479,7 +19479,8 @@ static void c2b_cvx_maybe(void);       /* v106.8: прямой OOB "connect0x%%0
 static void c2b_pcx_maybe(void);       /* v107.0: парный каденс 0x22+вербатим-'k' (грант-эксперимент) */
 static u32 c2b_pcx_arm(void);          /* v107.2.1: сборка+сташ пенд-пары (общий: тик-fallback + kdr-sync) */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
-static void c2b_dsw_maybe(u32 t, u32 st, i32 rc); /* v107.5: dance-state watch (тело = в runtime-регионе) */
+static void c2b_dsw_maybe(u32 t, u32 st, i32 rc, u32 cs, i32 rc3); /* v107.6: dance-state watch (тело = в runtime-регионе) */
+static u32 c2b_dsw_wants(u32 t, u32 st); /* v107.6: due||trans гейт (always-остров) */
 
 
 
@@ -19694,7 +19695,34 @@ static void *c2b_g97_thread(void *arg)
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_b2e_maybe();       /* v106.3: синт-'B' с живым chal -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
-        c2b_dsw_maybe(t, st, rc);   /* v107.5: dance-state watch (только bridge-side) */
+        /* v107.6: DSW.V2 — перед строкой dsw = гард-чит слот 3
+         * (GetConnectionInfo(h, info*), info[0..3] = conn-state enum;
+         * карта-якорь run336/257: слот 1 = Connect — НЕ звать! слот 3 =
+         * чтение; v5-SEGV = эра слепых проб с генерик-аргами, слот-3
+         * якорен; run261 = «ненадёжен» = rc-ложь, не крах). Читаем ТОЛЬКО
+         * на due/trans-моментах (c2b_dsw_wants) = редкие реды. a5 =
+         * g_g95_seq (volatile, bridge-side, нулевой риск) = каденция
+         * серверных 'A' на тик-таймлайне. */
+        if (c2b_dsw_wants(t, st)) {
+            u8 mi[0x1A0];
+            u32 cs = 0xFFFFFFFFu;
+            i32 rc3 = 0x7FFFFFFF;
+            for (j = 0; j < sizeof mi; j++) mi[j] = 0;
+            if (g_gns_conn_iface && g_gns_conn_h) {
+                g_probe_active = 1;
+                if (__sigsetjmp(g_probe_jb, 1) == 0) {
+                    rc3 = ((i32 (*)(void *, uptr, void *))vt97[3])(
+                        g_gns_conn_iface, g_gns_conn_h, mi);
+                    cs = (u32)mi[0] | ((u32)mi[1] << 8) |
+                         ((u32)mi[2] << 16) | ((u32)mi[3] << 24);
+                } else {
+                    rc3 = -1;
+                    C2B_LOGS("[c2b] dsw: conninfo(3) SEGV\n");
+                }
+                g_probe_active = 0;
+            }
+            c2b_dsw_maybe(t, st, rc, cs, rc3);
+        }
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -20687,6 +20715,14 @@ static u32 c2b_dsw_trans(u32 st, u32 last)
 {
     return st != last;
 }
+/* v107.6: wants = due||trans — гейт для гард-чита слота 3 перед строкой
+ * dsw (тот же last, что и внутри maybe = без дрейфа). Pure = selftest.
+ * g_dsw_last живет ЗДЕСЬ (island): wants читает его, maybe = ниже. */
+static u32 g_dsw_last = 0xFFFFFFFFu;
+static u32 c2b_dsw_wants(u32 t, u32 st)
+{
+    return c2b_dsw_due(t) || c2b_dsw_trans(st, g_dsw_last);
+}
 
 /* вербатим-копия g_kfull + патч chal u32 LE @13..16 (протo@9..12 НЕ трогаем) */
 static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
@@ -21152,28 +21188,39 @@ static void c2b_kdr_maybe(void)
  * (GetConnectionInfo слот 13), kf/kc = устоявшиеся атомики kfull/kcap.
  * Ноль новых probe-чтений = ноль SEGV-поверхности. Формат фиксирован для
  * грепа "[c2b] dsw: t=". Killswitch C2B_DSW=0. due/trans = pure = selftest. */
-static u32 g_dsw_init, g_dsw_on = 1, g_dsw_last = 0xFFFFFFFFu;
-static void c2b_dsw_maybe(u32 t, u32 st, i32 rc)
+/* v107.6: строка дополнена cs/c3 (слот-3 conn-state + честный rc, гард-чит
+ * на wants-моментах в тик-цикле g97) и a5 (g_g95_seq, volatile bridge-side
+ * = каденция 'A' на тик-таймлайне). Формат-префикс "[c2b] dsw: t=" неизменен
+ * (греп-совместимость). Killswitch C2B_DSW=0. */
+static u32 g_dsw_init, g_dsw_on = 1;
+static void c2b_dsw_maybe(u32 t, u32 st, i32 rc, u32 cs, i32 rc3)
 {
-    u32 kf, kc;
+    u32 kf, kc, a5;
     if (!g_dsw_init) {
         const char *ed = getenv("C2B_DSW");
         if (ed && ed[0] == '0') g_dsw_on = 0;
         g_dsw_init = 1;
         if (g_dsw_on)
-            C2B_LOGS("[c2b] dsw: ARMED (v107.5 dance-state watch, every 40 ticks + st-transitions)\n");
+            C2B_LOGS("[c2b] dsw: ARMED (v107.6 dance-state watch, every 40 ticks + st-transitions + conninfo)\n");
     }
     if (!g_dsw_on) return;
     if (!c2b_dsw_due(t) && !c2b_dsw_trans(st, g_dsw_last)) return;
     g_dsw_last = st;
     kf = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
     kc = __atomic_load_n(&g_kcap_n, __ATOMIC_ACQUIRE);
+    a5 = g_g95_seq;
     C2B_LOGS("[c2b] dsw: t=");
     C2B_LOGN(t);
     C2B_LOGS("st=");
     C2B_LOGN(st);
     C2B_LOGS("rc=");
     C2B_LOGN((u32)(i32)rc);
+    C2B_LOGS("cs=");
+    C2B_LOGN(cs);
+    C2B_LOGS("c3=");
+    C2B_LOGN((u32)rc3);
+    C2B_LOGS("a5=");
+    C2B_LOGN(a5);
     C2B_LOGS("kf=");
     C2B_LOGN(kf);
     C2B_LOGS("kc=");
@@ -33996,6 +34043,14 @@ static void test_swr(void)
     CHECK(c2b_dsw_trans(3, 3) == 0, "dsw: st=3,last=3 = нет перехода");
     CHECK(c2b_dsw_trans(5, 3) == 1, "dsw: st=5,last=3 = переход");
     CHECK(c2b_dsw_trans(0, 0xFFFFFFFFu) == 1, "dsw: первый тик = переход");
+    /* --- v107.6: dsw wants (гейт гард-чита слота 3) --- */
+    printf("[t] dsw-wants\n");
+    g_dsw_last = 3u;
+    CHECK(c2b_dsw_wants(40, 3) == 1, "dsw-wants: t=40 = due = хочет");
+    CHECK(c2b_dsw_wants(1, 3) == 0, "dsw-wants: t=1 st=3 = тихо");
+    CHECK(c2b_dsw_wants(1, 4) == 1, "dsw-wants: st 3->4 = переход = хочет");
+    g_dsw_last = 0xFFFFFFFFu;
+    CHECK(c2b_dsw_wants(1, 0) == 1, "dsw-wants: первый тик = хочет");
     /* --- v106.7: g16-deep-dump длина (clamp 0..72) --- */
     printf("[t] g16-dumplen\n");
     CHECK(c2b_g16_dumplen(0) == 0, "dumplen: 0 = 0");

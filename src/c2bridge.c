@@ -19479,6 +19479,7 @@ static void c2b_cvx_maybe(void);       /* v106.8: прямой OOB "connect0x%%0
 static void c2b_pcx_maybe(void);       /* v107.0: парный каденс 0x22+вербатим-'k' (грант-эксперимент) */
 static u32 c2b_pcx_arm(void);          /* v107.2.1: сборка+сташ пенд-пары (общий: тик-fallback + kdr-sync) */
 static void c2b_s2dn_maybe(void);      /* v94: тело = после #endif (selftest-видимое) */
+static void c2b_dsw_maybe(u32 t, u32 st, i32 rc); /* v107.5: dance-state watch (тело = в runtime-регионе) */
 
 
 
@@ -19693,6 +19694,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
         c2b_b2e_maybe();       /* v106.3: синт-'B' с живым chal -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
+        c2b_dsw_maybe(t, st, rc);   /* v107.5: dance-state watch (только bridge-side) */
         prev = st;
         prev_rc = rc;
         if (st >= 3 && st <= 7) {
@@ -20674,6 +20676,18 @@ static u32 c2b_kdr_gate(u32 on, u32 fires, u32 klen, u32 val, u32 kdb)
     return 1;
 }
 
+/* v107.5: DSW троттл-хелперы (pure, selftest-видимые; тела maybe = в
+ * runtime-регионе). due = каждые 40 тиков (20с при 0.5с-тике), trans =
+ * любая смена st. Первый тик (last=0xFFFFFFFF) = всегда лог. */
+static u32 c2b_dsw_due(u32 t)
+{
+    return (t % 40u) == 0u;
+}
+static u32 c2b_dsw_trans(u32 st, u32 last)
+{
+    return st != last;
+}
+
 /* вербатим-копия g_kfull + патч chal u32 LE @13..16 (протo@9..12 НЕ трогаем) */
 static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
                          u8 *out, u32 cap, u32 *outlen)
@@ -21126,6 +21140,45 @@ static void c2b_kdr_maybe(void)
      * предыдущая пара ещё не ушла — арм честно скипается. */
     if (g_kdr_fires >= 1u)
         (void)c2b_pcx_arm();
+}
+
+/* ---------- v107.5: DSW — DANCE-STATE WATCH ----------
+ * run538-загадка: длинный живой прогон (A=19, s2dn=41, SNM7=3) но kfull_n=0
+ * весь ран — движок НИ РАЗУ не вошёл в retry-цикл коннекта (танец = ретраи).
+ * cw-срез (cstate=1->2) = одинаков в 536 (танец 32) и 538 (ноль) = не
+ * дискриминирует; A-прибытия (19 шт) ретрай не триггерят. DSW = дешёвый
+ * always-on сэмплер ТОЛЬКО bridge-side счётчиков: строка t/st/rc/kf/kc раз
+ * в 40 тиков (20с) + на КАЖДОЙ смене st. st/rc = locals тик-цикла g97
+ * (GetConnectionInfo слот 13), kf/kc = устоявшиеся атомики kfull/kcap.
+ * Ноль новых probe-чтений = ноль SEGV-поверхности. Формат фиксирован для
+ * грепа "[c2b] dsw: t=". Killswitch C2B_DSW=0. due/trans = pure = selftest. */
+static u32 g_dsw_init, g_dsw_on = 1, g_dsw_last = 0xFFFFFFFFu;
+static void c2b_dsw_maybe(u32 t, u32 st, i32 rc)
+{
+    u32 kf, kc;
+    if (!g_dsw_init) {
+        const char *ed = getenv("C2B_DSW");
+        if (ed && ed[0] == '0') g_dsw_on = 0;
+        g_dsw_init = 1;
+        if (g_dsw_on)
+            C2B_LOGS("[c2b] dsw: ARMED (v107.5 dance-state watch, every 40 ticks + st-transitions)\n");
+    }
+    if (!g_dsw_on) return;
+    if (!c2b_dsw_due(t) && !c2b_dsw_trans(st, g_dsw_last)) return;
+    g_dsw_last = st;
+    kf = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+    kc = __atomic_load_n(&g_kcap_n, __ATOMIC_ACQUIRE);
+    C2B_LOGS("[c2b] dsw: t=");
+    C2B_LOGN(t);
+    C2B_LOGS("st=");
+    C2B_LOGN(st);
+    C2B_LOGS("rc=");
+    C2B_LOGN((u32)(i32)rc);
+    C2B_LOGS("kf=");
+    C2B_LOGN(kf);
+    C2B_LOGS("kc=");
+    C2B_LOGN(kc);
+    C2B_LOGS("\n");
 }
 
 /* v106.9: CVX рантайм — см. блок у always-острова c2b_cvx_build/c2b_cvx_gate.
@@ -33932,6 +33985,17 @@ static void test_swr(void)
         CHECK(c2b_kdr_build(kf6, 64, 1u, ko6, sizeof ko6, &kn6) == 0,
               "kdr: не 'k' = 0");
     }
+    /* --- v107.5: dsw (dance-state watch, throttle + transitions) --- */
+    printf("[t] dsw\n");
+    CHECK(c2b_dsw_due(0) == 1, "dsw: t=0 = due");
+    CHECK(c2b_dsw_due(1) == 0, "dsw: t=1 = тихо");
+    CHECK(c2b_dsw_due(39) == 0, "dsw: t=39 = тихо");
+    CHECK(c2b_dsw_due(40) == 1, "dsw: t=40 = due");
+    CHECK(c2b_dsw_due(400) == 1, "dsw: t=400 = due");
+    CHECK(c2b_dsw_due(719) == 0, "dsw: t=719 = тихо");
+    CHECK(c2b_dsw_trans(3, 3) == 0, "dsw: st=3,last=3 = нет перехода");
+    CHECK(c2b_dsw_trans(5, 3) == 1, "dsw: st=5,last=3 = переход");
+    CHECK(c2b_dsw_trans(0, 0xFFFFFFFFu) == 1, "dsw: первый тик = переход");
     /* --- v106.7: g16-deep-dump длина (clamp 0..72) --- */
     printf("[t] g16-dumplen\n");
     CHECK(c2b_g16_dumplen(0) == 0, "dumplen: 0 = 0");

@@ -6722,6 +6722,17 @@ static u32  g_ticket_calls;      /* вызовов GetAuthSessionTicket */
 static u32  g_ticket_ok;         /* с ненулевым handle */
 static u32  g_ticket_len;        /* длина последнего тикета */
 static u8   g_ticket_buf[2048];  /* последний тикет (полный, до 2048Б) */
+/* v107.9: источники тикета для TIK — приоритет свежести.
+ * g_auth_slot/g_auth_ident = рабочий vt-слот + кэш identity со старта
+ * (ре-проб в момент accept = без повторного GetSteamID). g_etix_* =
+ * снапшот СОБСТВЕННОГО тикета движка С ПРОВОДА (252B/332B protobuf-лейна
+ * fd=0x29: 22 0d .. + ASCII "steamid:.." — run542 x12 @0.5с, run544 x4
+ * 332B) = свежая форма, которую движок сам считает нужной слать. */
+static u32  g_auth_slot;         /* рабочий слот GetAuthSessionTicket (со старта) */
+static u8   g_auth_ident[16];    /* k_ESteamNetworkingIdentityType_SteamID + sid */
+static u8   g_etix_buf[512];     /* последний eng-wire тикет (protobuf-конверт) */
+static u32  g_etix_len;          /* его длина (0 = не было) */
+static u32  g_etix_n;            /* сколько снапшотов поймано */
 
 /* ---------- 41f-f: GNS-СПЬЮ через ISteamNetworkingUtils ----------
  * Run 99 (6492195): тикет добыт (slot 13, 252Б, наш steamid внутри), GNS-серт
@@ -7147,6 +7158,9 @@ static void c2b_auth_ticket_probe(void)
     for (t4 = 0; t4 < sizeof(ident); t4++) ident[t4] = 0;
     ident[0] = 3;                                  /* k_ESteamNetworkingIdentityType_SteamID */
     for (t4 = 0; t4 < 8; t4++) ident[8 + t4] = (u8)(sid_self >> (8 * t4));
+    /* v107.9: кэш identity для ре-проба в момент accept (без повторного
+     * GetSteamID-вызова из recvfrom-хука). */
+    for (t4 = 0; t4 < sizeof(ident); t4++) g_auth_ident[t4] = ident[t4];
     for (t4 = 0; t4 < sizeof(sa); t4++) ((u8 *)&sa)[t4] = 0;
     for (t4 = 0; t4 < sizeof(oldsa); t4++) ((u8 *)&oldsa)[t4] = 0;
     sa.handler = (uptr)c2b_probe_segv;
@@ -7180,6 +7194,7 @@ static void c2b_auth_ticket_probe(void)
             u32 rep;
             g_ticket_ok++;
             g_ticket_len = tlen;
+            g_auth_slot = idx;                     /* v107.9: рабочий слот */
             c2b_cl_hexline(g_ticket_buf, tlen, ln, (u32)sizeof(ln));
             C2B_LOGS(" ticket "); C2B_LOGS(ln); C2B_LOGS("\n");
             for (rep = 0; rep < 2 && g_ticket_ok < 3; rep++) {
@@ -7202,6 +7217,7 @@ static void c2b_auth_ticket_probe(void)
                 if (h && tlen && tlen <= sizeof(g_ticket_buf)) {
                     g_ticket_ok++;
                     g_ticket_len = tlen;
+                    g_auth_slot = idx;             /* v107.9: рабочий слот */
                     c2b_cl_hexline(g_ticket_buf, tlen, ln, (u32)sizeof(ln));
                     C2B_LOGS(" ticket "); C2B_LOGS(ln); C2B_LOGS("\n");
                 } else {
@@ -7240,7 +7256,8 @@ static void c2b_auth_ticket_probe(void)
 }
 #else
 static u32 g_auth_vtidx = 13;
-static void c2b_auth_ticket_probe(void) { (void)g_auth_vtidx; }
+static void c2b_auth_ticket_probe(void)
+{ (void)g_auth_vtidx; (void)g_auth_slot; (void)g_auth_ident; }
 #endif  /* C2B_SELFTEST */
 
 #ifndef C2B_SELFTEST
@@ -7625,6 +7642,31 @@ static u32 c2b_pcxr_sa_is_srv(const u8 *sa, u32 slen)
             sa[2] == 0x6d && sa[3] == 0x76 &&    /* порт 28022 BE */
             sa[4] == 152u && sa[5] == 233u &&    /* 152.233.19.133 */
             sa[6] == 19u && sa[7] == 133u) ? 1u : 0u;
+}
+
+/* ---------- v107.9: ETIX — детектор eng-wire тикета (pure, остров) ----------
+ * Форма лейны (run542 decode): protobuf-конверт 22 0d <13B сессия> 11 <6B>
+ * + steamid-пара x3 + ASCII "steamid:76561198647433947" (62 19 = поле-12
+ * len-25) + 32B хэши (12 20) + app-ownership sub (3a 26 ..). Длины = 252B
+ * (0xfc) x12 в run542, 332B x4 в run544 => якорь длины = окно, НЕ точное
+ * значение. Якоря: len 200..400 + голова 22 0d + ASCII-маркер "steamid:"
+ * (поле-12, гено-независим). Дешёвый: большинство трафика отсекается
+ * длиной, маркер = ограниченный скан. Selftest-видимость = ранняя зона
+ * (паттерн c2b_pcxr_sa_is_srv). */
+static u32 c2b_etix_is_ticket(const u8 *p, u32 len)
+{
+    u32 i, lim;
+    if (!p || len < 200u || len > 400u) return 0;
+    if (p[0] != 0x22u || p[1] != 0x0du) return 0;
+    lim = len - 8u;
+    for (i = 2u; i < lim; i++) {
+        if (p[i]     == (u8)'s' && p[i + 1] == (u8)'t' &&
+            p[i + 2] == (u8)'e' && p[i + 3] == (u8)'a' &&
+            p[i + 4] == (u8)'m' && p[i + 5] == (u8)'i' &&
+            p[i + 6] == (u8)'d' && p[i + 7] == (u8)':')
+            return 1;
+    }
+    return 0;
 }
 
 #ifndef C2B_SELFTEST
@@ -17849,6 +17891,29 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     {
         ssize_t r = ((c2b_sendto_fn)g_clp_sendto)(fd, buf, len, flags, addr, addrlen);
         c2b_g40_sdt_note(fd, (u32)len, addr, r);
+        /* v107.9 etix: снапшот СВЕЖЕГО тикета движка С ПРОВОДА (252B/332B
+         * protobuf-лейна fd=0x29) = источник-2 для TIK (probe-капчур =
+         * старт сессии = потенциально минутной давности; wire-форма =
+         * то, что движок сам шлёт всю сессию). Наши огни = g_clp_sendto =
+         * мимо хука = без самозахвата. Капчур = ПОСЛЕДНИЙ успешный
+         * (rc>=0); errno сохранён (дисциплина едина с pcxr-блоком). */
+        if (r >= 0 && buf && len >= 200u && len <= 400u &&
+            c2b_etix_is_ticket((const u8 *)buf, (u32)len)) {
+            u32 i;
+            int er = *__errno_location();
+            for (i = 0; i < len && i < sizeof(g_etix_buf); i++)
+                g_etix_buf[i] = ((volatile const u8 *)buf)[i];
+            g_etix_len = i;
+            g_etix_n++;
+            if (g_etix_n <= 4) {
+                C2B_LOGS("[c2b] etix: eng-ticket snapshotted len=");
+                C2B_LOGN(g_etix_len);
+                C2B_LOGS(" #");
+                C2B_LOGN(g_etix_n);
+                C2B_LOGS("\n");
+            }
+            *__errno_location() = er;
+        }
         /* v107.2.2 PCX-RELAY капчур+пост-огонь (урок run534-tracefs:
          * РЕАЛЬНЫЕ k/0x22 движка проходят ЭТОТ хвост с живым fd и
          * РЕАЛЬНЫМ sockaddr_in — 54x fd=0x29 против 6x fd=0 мёртвого
@@ -20776,6 +20841,11 @@ static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
  * ('B'-кейс = эхо-чеки -> vt+0x170 -> return; "connect\0"-хвост
  * игнорируется) => сервер-сайд = единственная живая цель. */
 static u32 g_tik_init, g_tik_on = 1, g_tik_sent;
+/* v107.9: выход свежего ре-проба (f-источник): буфер + длина. Глобаль =
+ * движок пишет через указатель в гард-вызове; читается сразу после.
+ * В selftest = нули (источник f просто недоступен — инертно). */
+static u8  g_tik_ft_buf[2048];
+static u32 g_tik_ft_len;
 static u32 c2b_tik_is_accept(const u8 *p, u32 len)
 {
     if (!p || len < 8u) return 0;
@@ -20788,7 +20858,9 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
                           const struct sockaddr *addr, socklen_t alen)
 {
     static u8 tik_buf[2500];
-    u32 n, i;
+    const u8 *tsrc;
+    u32 n, i, tlen;
+    u8 srcn;
     ssize_t sr;
     if (!g_tik_init) {
         const char *ed = getenv("C2B_TIK");
@@ -20804,11 +20876,53 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
         return;                              /* loopback = бейты моста */
     if (g_kfull_len < 32u || g_kfull_len > 1200u) return;
     if (g_kfull[0] != 0xff || g_kfull[4] != (u8)'k') return;
-    if (!g_ticket_len || g_ticket_len > 1200u) return;
     if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
+    /* v107.9: ИСТОЧНИК ТИКЕТА — приоритет свежести:
+     * (f) свежий ре-проб GetAuthSessionTicket ПРЯМО СЕЙЧАС (классическая
+     *     raw-blob форма, нулевая давность; слот/identity = рабочие со
+     *     старта; один гард-вызов без слипов — probe-дисциплина);
+     * (e) eng-wire снапшот (protobuf-конверт с провода — форма, которую
+     *     движок сам шлёт; давность = момент последней лейны);
+     * (p) старт-проб (классика, НО минутной давности — последний
+     *     фолбэк). src= в логе = A/B-метка формы на проводе. */
+    tsrc = 0; tlen = 0;
+#ifndef C2B_SELFTEST
+    if (g_steamuser_obj && g_auth_slot) {
+        u32 h9, tlen9 = 0;
+        u64 sid9;
+        u8 ident9[16];
+        u32 z9;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            sid9 = ((u64 (*)(void *))
+                    (*(void ***)g_steamuser_obj)[2])(g_steamuser_obj);
+            for (z9 = 0; z9 < sizeof(ident9); z9++) ident9[z9] = 0;
+            ident9[0] = 3;
+            for (z9 = 0; z9 < 8; z9++)
+                ident9[8 + z9] = (u8)(sid9 >> (8 * z9));
+            h9 = ((u32 (*)(void *, void *, i32, u32 *, void *))
+                  (*(void ***)g_steamuser_obj)[g_auth_slot])(
+                g_steamuser_obj, g_tik_ft_buf, (i32)sizeof(g_tik_ft_buf),
+                &tlen9, ident9);
+            g_probe_active = 0;
+            if (h9 && tlen9 && tlen9 <= sizeof(g_tik_ft_buf))
+                g_tik_ft_len = tlen9;
+        } else {
+            g_probe_active = 0;
+            C2B_LOGS("[c2b] tik: fresh re-probe FAULT — fallback source\n");
+        }
+    }
+#endif
+    if (g_tik_ft_len >= 16u && g_tik_ft_len <= 1200u) {
+        tsrc = g_tik_ft_buf; tlen = g_tik_ft_len; srcn = (u8)'f';
+    } else if (g_etix_len >= 200u && g_etix_len <= 400u) {
+        tsrc = g_etix_buf; tlen = g_etix_len; srcn = (u8)'e';
+    } else if (g_ticket_len && g_ticket_len <= 1200u) {
+        tsrc = g_ticket_buf; tlen = g_ticket_len; srcn = (u8)'p';
+    } else return;                           /* ни одного источника = мимо */
     n = 0;
     for (i = 0; i < g_kfull_len; i++) tik_buf[n++] = g_kfull[i];
-    for (i = 0; i < g_ticket_len; i++) tik_buf[n++] = g_ticket_buf[i];
+    for (i = 0; i < tlen; i++) tik_buf[n++] = tsrc[i];
     g_tik_sent = 1;                          /* снять ДО огня (pcxr-дисциплина) */
 #ifndef C2B_SELFTEST
     g_probe_active = 1;
@@ -20829,7 +20943,9 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
     C2B_LOGS(" kf=");
     C2B_LOGN(g_kfull_len);
     C2B_LOGS(" tk=");
-    C2B_LOGN(g_ticket_len);
+    C2B_LOGN(tlen);
+    C2B_LOGS(" src=");
+    C2B_LOGS(srcn == (u8)'f' ? "f" : srcn == (u8)'e' ? "e" : "p");
     C2B_LOGS(" rc=");
     C2B_LOGN((u32)(sr >= 0 ? sr : -1));
     C2B_LOGS(" fd=");
@@ -34162,6 +34278,33 @@ static void test_swr(void)
     CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff", 4) == 0,
           "tik-accept: голый префикс = нет");
     CHECK(c2b_tik_is_accept(0, 8) == 0, "tik-accept: нулевой буфер = нет");
+    /* --- v107.9: etix (детектор eng-wire тикета: 22 0d + ASCII "steamid:") --- */
+    printf("[t] etix\n");
+    {
+        u8 et9[400], et10[252];
+        u32 z9;
+        for (z9 = 0; z9 < sizeof et9; z9++) et9[z9] = (u8)(z9 * 7 + 3);
+        et9[0] = 0x22; et9[1] = 0x0d; et9[15] = 0x11;
+        for (z9 = 0; z9 < 8; z9++) et9[100 + z9] = (u8)"steamid:"[z9];
+        CHECK(c2b_etix_is_ticket(et9, 252) == 1,
+              "etix: 252B форма с маркером = да");
+        CHECK(c2b_etix_is_ticket(et9, 332) == 1,
+              "etix: 332B форма (run544-лейна) = да");
+        CHECK(c2b_etix_is_ticket(et9, 199) == 0,
+              "etix: ниже окна 200 = нет");
+        CHECK(c2b_etix_is_ticket(et9, 401) == 0,
+              "etix: выше окна 400 = нет");
+        et9[0] = 0x23;
+        CHECK(c2b_etix_is_ticket(et9, 252) == 0,
+              "etix: голова не 22 0d = нет");
+        et9[0] = 0x22;
+        for (z9 = 0; z9 < sizeof et10; z9++) et10[z9] = 0xB5;
+        et10[0] = 0x22; et10[1] = 0x0d;
+        CHECK(c2b_etix_is_ticket(et10, 252) == 0,
+              "etix: без ASCII-маркера = нет");
+        CHECK(c2b_etix_is_ticket(0, 252) == 0,
+              "etix: нулевой буфер = нет");
+    }
     /* --- v106.7: g16-deep-dump длина (clamp 0..72) --- */
     printf("[t] g16-dumplen\n");
     CHECK(c2b_g16_dumplen(0) == 0, "dumplen: 0 = 0");

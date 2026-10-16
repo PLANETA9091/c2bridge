@@ -123,6 +123,12 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      cnx:
+        description: "v108.8: the CNX killswitch A/B (C2B_CNX: '1' = the v108.5 default = the bare-'connect\\0' 12B OOB x2 on the kdr path; '0' = OFF). THE PHASE-6-COLLAPSE A/B (the 1540-round find): the CLV2 phase-6 full-kaccept baits = 14/5/2 in runs 548/549/550 (the pre-cnx era) but 0 + zero phase-6 events in 551/552/553 (the cnx era) DESPITE the bigger k-storms — the bare 'connect' OOB = the candidate server-dialog resetter. cnx=0 = the discriminating run: the phase-6 returns => the cnx = the cause (the dialog kill = a W1-side regression); the phase-6 stays 0 => the server-side shift (the lottery phase)."
+        default: "1"
+        required: false
+        type: choice
+        options: ["0", "1"]
       crtok:
         description: "v97: the SDR cert-validator cold-table bypass (tools/patch_crtok.py): the static byte-patch of the 64-bit steamclient.so copies BEFORE the run. The run507 verdict: the engine's GNS rejected the server's 0x23 ConnectOK with 'Bad cert: CA key %llu is not known to us' while the SDR network config was still fetching (HTTP 504 race = the CA table EMPTY); the FIRST channel died pre-config-load and the SECOND connected post-load — BOTH 0x23s carry the IDENTICAL cert => pure config-load race, the CA itself IS in the appid-730 config. Patch = the failure tail ('not known to us' -> xor eax,eax; ret 0) becomes 'mov al,1' => an unknown/cold CA returns VALID; the ed25519 signature verification for KNOWN CAs = a separate return path = stays hard-failing; the Bad-cert spew line still prints (the A/B telemetry). Anchors are verified byte-exact (the format string + the unique rip-relative lea + the tail pattern); any mismatch = the file is SKIPPED, never half-patched. '0' = the rollback lever (no patch, the run507 behavior)."
         default: "1"
@@ -208,6 +214,9 @@ jobs:
       # in-flight into the accepted modern form. Default '0' = the
       # run479-485 behavior (the rewrite OFF, the passive capture only).
       C2B_CRTFIX_V: ${{ inputs.crtfix || '0' }}
+      # v108.8: the cnx killswitch A/B (the phase-6-collapse discriminator;
+      # '0' = the bare-'connect' OOB OFF = the run550-era dialog behavior).
+      C2B_CNX_V: ${{ inputs.cnx || '1' }}
       # v97: the cert-validator cold-table bypass ('0' = the run507 behavior).
       C2B_CRTOK_V: ${{ inputs.crtok || '1' }}
       # v82c-d: the gap-stub patcher arm (default OFF = the run487 behavior;

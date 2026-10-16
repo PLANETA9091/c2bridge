@@ -728,6 +728,18 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     0) MODES="${MODES/ C2B_CRTFIX=1/}" ;;
     *) : ;;
   esac
+  # v108.8: cnx (workflow input cnx -> C2B_CNX_V). '1' = the v108.5 default
+  # (the bare-'connect\0' 12B OOB x2, ON). '0' = the KILLSWITCH = OFF. THE
+  # PHASE-6-COLLAPSE A/B (the 1540-round find): the CLV2 phase-6 full-kaccept
+  # baits = 14/5/2 in runs 548/549/550 (the pre-cnx era) but 0 + zero
+  # phase-6 events in 551/552/553 (the cnx era) DESPITE the bigger k-storms
+  # — the bare 'connect' OOB = the candidate server-dialog resetter. cnx=0
+  # = the discriminating run. The base MODES hardcode nothing for CNX (the
+  # C default = ON), so '0' must APPEND the kill: C2B_CNX=0.
+  case "${C2B_CNX_V-1}" in
+    0) MODES="$MODES C2B_CNX=0" ;;
+    *) : ;;
+  esac
   # v82c-d: gap (workflow input gap -> C2B_GAP_V). '1' = патч НЕ-смежных
   # (gap) sys-окон libc (b8 nr; перезагрузки; syscall; errno-якорь) — ГОРЯЧИЙ
   # sendto-стаб multi-threaded libc. run488: ДЕФОЛТНЫЙ gap-патч = крах старта

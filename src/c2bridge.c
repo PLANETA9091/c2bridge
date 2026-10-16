@@ -20874,12 +20874,16 @@ static u32 g_tik_init, g_tik_on = 1, g_tik_sent;
 static u8  g_tik_ft_buf[2048];
 static u32 g_tik_ft_len;
 /* v108.0: ЧИСТЫЙ БИЛДЕР кадра k+ticket (общий для tik/tiksyn): вербатим
- * kfull-класс (32..1200, ff×4 'k') + тикет-хвост (16..1200: 252B/332B
- * лейны). cap >= сумма. Возврат 0 = отказ (гейт-композиция обеих пушек). */
+ * kfull-класс (32..1200, ff×4 'k') + тикет. v108.3: СПЛАЙС @17 (после chal
+ * u32 @13..16 = классический C2S_CONNECT authslot) вместо хвоста — ценз
+ * run548: ХВОСТ = CLOSED-NEGATIVE (845B доставлен с движкового :27005,
+ * сервер молчит). out = k[0..16] + ticket + k[17..]; outlen = klen+tlen
+ * (тот же суммарный размер). Тикет (16..1200: 252B/332B лейны). Возврат 0
+ * = отказ (гейт-композиция обеих пушек). */
 static u32 c2b_tik_build(const u8 *kf, u32 klen, const u8 *tk, u32 tlen,
                          u8 *out, u32 cap, u32 *outlen)
 {
-    u32 i;
+    u32 i, w;
     if (!kf || !tk || !out || !outlen) return 0;
     if (klen < 32u || klen > 1200u) return 0;
     if (tlen < 16u || tlen > 1200u) return 0;
@@ -20887,8 +20891,10 @@ static u32 c2b_tik_build(const u8 *kf, u32 klen, const u8 *tk, u32 tlen,
     if (kf[0] != 0xff || kf[1] != 0xff ||
         kf[2] != 0xff || kf[3] != 0xff) return 0;
     if (kf[4] != (u8)'k') return 0;
-    for (i = 0; i < klen; i++) out[i] = kf[i];
-    for (i = 0; i < tlen; i++) out[klen + i] = tk[i];
+    w = 0;
+    for (i = 0; i < 17u && i < klen; i++) out[w++] = kf[i];
+    for (i = 0; i < tlen; i++) out[w++] = tk[i];
+    for (i = 17u; i < klen; i++) out[w++] = kf[i];
     *outlen = klen + tlen;
     return 1;
 }
@@ -21460,7 +21466,7 @@ static void c2b_tiksyn_maybe(void)
 #else
     sr = -1;                             /* selftest = инертен */
 #endif
-    C2B_LOGS("[c2b] tiksyn: tick->k+ticket len=");
+    C2B_LOGS("[c2b] tiksyn: tick->k^ticket(spl@17) len=");
     C2B_LOGN(n);
     C2B_LOGS(" kf=");
     C2B_LOGN(klen);
@@ -34561,8 +34567,9 @@ static void test_swr(void)
         for (q8 = 0; q8 < 252; q8++) tb[q8] = (u8)(255 - q8);
         CHECK(c2b_tik_build(kb, 513, tb, 252, ob, sizeof(ob), &ol) == 1 &&
               ol == 765u, "tikbuild: 513+252 = 765");
-        CHECK(memcmp(ob, kb, 513) == 0 && memcmp(ob + 513, tb, 252) == 0,
-              "tikbuild: вербатим-конкат");
+        CHECK(memcmp(ob, kb, 17) == 0 && memcmp(ob + 17, tb, 252) == 0 &&
+              memcmp(ob + 17 + 252, kb + 17, 513 - 17) == 0,
+              "tikbuild: сплайс @17 (голова+тикет+хвост-k)");
         CHECK(c2b_tik_build(kb, 513, tb, 252, ob, 764, &ol) == 0,
               "tikbuild: cap < сумма = отказ");
         CHECK(c2b_tik_build(kb, 20, tb, 252, ob, sizeof(ob), &ol) == 0,

@@ -6594,6 +6594,49 @@ static volatile u32 g_kwire_sent;
 #define C2B_KWIRE_CAP 12
 static u8  g_gns_dst[16];               /* g32: sockaddr_in цели (из env) */
 static socklen_t g_gns_dstlen;          /* 0 = не собран */
+/* v110.2: FCON = принудительный движковый connect (обход steam://-маршрутизации
+ * steam-клиента). ПОВОД (run580-589): на cybershoke-целях (appid 9032 /
+ * gameid 4465480, НЕ 730!) клиент глотает steam://connect URL (6/6 прогонов),
+ *ибо URL-роутер ищет ВЛАДЕЮЩЕЕ приложение; legacy-lane движка не стартует
+ * ВООБЩЕ ('Connecting to' не печатается). Сервер при этом ЖИВ (A2S_INFO
+ * отвечает из рана 589: 'CSGO PUBLIC #108 [LT]', 0/26, visibility=0, proto 17,
+ * ver 1.38.8.1) — бан A2S-lane открыт, GNS 512B-lane молчит. ФИКС: вставить
+ * 'connect ip:port' В КОМАНДНЫЙ БУФЕР движка самиими = хвост URL-хендлера
+ * 0x229be0 (RE run589-дампа): formatter 0x4123e0('connect %s\n', addr) ->
+ * len, затем insert 0x3f8350(threadid=0 [0x3f8310 = xor-eax-ret стаб], len,
+ * 0, 0) = мьютекс-гард cmpxchg + per-thread слот 0x2078; ГЛАВНЫЙ поток
+ * исполняет 'connect' в след. кадре = легальный legacy-lane путь (S2
+ * ChallengeRequest -> 'A' -> clv2). Killswitch C2B_FCONNECT=0 (дефолт ON).
+ * Один выстрел/сессию, под SEGV-гвардом. Сиг-чек 3 RVAs (урок g129). */
+static u32 g_fcon_go = 1;               /* C2B_FCONNECT=0 -> off (дефолт ON) */
+static u32 g_fcon_done;                 /* 1 = выстрел уже был (1/сессию) */
+/* v110.2: гейт файра (чистая фн = selftest). Выстрел = env-on + база движка
+ * + цель армлена + ещё не стреляли. */
+static u32 c2b_fcon_gate(u32 env_on, u32 base_ok, u32 tgt_ok, u32 done)
+{
+    if (!env_on || !base_ok || !tgt_ok || done) return 0;
+    return 1u;
+}
+/* v110.2: сиг-чек 3 RVAs хвоста URL-хендлера (чистая фн = selftest; урок
+ * g129: RVA без сиг-чека = стрельба по чужой сборке). Формы из дампа
+ * engine_client.so__2cd041 (run577/589):
+ *   0x4123e0 formatter: 55 49 89 FA 48 89 E5 53
+ *   0x3f8310 tid-стаб:  55 31 C0 48 89 E5 5D C3  (xor eax,eax; ret)
+ *   0x3f8350 insert:    55 48 89 E5 41 56 41 89 CE */
+static u32 c2b_fcon_sig_ok(const u8 *pf, const u8 *pt, const u8 *pi)
+{
+    static const u8 sf[8] = {0x55,0x49,0x89,0xFA,0x48,0x89,0xE5,0x53};
+    static const u8 st[8] = {0x55,0x31,0xC0,0x48,0x89,0xE5,0x5D,0xC3};
+    static const u8 si[8] = {0x55,0x48,0x89,0xE5,0x41,0x56,0x41,0x89};
+    u32 i;
+    if (!pf || !pt || !pi) return 0;
+    for (i = 0; i < 8; i++) {
+        if (pf[i] != sf[i]) return 0;
+        if (pt[i] != st[i]) return 0;
+        if (pi[i] != si[i]) return 0;
+    }
+    return 1u;
+}
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
 static u32 g_clv2_phase;         /* 0=idle 1='A' 2=ждём reply для 'i' 3='i' доставлен
@@ -13398,6 +13441,92 @@ static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 t
  * Путь: SteamInternal_FindOrCreateUserInterface(g_steamuser_user,
  * "SteamNetworkingSockets006" | 009) -> vt[1] ConnectByIPAddress(iface,
  * &SteamNetworkingIPAddr{a.b.c.d,0..,port}, 0, NULL). SEGV-гвард g7. */
+/* ---------- v110.2: FCON FIRE (real-build only) ----------
+ * ТОЧНАЯ реплика хвоста URL-хендлера 0x229be0 (run589-дамп, декод в блоке
+ * статиков): call formatter(rdi="connect %s\n", rsi=tgt) -> rax = len,
+ * r8 = ЕСТЕСТВЕННЫЙ leftover форматтера (хендлер НЕ трогает r8 до jmp —
+ * реплицируем: не трогаем тоже); 0x3f8310 = сиг-проверенный xor-eax-стаб =
+ * threadid 0 -> xor edi; insert(rdi=0, rsi=len, rdx=0, rcx=0) — мьютекс-гард
+ * + per-thread слот 0x2078, ГЛАВНЫЙ поток движка исполняет команду в след.
+ * кадре. Вызов под SEGV-гвардом (TLS g_probe_jb), 1/сессию. */
+static i32 c2b_fcon_fire(uptr base)
+{
+    uptr fmt_fn = base + 0x4123e0ull;
+    uptr ins_fn = base + 0x3f8350ull;
+    static const char cfmt[] = "connect %s\n";
+    const char *tgt = (const char *)g_gns_connect_target;
+    i32 rc = -1;
+    register uptr r10a __asm__("r10") = fmt_fn;
+    register uptr r11a __asm__("r11") = ins_fn;
+    register uptr rda  __asm__("rdi") = (uptr)cfmt;
+    register uptr rsa  __asm__("rsi") = (uptr)tgt;
+    __asm__ volatile(
+        "push %%rbx\n\t"
+        "push %%r11\n\t"
+        "call *%%r10\n\t"       /* formatter: rax = len, r8 = leftover */
+        "mov %%rax, %%rbx\n\t"
+        "xor %%edx, %%edx\n\t"
+        "xor %%ecx, %%ecx\n\t"
+        "xor %%edi, %%edi\n\t"  /* threadid = 0 (сиг-проверенный стаб) */
+        "mov %%rbx, %%rsi\n\t"  /* rsi = len */
+        "pop %%r11\n\t"
+        "call *%%r11\n\t"       /* insert(0, len, 0, 0) */
+        "pop %%rbx\n\t"
+        "mov %%eax, %0\n\t"
+        : "=m"(rc)
+        : "r"(r10a), "r"(r11a), "r"(rda), "r"(rsa)
+        : "rax", "rbx", "rcx", "rdx", "r8", "r9", "memory", "cc");
+    return rc;
+}
+static void c2b_fcon_maybe(void)
+{
+    u32 g;
+    i32 rc;
+    if (g_fcon_done) return;
+    g = c2b_fcon_gate(g_fcon_go, g_engine_base ? 1u : 0u,
+                      g_gns_connect_go, 0u);
+    if (!g) return;
+    g_fcon_done = 1;            /* 1/сессию, ДО файра (без ретраев) */
+    /* выравнивание тайминга по харнессу: (1) SDR-config = гейт харнесса
+     * перед его URL-файром (греют кеш -> ~0с; холодный = до 120с), (2)
+     * оседание меню: launch->menu = 25с (589); суммарно файр = в зону
+     * проверенного URL-тайминга (~30с), не в кадр 1. C2B_FCON_DELAY=сек. */
+    {
+        const char *ed = getenv("C2B_FCON_DELAY");
+        u32 dly = 25, w;
+        if (ed && ed[0] >= '0' && ed[0] <= '9') {
+            dly = 0;
+            for (w = 0; ed[w] >= '0' && ed[w] <= '9' && w < 4; w++)
+                dly = dly * 10 + (u32)(ed[w] - '0');
+        }
+        for (w = 0; w < 240 && !g_sdr_cfg_ok; w++) usleep(500000);
+        for (w = 0; w < dly * 2; w++) usleep(500000);
+        C2B_LOGS("[c2b] fcon: timing aligned sdr=");
+        C2B_LOGN(g_sdr_cfg_ok);
+        C2B_LOGS(" dly="); C2B_LOGN(dly);
+        C2B_LOGS("\n");
+    }
+    if (!c2b_fcon_sig_ok((const u8 *)(g_engine_base + 0x4123e0ull),
+                         (const u8 *)(g_engine_base + 0x3f8310ull),
+                         (const u8 *)(g_engine_base + 0x3f8350ull))) {
+        C2B_LOGS("[c2b] fcon: sig mismatch -> abort (build changed?)\n");
+        return;
+    }
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        rc = c2b_fcon_fire(g_engine_base);
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] fcon: SEGV under guard (no fire)\n");
+        return;
+    }
+    g_probe_active = 0;
+    C2B_LOGS("[c2b] fcon: fired connect ");
+    C2B_LOGS((const char *)g_gns_connect_target);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(rc < 0 ? 0u : (u32)rc));
+    C2B_LOGS("\n");
+}
 static void c2b_g32_drive(void)
 {
     u32 a[4], pr = 0;
@@ -13961,6 +14090,13 @@ static void c2b_g32_drive(void)
         sa.flags = 4;
         sigemptyset(sa.mask);
         if (sigaction(11, &sa, &oldsa) != 0) return;
+        /* v110.2: FCON — принудительный connect ВПЕРЕД GNS-драйвера:
+         * SEGV-гвард уже установлен, движок жив (drive = пост-арм), цель =
+ * g_gns_connect_target. Команда в буфере исполняется главным потоком в
+         * след. кадре; 'Connecting to'-печатей от tail-пути НЕТ (Msg = в
+         * пропущенной голове 0x229be0) — сентинел харнесса научен маркеру
+         * 'fcon: fired connect' (v110.2-харнесс). */
+        c2b_fcon_maybe();
         clp = g_clp_fouif;
         /* 58f-g75: ДВУХФАЗНЫЙ КОННЕКТ (cert-CA гонка ран 228-a1). Факт:
          * ConnectOK, обработанный ДО 'Got SDR network config' = 'Bad cert:
@@ -29517,6 +29653,13 @@ i32 c2b_main(void)
             g_gns_relay = 1;
             C2B_LOGS("[c2b] g32: relay=1 (captured 0x22 -> engine fd -> target)\n");
         }
+        e2 = getenv("C2B_FCONNECT");    /* v110.2: дефолт ON (=0 выключает) */
+        if (e2 && e2[0] == '0') {
+            g_fcon_go = 0;
+            C2B_LOGS("[c2b] fcon: disabled (C2B_FCONNECT=0)\n");
+        } else {
+            C2B_LOGS("[c2b] fcon: armed (default ON; C2B_FCONNECT=0 = off)\n");
+        }
     }
 #endif  /* C2B_SELFTEST (g32-env: статики в real-build регионе) */
     {   /* 41e-a: connectionless-слой v1; C2B_CL_VERBOSE=1 -> hexdump каждого
@@ -37804,6 +37947,32 @@ static void test_a2epatch(void)
 #  endif
 #endif
 
+/* v110.2: fcon-гейт + сиг-чек (чистые фн) */
+static void test_fcon(void)
+{
+    u8 buf[16];
+    u32 i;
+    printf("[t] fcon\n");
+    CHECK(c2b_fcon_gate(1, 1, 1, 0) == 1, "fcon gate all-ok == 1");
+    CHECK(c2b_fcon_gate(0, 1, 1, 0) == 0, "fcon gate env-off == 0");
+    CHECK(c2b_fcon_gate(1, 0, 1, 0) == 0, "fcon gate no-base == 0");
+    CHECK(c2b_fcon_gate(1, 1, 0, 0) == 0, "fcon gate no-target == 0");
+    CHECK(c2b_fcon_gate(1, 1, 1, 1) == 0, "fcon gate done == 0");
+    for (i = 0; i < 16; i++) buf[i] = 0;
+    buf[0] = 0x55; buf[1] = 0x49; buf[2] = 0x89; buf[3] = 0xFA;
+    buf[4] = 0x48; buf[5] = 0x89; buf[6] = 0xE5; buf[7] = 0x53;
+    CHECK(c2b_fcon_sig_ok(buf, (const u8 *)"\x55\x31\xc0\x48\x89\xe5\x5d\xc3",
+                          (const u8 *)"\x55\x48\x89\xe5\x41\x56\x41\x89") == 1,
+          "fcon sig exact match == 1");
+    buf[3] = 0xFB;      /* испорчен байт formatter-сига */
+    CHECK(c2b_fcon_sig_ok(buf, (const u8 *)"\x55\x31\xc0\x48\x89\xe5\x5d\xc3",
+                          (const u8 *)"\x55\x48\x89\xe5\x41\x56\x41\x89") == 0,
+          "fcon sig fmt-corrupt == 0");
+    CHECK(c2b_fcon_sig_ok((const u8 *)"", (const u8 *)"", (const u8 *)"") == 0,
+          "fcon sig empty ptrs == 0");
+    CHECK(c2b_fcon_sig_ok(0, 0, 0) == 0, "fcon sig null == 0");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -37861,6 +38030,7 @@ int main(void)
     test_g131();        /* v70: 0x24-reject декодер */
     test_ansolo();      /* v72: ANSOLO-билдер (корректный %011x) */
     test_fini2();       /* t36/audit05: контракт FINI/FINI2 (ранее был НЕ зарегистрирован) */
+    test_fcon();        /* v110.2: fcon-гейт + сиг-чек 3 RVAs */
 #ifndef C2B_ST_NO_DETOUR
     test_detour();
     test_detour2();

@@ -1378,6 +1378,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     engine_alive || { log "attempt $ATTEMPT: client died during connect"; save_conlog; break; }
     if (( ! CONNECT_SENTINEL )); then
       if grep -aq "Connecting to" "$OUT" 2>/dev/null \
+         || grep -aq "fcon: fired connect" "$OUT" 2>/dev/null \
          || sudo -n grep -aq "Connecting to" "$CONLOG" 2>/dev/null; then
         CONNECT_SENTINEL=1; SOFT_STREAK=0
         log "attempt $ATTEMPT: 'Connecting to' seen (URL delivered)"

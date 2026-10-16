@@ -20823,6 +20823,20 @@ static u32 c2b_b2e_proto(u32 fires, u32 pr_live)
     if (pr_live == 0u || pr_live > 16u) return 3u;
     return pr_live;
 }
+/* v109.4: b2c_ok = пред-условия in-channel-доставки 'B' (always-остров,
+ * selftest-виден). Канал = SendMessage-класс slot-11 (ABI k2v/h2v-огней).
+ * Повод (run563-RE): 'A'-challenge живёт in-channel (g71/g82w slot-14,
+ * движок пуллит), легаси-очередь мертва (g13=0 x2), 'k' in-channel = S2
+ * parse-error death (258/262/264) = сервер РЕАЛЬНО парсит in-channel
+ * payload'ы — 'B' = непробованный класс. iface/h живы + len вменяем
+ * [1..1400]. Чистая функция без побочек. */
+static i32 c2b_b2c_ok(u32 on, const void *iface, uptr h, u32 len)
+{
+    if (!on) return 0;
+    if (!iface || !h) return 0;
+    if (!len || len > 1400u) return 0;
+    return 1;
+}
 
 /* ---------- v106.6: KDR — KFULL CHAL-ПАТЧ ПРЯМОЙ ОТПРАВКА В СЕРВЕР ----------
  * ЦЕНЗ run525 (г90-хеды): движковый СОБСТВЕННЫЙ 'k' = 513B ff×4+'k'+'96\0'+
@@ -23374,18 +23388,26 @@ static void c2b_a2eb_maybe(void)
  * роутинг (ось 'B' закрывается окончательно). Кап 2, killswitch C2B_B2E=0.
  * На провод НЕ попадает (loopback). */
 static u32 g_b2e_init, g_b2e_on = 1, g_b2e_fires;
+static u32 g_b2c_on = 1;                /* v109.4: b2c in-channel-доставка */
 static void c2b_b2e_maybe(void)
 {
     static u8 b2_buf[64];
     u32 cs_b2 = 0, ch_b2 = 0, pr_b2 = 0, sb_len, ib2, src_grant;
+    i32 rc_bc = -999;
     u8 la[16];
     ssize_t sr;
     if (!g_b2e_init) {
         const char *eb2 = getenv("C2B_B2E");
         if (eb2 && eb2[0] == '0') g_b2e_on = 0;
+        {
+            const char *ebc = getenv("C2B_B2C");
+            if (ebc && ebc[0] == '0') g_b2c_on = 0;
+        }
         g_b2e_init = 1;
         if (g_b2e_on)
-            C2B_LOGS("[c2b] b2e: ARMED (v109.1 fresh-grant-chal first, split-cap eng=1/grant=4)\n");
+            C2B_LOGS("[c2b] b2e: ARMED (v109.4 split-cap eng=1/grant=4 + b2c in-channel)\n");
+        if (!g_b2c_on)
+            C2B_LOGS("[c2b] b2c: disabled (C2B_B2C=0)\n");
     }
     if (!g_b2e_on) return;
     if (g_b2e_fires >= 4u) return;
@@ -23409,6 +23431,27 @@ static void c2b_b2e_maybe(void)
     sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)b2_buf,
                                        sb_len, 0,
                                        (const struct sockaddr *)la, 16);
+    /* v109.4 B2C: ТОТ ЖЕ 'B' in-channel (slot-11 SendMessage-класс,
+     * ABI = k2v/h2v-огней, UNRELIABLE fl=0 = tolerated-silent-класс h2v).
+     * Легаси-loopback остаётся (A/B-история), in-channel = ЖИВОЙ путь:
+     * 'A' туда-сюда ходит (g90/g71), 'k' парсился сервером (S2-смерть).
+     * rc=1 = принят локальным GNS (k_EResultOK); rc=3 = NoConnection. */
+    if (c2b_b2c_ok(g_b2c_on, g_gns_conn_iface, g_gns_conn_h, sb_len)) {
+        void **vt_bc = *(void ***)g_gns_conn_iface;
+        i64 out_bc;
+        g_probe_active = 1;
+        if (__sigsetjmp(g_probe_jb, 1) == 0) {
+            rc_bc = ((i32 (*)(void *, uptr, const void *, u32, i32,
+                              i64 *))vt_bc[11])(
+                g_gns_conn_iface, g_gns_conn_h, b2_buf, sb_len,
+                0 /* UNRELIABLE */, &out_bc);
+            g_probe_active = 0;
+        } else {
+            g_probe_active = 0;
+            rc_bc = -998;
+            C2B_LOGS("[c2b] b2c: send SEGV\n");
+        }
+    }
     g_b2e_fires++;
     g_b2e_grant_seen = 0;       /* v108.7: грант-источник тратится файром */
     g_cw_burst = C2B_CW_BURST;  /* v106.4: пер-тик срезы окна перехода */
@@ -23426,6 +23469,8 @@ static void c2b_b2e_maybe(void)
     C2B_LOGN(sb_len);
     C2B_LOGS(" rc=");
     C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS(" ch=");
+    C2B_LOGN((u32)rc_bc);   /* v109.4: in-channel rc (-999 = скип, -998 = SEGV) */
     C2B_LOGS("\n");
     /* телеметрия-только: реакцию парсера читаем по g48/g66-классам + cw-срезам */
 }
@@ -34685,6 +34730,14 @@ static void test_swr(void)
     CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u, 0) == 0, "b2e: eng-кап 1 — fires=1 = скип (v109.1)");
     CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu, 1) == 1, "b2e: грант после eng-файра жив (общий счётчик)");
     CHECK(c2b_b2e_gate(1, 0, 0, 1) == 0, "b2e: chal=0 (не приземлился) = скип");
+    /* --- v109.4: b2c in-channel-пред-условия --- */
+    printf("[t] b2c\n");
+    CHECK(c2b_b2c_ok(0, (const void *)1, 0x1234u, 59) == 0, "b2c: on=0 = скип");
+    CHECK(c2b_b2c_ok(1, (const void *)0, 0x1234u, 59) == 0, "b2c: iface=0 = скип");
+    CHECK(c2b_b2c_ok(1, (const void *)1, 0, 59) == 0, "b2c: хэндл=0 = скип");
+    CHECK(c2b_b2c_ok(1, (const void *)1, 0x1234u, 0) == 0, "b2c: len=0 = скип");
+    CHECK(c2b_b2c_ok(1, (const void *)1, 0x1234u, 1401) == 0, "b2c: len>1400 = скип");
+    CHECK(c2b_b2c_ok(1, (const void *)1, 0x1234u, 59) == 1, "b2c: 59B = жив (run563-канал)");
     /* --- v106.5: b2e proto-пик (двухсторонний A/B) --- */
     printf("[t] b2e-proto\n");
     CHECK(c2b_b2e_proto(0u, 0u) == 2u, "b2e: fire#1 (любой live) = 2 (контроль v105)");

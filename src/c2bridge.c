@@ -19574,6 +19574,7 @@ static void c2b_a2e_maybe(void);       /* v43: релей серверного '
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_b2e_maybe(void);       /* v106.3: синт-'B' с живым chal -> движок */
 static void c2b_kdr_maybe(void);       /* v106.6: kfull chal-патч прямой в сервер */
+static void c2b_tiksyn_maybe(void);    /* v108.2: тик-путь огонь TIK k+ticket (тело = после kdr-глобалов) */
 static void c2b_cvx_maybe(void);       /* v106.8: прямой OOB "connect0x%%08x" в сервер */
 static void c2b_pcx_maybe(void);       /* v107.0: парный каденс 0x22+вербатим-'k' (грант-эксперимент) */
 static u32 c2b_pcx_arm(void);          /* v107.2.1: сборка+сташ пенд-пары (общий: тик-fallback + kdr-sync) */
@@ -19782,6 +19783,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_k27_maybe_fire();
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
         c2b_kdr_maybe();       /* v106.6: kfull chal-патч прямой в сервер (новый кфулл) */
+        c2b_tiksyn_maybe();    /* v108.2: огонь k+ticket (дифф к kdr-бейзлайну того же чала) */
         c2b_cvx_maybe();       /* v106.8: прямой OOB "connect0x" в сервер (после kdr-пары; v107.0 = opt-in) */
         c2b_pcx_maybe();       /* v107.0: пары 0x22+вербатим-'k' после kdr A/B (грант-эксперимент) */
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
@@ -20896,10 +20898,11 @@ static u32 c2b_tik_build(const u8 *kf, u32 klen, const u8 *tk, u32 tlen,
  * wire снапшот etix; p = старт-проб). Возврат 0 = источников нет. В
  * selftest re-probe = инертен (движка нет) — та же #ifndef-структура,
  * что в исходном tik_maybe (v107.8/107.9 без изменений семантики). */
-static u8 c2b_tik_pick(const u8 **tsrc, u32 *tlen)
+static u8 c2b_tik_pick(u32 do_rp, const u8 **tsrc, u32 *tlen)
 {
+    (void)do_rp;                         /* selftest: re-probe = инертен */
 #ifndef C2B_SELFTEST
-    if (g_steamuser_obj && g_auth_slot) {
+    if (do_rp && g_steamuser_obj && g_auth_slot) {
         u32 h9, tlen9 = 0;
         u64 sid9;
         u8 ident9[16];
@@ -20976,7 +20979,7 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
      *     движок сам шлёт; давность = момент последней лейны);
      * (p) старт-проб (классика, НО минутной давности — последний
      *     фолбэк). src= в логе = A/B-метка формы на проводе. */
-    srcn = c2b_tik_pick(&tsrc, &tlen);
+    srcn = c2b_tik_pick(1u, &tsrc, &tlen);
     if (!srcn) return;                       /* ни одного источника = мимо */
     if (!c2b_tik_build(g_kfull, g_kfull_len, tsrc, tlen, tik_buf,
                        (u32)sizeof(tik_buf), &n))
@@ -21064,7 +21067,7 @@ static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
     u8 srcn;
     ssize_t sr;
     g_tiksyn_sent = 1;                       /* один выбор за сессию, ДО огня */
-    srcn = c2b_tik_pick(&tsrc, &tlen);
+    srcn = c2b_tik_pick(1u, &tsrc, &tlen);
     if (!srcn) {
         C2B_LOGS("[c2b] tiksyn: no ticket source, spent\n");
         return;
@@ -21387,6 +21390,93 @@ static i64 g_k27k_out47;   /* vt[11] out-параметр (queued-status) */
  * (выше); здесь = рантайм-статик: fires/val/on + кап 2 + C2B_KDR=0. */
 static u32 g_kdr_init, g_kdr_on = 1, g_kdr_fires, g_kdr_val;
 static u32 g_kdb_on = 1;   /* v107.3: KDB бёрст (#3..#6 VAL), killswitch C2B_KDB=0 */
+
+/* v108.2: TIKSYN ТИК-ПУТЬ (основной огонь): ценз run547 — pcxr-хвост СПИТ
+ * для k-класса (движок шлёт 'k' прямыми syscall'ами мимо PLT-хука; 86 k на
+ * проводе из :27005, 0 каптур хвоста, 0 'fresh k -> ARMED') => огонь =
+ * тик-путь kdr-машины (ПРОВЕРЕННЫЙ канал g_clv2_fd -> 152.233.19.133:28022;
+ * kdr#1 = в precedes грантов run535 = грант-соседний вантидж). ARM = первый
+ * тик с g_kfull_n>0 (свидетельство свежего kfull-захвата), ОГОНЬ = следующий
+ * тик (~секунды): kdr-форма (chal = g_kdr_val = ТОТ ЖЕ A/B-чал, что у kdr#1 =
+ * прямой дифф с тикет-меньше бейзлайном ТОГО ЖЕ чала/сокета/момента) +
+ * тикет-хвост. Источник = c2b_tik_pick(0) = БЕЗ ре-проба (без виртуальных
+ * вызовов — bare-safe в тик-контексте; e=etix-снапшот/p=старт-проб).
+ * Один выстрел/сессию (sent ДО огня); killswitch C2B_TIKSYN=0; pcxr-путь
+ * (v108.1) остаётся бэкапом с тем же one-shot стейтом. */
+static void c2b_tiksyn_maybe(void)
+{
+    static u8 kb2[1200], tb2[2500];
+    u32 klen, n, fl, n47, i9;
+    u32 chal;
+    const u8 *tsrc;
+    u32 tlen;
+    u8 srcn;
+    u8 sa[16];
+    ssize_t sr;
+    c2b_tiksyn_lazy();
+    if (!g_tiksyn_on || g_tiksyn_sent) return;
+    n47 = __atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE);
+    if (!n47) return;                    /* нет свежих k = нечего слать */
+    if (!g_tiksyn_arm) {
+        g_tiksyn_arm = 1;
+        C2B_LOGS("[c2b] tiksyn: kfull seen -> ARMED (fire on the next tick)\n");
+        return;
+    }
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1u) return;
+    fl = g_kfull_len;
+    chal = g_kdr_val;                    /* тот же чал, что у kdr#1 = A/B-ячейка грант-соседа */
+    if (!c2b_kdr_build((const u8 *)g_kfull, fl, chal, kb2,
+                       (u32)sizeof(kb2), &klen)) return;
+    srcn = c2b_tik_pick(0u, &tsrc, &tlen);   /* БЕЗ ре-проба = bare-safe */
+    if (!srcn) {
+        C2B_LOGS("[c2b] tiksyn: no ticket source (tick), spent\n");
+        g_tiksyn_sent = 1;
+        return;
+    }
+    if (!c2b_tik_build(kb2, klen, tsrc, tlen, tb2,
+                       (u32)sizeof(tb2), &n)) {
+        C2B_LOGS("[c2b] tiksyn: build reject (tick), spent\n");
+        g_tiksyn_sent = 1;
+        return;
+    }
+    g_tiksyn_sent = 1;                   /* снять ДО огня (pcxr-дисциплина) */
+    for (i9 = 0; i9 < sizeof(sa); i9++) sa[i9] = 0;
+    sa[0] = 2;                           /* AF_INET (LE) */
+    sa[2] = 0x6d; sa[3] = 0x76;          /* порт 28022 BE */
+    sa[4] = 152; sa[5] = 233; sa[6] = 19; sa[7] = 133;
+#ifndef C2B_SELFTEST
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)tb2,
+                                           n, 0,
+                                           (const struct sockaddr *)sa, 16);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] tiksyn: tick send FAULT\n");
+        return;
+    }
+#else
+    sr = -1;                             /* selftest = инертен */
+#endif
+    C2B_LOGS("[c2b] tiksyn: tick->k+ticket len=");
+    C2B_LOGN(n);
+    C2B_LOGS(" kf=");
+    C2B_LOGN(klen);
+    C2B_LOGS(" tk=");
+    C2B_LOGN(tlen);
+    C2B_LOGS(" src=");
+    C2B_LOGS(srcn == (u8)'f' ? "f" : srcn == (u8)'e' ? "e" : "p");
+    C2B_LOGS(" chal=");
+    C2B_LOGH((u8)(chal >> 24)); C2B_LOGH((u8)(chal >> 16));
+    C2B_LOGH((u8)(chal >> 8)); C2B_LOGH((u8)chal);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr >= 0 ? sr : -1));
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)g_clv2_fd);
+    C2B_LOGS("\n");
+}
 
 /* v47b: попытка k27k-выстрела (вызывается ИЗ form-пути на A-fire, И из
  * кождого тика g97 пока pend — источник 'k' (g70-капчер) часто ПОЗЖЕ
@@ -27565,13 +27655,6 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                             C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
                             C2B_LOGS(" ver="); C2B_LOGN(c2b_clv2_client_version());
                             C2B_LOGS("\n");
-                            /* v108.0 tiksyn: приманка = триггер (arm; огонь =
-                             * первый свежий движковый 'k' в pcxr-хвосте). */
-                            c2b_tiksyn_lazy();
-                            if (g_tiksyn_on && !g_tiksyn_sent) {
-                                g_tiksyn_arm = 1;
-                                C2B_LOGS("[c2b] tiksyn: bait -> ARMED\n");
-                            }
                             return (ssize_t)pl;
                         }
                         C2B_LOGS("[c2b] g58: kaccept cap too small, fallback to dumb bait\n");

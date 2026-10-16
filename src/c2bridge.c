@@ -21183,15 +21183,31 @@ static void c2b_tik_window_fire(void)
     ssize_t sr;
     win = __atomic_exchange_n(&g_tik_win, 0u, __ATOMIC_ACQ_REL); /* 1-shot take */
     if (!win) return;
+    /* v109.7: the dest fallback — the 'B.'-frames ride INSIDE the GNS stream
+     * in the SDR era (the recvfrom hook never sees the bare ff x4 'B.' =
+     * run570-a3: 12 reject-frames in the drain, 0 through the hook), so the
+     * 'B.'-sender capture = dead exactly in the granted-dialog runs where
+     * the window fires. FALL BACK to the qconnect target (the same connless
+     * addr the kdr/tiksyn fires use = g_clv2_dst). */
+    if (!g_tik_dst_set) {
+        if (g_clv2_dstlen >= 6 && g_clv2_fd >= 0) {
+            memcpy(g_tik_dst, g_clv2_dst, sizeof(g_clv2_dst));
+            g_tik_dst_len = g_clv2_dstlen;
+            g_tik_fd = g_clv2_fd;
+            __atomic_store_n(&g_tik_dst_set, 1u, __ATOMIC_RELEASE);
+            C2B_LOGS("[c2b] tik: window dest = clv2 target (no B.-capture)\n");
+        } else {
+            if (!g_tik_skip_nodst) {
+                g_tik_skip_nodst = 1;
+                C2B_LOGS("[c2b] tik: window skip nodst (no capture, no clv2 dst)\n");
+            }
+            return;
+        }
+    }
     kfull_ok = (g_kfull_len >= 32u && g_kfull_len <= 1200u &&
                 g_kfull[0] == 0xff && g_kfull[4] == (u8)'k') ? 1u : 0u;
     if (!c2b_tik_win_gate(win, g_tik_sent, g_tik_dst_set, kfull_ok)) {
-        if (!g_tik_dst_set) {
-            if (!g_tik_skip_nodst) {
-                g_tik_skip_nodst = 1;
-                C2B_LOGS("[c2b] tik: window skip nodst\n");
-            }
-        } else if (!kfull_ok) {
+        if (!kfull_ok) {
             if (!g_tik_skip_nokf) {
                 g_tik_skip_nokf = 1;
                 C2B_LOGS("[c2b] tik: window skip nokf (no 'k' template this session)\n");

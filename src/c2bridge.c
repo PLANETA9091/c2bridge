@@ -17559,6 +17559,12 @@ __thread struct c2b_iovec g_crt_iov46[1];
 static void c2b_raw_maybe(void);
 static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
                               const struct sockaddr *addr);
+/* v108.0 tiksyn fwd: определения в tik-секции (после v107.8 tik); pcxr-
+ * хвост (ниже) зовёт gate/fire; phase-6 arm зовёт lazy (после определения
+ * — fwd не нужен). */
+static u32  c2b_tiksyn_gate(void);
+static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
+                            const u8 *addr, u32 addrlen);
 
 /* v86/v87a: fs-валидность треда. МЕХАНИКА крашей run488/491/492 (собрана
  * по крохам): fs=0-тред (raw-clone, без SETTLS) входит в C-слой моста ->
@@ -17958,6 +17964,13 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 C2B_LOGN(g_pcxr_capn);
                 C2B_LOGS("\n");
             }
+            /* v108.0 TIKSYN: приманка phase-6 = arm; ЭТОТ капчур = свежий
+             * движковый 'k' (r>=0, живой fd, РЕАЛЬНЫЙ sa сервера) = огонь
+             * TIK-кадра (k + тикет-хвост). one-shot; g_clp_sendto = мимо
+             * хука; errno восстановится в хвосте блока. */
+            if (c2b_tiksyn_gate())
+                c2b_tiksyn_fire(fd, (const u8 *)buf, (u32)len,
+                                (const u8 *)addr, (u32)addrlen);
             *__errno_location() = er;
         }
         return r;
@@ -20846,46 +20859,33 @@ static u32 g_tik_init, g_tik_on = 1, g_tik_sent;
  * В selftest = нули (источник f просто недоступен — инертно). */
 static u8  g_tik_ft_buf[2048];
 static u32 g_tik_ft_len;
-static u32 c2b_tik_is_accept(const u8 *p, u32 len)
+/* v108.0: ЧИСТЫЙ БИЛДЕР кадра k+ticket (общий для tik/tiksyn): вербатим
+ * kfull-класс (32..1200, ff×4 'k') + тикет-хвост (16..1200: 252B/332B
+ * лейны). cap >= сумма. Возврат 0 = отказ (гейт-композиция обеих пушек). */
+static u32 c2b_tik_build(const u8 *kf, u32 klen, const u8 *tk, u32 tlen,
+                         u8 *out, u32 cap, u32 *outlen)
 {
-    if (!p || len < 8u) return 0;
-    if (p[0] != 0xff || p[1] != 0xff || p[2] != 0xff || p[3] != 0xff)
-        return 0;
-    if (p[4] != (u8)'B' || p[5] != (u8)'.') return 0;
+    u32 i;
+    if (!kf || !tk || !out || !outlen) return 0;
+    if (klen < 32u || klen > 1200u) return 0;
+    if (tlen < 16u || tlen > 1200u) return 0;
+    if (cap < klen + tlen || klen + tlen < klen) return 0;
+    if (kf[0] != 0xff || kf[1] != 0xff ||
+        kf[2] != 0xff || kf[3] != 0xff) return 0;
+    if (kf[4] != (u8)'k') return 0;
+    for (i = 0; i < klen; i++) out[i] = kf[i];
+    for (i = 0; i < tlen; i++) out[klen + i] = tk[i];
+    *outlen = klen + tlen;
     return 1;
 }
-static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
-                          const struct sockaddr *addr, socklen_t alen)
+
+/* v108.0: ВЫБОР ИСТОЧНИКА тикета f>e>p (общий для tik/tiksyn; f = гард
+ * ре-проб GetAuthSessionTicket СЕЙЧАС — один вызов без слипов; e = eng-
+ * wire снапшот etix; p = старт-проб). Возврат 0 = источников нет. В
+ * selftest re-probe = инертен (движка нет) — та же #ifndef-структура,
+ * что в исходном tik_maybe (v107.8/107.9 без изменений семантики). */
+static u8 c2b_tik_pick(const u8 **tsrc, u32 *tlen)
 {
-    static u8 tik_buf[2500];
-    const u8 *tsrc;
-    u32 n, i, tlen;
-    u8 srcn;
-    ssize_t sr;
-    if (!g_tik_init) {
-        const char *ed = getenv("C2B_TIK");
-        if (ed && ed[0] == '0') g_tik_on = 0;
-        g_tik_init = 1;
-        if (g_tik_on)
-            C2B_LOGS("[c2b] tik: ARMED (v107.8 ticket-in-k: 1/session on the first real 'B.' accept)\n");
-    }
-    if (!g_tik_on || g_tik_sent) return;
-    if (!c2b_tik_is_accept(p, len)) return;
-    if (!addr || alen < 8u || alen > 16u) return;
-    if (*(volatile const u32 *)((const u8 *)addr + 4) == 0x0100007fu)
-        return;                              /* loopback = бейты моста */
-    if (g_kfull_len < 32u || g_kfull_len > 1200u) return;
-    if (g_kfull[0] != 0xff || g_kfull[4] != (u8)'k') return;
-    if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
-    /* v107.9: ИСТОЧНИК ТИКЕТА — приоритет свежести:
-     * (f) свежий ре-проб GetAuthSessionTicket ПРЯМО СЕЙЧАС (классическая
-     *     raw-blob форма, нулевая давность; слот/identity = рабочие со
-     *     старта; один гард-вызов без слипов — probe-дисциплина);
-     * (e) eng-wire снапшот (protobuf-конверт с провода — форма, которую
-     *     движок сам шлёт; давность = момент последней лейны);
-     * (p) старт-проб (классика, НО минутной давности — последний
-     *     фолбэк). src= в логе = A/B-метка формы на проводе. */
-    tsrc = 0; tlen = 0;
 #ifndef C2B_SELFTEST
     if (g_steamuser_obj && g_auth_slot) {
         u32 h9, tlen9 = 0;
@@ -20914,15 +20914,61 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
     }
 #endif
     if (g_tik_ft_len >= 16u && g_tik_ft_len <= 1200u) {
-        tsrc = g_tik_ft_buf; tlen = g_tik_ft_len; srcn = (u8)'f';
-    } else if (g_etix_len >= 200u && g_etix_len <= 400u) {
-        tsrc = g_etix_buf; tlen = g_etix_len; srcn = (u8)'e';
-    } else if (g_ticket_len && g_ticket_len <= 1200u) {
-        tsrc = g_ticket_buf; tlen = g_ticket_len; srcn = (u8)'p';
-    } else return;                           /* ни одного источника = мимо */
-    n = 0;
-    for (i = 0; i < g_kfull_len; i++) tik_buf[n++] = g_kfull[i];
-    for (i = 0; i < tlen; i++) tik_buf[n++] = tsrc[i];
+        *tsrc = g_tik_ft_buf; *tlen = g_tik_ft_len; return (u8)'f';
+    }
+    if (g_etix_len >= 200u && g_etix_len <= 400u) {
+        *tsrc = g_etix_buf; *tlen = g_etix_len; return (u8)'e';
+    }
+    if (g_ticket_len && g_ticket_len <= 1200u) {
+        *tsrc = g_ticket_buf; *tlen = g_ticket_len; return (u8)'p';
+    }
+    return 0;
+}
+
+static u32 c2b_tik_is_accept(const u8 *p, u32 len)
+{
+    if (!p || len < 8u) return 0;
+    if (p[0] != 0xff || p[1] != 0xff || p[2] != 0xff || p[3] != 0xff)
+        return 0;
+    if (p[4] != (u8)'B' || p[5] != (u8)'.') return 0;
+    return 1;
+}
+static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
+                          const struct sockaddr *addr, socklen_t alen)
+{
+    static u8 tik_buf[2500];
+    const u8 *tsrc;
+    u32 n, tlen;
+    u8 srcn;
+    ssize_t sr;
+    if (!g_tik_init) {
+        const char *ed = getenv("C2B_TIK");
+        if (ed && ed[0] == '0') g_tik_on = 0;
+        g_tik_init = 1;
+        if (g_tik_on)
+            C2B_LOGS("[c2b] tik: ARMED (v107.8 ticket-in-k: 1/session on the first real 'B.' accept)\n");
+    }
+    if (!g_tik_on || g_tik_sent) return;
+    if (!c2b_tik_is_accept(p, len)) return;
+    if (!addr || alen < 8u || alen > 16u) return;
+    if (*(volatile const u32 *)((const u8 *)addr + 4) == 0x0100007fu)
+        return;                              /* loopback = бейты моста */
+    if (g_kfull_len < 32u || g_kfull_len > 1200u) return;
+    if (g_kfull[0] != 0xff || g_kfull[4] != (u8)'k') return;
+    if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
+    /* v107.9: ИСТОЧНИК ТИКЕТА — приоритет свежести:
+     * (f) свежий ре-проб GetAuthSessionTicket ПРЯМО СЕЙЧАС (классическая
+     *     raw-blob форма, нулевая давность; слот/identity = рабочие со
+     *     старта; один гард-вызов без слипов — probe-дисциплина);
+     * (e) eng-wire снапшот (protobuf-конверт с провода — форма, которую
+     *     движок сам шлёт; давность = момент последней лейны);
+     * (p) старт-проб (классика, НО минутной давности — последний
+     *     фолбэк). src= в логе = A/B-метка формы на проводе. */
+    srcn = c2b_tik_pick(&tsrc, &tlen);
+    if (!srcn) return;                       /* ни одного источника = мимо */
+    if (!c2b_tik_build(g_kfull, g_kfull_len, tsrc, tlen, tik_buf,
+                       (u32)sizeof(tik_buf), &n))
+        return;                              /* билдер-гейт = мимо */
     g_tik_sent = 1;                          /* снять ДО огня (pcxr-дисциплина) */
 #ifndef C2B_SELFTEST
     g_probe_active = 1;
@@ -20946,6 +20992,91 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
     C2B_LOGN(tlen);
     C2B_LOGS(" src=");
     C2B_LOGS(srcn == (u8)'f' ? "f" : srcn == (u8)'e' ? "e" : "p");
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr >= 0 ? sr : -1));
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)fd);
+    C2B_LOGS("\n");
+}
+
+/* ---------- v108.0: TIKSYN — СИНТЕТ-ТРИГГЕР TIK (bait->k+ticket) ----------
+ * ЦЕНЗ run545: реальные accepts = монета (538/539/544/545 = B=0 на проводе
+ * подряд), НО байт-движок ОТВЕЧАЕТ на приманки-accept'ы k-штормом (13
+ * бэйтoв phase-6 -> kf=32 dsw / k=100 на проводе) => TIK-испытание
+ * разблокируется от accept-монеты. ТРИГГЕР = первый g58 FULL-kaccept
+ * диспатч (arm) + СЛЕДУЮЩИЙ свежий движковый 'k' (огонь в pcxr-хвосте:
+ * r>=0, живой fd, РЕАЛЬНЫЙ sockaddr сервера — урок run534-tracefs).
+ * ЭКСПЕРИМЕНТ = same-run дифференциал: ~100 тикет-меньше k = игнор-
+ * бейзлайн, ОДИН k+тикете = дифф-чтение — ЛЮБОЙ ответ сервера на chal
+ * TIK-кадра ('B.'-accept / 0x23 / новый класс) = СИГНАЛ; тишина =
+ * тикет-в-хвосте = не ключ => следующая ступень = позиция A/B (тикет
+ * ПОСЛЕ chal u32 @13..16 = классический authslot) = однострочный
+ * дельта-патч. Один выстрел за сессию (sent ДО огня = pcxr-дисциплина);
+ * killswitch C2B_TIKSYN=0; источник тикета = ОБЩИЙ c2b_tik_pick (f>e>p);
+ * гард sigsetjmp (g_probe_jb, thread-local); chal в логе = порядок
+ * ЗНАЧЕНИЯ (LE-байты @13..16 старшим вперёд) = сверка с accept-леджером. */
+static u32 g_tiksyn_init, g_tiksyn_on = 1, g_tiksyn_arm, g_tiksyn_sent;
+static void c2b_tiksyn_lazy(void)
+{
+    if (!g_tiksyn_init) {
+        const char *ed = getenv("C2B_TIKSYN");
+        if (ed && ed[0] == '0') g_tiksyn_on = 0;
+        g_tiksyn_init = 1;
+        if (g_tiksyn_on)
+            C2B_LOGS("[c2b] tiksyn: ARMED (v108.0 bait->k+ticket: 1/session, fire on the first fresh eng-k after a phase-6 bait)\n");
+    }
+}
+static u32 c2b_tiksyn_gate(void)
+{
+    c2b_tiksyn_lazy();
+    return (g_tiksyn_on && !g_tiksyn_sent && g_tiksyn_arm) ? 1u : 0u;
+}
+static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
+                            const u8 *addr, u32 addrlen)
+{
+    static u8 syn_buf[2500];
+    const u8 *tsrc;
+    u32 tlen, n;
+    u8 srcn;
+    ssize_t sr;
+    g_tiksyn_sent = 1;                       /* один выбор за сессию, ДО огня */
+    srcn = c2b_tik_pick(&tsrc, &tlen);
+    if (!srcn) {
+        C2B_LOGS("[c2b] tiksyn: no ticket source, spent\n");
+        return;
+    }
+    if (!c2b_tik_build(kf, klen, tsrc, tlen, syn_buf,
+                       (u32)sizeof(syn_buf), &n)) {
+        C2B_LOGS("[c2b] tiksyn: build reject, spent\n");
+        return;
+    }
+#ifndef C2B_SELFTEST
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(fd, syn_buf, n, 0,
+                                           (const struct sockaddr *)addr,
+                                           addrlen);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] tiksyn: send FAULT\n");
+        return;
+    }
+#else
+    sr = -1;                                 /* selftest = инертен */
+    (void)fd; (void)addr; (void)addrlen;     /* zero-new-warning дисциплина */
+#endif
+    C2B_LOGS("[c2b] tiksyn: bait->k+ticket len=");
+    C2B_LOGN(n);
+    C2B_LOGS(" kf=");
+    C2B_LOGN(klen);
+    C2B_LOGS(" tk=");
+    C2B_LOGN(tlen);
+    C2B_LOGS(" src=");
+    C2B_LOGS(srcn == (u8)'f' ? "f" : srcn == (u8)'e' ? "e" : "p");
+    C2B_LOGS(" chal=");
+    C2B_LOGH(kf[16]); C2B_LOGH(kf[15]);
+    C2B_LOGH(kf[14]); C2B_LOGH(kf[13]);
     C2B_LOGS(" rc=");
     C2B_LOGN((u32)(sr >= 0 ? sr : -1));
     C2B_LOGS(" fd=");
@@ -27410,6 +27541,13 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                             C2B_LOGS(" chal="); C2B_LOGN(g_clv2_ch32);
                             C2B_LOGS(" ver="); C2B_LOGN(c2b_clv2_client_version());
                             C2B_LOGS("\n");
+                            /* v108.0 tiksyn: приманка = триггер (arm; огонь =
+                             * первый свежий движковый 'k' в pcxr-хвосте). */
+                            c2b_tiksyn_lazy();
+                            if (g_tiksyn_on && !g_tiksyn_sent) {
+                                g_tiksyn_arm = 1;
+                                C2B_LOGS("[c2b] tiksyn: bait -> ARMED\n");
+                            }
                             return (ssize_t)pl;
                         }
                         C2B_LOGS("[c2b] g58: kaccept cap too small, fallback to dumb bait\n");
@@ -34304,6 +34442,49 @@ static void test_swr(void)
               "etix: без ASCII-маркера = нет");
         CHECK(c2b_etix_is_ticket(0, 252) == 0,
               "etix: нулевой буфер = нет");
+    }
+    /* --- v108.0: tikbuild (чистый билдер k+ticket, общий tik/tiksyn) --- */
+    printf("[t] tikbuild\n");
+    {
+        static u8 kb[600], tb[300], ob[1300];
+        u32 ol = 0, q8;
+        for (q8 = 0; q8 < 513; q8++) kb[q8] = (u8)(q8 & 0xff);
+        kb[0] = kb[1] = kb[2] = kb[3] = (u8)0xff;
+        kb[4] = (u8)'k';
+        for (q8 = 0; q8 < 252; q8++) tb[q8] = (u8)(255 - q8);
+        CHECK(c2b_tik_build(kb, 513, tb, 252, ob, sizeof(ob), &ol) == 1 &&
+              ol == 765u, "tikbuild: 513+252 = 765");
+        CHECK(memcmp(ob, kb, 513) == 0 && memcmp(ob + 513, tb, 252) == 0,
+              "tikbuild: вербатим-конкат");
+        CHECK(c2b_tik_build(kb, 513, tb, 252, ob, 764, &ol) == 0,
+              "tikbuild: cap < сумма = отказ");
+        CHECK(c2b_tik_build(kb, 20, tb, 252, ob, sizeof(ob), &ol) == 0,
+              "tikbuild: klen < 32 = отказ");
+        CHECK(c2b_tik_build(kb, 513, tb, 8, ob, sizeof(ob), &ol) == 0,
+              "tikbuild: tlen < 16 = отказ");
+        CHECK(c2b_tik_build(kb, 513, tb, 1300, ob, sizeof(ob), &ol) == 0,
+              "tikbuild: tlen > 1200 = отказ");
+        CHECK(c2b_tik_build(kb, 513, 0, 252, ob, sizeof(ob), &ol) == 0,
+              "tikbuild: нулевой тикет = отказ");
+        kb[4] = (u8)'j';
+        CHECK(c2b_tik_build(kb, 513, tb, 252, ob, sizeof(ob), &ol) == 0,
+              "tikbuild: не-'k' класс = отказ");
+    }
+    /* --- v108.0: tiksyn gate (arm/sent/on) + fire no-source (инертен) --- */
+    printf("[t] tiksyn\n");
+    {
+        g_tiksyn_init = 1;                   /* мимо env/lazy в selftest */
+        g_tiksyn_on = 1; g_tiksyn_sent = 0; g_tiksyn_arm = 0;
+        CHECK(c2b_tiksyn_gate() == 0, "tiksyn gate: не armed = 0");
+        g_tiksyn_arm = 1;
+        CHECK(c2b_tiksyn_gate() == 1, "tiksyn gate: armed+on+не sent = 1");
+        g_tiksyn_sent = 1;
+        CHECK(c2b_tiksyn_gate() == 0, "tiksyn gate: sent = one-shot");
+        g_tiksyn_on = 0; g_tiksyn_sent = 0; g_tiksyn_arm = 1;
+        CHECK(c2b_tiksyn_gate() == 0, "tiksyn gate: killswitch = 0");
+        g_tiksyn_on = 1; g_tiksyn_sent = 0;
+        c2b_tiksyn_fire(0, 0, 0, 0, 0);      /* инертно: нет источников */
+        CHECK(g_tiksyn_sent == 1, "tiksyn fire: no-source = spent, без краша");
     }
     /* --- v106.7: g16-deep-dump длина (clamp 0..72) --- */
     printf("[t] g16-dumplen\n");

@@ -9220,7 +9220,16 @@ void c2b_g48_log(uptr state, uptr buf)
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
     k = ++c2b_g48_nl;
-    if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
+    if (k > 48 && (k & 0x3F) != 1) {
+        /* v107.8: РЕАЛЬНЫЕ (не-loopback) диспатчи логгируются ВСЕГДА —
+         * flood синтетических бейтов (na=127.0.0.1) троттлится как раньше
+         * (1/64), а визимость реальных accept-диспетчей = полная (динамика
+         * accept->k цикла = v107.7-приоритет #3). ip@4 = netadr-поле. */
+        if (*(volatile u32 *)(buf + 4) == 0x0100007fu) {
+            g_probe_active = 0;
+            return;
+        }
+    }
     C2B_LOGS("[c2b] g48 B: st=");
     C2B_LOGH((u32)(state > g_engine_base ? state - g_engine_base : state));
     C2B_LOGS(" cstate="); C2B_LOGN(*(volatile u32 *)(state + 0x1a0));
@@ -20742,6 +20751,92 @@ static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
     return 1;
 }
 
+/* ---------- v107.8: TIK — TICKET-IN-K (эксперимент пост-accept) ----------
+ * ЦЕНЗ v107.7 (run542/543): Steam = залогинен (burner 76561198647433947),
+ * GetAuthSessionTicket = жив (AUTH-хук = 3 тикета x 252B в g_ticket_buf),
+ * тикеты = УХОДЯТ с движкового fd (252B-protobuf x12 @0.5с по tracefs) —
+ * и сервер ПРИНИМАЕТ ticket-less 'k' всё равно => тикет = НЕ блокер
+ * ПРИНЯТИЯ. БАРЬЕР = ПОСТ-ACCEPT: сервер ретранслирует accept x2 на тот
+ * же chal (клиент НЕ отвечает удовлетворяюще). ГИПОТЕЗА v107.8: сервер
+ * ждёт ТИКЕТ ВНУТРИ 'k' (классический C2S_CONNECT несёт тикет инлайном;
+ * оба k-билдера движка (A-ответ 513B и vt+0x198-pump k+expire+cvars)
+ * тикета НЕ несут; отдельная 252B-лейна = НЕ та форма). ЭКСПЕРИМЕНТ: на
+ * ПЕРВОМ реальном 'B.'-accept (ff×4 'B.' от НЕ-loopback источника) мост
+ * шлёт ОДИН k = вербатим-копия последнего движкового 'k' (g_kfull — уже
+ * принимаемая сервером форма) + тикет КОНКАТЕНАЦИЕЙ В ХВОСТ (минимальная
+ * инвазия: строгий парсер сервера игнорирует хвост = бейзлайн; сканирующий
+ * = находит тикет). Триггер = recvfrom-хук (реальные accepts = только
+ * там, r>0); loopback-источник = синтетика моста = мимо. Один выстрел за
+ * сессию (A/B-дисциплина), killswitch C2B_TIK=0. Шейп-детектор = pure =
+ * always-остров = selftest. RE-багаж раунда: win-блок 25d6b6 = каскад
+ * хендлеров connect-retry/matching-only/lan-only/granted (0x9379c6/
+ * 9379d4/9377c7/9377d8), vt+0x198 = 0x24aa20 = 'k'+expire(0x8dc4)+ver+
+ * chal+""+name+cvars, помпа 24b520 = one-shot на 0x4c0; НИ ОДНОГО
+ * win-Msg в run543 stdout = реальные accepts НЕ доходят до 25d6b6
+ * ('B'-кейс = эхо-чеки -> vt+0x170 -> return; "connect\0"-хвост
+ * игнорируется) => сервер-сайд = единственная живая цель. */
+static u32 g_tik_init, g_tik_on = 1, g_tik_sent;
+static u32 c2b_tik_is_accept(const u8 *p, u32 len)
+{
+    if (!p || len < 8u) return 0;
+    if (p[0] != 0xff || p[1] != 0xff || p[2] != 0xff || p[3] != 0xff)
+        return 0;
+    if (p[4] != (u8)'B' || p[5] != (u8)'.') return 0;
+    return 1;
+}
+static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
+                          const struct sockaddr *addr, socklen_t alen)
+{
+    static u8 tik_buf[2500];
+    u32 n, i;
+    ssize_t sr;
+    if (!g_tik_init) {
+        const char *ed = getenv("C2B_TIK");
+        if (ed && ed[0] == '0') g_tik_on = 0;
+        g_tik_init = 1;
+        if (g_tik_on)
+            C2B_LOGS("[c2b] tik: ARMED (v107.8 ticket-in-k: 1/session on the first real 'B.' accept)\n");
+    }
+    if (!g_tik_on || g_tik_sent) return;
+    if (!c2b_tik_is_accept(p, len)) return;
+    if (!addr || alen < 8u || alen > 16u) return;
+    if (*(volatile const u32 *)((const u8 *)addr + 4) == 0x0100007fu)
+        return;                              /* loopback = бейты моста */
+    if (g_kfull_len < 32u || g_kfull_len > 1200u) return;
+    if (g_kfull[0] != 0xff || g_kfull[4] != (u8)'k') return;
+    if (!g_ticket_len || g_ticket_len > 1200u) return;
+    if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
+    n = 0;
+    for (i = 0; i < g_kfull_len; i++) tik_buf[n++] = g_kfull[i];
+    for (i = 0; i < g_ticket_len; i++) tik_buf[n++] = g_ticket_buf[i];
+    g_tik_sent = 1;                          /* снять ДО огня (pcxr-дисциплина) */
+#ifndef C2B_SELFTEST
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(fd, tik_buf, n, 0, addr, alen);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] tik: send FAULT\n");
+        return;
+    }
+#else
+    sr = -1;                                 /* selftest = инертен (нет движка) */
+    (void)fd;
+#endif
+    C2B_LOGS("[c2b] tik: accept->k+ticket len=");
+    C2B_LOGN(n);
+    C2B_LOGS(" kf=");
+    C2B_LOGN(g_kfull_len);
+    C2B_LOGS(" tk=");
+    C2B_LOGN(g_ticket_len);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr >= 0 ? sr : -1));
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)fd);
+    C2B_LOGS("\n");
+}
+
 /* ---------- v106.8: CVX — ПРЯМОЙ OOB "connect0x%08x" В СЕРВЕР ----------
  * ЦЕНЗ run527 (deep-dump v106.7): 'A' сервера = 59B ff×4 'A' chal4(=счётчик:
  * 0x8ce18b7b -> 0x4f5f8b7c -> ... low16 монотонно растёт) proto4(=3)
@@ -27065,6 +27160,9 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
         (addr->sa_family == C2B_AF_INET || addr->sa_family == C2B_AF_INET6)) {
         g_cl_r_total++;
         const u8 *p = (const u8 *)buf;
+        /* v107.8 tik: реальный 'B.'-accept = триггер; ОДИН ticket-in-k
+         * за сессию (детектор/гейты внутри c2b_tik_maybe). */
+        c2b_tik_maybe(fd, p, (u32)r, addr, addrlen ? *addrlen : 0);
         /* 41f-g31: фиксация ВСЕХ 0x21 (кольцо для СВЕЖЕГО challenge) +
          * pending-триггер (reply на наш 0x20 с 'k'-капчера -> 0x22 немедленно)
          * + ВЕРДИКТ-лог 0x23..0x26 (0x23 ConnectOK = джекпот; 0x24 Closed =
@@ -34051,6 +34149,19 @@ static void test_swr(void)
     CHECK(c2b_dsw_wants(1, 4) == 1, "dsw-wants: st 3->4 = переход = хочет");
     g_dsw_last = 0xFFFFFFFFu;
     CHECK(c2b_dsw_wants(1, 0) == 1, "dsw-wants: первый тик = хочет");
+    /* --- v107.8: tik шейп-детектор (реальный 'B.' accept) --- */
+    printf("[t] tik-accept\n");
+    CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff" "B.xxxxxxxx", 12) == 1,
+          "tik-accept: ff4 'B.' = accept");
+    CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff" "B.xxxxxx", 7) == 0,
+          "tik-accept: короче 8 = нет");
+    CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff" "A.xxxxxxxx", 12) == 0,
+          "tik-accept: 'A.' = не accept");
+    CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff" "k\x01\x02\x03", 8) == 0,
+          "tik-accept: 'k' = не accept");
+    CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff", 4) == 0,
+          "tik-accept: голый префикс = нет");
+    CHECK(c2b_tik_is_accept(0, 8) == 0, "tik-accept: нулевой буфер = нет");
     /* --- v106.7: g16-deep-dump длина (clamp 0..72) --- */
     printf("[t] g16-dumplen\n");
     CHECK(c2b_g16_dumplen(0) == 0, "dumplen: 0 = 0");

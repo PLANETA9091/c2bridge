@@ -1255,6 +1255,25 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       save_conlog
       pkill -9 -x csgo_linux64 2>/dev/null
       sleep 2
+      # v110.1: the game<->client pipe = per-runner flaky (runs 580-586: the
+      # steam:// URL swallowed, the game never even prints "Connecting to").
+      # Retrying the game alone re-uses the SAME wedged client for all 5
+      # attempts = useless by design. Restart the CLIENT too (the proven T-0
+      # relaunch recipe: pkill the ubuntu12_32 steam core + steam-login.sh),
+      # then let the next attempt's T-0 pipe wait settle the fresh client.
+      if [[ "${C2B_PIPE_RESTART:-1}" == "1" && -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+        log "attempt $ATTEMPT: pipe fast-fail -> restarting steam client (v110.1)"
+        pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea]' 2>/dev/null; sleep 3
+        STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+        C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+          bash "$NODE_HOME/steam-login.sh" \
+          >"$RUNDIR/steam-relaunch.pipefail.a${ATTEMPT}.log" 2>&1 </dev/null \
+          && log "attempt $ATTEMPT: steam client relogin OK" \
+          || log "WARNING: steam-login.sh pipefail relaunch rc=$? (continuing)"
+        sleep 5
+      else
+        log "attempt $ATTEMPT: pipe fast-fail -> client restart skipped (C2B_PIPE_RESTART=0 or creds unavailable)"
+      fi
       break
     fi
     sleep 5

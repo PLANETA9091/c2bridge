@@ -20802,7 +20802,8 @@ static u32 g_b2e_grant_chal, g_b2e_grant_seen;
  * каждый чалл уникален). Общий счётчик fires: eng-файр тратит слот
  * грантам, но после 1 eng-файра eng больше не стреляет. Always-остров =
  * selftest-видимость. */
-static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal, u32 src_grant)
+static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal, u32 src_grant,
+                        u32 last_chal)
 {
     if (!on) return 0;
     if (src_grant) {
@@ -20810,6 +20811,11 @@ static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal, u32 src_grant)
     } else {
         if (fires >= 1u) return 0;
     }
+    /* v109.8: проверка ПРОТАННОГО ЗНАЧЕНИЯ, не только флага (run570 fire#4:
+     * грант-источник повторил значение fire#3 e6f63073 = нулевая маржа,
+     * бюджет 4 сгорел на 3 уникальных значения). Повтор последнего
+     * файр-чалла = скип (last_chal=0 = сентинел "файра ещё не было"). */
+    if (last_chal && chal == last_chal) return 0;
     return chal ? 1u : 0u;
 }
 /* v108.7: b2e_chal = пик чалла (always-остров, selftest-виден).
@@ -23544,6 +23550,7 @@ static void c2b_a2eb_maybe(void)
  * роутинг (ось 'B' закрывается окончательно). Кап 2, killswitch C2B_B2E=0.
  * На провод НЕ попадает (loopback). */
 static u32 g_b2e_init, g_b2e_on = 1, g_b2e_fires;
+static u32 g_b2e_last_chal;            /* v109.8: чалл последнего файра */
 static u32 g_b2c_on = 1;                /* v109.4: b2c in-channel-доставка */
 static void c2b_b2e_maybe(void)
 {
@@ -23576,7 +23583,8 @@ static void c2b_b2e_maybe(void)
     src_grant = (g_b2e_grant_seen && g_b2e_grant_chal) ? 1u : 0u;
     ch_b2 = c2b_b2e_chal(ch_b2, g_b2e_grant_seen, g_b2e_grant_chal,
                          g_b2e_g51_seen, g_b2e_g51_chal);
-    if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2, src_grant)) return;
+    if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2, src_grant,
+                      g_b2e_last_chal)) return;
     sb_len = c2b_t3_build_b(b2_buf, 59u, ch_b2);   /* эхо ЖИВОГО чала, 59B granted */
     if (sb_len != 59u) return;
     pr_b2 = c2b_b2e_proto(g_b2e_fires, pr_b2);  /* v106.5: A/B #1=2, #2=живой */
@@ -23611,6 +23619,7 @@ static void c2b_b2e_maybe(void)
         }
     }
     g_b2e_fires++;
+    g_b2e_last_chal = ch_b2;    /* v109.8: значение протанчено файром */
     g_b2e_grant_seen = 0;       /* v108.7: грант-источник тратится файром */
     g_cw_burst = C2B_CW_BURST;  /* v106.4: пер-тик срезы окна перехода */
     C2B_LOGS("[c2b] b2e: synth-'B' live-chal #");
@@ -34888,15 +34897,24 @@ static void test_swr(void)
     CHECK(c2b_swr_gate2(1, 0, 5, 5, 0, 0) == 0, "swr2: sec_new=0 = скип");
     /* --- v106.3/v109.1: b2e-гейт (сплит-кап: eng=1, grant=4) --- */
     printf("[t] b2e\n");
-    CHECK(c2b_b2e_gate(0, 0, 0xec6d6678u, 0) == 0, "b2e: on=0 = скип");
-    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 1) == 1, "b2e: грант-пик — fires=0 жив (v109.1)");
-    CHECK(c2b_b2e_gate(1, 2, 0xec6d6678u, 1) == 1, "b2e: грант-кап 4 — fires=2 жив (v109.1)");
-    CHECK(c2b_b2e_gate(1, 3, 0x3ad660ceu, 1) == 1, "b2e: грант-кап 4 — fires=3 жив");
-    CHECK(c2b_b2e_gate(1, 4, 0xec6d6678u, 1) == 0, "b2e: грант-кап 4 = скип");
-    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 0) == 1, "b2e: eng-кап 1 — fires=0 жив (v109.1)");
-    CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u, 0) == 0, "b2e: eng-кап 1 — fires=1 = скип (v109.1)");
-    CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu, 1) == 1, "b2e: грант после eng-файра жив (общий счётчик)");
-    CHECK(c2b_b2e_gate(1, 0, 0, 1) == 0, "b2e: chal=0 (не приземлился) = скип");
+    CHECK(c2b_b2e_gate(0, 0, 0xec6d6678u, 0, 0) == 0, "b2e: on=0 = скип");
+    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 1, 0) == 1, "b2e: грант-пик — fires=0 жив (v109.1)");
+    CHECK(c2b_b2e_gate(1, 2, 0xec6d6678u, 1, 0) == 1, "b2e: грант-кап 4 — fires=2 жив (v109.1)");
+    CHECK(c2b_b2e_gate(1, 3, 0x3ad660ceu, 1, 0) == 1, "b2e: грант-кап 4 — fires=3 жив");
+    CHECK(c2b_b2e_gate(1, 4, 0xec6d6678u, 1, 0) == 0, "b2e: грант-кап 4 = скип");
+    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 0, 0) == 1, "b2e: eng-кап 1 — fires=0 жив (v109.1)");
+    CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u, 0, 0) == 0, "b2e: eng-кап 1 — fires=1 = скип (v109.1)");
+    CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu, 1, 0) == 1, "b2e: грант после eng-файра жив (общий счётчик)");
+    CHECK(c2b_b2e_gate(1, 0, 0, 1, 0) == 0, "b2e: chal=0 (не приземлился) = скип");
+    /* v109.8: протанное значение — повтор последнего файр-чалла = скип
+     * (run570 fire#4 = fire#3 значение = нулевая маржа), свежее значение
+     * после файра живо (бюджет на УНИКАЛЬНЫЕ значения). */
+    CHECK(c2b_b2e_gate(1, 2, 0xe6f63073u, 1, 0xe6f63073u) == 0,
+          "b2e: повтор значения файр-чалла = скип (v109.8, run570 fire#4)");
+    CHECK(c2b_b2e_gate(1, 2, 0xe6f63074u, 1, 0xe6f63073u) == 1,
+          "b2e: свежее значение после файра живо (v109.8)");
+    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 1, 0xec6d6678u) == 0,
+          "b2e: значение==last_chal скипается и при fires=0 (чистая семантика, v109.8)");
     /* --- v109.4: b2c in-channel-пред-условия --- */
     printf("[t] b2c\n");
     CHECK(c2b_b2c_ok(0, (const void *)1, 0x1234u, 59) == 0, "b2c: on=0 = скип");

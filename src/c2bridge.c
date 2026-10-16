@@ -9543,6 +9543,14 @@ static void c2b_g50_force_cstate(void)
 static volatile uptr c2b_g51_cont;
 static volatile uptr c2b_g51_needle, c2b_g51_strstr;
 static u32 c2b_g51_nl;
+/* v109.5: g51-live chal = третий источник для синт-'B' (always-остров).
+ * run565-RE: granted-фаза сервера => g49-детур 0 вызовов => cw-стейт
+ * (c2b_g49_state) = мёртвый источник, @0x4d8 на cw-срезах = 0x00000000
+ * ВСЕГДА, НО в g51-момент (strstr 25cf20 = ЖИВОЙ сайт granted-'A' И
+ * серверного 'B.') тот же @0x4d8 = 0xe3500fe6 НЕнулевой — чалл живёт
+ * в parse-контексте. Каптур ЗДЕСЬ (до рейта, каждый вызов = срез).
+ * Читается b2e_maybe как источник #2 (после гранта, перед cw). */
+static u32 g_b2e_g51_chal, g_b2e_g51_seen;
 
 void c2b_g51_log(uptr str, uptr buf, uptr state)
 {
@@ -9552,6 +9560,12 @@ void c2b_g51_log(uptr str, uptr buf, uptr state)
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) != 0) { g_probe_active = 0; return; }
     k = ++c2b_g51_nl;
+    /* v109.5: каптур chal ДО рейта — каждый вызов = живой срез
+     * (granted-фаза: единственный ненулевой движковый чалл). */
+    if (state) {
+        u32 ch51 = *(volatile u32 *)(state + 0x4d8);
+        if (ch51) { g_b2e_g51_chal = ch51; g_b2e_g51_seen = 1u; }
+    }
     if (k > 48 && (k & 0x3F) != 1) { g_probe_active = 0; return; }
     C2B_LOGS("[c2b] g51 A.str='");
     {
@@ -20796,18 +20810,24 @@ static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal, u32 src_grant)
     }
     return chal ? 1u : 0u;
 }
-/* v108.7: b2e_chal = двух-источник чалла (always-остров, selftest-виден).
+/* v108.7: b2e_chal = пик чалла (always-остров, selftest-виден).
  * v109.0 ФЛИП приоритета: свежий грант-чалл выигрывает у движкового
  * @0x4d8. Основание (run556, первый живой прогон event-wire): оба файра
  * ушли с ПРОТУХШИМ движковым 0x93bee2d9 (дважды одно значение), грант-чаллы
  * = свежая последовательность 06->0d (0xec39e306..0x59c5e30d) НИ РАЗУ не
  * использованы (src=grant не упражнён), ответ сервера = СВЕЖИЙ речеллендж
  * 0x78c8f205 != файр-чаллу => протухший чалл = кандидат-отказ. Синт-'B'
- * обязан эхоить СОБСТВЕННОЕ свежайшее значение accept'а сервера. Обе нули
+ * обязан эхоить СОБСТВЕННОЕ свежайшее значение accept'а сервера.
+ * v109.5 ТРЕТИЙ ИСТОЧНИК: g51-live (run565: granted-фаза = g49-детур
+ * 0 вызовов => cw-стейт мёртв, @0x4d8 на cw-срезах = 0, НО в g51-момент
+ * тот же @0x4d8 = 0xe3500fe6 живой). Приоритет: грант (эхо accept'а) >
+ * g51 (живой parse-контекст) > eng @0x4d8 (легаси-фолбэк). Все нули
  * = 0 = ворота скиппают. Чистая функция без побочек. */
-static u32 c2b_b2e_chal(u32 eng, u32 grant_seen, u32 grant_chal)
+static u32 c2b_b2e_chal(u32 eng, u32 grant_seen, u32 grant_chal,
+                        u32 g51_seen, u32 g51_chal)
 {
     if (grant_seen && grant_chal) return grant_chal;
+    if (g51_seen && g51_chal) return g51_chal;
     if (eng) return eng;
     return 0;
 }
@@ -23405,7 +23425,7 @@ static void c2b_b2e_maybe(void)
         }
         g_b2e_init = 1;
         if (g_b2e_on)
-            C2B_LOGS("[c2b] b2e: ARMED (v109.4 split-cap eng=1/grant=4 + b2c in-channel)\n");
+            C2B_LOGS("[c2b] b2e: ARMED (v109.5 g51-live src + b2c in-channel)\n");
         if (!g_b2c_on)
             C2B_LOGS("[c2b] b2c: disabled (C2B_B2C=0)\n");
     }
@@ -23414,10 +23434,12 @@ static void c2b_b2e_maybe(void)
     if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
         (uptr)g_clp_sendto == 1) return;
     (void)c2b_cw_read((uptr)c2b_g49_state, &cs_b2, &ch_b2, &pr_b2);
-    /* v109.0: двух-источник, ФЛИП — свежий грант-чалл выигрывает
-     * (протухший движковый @0x4d8 = фолбэк); src = истинный пик хелпера */
+    /* v109.0/v109.5: трёх-источник, ФЛИП — грант > g51-live (каптур в
+     * момент парса 25cf20) > движковый @0x4d8 (в granted-фазе = мёртвый
+     * источник, run565); src = истинный пик хелпера */
     src_grant = (g_b2e_grant_seen && g_b2e_grant_chal) ? 1u : 0u;
-    ch_b2 = c2b_b2e_chal(ch_b2, g_b2e_grant_seen, g_b2e_grant_chal);
+    ch_b2 = c2b_b2e_chal(ch_b2, g_b2e_grant_seen, g_b2e_grant_chal,
+                         g_b2e_g51_seen, g_b2e_g51_chal);
     if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2, src_grant)) return;
     sb_len = c2b_t3_build_b(b2_buf, 59u, ch_b2);   /* эхо ЖИВОГО чала, 59B granted */
     if (sb_len != 59u) return;
@@ -34746,18 +34768,24 @@ static void test_swr(void)
     CHECK(c2b_b2e_proto(1u, 0u) == 3u, "b2e: fire#2 live=0 = фолбэк 3");
     CHECK(c2b_b2e_proto(1u, 99u) == 3u, "b2e: fire#2 мусор 99 = фолбэк 3");
     CHECK(c2b_b2e_proto(1u, 2u) == 2u, "b2e: fire#2 живой 2 = 2 (честный live)");
-    /* --- v108.7: b2e двух-источник чалла (грант event-wire) --- */
+    /* --- v108.7/v109.5: b2e чалл = три источника (грант > g51-live > eng) --- */
     printf("[t] b2e-chal\n");
-    CHECK(c2b_b2e_chal(0xec6d6678u, 1, 0x3ad660ceu) == 0x3ad660ceu,
+    CHECK(c2b_b2e_chal(0xec6d6678u, 1, 0x3ad660ceu, 0, 0) == 0x3ad660ceu,
           "b2e-chal: свежий грант ВЫИГРЫВАЕТ у движкового (v109.0 флип)");
-    CHECK(c2b_b2e_chal(0xec6d6678u, 0, 0x3ad660ceu) == 0xec6d6678u,
-          "b2e-chal: гранта нет = движковый жив (фолбэк, fire#1-класс run556)");
-    CHECK(c2b_b2e_chal(0, 0, 0x3ad660ceu) == 0,
+    CHECK(c2b_b2e_chal(0xec6d6678u, 1, 0x3ad660ceu, 1, 0xe3500fe6u) == 0x3ad660ceu,
+          "b2e-chal: грант > g51-live (v109.5 приоритет)");
+    CHECK(c2b_b2e_chal(0xec6d6678u, 0, 0, 1, 0xe3500fe6u) == 0xe3500fe6u,
+          "b2e-chal: g51-live ВЫИГРЫВАЕТ у движкового (v109.5, run565)");
+    CHECK(c2b_b2e_chal(0xec6d6678u, 0, 0x3ad660ceu, 0, 0) == 0xec6d6678u,
+          "b2e-chal: гранта/g51 нет = движковый жив (фолбэк, fire#1-класс run556)");
+    CHECK(c2b_b2e_chal(0xec6d6678u, 0, 0, 1, 0) == 0xec6d6678u,
+          "b2e-chal: g51-флаг без чалла = движковый фолбэк");
+    CHECK(c2b_b2e_chal(0xec6d6678u, 0, 0, 0, 0xe3500fe6u) == 0xec6d6678u,
+          "b2e-chal: g51 не виден (chal не каптурился) = движковый фолбэк");
+    CHECK(c2b_b2e_chal(0, 0, 0x3ad660ceu, 0, 0) == 0,
           "b2e-chal: гранта нет + движковый 0 = скип (run553-негконтрол)");
-    CHECK(c2b_b2e_chal(0xec6d6678u, 1, 0) == 0xec6d6678u,
-          "b2e-chal: грант-флаг без чалла = движковый фолбэк");
-    CHECK(c2b_b2e_chal(0, 1, 0) == 0,
-          "b2e-chal: обе нули = 0 (нечем стрелять)");
+    CHECK(c2b_b2e_chal(0, 1, 0, 0, 0) == 0,
+          "b2e-chal: все нули = 0 (нечем стрелять)");
     /* --- v106.6: kdr (kfull chal-патч прямой в сервер) --- */
     printf("[t] kdr\n");
     CHECK(c2b_kdr_gate(0, 0, 513, 0xee0a07u, 1) == 0, "kdr: on=0 = скип");

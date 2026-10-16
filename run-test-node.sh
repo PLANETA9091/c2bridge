@@ -1264,13 +1264,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       if [[ "${C2B_PIPE_RESTART:-1}" == "1" && -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
         log "attempt $ATTEMPT: pipe fast-fail -> restarting steam client (v110.1)"
         pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea]' 2>/dev/null; sleep 3
-        STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
-        C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
-          bash "$NODE_HOME/steam-login.sh" \
-          >"$RUNDIR/steam-relaunch.pipefail.a${ATTEMPT}.log" 2>&1 </dev/null \
-          && log "attempt $ATTEMPT: steam client relogin OK" \
-          || log "WARNING: steam-login.sh pipefail relaunch rc=$? (continuing)"
-        sleep 5
+        LRX=0
+        while (( LRX < 2 )); do
+          LRX=$((LRX+1))
+          STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+          C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+            bash "$NODE_HOME/steam-login.sh" \
+            >"$RUNDIR/steam-relaunch.pipefail.a${ATTEMPT}.$LRX.log" 2>&1 </dev/null \
+            && { log "attempt $ATTEMPT: steam client relogin OK (try $LRX)"; break; } \
+            || log "WARNING: steam-login.sh pipefail relaunch try $LRX rc=$? (retrying after 15s)"
+          sleep 15
+        done
       else
         log "attempt $ATTEMPT: pipe fast-fail -> client restart skipped (C2B_PIPE_RESTART=0 or creds unavailable)"
       fi
@@ -1368,32 +1372,64 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # fast-fail: kill the game, restart the client (v110.1 recipe), retry.
   SOFT_WAIT=${C2B_CONNECT_SOFTWAIT:-60}
   CONNECT_SENTINEL=0
+  SOFT_STREAK=0
   SOFT_DL=$((SECONDS + SOFT_WAIT))
   while (( SECONDS < END )); do
     engine_alive || { log "attempt $ATTEMPT: client died during connect"; save_conlog; break; }
     if (( ! CONNECT_SENTINEL )); then
       if grep -aq "Connecting to" "$OUT" 2>/dev/null \
          || sudo -n grep -aq "Connecting to" "$CONLOG" 2>/dev/null; then
-        CONNECT_SENTINEL=1
+        CONNECT_SENTINEL=1; SOFT_STREAK=0
         log "attempt $ATTEMPT: 'Connecting to' seen (URL delivered)"
       elif (( SECONDS >= SOFT_DL )); then
-        log "attempt $ATTEMPT: SOFT pipe-fail: no 'Connecting to' in ${SOFT_WAIT}s after the fire -> client restart (v110.1b)"
-        save_conlog
-        pkill -9 -x csgo_linux64 2>/dev/null
-        if [[ "${C2B_PIPE_RESTART:-1}" == "1" && -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
-          log "attempt $ATTEMPT: soft-fail -> restarting steam client"
-          pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea]' 2>/dev/null; sleep 3
-          STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
-          C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
-            bash "$NODE_HOME/steam-login.sh" \
-            >"$RUNDIR/steam-relaunch.softfail.a${ATTEMPT}.log" 2>&1 </dev/null \
-            && log "attempt $ATTEMPT: steam client relogin OK (soft-fail path)" \
-            || log "WARNING: steam-login.sh softfail relaunch rc=$? (continuing)"
-          sleep 5
+        # v110.1c: the relogin = the flaky+expensive lever (run588: rc=2 twice,
+        # ~3min each — the burner-account re-logon = throttled in the evening)
+        # and the client = NOT the broken part (pipe=ok at the launch, the
+        # session = alive): the flaky hop = the URL DELIVERY. Ladder:
+        # (1) re-fire the URL twice (15-20s apart), (2) still nothing = kill
+        # the GAME only (the disposable unit; the next attempt = relaunches
+        # it against the SAME logged-in client), (3) restart the CLIENT only
+        # on the 2nd consecutive soft-fail. The hard fast-fail keeps v110.1.
+        CONNECT_SENTINEL=1
+        GOTCON=0; RF=0
+        while (( RF < 2 && ! GOTCON )); do
+          RF=$((RF+1))
+          log "attempt $ATTEMPT: SOFT pipe-fail: re-firing steam://connect ($RF/2)"
+          sudo -n -u "$GAME_USER" env DISPLAY=:99 HOME="$GAME_HOME" \
+            "$STEAM_SH" "steam://connect/$TARGET" >"$TMPD/steam-connect-refire.a${ATTEMPT}.$RF.log" 2>&1 &
+          W2=0
+          while (( W2 < 20 && ! GOTCON )); do
+            sleep 5; W2=$((W2+5))
+            engine_alive || { log "attempt $ATTEMPT: engine died during refire wait"; break; }
+            if grep -aq "Connecting to" "$OUT" 2>/dev/null \
+               || sudo -n grep -aq "Connecting to" "$CONLOG" 2>/dev/null; then
+              GOTCON=1
+            fi
+          done
+        done
+        if (( GOTCON )); then
+          SOFT_STREAK=0
+          log "attempt $ATTEMPT: recovered after $RF refire(s) — 'Connecting to' seen, continuing the attempt"
         else
-          log "attempt $ATTEMPT: soft-fail -> client restart skipped (C2B_PIPE_RESTART=0 or creds unavailable)"
+          SOFT_STREAK=$((SOFT_STREAK+1))
+          log "attempt $ATTEMPT: SOFT pipe-fail persists after 2 refires (streak=$SOFT_STREAK) -> killing the game only"
+          save_conlog
+          pkill -9 -x csgo_linux64 2>/dev/null
+          if (( SOFT_STREAK >= 2 )) && [[ "${C2B_PIPE_RESTART:-1}" == "1" && -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+            log "attempt $ATTEMPT: 2 consecutive soft-fails -> restarting steam client"
+            pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea]' 2>/dev/null; sleep 3
+            STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+            C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+              bash "$NODE_HOME/steam-login.sh" \
+              >"$RUNDIR/steam-relaunch.softfail.a${ATTEMPT}.log" 2>&1 </dev/null \
+              && log "attempt $ATTEMPT: steam client relogin OK (soft-fail path)" \
+              || log "WARNING: steam-login.sh softfail relaunch rc=$? (continuing)"
+            sleep 5
+          else
+            log "attempt $ATTEMPT: client restart skipped (streak<$SOFT_STREAK guard or C2B_PIPE_RESTART=0 or creds unavailable)"
+          fi
+          break
         fi
-        break
       fi
     fi
     if grep -aqiE 'Connected\(|Signing up to server|Connected to' "$OUT" 2>/dev/null \

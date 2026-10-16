@@ -19603,6 +19603,7 @@ static void c2b_s2o_maybe(void);       /* v106.1: компакт-S2 out (тел�
 static void c2b_a2e_maybe(void);       /* v43: релей серверного 'A' в движок */
 static void c2b_a2eb_maybe(void);      /* v45: релей серверного 'B' в движок */
 static void c2b_b2e_maybe(void);       /* v106.3: синт-'B' с живым chal -> движок */
+static void c2b_tik_window_fire(void); /* v109.6: freeze-window tik (b2e ch=1 arm) */
 static void c2b_kdr_maybe(void);       /* v106.6: kfull chal-патч прямой в сервер */
 static void c2b_tiksyn_maybe(void);    /* v108.2: тик-путь огонь TIK k+ticket (тело = после kdr-глобалов) */
 static void c2b_cnx_maybe(void);       /* v108.5: бape "connect\0" OOB (строковый claim-кандидат) */
@@ -19826,6 +19827,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_s2o_maybe();       /* v106.1: компакт-S2 out post-'B' (новый хед-эпок) */
         c2b_a2e_maybe();       /* v43: серверный 'A' (запатчен) -> движок */
         c2b_a2eb_maybe();      /* v45: серверный 'B' (accept, вербатим) -> движок */
+        c2b_tik_window_fire(); /* v109.6: freeze-window tik (1-tick delay) */
         c2b_b2e_maybe();       /* v106.3: синт-'B' с живым chal -> движок */
         c2b_s2dn_maybe();      /* v94: дренаж даунлинк-ring'а + spec-лог */
         /* v107.6: DSW.V2 — перед строкой dsw = гард-чит слот 3
@@ -20952,6 +20954,19 @@ static u32 c2b_kdr_build(const u8 *kfull, u32 klen, u32 chal,
  * ('B'-кейс = эхо-чеки -> vt+0x170 -> return; "connect\0"-хвост
  * игнорируется) => сервер-сайд = единственная живая цель. */
 static u32 g_tik_init, g_tik_on = 1, g_tik_sent;
+/* v109.6: freeze-window tik — run568: after the ch=1 b2e fire the server
+ * dialog FROZE re-announcing OUR fire-chal (x6, no fresh rechallenge) =
+ * the waiting state; the legacy post-'B' step = the ticket-carrying 'k'.
+ * The window = armed on the b2e ch=1, fired the NEXT tick (the in-channel
+ * 'B' flushes first), 1/session shared with the 'B.'-frame path. The dest
+ * = the 'B.'-sender (captured pre-guards: the template/ticket guards may
+ * skip, the dest stays valid for the window). */
+static volatile u32 g_tik_win;
+static u8   g_tik_dst[16];
+static socklen_t g_tik_dst_len;
+static volatile u32 g_tik_dst_set;
+static i32  g_tik_fd = -1;
+static u32  g_tik_skip_nokf, g_tik_skip_noticket, g_tik_skip_nodst;
 /* v107.9: выход свежего ре-проба (f-источник): буфер + длина. Глобаль =
  * движок пишет через указатель в гард-вызове; читается сразу после.
  * В selftest = нули (источник f просто недоступен — инертно). */
@@ -21074,10 +21089,29 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
     }
     if (!g_tik_on || g_tik_sent) return;
     if (!c2b_tik_is_accept(p, len)) return;
-    if (!addr || alen < 8u || alen > 16u) return;
+    if (!addr || alen < 8u || alen > 16u) {
+        if (!g_tik_skip_nodst) {
+            g_tik_skip_nodst = 1;
+            C2B_LOGS("[c2b] tik: skip nodst (bad 'B.' addr)\n");
+        }
+        return;
+    }
     if (*(volatile const u32 *)((const u8 *)addr + 4) == 0x0100007fu)
         return;                              /* loopback = бейты моста */
-    if (g_kfull_len < 32u || g_kfull_len > 1200u) return;
+    /* v109.6: the 'B.'-sender = the freeze-window dest (pre-guards capture) */
+    if (!g_tik_dst_set) {
+        memcpy(g_tik_dst, addr, alen);
+        g_tik_dst_len = alen;
+        g_tik_fd = fd;
+        __atomic_store_n(&g_tik_dst_set, 1u, __ATOMIC_RELEASE);
+    }
+    if (g_kfull_len < 32u || g_kfull_len > 1200u) {
+        if (!g_tik_skip_nokf) {
+            g_tik_skip_nokf = 1;
+            C2B_LOGS("[c2b] tik: skip nokf (no full-'k' template captured this session)\n");
+        }
+        return;
+    }
     if (g_kfull[0] != 0xff || g_kfull[4] != (u8)'k') return;
     if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
     /* v107.9: ИСТОЧНИК ТИКЕТА — приоритет свежести:
@@ -21089,7 +21123,13 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
      * (p) старт-проб (классика, НО минутной давности — последний
      *     фолбэк). src= в логе = A/B-метка формы на проводе. */
     srcn = c2b_tik_pick(1u, &tsrc, &tlen, 0u);
-    if (!srcn) return;                       /* ни одного источника = мимо */
+    if (!srcn) {
+        if (!g_tik_skip_noticket) {
+            g_tik_skip_noticket = 1;
+            C2B_LOGS("[c2b] tik: skip noticket (no live ticket source)\n");
+        }
+        return;
+    }
     if (!c2b_tik_build(g_kfull, g_kfull_len, tsrc, tlen, tik_buf,
                        (u32)sizeof(tik_buf), &n))
         return;                              /* билдер-гейт = мимо */
@@ -21120,6 +21160,86 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
     C2B_LOGN((u32)(sr >= 0 ? sr : -1));
     C2B_LOGS(" fd=");
     C2B_LOGN((u32)fd);
+    C2B_LOGS("\n");
+}
+
+/* ---------- v109.6: FREEZE-WINDOW TIK FIRE ----------
+ * Pure gate (selftest-tested): the window armed + not spent + the dest
+ * captured + a valid kfull template. The fire itself = c2b_tik_window_fire
+ * (the tick path, right before b2e_maybe = the 1-tick delay: the arm in
+ * tick N's b2e_maybe, the fire in tick N+1 = the in-channel 'B' flushes
+ * first). Shares g_tik_sent with the 'B.'-frame path (1/session total). */
+static u32 c2b_tik_win_gate(u32 win, u32 sent, u32 dst_set, u32 kfull_ok)
+{
+    if (!win || sent || !dst_set || !kfull_ok) return 0;
+    return 1u;
+}
+static void c2b_tik_window_fire(void)
+{
+    static u8 win_buf[2500];
+    const u8 *tsrc;
+    u32 tlen, wn, kfull_ok, win;
+    u8 srcn;
+    ssize_t sr;
+    win = __atomic_exchange_n(&g_tik_win, 0u, __ATOMIC_ACQ_REL); /* 1-shot take */
+    if (!win) return;
+    kfull_ok = (g_kfull_len >= 32u && g_kfull_len <= 1200u &&
+                g_kfull[0] == 0xff && g_kfull[4] == (u8)'k') ? 1u : 0u;
+    if (!c2b_tik_win_gate(win, g_tik_sent, g_tik_dst_set, kfull_ok)) {
+        if (!g_tik_dst_set) {
+            if (!g_tik_skip_nodst) {
+                g_tik_skip_nodst = 1;
+                C2B_LOGS("[c2b] tik: window skip nodst\n");
+            }
+        } else if (!kfull_ok) {
+            if (!g_tik_skip_nokf) {
+                g_tik_skip_nokf = 1;
+                C2B_LOGS("[c2b] tik: window skip nokf (no 'k' template this session)\n");
+            }
+        }
+        return;
+    }
+    if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
+    srcn = c2b_tik_pick(1u, &tsrc, &tlen, 0u);
+    if (!srcn) {
+        if (!g_tik_skip_noticket) {
+            g_tik_skip_noticket = 1;
+            C2B_LOGS("[c2b] tik: window skip noticket\n");
+        }
+        return;
+    }
+    if (!c2b_tik_build(g_kfull, g_kfull_len, tsrc, tlen, win_buf,
+                       (u32)sizeof(win_buf), &wn))
+        return;
+    g_tik_sent = 1;                          /* spent BEFORE the fire */
+#ifndef C2B_SELFTEST
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(g_tik_fd, (const void *)win_buf,
+                                           wn, 0,
+                                           (const struct sockaddr *)g_tik_dst,
+                                           g_tik_dst_len);
+        g_probe_active = 0;
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] tik: window send FAULT\n");
+        return;
+    }
+#else
+    sr = -1;                                 /* selftest = inert */
+#endif
+    C2B_LOGS("[c2b] tik: window->k+ticket len=");
+    C2B_LOGN(wn);
+    C2B_LOGS(" kf=");
+    C2B_LOGN(g_kfull_len);
+    C2B_LOGS(" tk=");
+    C2B_LOGN(tlen);
+    C2B_LOGS(" src=");
+    C2B_LOGS(srcn == (u8)'f' ? "f" : srcn == (u8)'e' ? "e" : "p");
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr >= 0 ? sr : -1));
+    C2B_LOGS(" fd=");
+    C2B_LOGN((u32)g_tik_fd);
     C2B_LOGS("\n");
 }
 
@@ -23495,6 +23615,15 @@ static void c2b_b2e_maybe(void)
     C2B_LOGN((u32)rc_bc);   /* v109.4: in-channel rc (-999 = скип, -998 = SEGV) */
     C2B_LOGS("\n");
     /* телеметрия-только: реакцию парсера читаем по g48/g66-классам + cw-срезам */
+    /* v109.6: ch=1 = the in-channel 'B' LANDED => the freeze-window arm
+     * (run568: the server froze re-announcing our fire-chal = the waiting
+     * state; the ticket-carrying 'k' = the legacy post-'B' step). The fire
+     * = the NEXT tick (c2b_tik_window_fire in the tick path). 1/session
+     * shared with the 'B.'-frame path (g_tik_sent). */
+    if (rc_bc == 1 && !g_tik_sent) {
+        g_tik_win = 1;
+        C2B_LOGS("[c2b] tik: window armed (b2e ch=1)\n");
+    }
 }
 
 static void c2b_k19_relay(void)
@@ -34853,6 +34982,12 @@ static void test_swr(void)
     CHECK(c2b_tik_is_accept((const u8 *)"\xff\xff\xff\xff", 4) == 0,
           "tik-accept: голый префикс = нет");
     CHECK(c2b_tik_is_accept(0, 8) == 0, "tik-accept: нулевой буфер = нет");
+    /* v109.6: the freeze-window gate */
+    CHECK(c2b_tik_win_gate(1, 0, 1, 1) == 1, "tik-win: armed+fresh+dst+kfull = fire");
+    CHECK(c2b_tik_win_gate(1, 1, 1, 1) == 0, "tik-win: spent = skip");
+    CHECK(c2b_tik_win_gate(0, 0, 1, 1) == 0, "tik-win: no window = skip");
+    CHECK(c2b_tik_win_gate(1, 0, 0, 1) == 0, "tik-win: no dest = skip");
+    CHECK(c2b_tik_win_gate(1, 0, 1, 0) == 0, "tik-win: no kfull = skip");
     /* --- v107.9: etix (детектор eng-wire тикета: 22 0d + ASCII "steamid:") --- */
     printf("[t] etix\n");
     {

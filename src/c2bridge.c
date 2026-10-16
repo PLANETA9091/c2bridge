@@ -21198,12 +21198,33 @@ static u32 c2b_tik_win_gate(u32 win, u32 sent, u32 dst_set, u32 kfull_ok)
     if (!win || sent || !dst_set || !kfull_ok) return 0;
     return 1u;
 }
+/* v110.0: ВЕРБАТИМ-билдер окна — ЧИСТАЯ функция (selftest-виден).
+ * ПОВОД (run571/573 RE): kfull 0x201 = 17B header + 0x1f0=496B ТИКЕТ
+ * @17.. РОВНО (17+496=513) — движковый 'k' УЖЕ несёт authentic-тикет
+ * в authslot'е. Старый сплайс (tik_build @17) вставлял НАШ re-probe
+ * 252B ПЕРЕД движковым 496B = ДВОЙНОЙ тикет (252+496) = малformed
+ * композит — кандидат-причина тишины сервера на оба окна файра
+ * (571/573). Вербатим = ЧИСТЫЙ пост-'B' шаг: движков собственный 'k'
+ * (с его authentic-тикетом) повторно доставлен В ОКНЕ ЗАМЕРЗАНИЯ.
+ * Guards: 32..1200, ff×4 'k', cap >= klen. */
+static u32 c2b_tik_win_build(const u8 *kf, u32 klen, u8 *out, u32 cap,
+                             u32 *outlen)
+{
+    u32 i;
+    if (!kf || !out || !outlen) return 0;
+    if (klen < 32u || klen > 1200u) return 0;
+    if (cap < klen) return 0;
+    if (kf[0] != 0xff || kf[1] != 0xff ||
+        kf[2] != 0xff || kf[3] != 0xff) return 0;
+    if (kf[4] != (u8)'k') return 0;
+    for (i = 0; i < klen; i++) out[i] = kf[i];
+    *outlen = klen;
+    return 1;
+}
 static void c2b_tik_window_fire(void)
 {
     static u8 win_buf[2500];
-    const u8 *tsrc;
-    u32 tlen, wn, kfull_ok, win;
-    u8 srcn;
+    u32 wn, kfull_ok, win;
     ssize_t sr;
     win = __atomic_exchange_n(&g_tik_win, 0u, __ATOMIC_ACQ_REL); /* 1-shot take */
     if (!win) return;
@@ -21240,16 +21261,14 @@ static void c2b_tik_window_fire(void)
         return;
     }
     if (!g_clp_sendto || (uptr)g_clp_sendto == 1u) return;
-    srcn = c2b_tik_pick(1u, &tsrc, &tlen, 0u);
-    if (!srcn) {
-        if (!g_tik_skip_noticket) {
-            g_tik_skip_noticket = 1;
-            C2B_LOGS("[c2b] tik: window skip noticket\n");
-        }
-        return;
-    }
-    if (!c2b_tik_build(g_kfull, g_kfull_len, tsrc, tlen, win_buf,
-                       (u32)sizeof(win_buf), &wn))
+    /* v110.0: ВЕРБАТИМ-файр — движков собственный kfull (ff×4 'k' + chal
+     * + authentic-тикет @17.. = 17+0x1f0=0x201 РОВНО) уходит В ОКНО БЕЗ
+     * сплайса. Старый композит = наш 252B re-probe ПЕРЕД движковым 496B
+     * тикетом = двойной тикет = малformed (кандидат-причина тишины 571/573).
+ * tik_pick/tik_build остаются для tiksyn (A/B-история). src=v = честная
+ * метка формы. */
+    if (!c2b_tik_win_build(g_kfull, g_kfull_len, win_buf,
+                           (u32)sizeof(win_buf), &wn))
         return;
     g_tik_sent = 1;                          /* spent BEFORE the fire */
 #ifndef C2B_SELFTEST
@@ -21272,10 +21291,7 @@ static void c2b_tik_window_fire(void)
     C2B_LOGN(wn);
     C2B_LOGS(" kf=");
     C2B_LOGN(g_kfull_len);
-    C2B_LOGS(" tk=");
-    C2B_LOGN(tlen);
-    C2B_LOGS(" src=");
-    C2B_LOGS(srcn == (u8)'f' ? "f" : srcn == (u8)'e' ? "e" : "p");
+    C2B_LOGS(" src=v");                      /* v110.0: вербатим (authentic-тикет внутри) */
     C2B_LOGS(" rc=");
     C2B_LOGN((u32)(sr >= 0 ? sr : -1));
     C2B_LOGS(" fd=");
@@ -35088,6 +35104,29 @@ static void test_swr(void)
     CHECK(c2b_tik_win_gate(0, 0, 1, 1) == 0, "tik-win: no window = skip");
     CHECK(c2b_tik_win_gate(1, 0, 0, 1) == 0, "tik-win: no dest = skip");
     CHECK(c2b_tik_win_gate(1, 0, 1, 0) == 0, "tik-win: no kfull = skip");
+    /* v110.0: вербатим-билдер окна — байт-ИДЕНТИЧНОСТЬ kf (никаких
+     * сплайсов: authentic-тикет @17.. уже в kfull). Guards + identity. */
+    {
+        u8 wb[700], wref[700];
+        u32 wl = 0, wi;
+        for (wi = 0; wi < 513u; wi++) wref[wi] = (u8)(wi * 5 + 1);
+        wref[0] = 0xff; wref[1] = 0xff; wref[2] = 0xff; wref[3] = 0xff;
+        wref[4] = (u8)'k';
+        memset(wb, 0x77, sizeof wb);
+        CHECK(c2b_tik_win_build(wref, 513u, wb, sizeof wb, &wl) == 1,
+              "tik-win-build: 513B kfull = ok");
+        CHECK(wl == 513u, "tik-win-build: outlen = klen (без сплайса)");
+        CHECK(memcmp(wb, wref, 513u) == 0,
+              "tik-win-build: байт-идентичность (вербатим, тикет @17.. цел)");
+        CHECK(wb[513] == 0x77, "tik-win-build: за klen буфер не тронут");
+        CHECK(c2b_tik_win_build(wref, 31u, wb, sizeof wb, &wl) == 0,
+              "tik-win-build: klen<32 = отказ");
+        CHECK(c2b_tik_win_build(wref, 700u, wb, 600u, &wl) == 0,
+              "tik-win-build: cap<klen = отказ");
+        wref[4] = (u8)'x';
+        CHECK(c2b_tik_win_build(wref, 513u, wb, sizeof wb, &wl) == 0,
+              "tik-win-build: не-'k' = отказ");
+    }
     /* --- v107.9: etix (детектор eng-wire тикета: 22 0d + ASCII "steamid:") --- */
     printf("[t] etix\n");
     {

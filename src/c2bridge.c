@@ -12798,8 +12798,9 @@ static u32 c2b_t3_build_s2c(u8 *q, u32 cap)
 static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32)
 {
     static const char hxk[] = "0123456789ABCDEF";
+    static const char gnd[] = "connect-granted0x";
     u32 sh, i, ver;
-    if (!q || cap < 40u) return 0;
+    if (!q || cap < 59u) return 0;
     if (!ch32) ch32 = 0x12345678u;                 /* sscanf требует nonzero */
     q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
     q[4] = 'B';
@@ -12809,14 +12810,26 @@ static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32)
     q[14] = (u8)ch32; q[15] = (u8)(ch32 >> 8);
     q[16] = (u8)(ch32 >> 16); q[17] = (u8)(ch32 >> 24);
     q[18] = 2u; q[19] = 0u; q[20] = 0u; q[21] = 0u;  /* proto32=2 (25ab14) */
-    q[22] = 8u; q[23] = 0u;                        /* strlen "connect\0" = 8 */
-    q[24] = 'c'; q[25] = 'o'; q[26] = 'n'; q[27] = 'n';
-    q[28] = 'e'; q[29] = 'c'; q[30] = 't'; q[31] = 0;
+    q[22] = 18u; q[23] = 0u;                       /* strlen 18 (LE 16 бит) */
+    for (i = 0; i < 18u; i++) q[24 + i] = (u8)gnd[i];
+    /* v109.2: строка = "connect-granted0x\0" (18Б c NUL @24..41) — ИГЛА
+     * granted (25d8b5 strstr match + pw="" -> 25d8e3 call 24b520 scp
+     * НАПРЯМУЮ + чистый jmp, БЕЗ grace-цикла). Обе интерпретации чителя
+     * (len-prefix/read-until-NUL) выровнены на @42. Шаблон = СОБСТВЕННЫЙ
+     * granted-‘A’ сервера (run560, pkt len=0x3b: "connect-granted0x\0" +
+     * "96\0"+ver+pw NUL+00+lob=0) = сервер сам выдал форму! 40B-форма
+     * (187-era, b1..b4@36..39) = двойной анахронизм: в текущем движке
+     * (34a96ae, g54/g56-RE) @36..39 = expire-хвост/pw/b2-начало =
+     * misaligned -> pw-читер съедает бул -> strstr-цепочка ("connect"
+     * НИ ОДНУ иглу) -> grace-отскок 25d816 = ДВИЖКОВАЯ СТОРОНА W2-стены.
+     * run452-эмпирика needle-формы: win 0x4b9=1 x26, НОЛЬ grace. */
     ver = c2b_clv2_client_version();               /* g44: server==client */
-    q[32] = (u8)ver; q[33] = (u8)(ver >> 8);
-    q[34] = (u8)(ver >> 16); q[35] = (u8)(ver >> 24);
-    q[36] = 0u; q[37] = 0u; q[38] = 0u; q[39] = 0u;  /* b1..b4=0 -> WIN */
-    for (i = 40u; i < cap; i++) q[i] = 0u;         /* хвост не читается */
+    q[42] = (u8)ver; q[43] = (u8)(ver >> 8);       /* expire @42..45 (514ab0) */
+    q[44] = (u8)(ver >> 16); q[45] = (u8)(ver >> 24);
+    q[46] = 0u;                                    /* pw NUL (pw="") @46 */
+    q[47] = 0u;                                    /* b2=0 -> цепочка -> ИГЛА */
+    for (i = 48u; i < 59u; i++) q[i] = 0u;         /* lobby @48..55 = 0, пад */
+    for (i = 59u; i < cap; i++) q[i] = 0u;         /* хвост не читается */
     return cap;
 }
 
@@ -12837,7 +12850,7 @@ static u32 c2b_t3_step(u8 *out, u32 len, c2b_t3_st_t *st)
     st->seenA++;
     st->chal = chal;
     if (st->seenA >= 2u && !st->nB && st->nB < C2B_T3V_CAP_B &&
-        len - mo >= 40u) {
+        len - mo >= 59u) {
         c2b_t3_build_b(out + mo, len - mo, chal);
         st->nB++;
         return 1u;
@@ -15320,14 +15333,17 @@ static u32 c2b_clv2_client_version(void)
 }
 
 /* g42: строитель движкового 'B' connect-accept — payload по ПОЛНОМУ RE
- * 0x25a8b0/25bfa3/25cf20/25d26e (см. блок 44f-g42 выше): '.' + 8hex + chal32
- * + proto32=2 + 00 00 + "connect\0" + expire32=0 + b1..b4=0, падд до lastA. */
+ * 0x25a8b0/25bfa3/25cf20/25d26e (см. блок 44f-g42 выше). v109.2: 59B
+ * granted-форма (игла "connect-granted0x" -> 25d8e3 scp напрямую, шаблон =
+ * собственный granted-‘A’ сервера run560; 40B/187-era = misaligned ->
+ * grace-отскок — см. полный мотив в c2b_t3_build_b), падд до lastA. */
 static u32 c2b_clv2_build_kaccept(u8 *q, u32 cap, u32 hx)
 {
     u32 i, pl, pl2;
     static const char hxk[] = "0123456789ABCDEF";
+    static const char gnd[] = "connect-granted0x";
     u32 sh;
-    if (cap < 40) return 0;
+    if (cap < 59) return 0;
     if (!hx) hx = g_clv2_ch32;
     if (!hx) hx = 0x12345678u;             /* sscanf требует nonzero */
     q[0] = 0xff; q[1] = 0xff; q[2] = 0xff; q[3] = 0xff;
@@ -15340,22 +15356,22 @@ static u32 c2b_clv2_build_kaccept(u8 *q, u32 cap, u32 hx)
     q[16] = (u8)(g_clv2_ch32 >> 16);
     q[17] = (u8)(g_clv2_ch32 >> 24);
     q[18] = 2; q[19] = 0; q[20] = 0; q[21] = 0;  /* proto32=2 (!=3 -> путь 25ab14) */
-    /* g45: 16 бит перед строкой = ДЛИНА (run191: len=0 -> пустая строка ->
-     * strstr("connect") fail -> ТИХИЙ reject ДО версии — верси- Msg не печа-
-     * тался). 8 = "connect"+NUL: при read-until-NUL читер до NUL включите-
-     * льно, позиция после него — обе интерпретации (skip/len) выравнены. */
-    q[22] = 8; q[23] = 0;                  /* длина строки = 8 (LE 16 бит) */
-    q[24] = 'c'; q[25] = 'o'; q[26] = 'n'; q[27] = 'n';
-    q[28] = 'e'; q[29] = 'c'; q[30] = 't'; q[31] = 0;  /* "connect\0" [@25cf20] */
+    /* 16 бит перед строкой = ДЛИНА (g45/run191: len=0 -> тихий reject).
+     * 18 = "connect-granted0x"+NUL: обе интерпретации чителя выровнены
+     * на @42 (см. c2b_t3_build_b). */
+    q[22] = 18; q[23] = 0;                 /* длина строки = 18 (LE 16 бит) */
+    for (i = 0; i < 18; i++) q[24 + i] = (u8)gnd[i];   /* игла [@25d8b5] */
     {
         u32 ver = c2b_clv2_client_version();   /* g44: server==client иначе reject */
-        q[32] = (u8)ver; q[33] = (u8)(ver >> 8);
-        q[34] = (u8)(ver >> 16); q[35] = (u8)(ver >> 24);
+        q[42] = (u8)ver; q[43] = (u8)(ver >> 8);
+        q[44] = (u8)(ver >> 16); q[45] = (u8)(ver >> 24);   /* expire @42..45 */
     }
-    q[36] = 0; q[37] = 0; q[38] = 0; q[39] = 0;  /* b1..b4=0 -> WIN-путь 25d6b6 */
-    pl = 40;
+    q[46] = 0;                             /* pw NUL (pw="") @46 */
+    q[47] = 0;                             /* b2=0 -> цепочка -> игла granted */
+    for (i = 48; i < 59; i++) q[i] = 0;    /* lobby @48..55 = 0, пад */
+    pl = 59;
     pl2 = g_clv2_last_A_len;               /* падд до lastA (хвост не читается) */
-    if (pl2 < 40) pl2 = 40;
+    if (pl2 < 59) pl2 = 59;
     if (pl2 > cap) pl2 = cap;
     for (i = pl; i < pl2; i++) q[i] = 0;
     return pl2;
@@ -23360,7 +23376,7 @@ static void c2b_a2eb_maybe(void)
 static u32 g_b2e_init, g_b2e_on = 1, g_b2e_fires;
 static void c2b_b2e_maybe(void)
 {
-    static u8 b2_buf[48];
+    static u8 b2_buf[64];
     u32 cs_b2 = 0, ch_b2 = 0, pr_b2 = 0, sb_len, ib2, src_grant;
     u8 la[16];
     ssize_t sr;
@@ -23381,8 +23397,8 @@ static void c2b_b2e_maybe(void)
     src_grant = (g_b2e_grant_seen && g_b2e_grant_chal) ? 1u : 0u;
     ch_b2 = c2b_b2e_chal(ch_b2, g_b2e_grant_seen, g_b2e_grant_chal);
     if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2, src_grant)) return;
-    sb_len = c2b_t3_build_b(b2_buf, 40u, ch_b2);   /* эхо ЖИВОГО чала */
-    if (sb_len != 40u) return;
+    sb_len = c2b_t3_build_b(b2_buf, 59u, ch_b2);   /* эхо ЖИВОГО чала, 59B granted */
+    if (sb_len != 59u) return;
     pr_b2 = c2b_b2e_proto(g_b2e_fires, pr_b2);  /* v106.5: A/B #1=2, #2=живой */
     b2_buf[18] = (u8)pr_b2;
     for (ib2 = 0; ib2 < sizeof(la); ib2++) la[ib2] = 0;
@@ -27753,7 +27769,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             /* g42: первый 0x23 ConnectOK -> движку ПОЛНЫЙ 'B' connect-accept
              * (payload по RE 0x25a8b0/25cf20/25d26e — через builder). */
             if (p[0] == 0x23 && !g_clv2_23_seen && fd == g_clv2_fd &&
-                (u32)r >= 6 && (u32)len >= 40) {
+                (u32)r >= 6 && (u32)len >= 59) {
                 u8 *q = (u8 *)buf;
                 u32 hx, pl;
                 c2b_g50_force_cstate();   /* 47f-g50: ворота открыты ДО accept */
@@ -27792,7 +27808,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                      * доказанный 'A'-пушем). Прямой 0x23-триггер (выше) имеет
                      * приоритет, если 0x23 всё же долетит. */
                     if (!g_clv2_23_seen && g_clv2_cr_sent && g_clv2_22_first_ms &&
-                        (u32)len >= 40) {
+                        (u32)len >= 59) {
                         u64 now2 = c2b_mono_ms();
                         if (now2 - g_clv2_22_first_ms >= 2500u) {
                             u32 pl = c2b_clv2_build_kaccept(q, (u32)len, 0);
@@ -27817,7 +27833,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                      * packet). Варианты хвоста (C2B_CLV2_BHEX): 0="AAAAAAAA"
                      * (ран 80-93), 1=hex challenge из 'A', 2=hex qc_val
                      * (эхо qconnect0x). Дифференцирует реакцию движка. */
-                    if ((u32)len >= 14 && !c2b_clv2_suspended()) {
+                    if ((u32)len >= 59 && !c2b_clv2_suspended()) {
                         /* v68-susp: сервер-'A' жив — фаза-6 фейк-'B' молчит
                          * (движок остаётся в challenge-фазе сервера). */
                         u32 hx;
@@ -34421,8 +34437,8 @@ static void test_t2v(void)
  * SW/ACK после 'B' = S2-инж (кап 2), без 'B' = скип. */
 static void test_t3v(void)
 {
-    u8 sl[64];
-    u8 s1[64];
+    u8 sl[80];
+    u8 s1[80];
     c2b_t3_st_t st;
     printf("[t] t3v\n");
     /* --- SignonState-билдер: байты + границы --- */
@@ -34441,24 +34457,37 @@ static void test_t3v(void)
         g_clv2_ch32 = 0xB0AA4BD7u;
         memset(sl, 0x11, sizeof sl);
         memset(s1, 0x22, sizeof s1);
-        CHECK(c2b_t3_build_b(sl, 40, 0xB0AA4BD7u) == 40, "t3v: b cap=40 = 40B");
-        CHECK(c2b_clv2_build_kaccept(s1, 40, 0xB0AA4BD7u) == 40,
-              "t3v: g42-билдер 40B (паритет-реф)");
-        CHECK(memcmp(sl, s1, 40) == 0, "t3v: 'B' = байт-паритет с g42-формой");
+        CHECK(c2b_t3_build_b(sl, 59, 0xB0AA4BD7u) == 59, "t3v: b cap=59 = 59B (v109.2)");
+        CHECK(c2b_clv2_build_kaccept(s1, 59, 0xB0AA4BD7u) == 59,
+              "t3v: g42-билдер 59B (паритет-реф)");
+        CHECK(memcmp(sl, s1, 59) == 0, "t3v: 'B' = байт-паритет с g42-формой");
+        /* v109.2: granted-раскладка (шаблон = серверный granted-'A' run560):
+         * игла "connect-granted0x\0" @24..41, expire=ver @42..45, pw NUL @46,
+         * b2=0 @47 (цепочка -> игла 25d8e3 scp напрямую), lobby=0 @48..55 */
+        CHECK(sl[22] == 18u && sl[23] == 0u, "t3v: strlen=18 @22 (LE 16 бит)");
+        CHECK(sl[24] == 'c' && sl[30] == 't' && sl[31] == '-' &&
+              sl[39] == '0' && sl[40] == 'x' && sl[41] == 0u,
+              "t3v: игла connect-granted0x\0 @24..41");
+        CHECK(sl[46] == 0u && sl[47] == 0u, "t3v: pw NUL @46 + b2=0 @47");
+        {
+            u32 vr = c2b_clv2_client_version();
+            CHECK(sl[42] == (u8)vr && sl[45] == (u8)(vr >> 24),
+                  "t3v: expire=ver @42..45 (g44/514ab0)");
+        }
         memset(sl, 0x11, sizeof sl);
         memset(s1, 0x22, sizeof s1);
-        CHECK(c2b_t3_build_b(sl, 54, 0xB0AA4BD7u) == 54,
-              "t3v: b cap=54 = 54B (пад)");
-        CHECK(c2b_clv2_build_kaccept(s1, 40, 0xB0AA4BD7u) == 40,
-              "t3v: g42 40B ref#2");
-        CHECK(memcmp(sl, s1, 40) == 0,
-              "t3v: 'B' первые 40B = паритет при паде");
+        CHECK(c2b_t3_build_b(sl, 64, 0xB0AA4BD7u) == 64,
+              "t3v: b cap=64 = 64B (пад до cap)");
+        CHECK(c2b_clv2_build_kaccept(s1, 59, 0xB0AA4BD7u) == 59,
+              "t3v: g42 59B ref#2");
+        CHECK(memcmp(sl, s1, 59) == 0,
+              "t3v: 'B' первые 59B = паритет при паде");
         g_clv2_ch32 = ch_save;
     }
-    CHECK(sl[40] == 0u && sl[53] == 0u, "t3v: 'B' пад-хвост = нули");
-    CHECK(c2b_t3_build_b(sl, 39, 1u) == 0, "t3v: b cap=39 = 0");
-    CHECK(c2b_t3_build_b(0, 54, 1u) == 0, "t3v: b NULL = 0");
-    CHECK(c2b_t3_build_b(sl, 54, 0) == 54, "t3v: b chal=0 -> fallback 12345678");
+    CHECK(sl[56] == 0u && sl[63] == 0u, "t3v: 'B' пад-хвост = нули");
+    CHECK(c2b_t3_build_b(sl, 58, 1u) == 0, "t3v: b cap=58 = 0 (минимум 59)");
+    CHECK(c2b_t3_build_b(0, 64, 1u) == 0, "t3v: b NULL = 0");
+    CHECK(c2b_t3_build_b(sl, 59, 0) == 59, "t3v: b chal=0 -> fallback 12345678");
     CHECK(sl[6] == '1' && sl[13] == '8', "t3v: b fallback hex = 12345678");
     /* --- стад-машина (run517-реалистичные слоты: [SNP-фрейм 12B]
      *     [ff×4+'A' @12 + chal + proto]) --- */
@@ -34478,7 +34507,8 @@ static void test_t3v(void)
     memset(sl, 0, sizeof sl); sl[0] = 0x80u;
     CHECK(c2b_t3_step(sl, 7, &st) == 0, "t3v: 7B SW/ACK = скип");
     CHECK(st.nB == 0u && st.nS2 == 0u, "t3v: 7B ничего не меняет");
-    /* 'A'#2 = жертвенный слот -> 'B' В PAYLOAD (@mo), префикс цел */
+    /* 'A'#2 = жертвенный слот -> 'B' В PAYLOAD (@mo), префикс цел
+     * (v109.2: слот 71B = 12 префикс + 59 granted-форма) */
     memset(sl, 0, sizeof sl);
     sl[0] = 0x80u; sl[1] = 0x00u; sl[2] = 0x98u; sl[3] = 0x03u;
     sl[4] = 0x00u; sl[5] = 0xd8u; sl[6] = 0x00u; sl[7] = 0x37u;
@@ -34486,7 +34516,7 @@ static void test_t3v(void)
     sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
     sl[17] = 0x11u; sl[18] = 0x22u; sl[19] = 0x33u; sl[20] = 0x44u;
     sl[21] = 3u;
-    CHECK(c2b_t3_step(sl, 54, &st) == 1, "t3v: 'A'#2 = 'B' инж");
+    CHECK(c2b_t3_step(sl, 71, &st) == 1, "t3v: 'A'#2 = 'B' инж (59B слот)");
     CHECK(st.nB == 1u, "t3v: nB=1");
     CHECK(sl[0] == 0x80u && sl[2] == 0x98u && sl[3] == 0x03u,
           "t3v: SNP-префикс [0..12) СОХРАНЁН");
@@ -34500,8 +34530,11 @@ static void test_t3v(void)
     CHECK(sl[26] == 0x11u && sl[27] == 0x22u && sl[28] == 0x33u &&
           sl[29] == 0x44u, "t3v: chal LE @26..29 (payload+14)");
     CHECK(sl[30] == 2u, "t3v: proto=2 @30 (payload+18)");
-    CHECK(sl[36] == 'c' && sl[43] == 0u, "t3v: connect\\0 @36..43");
-    CHECK(sl[52] == 0u && sl[53] == 0u, "t3v: пад-хвост нулями (40+2)");
+    CHECK(sl[34] == 18u && sl[35] == 0u, "t3v: strlen=18 @34 (payload+22)");
+    CHECK(sl[36] == 'c' && sl[50] == 'd' && sl[52] == 'x' && sl[53] == 0u,
+          "t3v: игла connect-granted0x\0 @36..53 (payload+24)");
+    CHECK(sl[58] == 0u && sl[59] == 0u && sl[70] == 0u,
+          "t3v: pw/b2/пад-хвост нулями (59-форма)");
     /* 'A'#3 (после 'B') = СТАДИЯ S2 v106.1: payload = компакт 07 08 02 */
     memset(sl, 0, sizeof sl);
     sl[0] = 0x80u; sl[2] = 0x98u; sl[3] = 0x04u;
@@ -34537,7 +34570,7 @@ static void test_t3v(void)
     (void)c2b_t3_step(sl, 54, &st);            /* 'A'#1 нотед */
     (void)c2b_t3_step(sl, 54, &st);            /* 'A'#2: len-mo=42>=40 -> 'B'... */
     {   /* прямой чек: fresh-стейт с seenA=2, nB=0 => 'A'#3 = 'B' (не S2):
-         * стадийная дисциплина — S2 требует nB>=1 */
+         * стадийная дисциплина — S2 требует nB>=1 (v109.2: слот 71B) */
         c2b_t3_st_t st_nb;
         memset(&st_nb, 0, sizeof st_nb);
         st_nb.on = 1u; st_nb.seenA = 2u;
@@ -34545,7 +34578,7 @@ static void test_t3v(void)
         sl[0] = 0x80u;
         sl[12] = sl[13] = sl[14] = sl[15] = 0xffu; sl[16] = 'A';
         sl[17] = 0x11u; sl[21] = 3u;
-        CHECK(c2b_t3_step(sl, 54, &st_nb) == 1 && st_nb.nB == 1u &&
+        CHECK(c2b_t3_step(sl, 71, &st_nb) == 1 && st_nb.nB == 1u &&
               st_nb.nS2 == 0u,
               "t3v: seenA=3/nB=0 => 'B' первичен (S2 ждёт nB>=1)");
     }

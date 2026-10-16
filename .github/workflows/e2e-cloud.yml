@@ -135,6 +135,11 @@ on:
         required: false
         type: choice
         options: ["0", "1"]
+      b2pw:
+        description: "v109.9: the in-channel 'B' pw-attempt (C2B_B2PW). THE PW A/B: the server's own intro = 'Server using <none> lobbies, REQUIRING PW YES, lobby id 0' (repeated xN every run) = sv_password IS SET on 152.233.19.133:28022; our in-channel synth-'B' carries pw='' @46 = the eternal 'B.'-reject class while the chal echoes are ACCEPTED into the dialog. The lane-split: the loopback copy ALWAYS keeps pw='' (the granted-needle branch 25d8b5 REQUIRES pw='' for the direct-scp win-tail — flipping it = the anti-win on the engine side); the in-channel copy = the client-connect direction where the server reads pw @46 as the password attempt. b2pw=x = the diagnostic A/B: the reject-class delta (a DIFFERENT reject form / a stop / an accept) = the pw = the gate; no delta = the pw = not the server-side gate. Empty = the v109.4..8 parity (both copies pw='')."
+        default: ""
+        required: false
+        type: string
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -161,6 +166,7 @@ jobs:
       # map = added to the artifact (the ci-collect) = any future crash
       # rip-offset resolves to the fn name.
       C2B_G109: "0"
+      C2B_B2PW: ${{ inputs.b2pw || '' }}
       # v53b/v54: ядерная правда о send-классе. STRACEGame = ВЫКЛ (run401/402:
       # TracerPid != 0 = анти-дебуг движка = отправитель 0x22 НЕ СТРЕЛЯЕТ под
       # любым трейсером — наблюдаемая добилась обратного). TRACEFS_GAME =

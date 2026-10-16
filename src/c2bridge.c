@@ -12808,8 +12808,16 @@ static u32 c2b_t3_build_s2c(u8 *q, u32 cap)
 }
 
 /* 'B' kaccept = клон g42-формы с ЯВНЫМ chal (без глобального g_clv2_ch32 —
- * эра туннеля: legacy-стейт может быть нулев/чужой). 40B + zero-пад до cap. */
-static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32)
+ * эра туннеля: legacy-стейт может быть нулев/чужой). 40B + zero-пад до cap.
+ * v109.9: +pw — ЛАНЕВАЯ ДИВЕРГЕНЦИЯ. Один и тот же 59B едет в ДВЕ стороны:
+ * (1) loopback = МИМИК серверного reply-формы (игла granted + pw="" =
+ * ТРЕБОВАНИЕ ветки 25d8b5->25d8e3 scp НАПРЯМУЮ; pw!="" = срыв иглы в
+ * grace-цикл = анти-выигрыш); (2) in-channel = КЛИЕНТ-коннект к серверу,
+ * сервер читает pw @46 как ПОПЫТКУ ПАРОЛЯ против своего sv_password
+ * ("requiring pw yes" = сервер сам объявил; наш pw="" = вечный 'B.'-reject
+ * класс — кандидат-гейт №1). pw=NULL/"" = паритет со старой формой;
+ * непустой pw = сдвиг хвоста (pw-строка до NUL, b2 СРАЗУ после, lobby до 59). */
+static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32, const char *pw)
 {
     static const char hxk[] = "0123456789ABCDEF";
     static const char gnd[] = "connect-granted0x";
@@ -12843,6 +12851,16 @@ static u32 c2b_t3_build_b(u8 *q, u32 cap, u32 ch32)
     q[46] = 0u;                                    /* pw NUL (pw="") @46 */
     q[47] = 0u;                                    /* b2=0 -> цепочка -> ИГЛА */
     for (i = 48u; i < 59u; i++) q[i] = 0u;         /* lobby @48..55 = 0, пад */
+    /* v109.9: непустой pw = in-channel вариант (клиент-коннект): pw-строка
+     * @46.. до NUL, b2=0 СРАЗУ после NUL, lobby=0 до 59. Последовательный
+     * читатель (pw-строка -> b2-бул -> lobby) = RE-модель хвоста. */
+    if (pw && pw[0]) {
+        u32 j;
+        for (j = 0u; pw[j] && j < 10u; j++) q[46 + j] = (u8)pw[j];
+        q[46 + j] = 0u;                            /* NUL-терминатор pw */
+        q[47 + j] = 0u;                            /* b2=0 после pw */
+        for (i = 48u + j; i < 59u; i++) q[i] = 0u; /* lobby/пад до 59 */
+    }
     for (i = 59u; i < cap; i++) q[i] = 0u;         /* хвост не читается */
     return cap;
 }
@@ -12865,7 +12883,7 @@ static u32 c2b_t3_step(u8 *out, u32 len, c2b_t3_st_t *st)
     st->chal = chal;
     if (st->seenA >= 2u && !st->nB && st->nB < C2B_T3V_CAP_B &&
         len - mo >= 59u) {
-        c2b_t3_build_b(out + mo, len - mo, chal);
+        c2b_t3_build_b(out + mo, len - mo, chal, 0);   /* t3v = мимик-лane, pw="" */
         st->nB++;
         return 1u;
     }
@@ -23552,12 +23570,18 @@ static void c2b_a2eb_maybe(void)
 static u32 g_b2e_init, g_b2e_on = 1, g_b2e_fires;
 static u32 g_b2e_last_chal;            /* v109.8: чалл последнего файра */
 static u32 g_b2c_on = 1;                /* v109.4: b2c in-channel-доставка */
+/* v109.9: C2B_B2PW = пароль-попытка для in-channel копии 'B' (клиент-коннект
+ * к серверу с sv_password). loopback-копия = ВСЕГДА pw="" (требование иглы
+ * 25d8b5). Пусто (дефолт) = старое поведение (обе копии pw=""). */
+static char g_b2e_pw[16];
+static u32 g_b2e_pw_len;
 static void c2b_b2e_maybe(void)
 {
     static u8 b2_buf[64];
     u32 cs_b2 = 0, ch_b2 = 0, pr_b2 = 0, sb_len, ib2, src_grant;
     i32 rc_bc = -999;
     u8 la[16];
+    u8 *buf_bc;                    /* v109.9: in-channel буфер (pw-вариант) */
     ssize_t sr;
     if (!g_b2e_init) {
         const char *eb2 = getenv("C2B_B2E");
@@ -23566,9 +23590,20 @@ static void c2b_b2e_maybe(void)
             const char *ebc = getenv("C2B_B2C");
             if (ebc && ebc[0] == '0') g_b2c_on = 0;
         }
+        {
+            const char *ebp = getenv("C2B_B2PW");   /* v109.9: pw-попытка */
+            u32 j;
+            if (ebp) for (j = 0u; ebp[j] && j < 15u; j++) g_b2e_pw[j] = ebp[j];
+            g_b2e_pw[j] = 0;
+            g_b2e_pw_len = j;
+        }
         g_b2e_init = 1;
-        if (g_b2e_on)
-            C2B_LOGS("[c2b] b2e: ARMED (v109.5 g51-live src + b2c in-channel)\n");
+        if (g_b2e_on) {
+            C2B_LOGS("[c2b] b2e: ARMED (v109.9 lane-split pw: loopback=\"\" in-channel=");
+            if (g_b2e_pw_len) { C2B_LOGS(g_b2e_pw); }
+            else C2B_LOGS("\"\"");
+            C2B_LOGS("\n");
+        }
         if (!g_b2c_on)
             C2B_LOGS("[c2b] b2c: disabled (C2B_B2C=0)\n");
     }
@@ -23585,7 +23620,7 @@ static void c2b_b2e_maybe(void)
                          g_b2e_g51_seen, g_b2e_g51_chal);
     if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2, src_grant,
                       g_b2e_last_chal)) return;
-    sb_len = c2b_t3_build_b(b2_buf, 59u, ch_b2);   /* эхо ЖИВОГО чала, 59B granted */
+    sb_len = c2b_t3_build_b(b2_buf, 59u, ch_b2, 0); /* эхо ЖИВОГО чала, 59B granted; loopback = pw="" (игла) */
     if (sb_len != 59u) return;
     pr_b2 = c2b_b2e_proto(g_b2e_fires, pr_b2);  /* v106.5: A/B #1=2, #2=живой */
     b2_buf[18] = (u8)pr_b2;
@@ -23597,6 +23632,17 @@ static void c2b_b2e_maybe(void)
     sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)b2_buf,
                                        sb_len, 0,
                                        (const struct sockaddr *)la, 16);
+    /* v109.9: in-channel копия = pw-вариант (клиент-коннект против
+     * sv_password сервера, C2B_B2PW). Дефолт (pw_len=0) = ТОТ ЖЕ буфер
+     * (паритет с v109.4..8). Строим ПОСЛЕ proto-байта (тот же @18). */
+    buf_bc = b2_buf;
+    if (g_b2e_pw_len) {
+        static u8 b2c_buf[64];
+        if (c2b_t3_build_b(b2c_buf, 59u, ch_b2, g_b2e_pw) == 59u) {
+            b2c_buf[18] = (u8)pr_b2;
+            buf_bc = b2c_buf;
+        }
+    }
     /* v109.4 B2C: ТОТ ЖЕ 'B' in-channel (slot-11 SendMessage-класс,
      * ABI = k2v/h2v-огней, UNRELIABLE fl=0 = tolerated-silent-класс h2v).
      * Легаси-loopback остаётся (A/B-история), in-channel = ЖИВОЙ путь:
@@ -23609,7 +23655,7 @@ static void c2b_b2e_maybe(void)
         if (__sigsetjmp(g_probe_jb, 1) == 0) {
             rc_bc = ((i32 (*)(void *, uptr, const void *, u32, i32,
                               i64 *))vt_bc[11])(
-                g_gns_conn_iface, g_gns_conn_h, b2_buf, sb_len,
+                g_gns_conn_iface, g_gns_conn_h, buf_bc, sb_len,
                 0 /* UNRELIABLE */, &out_bc);
             g_probe_active = 0;
         } else {
@@ -23638,6 +23684,10 @@ static void c2b_b2e_maybe(void)
     C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
     C2B_LOGS(" ch=");
     C2B_LOGN((u32)rc_bc);   /* v109.4: in-channel rc (-999 = скип, -998 = SEGV) */
+    if (g_b2e_pw_len) {      /* v109.9: pw-вариант в in-channel копии */
+        C2B_LOGS(" b2pw=");
+        C2B_LOGN(g_b2e_pw_len);
+    }
     C2B_LOGS("\n");
     /* телеметрия-только: реакцию парсера читаем по g48/g66-классам + cw-срезам */
     /* v109.6: ch=1 = the in-channel 'B' LANDED => the freeze-window arm
@@ -34678,7 +34728,7 @@ static void test_t3v(void)
         g_clv2_ch32 = 0xB0AA4BD7u;
         memset(sl, 0x11, sizeof sl);
         memset(s1, 0x22, sizeof s1);
-        CHECK(c2b_t3_build_b(sl, 59, 0xB0AA4BD7u) == 59, "t3v: b cap=59 = 59B (v109.2)");
+        CHECK(c2b_t3_build_b(sl, 59, 0xB0AA4BD7u, 0) == 59, "t3v: b cap=59 = 59B (v109.2)");
         CHECK(c2b_clv2_build_kaccept(s1, 59, 0xB0AA4BD7u) == 59,
               "t3v: g42-билдер 59B (паритет-реф)");
         CHECK(memcmp(sl, s1, 59) == 0, "t3v: 'B' = байт-паритет с g42-формой");
@@ -34697,7 +34747,7 @@ static void test_t3v(void)
         }
         memset(sl, 0x11, sizeof sl);
         memset(s1, 0x22, sizeof s1);
-        CHECK(c2b_t3_build_b(sl, 64, 0xB0AA4BD7u) == 64,
+        CHECK(c2b_t3_build_b(sl, 64, 0xB0AA4BD7u, 0) == 64,
               "t3v: b cap=64 = 64B (пад до cap)");
         CHECK(c2b_clv2_build_kaccept(s1, 59, 0xB0AA4BD7u) == 59,
               "t3v: g42 59B ref#2");
@@ -34706,10 +34756,26 @@ static void test_t3v(void)
         g_clv2_ch32 = ch_save;
     }
     CHECK(sl[56] == 0u && sl[63] == 0u, "t3v: 'B' пад-хвост = нули");
-    CHECK(c2b_t3_build_b(sl, 58, 1u) == 0, "t3v: b cap=58 = 0 (минимум 59)");
-    CHECK(c2b_t3_build_b(0, 64, 1u) == 0, "t3v: b NULL = 0");
-    CHECK(c2b_t3_build_b(sl, 59, 0) == 59, "t3v: b chal=0 -> fallback 12345678");
+    CHECK(c2b_t3_build_b(sl, 58, 1u, 0) == 0, "t3v: b cap=58 = 0 (минимум 59)");
+    CHECK(c2b_t3_build_b(0, 64, 1u, 0) == 0, "t3v: b NULL = 0");
+    CHECK(c2b_t3_build_b(sl, 59, 0, 0) == 59, "t3v: b chal=0 -> fallback 12345678");
     CHECK(sl[6] == '1' && sl[13] == '8', "t3v: b fallback hex = 12345678");
+    /* v109.9: pw-вариант — in-channel копия (клиент-коннект против
+     * sv_password). pw="x" = @46='x', @47=NUL, @48=b2=0, lobby до 59;
+     * pw=NULL/"" = паритет со старой формой (@46=0, @47=0). */
+    memset(sl, 0x11, sizeof sl);
+    CHECK(c2b_t3_build_b(sl, 59, 0xB0AA4BD7u, "x") == 59, "t3v: b pw=x = 59B");
+    CHECK(sl[46] == 'x' && sl[47] == 0u && sl[48] == 0u && sl[49] == 0u,
+          "t3v: b pw=x @46, NUL @47, b2=0 @48 (сдвиг хвоста)");
+    memset(sl, 0x11, sizeof sl);
+    CHECK(c2b_t3_build_b(sl, 59, 0xB0AA4BD7u, 0) == 59, "t3v: b pw=NULL = 59B");
+    CHECK(sl[46] == 0u && sl[47] == 0u && sl[48] == 0u,
+          "t3v: b pw=NULL паритет @46..48 = нули (игла-семантика цела)");
+    memset(sl, 0x11, sizeof sl);
+    CHECK(c2b_t3_build_b(sl, 59, 0xB0AA4BD7u, "0123456789ABCDEF") == 59,
+          "t3v: b pw переполнение = кламп 10 + NUL");
+    CHECK(sl[55] == '9' && sl[56] == 0u,
+          "t3v: b pw кламп = 10 символов + NUL @56 (без OOB)");
     /* --- стад-машина (run517-реалистичные слоты: [SNP-фрейм 12B]
      *     [ff×4+'A' @12 + chal + proto]) --- */
     memset(&st, 0, sizeof st);

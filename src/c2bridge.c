@@ -13485,12 +13485,22 @@ static void c2b_fcon_maybe(void)
     if (g_fcon_done) return;
     g = c2b_fcon_gate(g_fcon_go, g_engine_base ? 1u : 0u,
                       g_gns_connect_go, 0u);
-    if (!g) return;
+    if (!g) {
+        /* v110.2b: гейт-скип = ЛОГИРУЕМ (590: немой скип = слепая зона) */
+        C2B_LOGS("[c2b] fcon: gate skip go=");
+        C2B_LOGN(g_fcon_go);
+        C2B_LOGS(" base=");
+        C2B_LOGN(g_engine_base ? 1u : 0u);
+        C2B_LOGS(" tgt=");
+        C2B_LOGN(g_gns_connect_go);
+        C2B_LOGS("\n");
+        return;
+    }
     g_fcon_done = 1;            /* 1/сессию, ДО файра (без ретраев) */
-    /* выравнивание тайминга по харнессу: (1) SDR-config = гейт харнесса
-     * перед его URL-файром (греют кеш -> ~0с; холодный = до 120с), (2)
-     * оседание меню: launch->menu = 25с (589); суммарно файр = в зону
-     * проверенного URL-тайминга (~30с), не в кадр 1. C2B_FCON_DELAY=сек. */
+    /* v110.2b: тайминг = ТОЛЬКО оседание (C2B_FCON_DELAY, дефолт 25с =
+     * launch->menu 589). SDR-wait УДАЛЁН (590-урок: g_sdr_cfg_ok =
+     * пер-процессный флаг хука спью; в процессе g32-треда он НЕ
+     * выставляется -> немой 120с-столл, логи за окном захвата). */
     {
         const char *ed = getenv("C2B_FCON_DELAY");
         u32 dly = 25, w;
@@ -13499,12 +13509,10 @@ static void c2b_fcon_maybe(void)
             for (w = 0; ed[w] >= '0' && ed[w] <= '9' && w < 4; w++)
                 dly = dly * 10 + (u32)(ed[w] - '0');
         }
-        for (w = 0; w < 240 && !g_sdr_cfg_ok; w++) usleep(500000);
+        C2B_LOGS("[c2b] fcon: fired in ");
+        C2B_LOGN(dly);
+        C2B_LOGS("s (settle)\n");
         for (w = 0; w < dly * 2; w++) usleep(500000);
-        C2B_LOGS("[c2b] fcon: timing aligned sdr=");
-        C2B_LOGN(g_sdr_cfg_ok);
-        C2B_LOGS(" dly="); C2B_LOGN(dly);
-        C2B_LOGS("\n");
     }
     if (!c2b_fcon_sig_ok((const u8 *)(g_engine_base + 0x4123e0ull),
                          (const u8 *)(g_engine_base + 0x3f8310ull),

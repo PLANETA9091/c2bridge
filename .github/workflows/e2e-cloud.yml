@@ -145,6 +145,11 @@ on:
         default: "none,0,cybershoke,cybershoke.net"
         required: false
         type: string
+      appid:
+        description: "v110.4: the STEAM APPID LEVER (C2B_APPID_V). THIS ROUND'S JOIN-TOKEN HUNT VERDICT: cybershoke's web bundle (index-B6e14lKM.js) Join = steam://rungameid/4465480//+connect ip:port for game-1 servers (730 for game-2) — NO password, NO token, NO key API anywhere in the 967KB bundle. App 4465480 = Valve's own legacy 'Counter-Strike:Global Offensive' (Free To Play store entry, backdated 2012) = the A2S gameid of the cybershoke servers. => real clients present appid 4465480 (legacy CS:GO) while our sandbox engine presents its compiled-in 730 (CS2 took 730) => the per-client 'requiring pw yes' flag (run591 + the run592 zero-delta across all pw values) = the IDENTITY discriminator. appid=4465480 => steam_appid.txt in the engine CWD + SteamAppId env; F2P => SteamAPI_Init auto-licenses the burner. '0' = off = the 592 parity."
+        default: "0"
+        required: false
+        type: string
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -174,6 +179,8 @@ jobs:
       C2B_B2PW: ${{ inputs.b2pw || '' }}
       # v110.3: the fcon pw-lane variants (the harness picks per attempt)
       C2B_FCON_PW_LIST: ${{ inputs.fconpw || 'none,0,cybershoke,cybershoke.net' }}
+      # v110.4: the steam appid lever ('0' = off = the compiled-in 730)
+      C2B_APPID_V: ${{ inputs.appid || '0' }}
       # v53b/v54: ядерная правда о send-классе. STRACEGame = ВЫКЛ (run401/402:
       # TracerPid != 0 = анти-дебуг движка = отправитель 0x22 НЕ СТРЕЛЯЕТ под
       # любым трейсером — наблюдаемая добилась обратного). TRACEFS_GAME =

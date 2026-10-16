@@ -164,6 +164,32 @@ command -v xdotool >/dev/null 2>&1 || finish 3 "FAIL: xdotool not installed"
 [[ -x "$GAME_DIR/csgo_linux64" ]] || finish 3 "FAIL: $GAME_DIR/csgo_linux64 not found (bad bundle?)"
 ls "$BRIDGE_DIR"/c2b_spy64.so >/dev/null 2>&1 || finish 3 "FAIL: bridge binaries missing in $BRIDGE_DIR"
 
+# ---------- 0a. v110.4: the STEAM APPID LEVER (C2B_APPID_V) ----------
+# The cybershoke public servers' A2S gameid = 4465480 = Valve's OWN legacy
+# 'Counter-Strike:Global Offensive' store app (Free To Play; the store entry
+# backdated to 21 Aug 2012 = the legacy CS:GO re-listing after CS2 took
+# appid 730). THE DECISIVE EVIDENCE (this round's in-page JS hunt of
+# cybershoke.net/assets/index-B6e14lKM.js): the web Join button =
+#   d.id_games===2 ? `steam://rungameid/730//+connect ${ip}:${port}`
+#                 : `steam://rungameid/4465480//+connect ${ip}:${port}`
+# = NO password, NO token, NO key anywhere in the web connect flow (both
+# the card and the list handlers dump-verified; zero per-server key/ticket
+# API endpoints in the whole 967KB bundle). => real clients run the legacy
+# engine AS APPID 4465480 while our sandbox presents the compiled-in 730
+# => the server's per-client pw-flag (run591 'requiring pw yes' + run592
+# zero-delta across none/0/cybershoke/cybershoke.net) = the IDENTITY
+# discriminator, not a password gate. F2P => SteamAPI_Init under the new
+# appid auto-licenses the burner (no purchase step). C2B_APPID_V=<int> =>
+# steam_appid.txt in GAME_DIR (the engine CWD) + SteamAppId=<int> env on
+# the launch (steam_api prefers steam_appid.txt; belt+braces both).
+# Default '0' = OFF = the 592 parity (compiled-in 730).
+APPID_ENV=""
+if [[ -n "${C2B_APPID_V:-}" && "${C2B_APPID_V}" != "0" && "${C2B_APPID_V}" != "none" ]]; then
+  echo "$C2B_APPID_V" > "$GAME_DIR/steam_appid.txt"
+  APPID_ENV="SteamAppId=$C2B_APPID_V"
+  log "appid lever: steam_appid.txt=$C2B_APPID_V + SteamAppId env ON"
+fi
+
 # ---------- 0b. dependency audit (dlopen of engine modules fails silently
 # when a NEEDED lib is missing: the engine only prints the 32-bit probe's
 # wrong-ELF-class error, see run 37123582445) ----------
@@ -971,7 +997,11 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # (set disable-randomization off), so if the clean attempt dies we still
   # get a full backtrace from an address-space that matches real conditions.
   DBG_INNER=""
-  DBG_ATTEMPT="${DBG_ATTEMPT:-2}"
+  # v110.4: default DBG_ATTEMPT = 0 (NO gdb/strace attempt in the A/B —
+  # the 0610 round's a2 no-fire reliability priority: gdb disables ASLR
+  # adjacent variance and the gdb variant wastes the B/C slot; set the
+  # workflow input dbg to re-arm).
+  DBG_ATTEMPT="${DBG_ATTEMPT:-0}"
   if (( FARM )); then
     # FARM GROUND TRUTH (runs 57-60: handoff fires, engine 'Retrying public'
     # for 240s, ZERO packets leave via sendto on ANY port). Trace the engine's
@@ -1018,6 +1048,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" DISPLAY=:99 \
     LD_LIBRARY_PATH="${LDPREFIX:+$LDPREFIX:}$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin" \
     SDL_AUDIODRIVER=dummy \
+    $APPID_ENV \
     C2B_G109="${C2B_G109:-1}" \
     C2B_G110="${C2B_G110:-1}" \
     C2B_G113_GO="$RUNDIR/g113.go" \

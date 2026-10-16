@@ -1360,8 +1360,42 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   touch "$RUNDIR/g113.go" 2>/dev/null || true
 
   END=$((SECONDS + DURATION))
+  # v110.1b: SOFT pipe-fail sentinel. The fire = issued; if the engine never
+  # prints "Connecting to" within SOFT_WAIT seconds, the URL = swallowed by a
+  # wedged client WITHOUT the S_API modal marker (run587 a1/a3/a4: menu
+  # reached + steam:// fired + 240s of dead air, 'Connecting to' = never
+  # printed, the hard fast-fail = never triggered). Same remedy as the hard
+  # fast-fail: kill the game, restart the client (v110.1 recipe), retry.
+  SOFT_WAIT=${C2B_CONNECT_SOFTWAIT:-60}
+  CONNECT_SENTINEL=0
+  SOFT_DL=$((SECONDS + SOFT_WAIT))
   while (( SECONDS < END )); do
     engine_alive || { log "attempt $ATTEMPT: client died during connect"; save_conlog; break; }
+    if (( ! CONNECT_SENTINEL )); then
+      if grep -aq "Connecting to" "$OUT" 2>/dev/null \
+         || sudo -n grep -aq "Connecting to" "$CONLOG" 2>/dev/null; then
+        CONNECT_SENTINEL=1
+        log "attempt $ATTEMPT: 'Connecting to' seen (URL delivered)"
+      elif (( SECONDS >= SOFT_DL )); then
+        log "attempt $ATTEMPT: SOFT pipe-fail: no 'Connecting to' in ${SOFT_WAIT}s after the fire -> client restart (v110.1b)"
+        save_conlog
+        pkill -9 -x csgo_linux64 2>/dev/null
+        if [[ "${C2B_PIPE_RESTART:-1}" == "1" && -f "$NODE_HOME/steam-login.sh" && -n "${STEAM_USER:-}" ]]; then
+          log "attempt $ATTEMPT: soft-fail -> restarting steam client"
+          pkill -9 -u "$GAME_USER" -f 'ubuntu12_32/stea]' 2>/dev/null; sleep 3
+          STEAM_USER="$STEAM_USER" STEAM_PASS="${STEAM_PASS:-}" \
+          C2B_GAME_USER="$GAME_USER" DISPLAY=:99 \
+            bash "$NODE_HOME/steam-login.sh" \
+            >"$RUNDIR/steam-relaunch.softfail.a${ATTEMPT}.log" 2>&1 </dev/null \
+            && log "attempt $ATTEMPT: steam client relogin OK (soft-fail path)" \
+            || log "WARNING: steam-login.sh softfail relaunch rc=$? (continuing)"
+          sleep 5
+        else
+          log "attempt $ATTEMPT: soft-fail -> client restart skipped (C2B_PIPE_RESTART=0 or creds unavailable)"
+        fi
+        break
+      fi
+    fi
     if grep -aqiE 'Connected\(|Signing up to server|Connected to' "$OUT" 2>/dev/null \
        || sudo -n grep -aqiE 'Connected\(|Signing up to server|Connected to' "$CONLOG" 2>/dev/null; then
       CONNECTED=1; log "attempt $ATTEMPT: CONNECTION MARKER FOUND"

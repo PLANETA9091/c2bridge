@@ -17562,7 +17562,7 @@ static void c2b_raw_lane_note(int fd, const void *buf, u32 len,
 /* v108.0 tiksyn fwd: определения в tik-секции (после v107.8 tik); pcxr-
  * хвост (ниже) зовёт gate/fire; phase-6 arm зовёт lazy (после определения
  * — fwd не нужен). */
-static u32  c2b_tiksyn_gate(void);
+static u32  c2b_tiksyn_tick(void);
 static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
                             const u8 *addr, u32 addrlen);
 
@@ -17938,6 +17938,18 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             for (i = 0; i < 16; i++)
                 g_pcxr_engsa[i] = ((volatile const u8 *)addr)[i];
             g_pcxr_capn++;
+            /* v108.1 диагностика: pcxr-хвост ЖИВ для k-класса? (первые 3
+             * каптура; ценз run546: 86 k на проводе с порта движка 27005,
+             * но хвост нем => капн невидим без огня — чиним слепоту) */
+            if (g_pcxr_capn <= 3u) {
+                C2B_LOGS("[c2b] pcxr: k-cap #");
+                C2B_LOGN(g_pcxr_capn);
+                C2B_LOGS(" len=");
+                C2B_LOGN((u32)len);
+                C2B_LOGS(" fd=");
+                C2B_LOGN((u32)fd);
+                C2B_LOGS("\n");
+            }
             if (g_pcxr_pend) {
                 ssize_t r22, rk;
                 g_pcxr_pend = 0;      /* снять ДО огня = без ре-энтри */
@@ -17964,11 +17976,11 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                 C2B_LOGN(g_pcxr_capn);
                 C2B_LOGS("\n");
             }
-            /* v108.0 TIKSYN: приманка phase-6 = arm; ЭТОТ капчур = свежий
-             * движковый 'k' (r>=0, живой fd, РЕАЛЬНЫЙ sa сервера) = огонь
-             * TIK-кадра (k + тикет-хвост). one-shot; g_clp_sendto = мимо
-             * хука; errno восстановится в хвосте блока. */
-            if (c2b_tiksyn_gate())
+            /* v108.0/108.1 TIKSYN: свежий движковый 'k' (r>=0, живой fd,
+             * РЕАЛЬНЫЙ sa сервера) = триггер: первый = arm, следующий =
+             * огонь TIK-кадра (k + тикет-хвост). one-shot; g_clp_sendto =
+             * мимо хука; errno восстановится в хвосте блока. */
+            if (c2b_tiksyn_tick())
                 c2b_tiksyn_fire(fd, (const u8 *)buf, (u32)len,
                                 (const u8 *)addr, (u32)addrlen);
             *__errno_location() = er;
@@ -21026,10 +21038,22 @@ static void c2b_tiksyn_lazy(void)
             C2B_LOGS("[c2b] tiksyn: ARMED (v108.0 bait->k+ticket: 1/session, fire on the first fresh eng-k after a phase-6 bait)\n");
     }
 }
-static u32 c2b_tiksyn_gate(void)
+/* v108.1: ПРОДАКШН-гейт pcxr-хвоста (v108.0 gate удалён = zero-new-warning:
+ * был не-used в .so после перехода на tick): ПЕРВЫЙ свежий движковый 'k'
+ * = arm (>=1 бейзлайн-k уже ушёл), СЛЕДУЮЩИЙ = огонь. Урок run546: бэйты
+ * phase-6 = вторая монета (0 бэйтoв при живом k-бурсте 86 шт = tiksyn
+ * не стрелял) — привязка к бэйту снята: дифф-окно = сам k-бурст.
+ * Бэйт-arm (phase-6) остаётся как ранняя arm-точка. */
+static u32 c2b_tiksyn_tick(void)
 {
     c2b_tiksyn_lazy();
-    return (g_tiksyn_on && !g_tiksyn_sent && g_tiksyn_arm) ? 1u : 0u;
+    if (!g_tiksyn_on || g_tiksyn_sent) return 0;
+    if (!g_tiksyn_arm) {
+        g_tiksyn_arm = 1;
+        C2B_LOGS("[c2b] tiksyn: fresh k -> ARMED (v108.1: fire on the NEXT fresh k, >=1 baseline k on the wire)\n");
+        return 0;
+    }
+    return 1;
 }
 static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
                             const u8 *addr, u32 addrlen)
@@ -34470,18 +34494,18 @@ static void test_swr(void)
         CHECK(c2b_tik_build(kb, 513, tb, 252, ob, sizeof(ob), &ol) == 0,
               "tikbuild: не-'k' класс = отказ");
     }
-    /* --- v108.0: tiksyn gate (arm/sent/on) + fire no-source (инертен) --- */
+    /* --- v108.0/108.1: tiksyn tick (матрица флагов) + fire no-source --- */
     printf("[t] tiksyn\n");
     {
         g_tiksyn_init = 1;                   /* мимо env/lazy в selftest */
         g_tiksyn_on = 1; g_tiksyn_sent = 0; g_tiksyn_arm = 0;
-        CHECK(c2b_tiksyn_gate() == 0, "tiksyn gate: не armed = 0");
-        g_tiksyn_arm = 1;
-        CHECK(c2b_tiksyn_gate() == 1, "tiksyn gate: armed+on+не sent = 1");
+        CHECK(c2b_tiksyn_tick() == 0 && g_tiksyn_arm == 1,
+              "tiksyn tick: первый k = arm, огня нет");
+        CHECK(c2b_tiksyn_tick() == 1, "tiksyn tick: следующий k = огонь");
         g_tiksyn_sent = 1;
-        CHECK(c2b_tiksyn_gate() == 0, "tiksyn gate: sent = one-shot");
+        CHECK(c2b_tiksyn_tick() == 0, "tiksyn tick: sent = one-shot");
         g_tiksyn_on = 0; g_tiksyn_sent = 0; g_tiksyn_arm = 1;
-        CHECK(c2b_tiksyn_gate() == 0, "tiksyn gate: killswitch = 0");
+        CHECK(c2b_tiksyn_tick() == 0, "tiksyn tick: killswitch = 0");
         g_tiksyn_on = 1; g_tiksyn_sent = 0;
         c2b_tiksyn_fire(0, 0, 0, 0, 0);      /* инертно: нет источников */
         CHECK(g_tiksyn_sent == 1, "tiksyn fire: no-source = spent, без краша");

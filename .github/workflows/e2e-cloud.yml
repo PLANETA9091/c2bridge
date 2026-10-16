@@ -415,6 +415,20 @@ jobs:
           mkdir -p /tmp/steamcmd && cd /tmp/steamcmd
           [ -x steamcmd.sh ] || { curl -fsSL -o sc.tar.gz https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz && tar xzf sc.tar.gz; }
           set +e
+          # v110.5: the F2P LICENSE PRE-GRANT (run593 lesson: the appid lever
+          # alone = ALL 5 attempts died in ~5s with the client UP+logged-in and
+          # the steamclient init PROVEN far (GNS configs fetched, the bridge's
+          # AUTH SteamUser capture resolved) => the silent exit = the LICENSE
+          # reject (SteamAPI_Init does NOT auto-grant F2P; the engine's
+          # BIsSubscribedApp path fails -> exit). app_license_request rides
+          # the SAME probe session (zero extra kick windows; the grant is
+          # PERMANENT on the account). Harmless when already licensed.
+          if [ -n "${C2B_APPID_V:-}" ] && [ "$C2B_APPID_V" != "0" ] && [ "$C2B_APPID_V" != "none" ]; then
+            timeout 120 ./steamcmd.sh +login "$STEAM_USER" "$STEAM_PASS" +app_license_request "$C2B_APPID_V" +quit > licreq.log 2>&1
+            echo "licreq rc=$? (appid=$C2B_APPID_V):"
+            grep -aiE "license|owned|error|Logged in OK|Success" licreq.log | grep -av "password" | head -8
+            cp -f licreq.log "$C2B_NODE_HOME/licreq.log" 2>/dev/null || true
+          fi
           timeout 90 ./steamcmd.sh +login "$STEAM_USER" "$STEAM_PASS" +quit > probe.log 2>&1
           RC=$?
           set -e

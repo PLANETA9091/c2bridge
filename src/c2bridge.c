@@ -19575,6 +19575,7 @@ static void c2b_a2eb_maybe(void);      /* v45: релей серверного '
 static void c2b_b2e_maybe(void);       /* v106.3: синт-'B' с живым chal -> движок */
 static void c2b_kdr_maybe(void);       /* v106.6: kfull chal-патч прямой в сервер */
 static void c2b_tiksyn_maybe(void);    /* v108.2: тик-путь огонь TIK k+ticket (тело = после kdr-глобалов) */
+static void c2b_cnx_maybe(void);       /* v108.5: бape "connect\0" OOB (строковый claim-кандидат) */
 static void c2b_cvx_maybe(void);       /* v106.8: прямой OOB "connect0x%%08x" в сервер */
 static void c2b_pcx_maybe(void);       /* v107.0: парный каденс 0x22+вербатим-'k' (грант-эксперимент) */
 static u32 c2b_pcx_arm(void);          /* v107.2.1: сборка+сташ пенд-пары (общий: тик-fallback + kdr-sync) */
@@ -19784,6 +19785,7 @@ static void *c2b_g97_thread(void *arg)
         c2b_k2v_maybe();       /* v98: вербатим-'k' in-channel (новый эпок) */
         c2b_kdr_maybe();       /* v106.6: kfull chal-патч прямой в сервер (новый кфулл) */
         c2b_tiksyn_maybe();    /* v108.2: огонь k+ticket (дифф к kdr-бейзлайну того же чала) */
+        c2b_cnx_maybe();       /* v108.5: бape "connect\0" claim OOB (следом за auth-попыткой) */
         c2b_cvx_maybe();       /* v106.8: прямой OOB "connect0x" в сервер (после kdr-пары; v107.0 = opt-in) */
         c2b_pcx_maybe();       /* v107.0: пары 0x22+вербатим-'k' после kdr A/B (грант-эксперимент) */
         c2b_h2v_maybe();       /* v100: hello 0x80-class in-channel (новый эпок) */
@@ -21186,6 +21188,50 @@ static u32 c2b_cvx_gate(u32 on, u32 fires, u32 val, u32 achal,
     return (achal && a_new && delay_ok) ? 1u : 0u;
 }
 
+static u32 c2b_cnx_build(u8 *out, u32 cap, u32 *outlen)
+{
+    static const u8 frm[12] = {
+        0xff, 0xff, 0xff, 0xff, 'c', 'o', 'n', 'n', 'e', 'c', 't', 0
+    };
+    u32 k;
+    if (!out || !outlen) return 0;
+    if (cap < 12u) return 0;
+    for (k = 0; k < 12u; k++) out[k] = frm[k];
+    *outlen = 12u;
+    return 1;
+}
+
+/* ---------- v108.5: CNX — БАРЕ "connect\0" OOB В СЕРВЕР ----------
+ * ЦЕНЗ: строковый класс коннект-команд = частично проверен — run384:
+ * сервер РАСПАРСИЛ 'qconnect0x<val>' (строковая OOB); CVX v106.8
+ * (run529): 'connect0x<val>' (VAL и живой счётчик) = ТИХО (ретир
+ * v107.0). НЕПРОВЕРЕННАЯ ЯЧЕЙКА = БАРЕ "connect\0" (v107.7-хинт:
+ * сервер = возможно ждёт 'connect' OOB от клиентского сокета ДО/
+ * вместо 'B.'-accept; 'A'-str18 = "connect-granted0x" = сервер В
+ * ГРАНТ-СОСТОЯНИИ в каждом 'A' = claim-кандидат). Форма = ff×4 +
+ * "connect" + NUL = 12B (минимальная строка БЕЗ значения = точная
+ * форма хинта; val-формы = класс CVX = проверены). Кап 2: fire#1 =
+ * тик-соседний (следующий тик после kfull-свидетеля = танц-вантидж,
+ * урок tiksyn v108.2; порядок тик-стека = ПОСЛЕ tiksyn-огня = слижет
+ * за auth-попыткой = естественный claim-порядок), fire#2 =
+ * СОБЫТИЙНЫЙ (новый 'A' после fire#1 = g95-seq, гэп 10 тиков — урок
+ * CVX run528) = A-соседний вантидж, ТА ЖЕ форма. Путь = kdr-проверенный
+ * sendto (g_clv2_fd -> 152.233.19.133:28022); гард sigsetjmp;
+ * killswitch C2B_CNX=0 (дефолт ВКЛ = эксперимент раунда). 12B на
+ * проводе = уникальная длина = атрибуция в ff4-цензуз по длине. */
+
+/* ворота cnx: on, кап 2; fire#1 = kfull-свидетель + гэп; fire#2 =
+ * СОБЫТИЕ "новый 'A' после fire#1" + малый гэп. Чистая политика
+ * (always-остров). */
+static u32 c2b_cnx_gate(u32 on, u32 fires, u32 kfull_seen,
+                        u32 a_evt, u32 delay_ok)
+{
+    if (!on) return 0;
+    if (fires >= 2u) return 0;
+    if (fires == 0u) return (kfull_seen && delay_ok) ? 1u : 0u;
+    return (a_evt && delay_ok) ? 1u : 0u;
+}
+
 /* ---------- v107.0→v107.1: PCX — ПАРНЫЙ КАДЕНС ГРАНТОВ (0x22 + 'k') ----
  * ЦЕНЗ run529/530 (census v3 = scripts/run529_grant_context.py): ВСЕ
  * x11/11 серверных 'B.'-грантов (run526 x9, run528 x1, run529 x1) следуют
@@ -21789,6 +21835,82 @@ static void c2b_cvx_maybe(void)
     C2B_LOGN(g_cvx_fires);
     C2B_LOGS(" val=");
     C2B_LOGH(val);
+    C2B_LOGS(" len=");
+    C2B_LOGN(n);
+    C2B_LOGS(" rc=");
+    C2B_LOGN((u32)(sr < 0 ? (u32)-1 : (u32)sr));
+    C2B_LOGS("\n");
+}
+
+/* ---------- v108.5: CNX рантайм — см. блок у always-острова
+ * c2b_cnx_build/c2b_cnx_gate. Огонь = тик g97 (порядок стека = ПОСЛЕ
+ * tiksyn = claim следует за auth-попыткой в том же тике); fire#1 =
+ * следующий тик после первого kfull-свидетеля (немедленный, урок
+ * tiksyn v108.2: окно ответа = весь ран в ff4-цензузе, атрибуция =
+ * по уникальной длине 12B); fire#2 = СОБЫТИЙНЫЙ: новый 'A' после
+ * fire#1 (g_g95_seq изменился с fire#1-снапа; чтение = volatile u32
+ * на нитке recv, дисциплина cstate-slice run519) + гэп 10 тиков
+ * (урок CVX run528: до события delay заморожен, после — малый гэп).
+ * Кап 2, killswitch C2B_CNX=0. */
+static u32 g_cnx_init, g_cnx_on = 1, g_cnx_fires, g_cnx_tick;
+static u32 g_cnx_kf_seen, g_cnx_delay, g_cnx_f1_seq, g_cnx_a_evt;
+
+static void c2b_cnx_maybe(void)
+{
+    static u8 cbuf[16];
+    u32 delay_ok, i, n;
+    u8 sa[16];
+    ssize_t sr;
+    if (!g_cnx_init) {
+        const char *e = getenv("C2B_CNX");
+        if (e && e[0] == '0') g_cnx_on = 0;
+        g_cnx_init = 1;
+        if (g_cnx_on)
+            C2B_LOGS("[c2b] cnx: ARMED (v108.5 bare-'connect' OOB cap 2: fire1=first kfull tick, fire2=first new 'A' after fire1)\n");
+    }
+    if (!g_cnx_on) return;
+    if (g_cnx_fires >= 2u) return;
+    if (!g_clv2_fd || g_clv2_fd < 0 || !g_clp_sendto ||
+        (uptr)g_clp_sendto == 1) return;
+    g_cnx_tick++;
+    if (!g_cnx_kf_seen) {
+        if (!__atomic_load_n(&g_kfull_n, __ATOMIC_ACQUIRE)) return;
+        g_cnx_kf_seen = 1;                    /* kfull-свидетель = ARMED */
+        C2B_LOGS("[c2b] cnx: kfull seen -> ARMED (fire#1 on the next tick)\n");
+        return;                               /* огонь = следующий тик */
+    }
+    if (g_cnx_fires == 1u && !g_cnx_a_evt &&
+        g_g95_seq != g_cnx_f1_seq) {
+        g_cnx_a_evt = 1;
+        g_cnx_delay = 0;
+    }
+    if (g_cnx_fires == 1u && !g_cnx_a_evt) return;
+    g_cnx_delay++;
+    delay_ok = (g_cnx_fires == 0u) ? (g_cnx_delay >= 1u)
+                                   : (g_cnx_delay >= 10u);
+    if (!c2b_cnx_gate(g_cnx_on, g_cnx_fires, g_cnx_kf_seen,
+                      g_cnx_a_evt, delay_ok)) return;
+    if (!c2b_cnx_build(cbuf, (u32)sizeof cbuf, &n)) return;
+    for (i = 0; i < sizeof(sa); i++) sa[i] = 0;
+    sa[0] = 2;                     /* AF_INET (LE) */
+    sa[2] = 0x6d; sa[3] = 0x76;    /* порт 28022 BE */
+    sa[4] = 152; sa[5] = 233; sa[6] = 19; sa[7] = 133;
+    g_probe_active = 1;
+    if (__sigsetjmp(g_probe_jb, 1) == 0) {
+        sr = ((c2b_sendto_fn)g_clp_sendto)(g_clv2_fd, (const void *)cbuf,
+                                           n, 0,
+                                           (const struct sockaddr *)sa, 16);
+    } else {
+        g_probe_active = 0;
+        C2B_LOGS("[c2b] cnx: send SEGV\n");
+        return;
+    }
+    g_probe_active = 0;
+    g_cnx_fires++;
+    g_cnx_delay = 0;
+    if (g_cnx_fires == 1u) g_cnx_f1_seq = g_g95_seq;  /* снап события fire#2 */
+    C2B_LOGS("[c2b] cnx: bare-'connect' #");
+    C2B_LOGN(g_cnx_fires);
     C2B_LOGS(" len=");
     C2B_LOGN(n);
     C2B_LOGS(" rc=");
@@ -34638,6 +34760,31 @@ static void test_swr(void)
         r8 = c2b_tik_pick(0u, &ps8, &pl8, 1u);
         CHECK(r8 == 0, "tikpick: нет источников = 0");
         g_etix_len = ol_e; g_ticket_len = ol_p; g_tik_ft_len = ol_f;
+    }
+    /* --- v108.5: cnx (баре "connect\0" OOB: билдер + ворота) --- */
+    printf("[t] cnx\n");
+    {
+        static u8 cb[32];
+        u32 ol = 0;
+        CHECK(c2b_cnx_build(cb, sizeof(cb), &ol) == 1 && ol == 12u,
+              "cnx: 12B билд");
+        CHECK(cb[0] == 0xff && cb[1] == 0xff && cb[2] == 0xff &&
+              cb[3] == 0xff && memcmp(cb + 4, "connect", 8) == 0,
+              "cnx: форма = ff×4 + connect + NUL");
+        CHECK(c2b_cnx_build(cb, 11, &ol) == 0, "cnx: cap < 12 = отказ");
+        CHECK(c2b_cnx_build(0, sizeof(cb), &ol) == 0 &&
+              c2b_cnx_build(cb, sizeof(cb), 0) == 0,
+              "cnx: нулевые указатели = отказ");
+        CHECK(c2b_cnx_gate(0, 0, 1, 1, 1) == 0, "cnx: off = скип");
+        CHECK(c2b_cnx_gate(1, 0, 0, 1, 1) == 0,
+              "cnx: fire1 без kfull-свидетеля = скип");
+        CHECK(c2b_cnx_gate(1, 0, 1, 1, 1) == 1,
+              "cnx: fire1 = kfull+гэп = огонь");
+        CHECK(c2b_cnx_gate(1, 2, 1, 1, 1) == 0, "cnx: кап 2 = скип");
+        CHECK(c2b_cnx_gate(1, 1, 1, 0, 1) == 0,
+              "cnx: fire2 без A-события = скип");
+        CHECK(c2b_cnx_gate(1, 1, 1, 1, 1) == 1,
+              "cnx: fire2 = A-событие+гэп = огонь");
     }
     /* --- v108.0/108.1: tiksyn tick (матрица флагов) + fire no-source --- */
     printf("[t] tiksyn\n");

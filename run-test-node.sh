@@ -873,6 +873,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       5) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
     esac
   fi
+  # v110.3: per-attempt fcon pw variant (comma-list; aN = variant N;
+  # 'none' = control = NO pw line = the 591 parity). Values = space-free
+  # (they ride through `env` via EXTRA_ENV word-splitting).
+  FCONPW="none"
+  if [[ -n "${C2B_FCON_PW_LIST:-}" ]]; then
+    IFS=',' read -r -a FCON_PW_ARR <<< "$C2B_FCON_PW_LIST"
+    FCONPW="${FCON_PW_ARR[$(( ATTEMPT - 1 ))]:-none}"
+  fi
+  EXTRA_ENV="$EXTRA_ENV C2B_FCON_PW=$FCONPW"
+  log "attempt $ATTEMPT: variant=$VARIANT fconpw=$FCONPW"
   ls -la "$GAME_HOME/.steam/" > "$RUNDIR/dot-steam.a${ATTEMPT}.txt" 2>/dev/null
   # fresh console.log per attempt: condebug APPENDS, and the menu marker is
   # written to console.log ONLY (run 31: stdout never contains

@@ -6637,6 +6637,19 @@ static u32 c2b_fcon_sig_ok(const u8 *pf, const u8 *pt, const u8 *pi)
     }
     return 1u;
 }
+/* v110.3: чистый гейт pw-лейна ('none'/пусто = контроль = без pw-строки).
+ * C2B_FCON_PW: перед принудительным connect вставляем 'password <pw>\n'
+ * в тот же командный буфер (FIFO: password -> connect) = ровно то, что
+ * делает CS:GO UI-промпт. Повод: 591-a3 'requiring pw yes'; A2S_RULES
+ * = sv_password=0 + sm_command_eater nokey => гейт = НЕ sv_password,
+ * A/B вариантов = дискриминатор. */
+static u32 c2b_fcon_pw_use(const char *pw)
+{
+    if (!pw || !pw[0]) return 0;
+    if (pw[0] == 'n' && pw[1] == 'o' && pw[2] == 'n' && pw[3] == 'e' && pw[4] == 0)
+        return 0;
+    return 1u;
+}
 static u32 g_clv2_fmt;           /* C2B_CLV2_FMT: вариант формата 'A'-ответа */
 static u32 g_clv2_qc_val;        /* хвост qconnect0x%08X от движка (эхо-кандидат) */
 static u32 g_clv2_phase;         /* 0=idle 1='A' 2=ждём reply для 'i' 3='i' доставлен
@@ -13449,17 +13462,24 @@ static void c2b_g84_pollslot(void **vt7, void *ciface, uptr ch7, u32 slot, u32 t
  * threadid 0 -> xor edi; insert(rdi=0, rsi=len, rdx=0, rcx=0) — мьютекс-гард
  * + per-thread слот 0x2078, ГЛАВНЫЙ поток движка исполняет команду в след.
  * кадре. Вызов под SEGV-гвардом (TLS g_probe_jb), 1/сессию. */
-static i32 c2b_fcon_fire(uptr base)
+/* v110.3: fire-line ОБобщена (fmt,arg) — та же точная реплика хвоста
+ * URL-хендлера, один formatter+insert-пейр. PW-лейн: перед 'connect'
+ * вставляем 'password <pw>\n' (CS:GO-квар password = "Current server
+ * access password" — ровно то, что делает UI-промпт при ответе).
+ * Повод: 591-a3 = 'requiring pw yes' + попап GenericConfirmText; НО
+ * A2S_RULES (probe 2026-10-17) = sv_password=0 (сентинел "нет пароля")
+ * + SourceMod sm_command_eater (nokey-система) => pw-гейт = НЕ
+ * sv_password; A/B вариантов = дискриминатор
+ * (0/cybershoke/cybershoke.net/x против none=контроль 591). */
+static i32 c2b_fcon_fire_line(uptr base, const char *fmt, const char *arg)
 {
     uptr fmt_fn = base + 0x4123e0ull;
     uptr ins_fn = base + 0x3f8350ull;
-    static const char cfmt[] = "connect %s\n";
-    const char *tgt = (const char *)g_gns_connect_target;
     i32 rc = -1;
     register uptr r10a __asm__("r10") = fmt_fn;
     register uptr r11a __asm__("r11") = ins_fn;
-    register uptr rda  __asm__("rdi") = (uptr)cfmt;
-    register uptr rsa  __asm__("rsi") = (uptr)tgt;
+    register uptr rda  __asm__("rdi") = (uptr)fmt;
+    register uptr rsa  __asm__("rsi") = (uptr)arg;
     __asm__ volatile(
         "push %%rbx\n\t"
         "push %%r11\n\t"
@@ -13478,10 +13498,27 @@ static i32 c2b_fcon_fire(uptr base)
         : "rax", "rbx", "rcx", "rdx", "r8", "r9", "memory", "cc");
     return rc;
 }
+static i32 c2b_fcon_fire(uptr base, const char *pw)
+{
+    static const char cfmt[] = "connect %s\n";
+    static const char pfmt[] = "password %s\n";
+    const char *tgt = (const char *)g_gns_connect_target;
+    if (pw && pw[0]) {
+        /* pw-строка ПЕРЕД connect: командный буфер = FIFO,
+         * исполнение главным потоком по порядку вставок */
+        i32 prc = c2b_fcon_fire_line(base, pfmt, pw);
+        C2B_LOGS("[c2b] fcon: pw-line insert rc=");
+        C2B_LOGN((u32)(prc < 0 ? 0u : (u32)prc));
+        C2B_LOGS("\n");
+    }
+    return c2b_fcon_fire_line(base, cfmt, tgt);
+}
 static void c2b_fcon_maybe(void)
 {
     u32 g;
     i32 rc;
+    const char *pw = getenv("C2B_FCON_PW");
+    u32 pwu = c2b_fcon_pw_use(pw);   /* v110.3: pw-лейн ('none' = контроль) */
     if (g_fcon_done) return;
     g = c2b_fcon_gate(g_fcon_go, g_engine_base ? 1u : 0u,
                       g_gns_connect_go, 0u);
@@ -13520,9 +13557,14 @@ static void c2b_fcon_maybe(void)
         C2B_LOGS("[c2b] fcon: sig mismatch -> abort (build changed?)\n");
         return;
     }
+    if (pwu) {
+        C2B_LOGS("[c2b] fcon: pw lane '");
+        C2B_LOGS(pw);
+        C2B_LOGS("'\n");
+    }
     g_probe_active = 1;
     if (__sigsetjmp(g_probe_jb, 1) == 0) {
-        rc = c2b_fcon_fire(g_engine_base);
+        rc = c2b_fcon_fire(g_engine_base, pwu ? pw : (const char *)0);
     } else {
         g_probe_active = 0;
         C2B_LOGS("[c2b] fcon: SEGV under guard (no fire)\n");
@@ -14104,6 +14146,26 @@ static void c2b_g32_drive(void)
          * след. кадре; 'Connecting to'-печатей от tail-пути НЕТ (Msg = в
          * пропущенной голове 0x229be0) — сентинел харнесса научен маркеру
          * 'fcon: fired connect' (v110.2-харнесс). */
+        /* v110.2c: a1/a2-класс (591): base=0 на файре = гейт-скип БЕЗ
+         * ретрая (call-site один, драйв дальше идёт в GNS-лейн). Ждём
+         * загрузки engine .so до C2B_FCON_BASEWAIT с (дефолт 30с),
+         * ПОТОМ вызываем fcon_maybe (свой settle 25с внутри). */
+        if (!g_engine_base) {
+            u32 bw, bl = 30;
+            const char *be = getenv("C2B_FCON_BASEWAIT");
+            if (be && be[0] >= '0' && be[0] <= '9') {
+                bl = 0;
+                for (bw = 0; be[bw] >= '0' && be[bw] <= '9' && bw < 3; bw++)
+                    bl = bl * 10 + (u32)(be[bw] - '0');
+            }
+            for (bw = 0; bw < bl * 2 && !g_engine_base; bw++)
+                usleep(500000);
+            C2B_LOGS("[c2b] fcon: base-wait done base=");
+            C2B_LOGN(g_engine_base ? 1u : 0u);
+            C2B_LOGS(" waited_s=");
+            C2B_LOGN(bw / 2);
+            C2B_LOGS("\n");
+        }
         c2b_fcon_maybe();
         clp = g_clp_fouif;
         /* 58f-g75: ДВУХФАЗНЫЙ КОННЕКТ (cert-CA гонка ран 228-a1). Факт:
@@ -37979,6 +38041,12 @@ static void test_fcon(void)
     CHECK(c2b_fcon_sig_ok((const u8 *)"", (const u8 *)"", (const u8 *)"") == 0,
           "fcon sig empty ptrs == 0");
     CHECK(c2b_fcon_sig_ok(0, 0, 0) == 0, "fcon sig null == 0");
+    /* v110.3: pw-гейт ('none'/пусто = контроль, остальное = pw-строка) */
+    CHECK(c2b_fcon_pw_use(0) == 0, "fcon pw null == 0");
+    CHECK(c2b_fcon_pw_use("") == 0, "fcon pw empty == 0");
+    CHECK(c2b_fcon_pw_use("none") == 0, "fcon pw none == 0");
+    CHECK(c2b_fcon_pw_use("x") == 1, "fcon pw x == 1");
+    CHECK(c2b_fcon_pw_use("0") == 1, "fcon pw 0 == 1 (A2S literal)");
 }
 
 int main(void)

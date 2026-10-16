@@ -140,6 +140,11 @@ on:
         default: ""
         required: false
         type: string
+      fconpw:
+        description: "v110.3: the fcon pw-lane variants (C2B_FCON_PW_LIST, comma-list; attempt N = variant N). Before the forced engine connect (v110.2 tail-replica) the bridge inserts 'password <pw>\\n' into the SAME command buffer (FIFO: password then connect) = exactly what the CS:GO pw UI does. RUN591 PROOF: the cybershoke empty target (91.103.255.200:27018) answers the legacy connect lane ('Connecting to public(...)' + 'Server using <none> lobbies, requiring pw yes, lobby id 0' + the GenericConfirmText popup = the engine parked at the pw gate). BUT A2S_RULES probe = sv_password=0 (the engine sentinel: NO pw) + SourceMod sm_command_eater nokey-system => the pw gate = NOT sv_password; the A/B = the discriminator: a DIFFERENT reject class / popup / accept = the pw = the gate; zero delta across variants = the gate = NOT the pw (the lobby/auth lane = next). 'none' = control (no pw line = the 591 parity). Default 'none,0,cybershoke,cybershoke.net' (a5 = no-preload, its variant = unused)."
+        default: "none,0,cybershoke,cybershoke.net"
+        required: false
+        type: string
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -167,6 +172,8 @@ jobs:
       # rip-offset resolves to the fn name.
       C2B_G109: "0"
       C2B_B2PW: ${{ inputs.b2pw || '' }}
+      # v110.3: the fcon pw-lane variants (the harness picks per attempt)
+      C2B_FCON_PW_LIST: ${{ inputs.fconpw || 'none,0,cybershoke,cybershoke.net' }}
       # v53b/v54: ядерная правда о send-классе. STRACEGame = ВЫКЛ (run401/402:
       # TracerPid != 0 = анти-дебуг движка = отправитель 0x22 НЕ СТРЕЛЯЕТ под
       # любым трейсером — наблюдаемая добилась обратного). TRACEFS_GAME =

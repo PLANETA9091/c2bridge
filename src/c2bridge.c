@@ -6738,7 +6738,7 @@ static u32  g_etix_n;            /* сколько снапшотов пойма
  * Run 99 (6492195): тикет добыт (slot 13, 252Б, наш steamid внутри), GNS-серт
  * есть, SDR OK — но движок по-прежнему аборитит GNS-хендшейк с целью между
  * ChallengeReply(0x21) и ConnectRequest(0x22) (retry с новым connection_id,
- * 0x22 НИКОГДА не летит). +sdr_spew_level 7 spew не дал (конвар не路由ит в
+ * 0x22 НИКОГДА не летит). +sdr_spew_level 7 spew не дал (конвар не роутит в
  * condebug-консоль). Решение: капчурим ISteamNetworkingUtils в FUv и
  * САМИ ставим debug-callback: SetDebugOutputFunction(5 = Verbose, our_cb)
  * — vt[1] в ISteamNetworkingUtils003/004 (vt[0]=GetTimestamp безобиден).
@@ -20764,13 +20764,20 @@ static u32 c2b_s2o_build(const u8 *hdr, u8 *out, u32 cap)
 static u32 g_b2e_grant_chal, g_b2e_grant_seen;
 /* v106.3: b2e_gate = ворота b2e-рычага: on, кап, chal!=0 (0x22-чейндж
  * приземлился @0x4d8 — эхо 'B' обязано совпасть). v109.0: кап 2 -> 4
- * (run556 = рекорд 15 грантов: 13 arms впустую — кап = связывающее
- * ограничение; 4 = 4 РАЗНЫХ свежих чалла за ран). Always-остров =
+ * (run556 = рекорд 15 грантов). v109.1 СПЛИТ-КАП: eng-пик = 1 файр
+ * (run559: 4x ОДИН протухший чалл = нулевая маржа — повтор значения = 0),
+ * грант-пик = полный бюджет 4 (свежая последовательность 06->0d =
+ * каждый чалл уникален). Общий счётчик fires: eng-файр тратит слот
+ * грантам, но после 1 eng-файра eng больше не стреляет. Always-остров =
  * selftest-видимость. */
-static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal)
+static u32 c2b_b2e_gate(u32 on, u32 fires, u32 chal, u32 src_grant)
 {
     if (!on) return 0;
-    if (fires >= 4u) return 0;
+    if (src_grant) {
+        if (fires >= 4u) return 0;
+    } else {
+        if (fires >= 1u) return 0;
+    }
     return chal ? 1u : 0u;
 }
 /* v108.7: b2e_chal = двух-источник чалла (always-остров, selftest-виден).
@@ -23362,7 +23369,7 @@ static void c2b_b2e_maybe(void)
         if (eb2 && eb2[0] == '0') g_b2e_on = 0;
         g_b2e_init = 1;
         if (g_b2e_on)
-            C2B_LOGS("[c2b] b2e: ARMED (v109.0 synth-'B' fresh-grant-chal first, cap 4)\n");
+            C2B_LOGS("[c2b] b2e: ARMED (v109.1 fresh-grant-chal first, split-cap eng=1/grant=4)\n");
     }
     if (!g_b2e_on) return;
     if (g_b2e_fires >= 4u) return;
@@ -23373,7 +23380,7 @@ static void c2b_b2e_maybe(void)
      * (протухший движковый @0x4d8 = фолбэк); src = истинный пик хелпера */
     src_grant = (g_b2e_grant_seen && g_b2e_grant_chal) ? 1u : 0u;
     ch_b2 = c2b_b2e_chal(ch_b2, g_b2e_grant_seen, g_b2e_grant_chal);
-    if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2)) return;
+    if (!c2b_b2e_gate(g_b2e_on, g_b2e_fires, ch_b2, src_grant)) return;
     sb_len = c2b_t3_build_b(b2_buf, 40u, ch_b2);   /* эхо ЖИВОГО чала */
     if (sb_len != 40u) return;
     pr_b2 = c2b_b2e_proto(g_b2e_fires, pr_b2);  /* v106.5: A/B #1=2, #2=живой */
@@ -34634,15 +34641,17 @@ static void test_swr(void)
     CHECK(c2b_swr_gate2(1, 0, 5, 5, 9, 9) == 0, "swr2: kfull без измен = скип");
     CHECK(c2b_swr_gate2(1, 0, 0, 0, 0, 0) == 0, "swr2: всё нулевое = скип");
     CHECK(c2b_swr_gate2(1, 0, 5, 5, 0, 0) == 0, "swr2: sec_new=0 = скип");
-    /* --- v106.3: b2e-гейт --- */
+    /* --- v106.3/v109.1: b2e-гейт (сплит-кап: eng=1, grant=4) --- */
     printf("[t] b2e\n");
-    CHECK(c2b_b2e_gate(0, 0, 0xec6d6678u) == 0, "b2e: on=0 = скип");
-    CHECK(c2b_b2e_gate(1, 2, 0xec6d6678u) == 1, "b2e: кап 4 — fires=2 жив (v109.0)");
-    CHECK(c2b_b2e_gate(1, 3, 0x3ad660ceu) == 1, "b2e: кап 4 — fires=3 жив");
-    CHECK(c2b_b2e_gate(1, 4, 0xec6d6678u) == 0, "b2e: кап 4 = скип (v109.0)");
-    CHECK(c2b_b2e_gate(1, 0, 0) == 0, "b2e: chal=0 (не приземлился) = скип");
-    CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u) == 1, "b2e: живой chal = 1");
-    CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu) == 1, "b2e: другой живой chal = 1");
+    CHECK(c2b_b2e_gate(0, 0, 0xec6d6678u, 0) == 0, "b2e: on=0 = скип");
+    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 1) == 1, "b2e: грант-пик — fires=0 жив (v109.1)");
+    CHECK(c2b_b2e_gate(1, 2, 0xec6d6678u, 1) == 1, "b2e: грант-кап 4 — fires=2 жив (v109.1)");
+    CHECK(c2b_b2e_gate(1, 3, 0x3ad660ceu, 1) == 1, "b2e: грант-кап 4 — fires=3 жив");
+    CHECK(c2b_b2e_gate(1, 4, 0xec6d6678u, 1) == 0, "b2e: грант-кап 4 = скип");
+    CHECK(c2b_b2e_gate(1, 0, 0xec6d6678u, 0) == 1, "b2e: eng-кап 1 — fires=0 жив (v109.1)");
+    CHECK(c2b_b2e_gate(1, 1, 0xec6d6678u, 0) == 0, "b2e: eng-кап 1 — fires=1 = скип (v109.1)");
+    CHECK(c2b_b2e_gate(1, 1, 0x3ad660ceu, 1) == 1, "b2e: грант после eng-файра жив (общий счётчик)");
+    CHECK(c2b_b2e_gate(1, 0, 0, 1) == 0, "b2e: chal=0 (не приземлился) = скип");
     /* --- v106.5: b2e proto-пик (двухсторонний A/B) --- */
     printf("[t] b2e-proto\n");
     CHECK(c2b_b2e_proto(0u, 0u) == 2u, "b2e: fire#1 (любой live) = 2 (контроль v105)");

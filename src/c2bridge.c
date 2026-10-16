@@ -20903,8 +20903,14 @@ static u32 c2b_tik_build(const u8 *kf, u32 klen, const u8 *tk, u32 tlen,
  * ре-проб GetAuthSessionTicket СЕЙЧАС — один вызов без слипов; e = eng-
  * wire снапшот etix; p = старт-проб). Возврат 0 = источников нет. В
  * selftest re-probe = инертен (движка нет) — та же #ifndef-структура,
- * что в исходном tik_maybe (v107.8/107.9 без изменений семантики). */
-static u8 c2b_tik_pick(u32 do_rp, const u8 **tsrc, u32 *tlen)
+ * что в исходном tik_maybe (v107.8/107.9 без изменений семантики).
+ * v108.4: raw_first-режим = ПОРЯДОК f>p>e (raw-blob-класс 252B раньше
+ * конверта): ценз run548/549 — ОБА негатива (хвост + сплайс @17) вышли
+ * с e-источником = ПРОТОБУФ-КОНВЕРТ 332B; классический C2S_CONNECT
+ * authslot = аргуably RAW GetAuthSessionTicket blob => оставшаяся
+ * ячейка матрицы (позиция, raw) = проверяется raw-первым порядком.
+ * raw_first=0 = старый порядок f>e>p (без изменений семантики). */
+static u8 c2b_tik_pick(u32 do_rp, const u8 **tsrc, u32 *tlen, u32 raw_first)
 {
     (void)do_rp;                         /* selftest: re-probe = инертен */
 #ifndef C2B_SELFTEST
@@ -20936,6 +20942,19 @@ static u8 c2b_tik_pick(u32 do_rp, const u8 **tsrc, u32 *tlen)
 #endif
     if (g_tik_ft_len >= 16u && g_tik_ft_len <= 1200u) {
         *tsrc = g_tik_ft_buf; *tlen = g_tik_ft_len; return (u8)'f';
+    }
+    if (raw_first) {
+        /* v108.4: RAW-первый — p (старт-проб blob, давность ~мин) ДО
+         * e (конверт = known-negative форма run548/549). e = последний
+         * фолбэк: огонь всё равно случается (один выстрел не сгорает
+         * зря), src= в логе = честная A/B-метка выпавшей формы. */
+        if (g_ticket_len && g_ticket_len <= 1200u) {
+            *tsrc = g_ticket_buf; *tlen = g_ticket_len; return (u8)'p';
+        }
+        if (g_etix_len >= 200u && g_etix_len <= 400u) {
+            *tsrc = g_etix_buf; *tlen = g_etix_len; return (u8)'e';
+        }
+        return 0;
     }
     if (g_etix_len >= 200u && g_etix_len <= 400u) {
         *tsrc = g_etix_buf; *tlen = g_etix_len; return (u8)'e';
@@ -20985,7 +21004,7 @@ static void c2b_tik_maybe(int fd, const u8 *p, u32 len,
      *     движок сам шлёт; давность = момент последней лейны);
      * (p) старт-проб (классика, НО минутной давности — последний
      *     фолбэк). src= в логе = A/B-метка формы на проводе. */
-    srcn = c2b_tik_pick(1u, &tsrc, &tlen);
+    srcn = c2b_tik_pick(1u, &tsrc, &tlen, 0u);
     if (!srcn) return;                       /* ни одного источника = мимо */
     if (!c2b_tik_build(g_kfull, g_kfull_len, tsrc, tlen, tik_buf,
                        (u32)sizeof(tik_buf), &n))
@@ -21073,7 +21092,9 @@ static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
     u8 srcn;
     ssize_t sr;
     g_tiksyn_sent = 1;                       /* один выбор за сессию, ДО огня */
-    srcn = c2b_tik_pick(1u, &tsrc, &tlen);
+    /* v108.4: raw-first + ре-проб ЗДЕСЬ ТОЖЕ (pcxr = бэкап той же ячейки;
+     * случайный огонь конвертом сжёг бы one-shot впустую). */
+    srcn = c2b_tik_pick(1u, &tsrc, &tlen, 1u);
     if (!srcn) {
         C2B_LOGS("[c2b] tiksyn: no ticket source, spent\n");
         return;
@@ -21099,7 +21120,7 @@ static void c2b_tiksyn_fire(int fd, const u8 *kf, u32 klen,
     sr = -1;                                 /* selftest = инертен */
     (void)fd; (void)addr; (void)addrlen;     /* zero-new-warning дисциплина */
 #endif
-    C2B_LOGS("[c2b] tiksyn: bait->k+ticket len=");
+    C2B_LOGS("[c2b] tiksyn: bait->k+ticket(raw) len=");
     C2B_LOGN(n);
     C2B_LOGS(" kf=");
     C2B_LOGN(klen);
@@ -21405,10 +21426,14 @@ static u32 g_kdb_on = 1;   /* v107.3: KDB бёрст (#3..#6 VAL), killswitch C2
  * тик с g_kfull_n>0 (свидетельство свежего kfull-захвата), ОГОНЬ = следующий
  * тик (~секунды): kdr-форма (chal = g_kdr_val = ТОТ ЖЕ A/B-чал, что у kdr#1 =
  * прямой дифф с тикет-меньше бейзлайном ТОГО ЖЕ чала/сокета/момента) +
- * тикет-хвост. Источник = c2b_tik_pick(0) = БЕЗ ре-проба (без виртуальных
- * вызовов — bare-safe в тик-контексте; e=etix-снапшот/p=старт-проб).
- * Один выстрел/сессию (sent ДО огня); killswitch C2B_TIKSYN=0; pcxr-путь
- * (v108.1) остаётся бэкапом с тем же one-shot стейтом. */
+ * тикет-хвост. v108.4: источник = c2b_tik_pick(1,,1) = raw-first (f>p>e)
+ * + СВЕЖИЙ ре-проб в тик-контексте (гард sigsetjmp = kdr-прецедент: г97
+ * detail/krel-ts = те же гард-виртуалы в этом же тике; один вызов без
+ * слипов): ценз run548/549 — оба негатива вышли с e-конвертом 332B,
+ * RAW-blob-ячейка (252B-класс) = непроверена => порядок p ДО e, f =
+ * свежий blob нулевой давности. Один выстрел/сессию (sent ДО огня);
+ * killswitch C2B_TIKSYN=0; pcxr-путь (v108.1) остаётся бэкапом той же
+ * raw-ячейки с тем же one-shot стейтом. */
 static void c2b_tiksyn_maybe(void)
 {
     static u8 kb2[1200], tb2[2500];
@@ -21434,7 +21459,7 @@ static void c2b_tiksyn_maybe(void)
     chal = g_kdr_val;                    /* тот же чал, что у kdr#1 = A/B-ячейка грант-соседа */
     if (!c2b_kdr_build((const u8 *)g_kfull, fl, chal, kb2,
                        (u32)sizeof(kb2), &klen)) return;
-    srcn = c2b_tik_pick(0u, &tsrc, &tlen);   /* БЕЗ ре-проба = bare-safe */
+    srcn = c2b_tik_pick(1u, &tsrc, &tlen, 1u);   /* v108.4: raw-first + свежий ре-проб (гард) */
     if (!srcn) {
         C2B_LOGS("[c2b] tiksyn: no ticket source (tick), spent\n");
         g_tiksyn_sent = 1;
@@ -21466,7 +21491,7 @@ static void c2b_tiksyn_maybe(void)
 #else
     sr = -1;                             /* selftest = инертен */
 #endif
-    C2B_LOGS("[c2b] tiksyn: tick->k^ticket(spl@17) len=");
+    C2B_LOGS("[c2b] tiksyn: tick->k^ticket(spl@17,raw) len=");
     C2B_LOGN(n);
     C2B_LOGS(" kf=");
     C2B_LOGN(klen);
@@ -34583,6 +34608,36 @@ static void test_swr(void)
         kb[4] = (u8)'j';
         CHECK(c2b_tik_build(kb, 513, tb, 252, ob, sizeof(ob), &ol) == 0,
               "tikbuild: не-'k' класс = отказ");
+    }
+    /* --- v108.4: tikpick raw-first порядок (f инертен в selftest = 0) --- */
+    printf("[t] tikpick\n");
+    {
+        u32 z8;
+        u32 ol_e = g_etix_len, ol_p = g_ticket_len, ol_f = g_tik_ft_len;
+        const u8 *ps8 = NULL; u32 pl8 = 0; u8 r8;
+        for (z8 = 0; z8 < 300; z8++) g_etix_buf[z8] = (u8)(0x80 | (z8 & 0x7f));
+        for (z8 = 0; z8 < 252; z8++) g_ticket_buf[z8] = (u8)(0x7f - (z8 & 0x3f));
+        g_etix_buf[0] = 0x22; g_etix_buf[1] = 0x0d;
+        g_tik_ft_len = 0;                    /* f-источник = инертен в selftest */
+        g_etix_len = 300; g_ticket_len = 252;
+        r8 = c2b_tik_pick(0u, &ps8, &pl8, 1u);
+        CHECK(r8 == (u8)'p' && ps8 == g_ticket_buf && pl8 == 252u,
+              "tikpick: raw_first=1, p+e живы = p (raw-blob первым)");
+        r8 = c2b_tik_pick(0u, &ps8, &pl8, 0u);
+        CHECK(r8 == (u8)'e' && ps8 == g_etix_buf && pl8 == 300u,
+              "tikpick: raw_first=0, p+e живы = e (старый порядок f>e>p)");
+        g_ticket_len = 0;
+        r8 = c2b_tik_pick(0u, &ps8, &pl8, 1u);
+        CHECK(r8 == (u8)'e' && pl8 == 300u,
+              "tikpick: raw_first=1, только e = e (последний фолбэк = огонь жив)");
+        g_etix_len = 0; g_ticket_len = 252;
+        r8 = c2b_tik_pick(0u, &ps8, &pl8, 1u);
+        CHECK(r8 == (u8)'p' && pl8 == 252u,
+              "tikpick: raw_first=1, только p = p");
+        g_etix_len = 0; g_ticket_len = 0;
+        r8 = c2b_tik_pick(0u, &ps8, &pl8, 1u);
+        CHECK(r8 == 0, "tikpick: нет источников = 0");
+        g_etix_len = ol_e; g_ticket_len = ol_p; g_tik_ft_len = ol_f;
     }
     /* --- v108.0/108.1: tiksyn tick (матрица флагов) + fire no-source --- */
     printf("[t] tiksyn\n");

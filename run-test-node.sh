@@ -732,10 +732,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     # steamclient session momentarily unsettled; sleep it off (default 15s,
     # '0' = off) before the next engine launch.
     SETTLE="${C2B_ATTEMPT_SETTLE:-15}"
-    if (( ATTEMPT > 1 )) && [[ "$SETTLE" != "0" ]]; then
-      log "attempt $ATTEMPT: inter-attempt settle ${SETTLE}s (warm-client race guard)"
-      sleep "$SETTLE"
-    fi
+  fi
+  # v110.9c: the settle covers ATTEMPT 1 TOO — the run599 lesson: a1 (core)
+  # hung pre-dyld with ZERO engine stdout ('AUTH: SteamUser never appeared' +
+  # 'g128 exhausted' + 'g126 nomap 3min') having launched ~10s after the
+  # steam login completed — the same warm-client race the v110.8 settle
+  # guards, but the first attempt had NO settle at all. The killer bisect
+  # (a1 vs a4) in run599 was invalidated by exactly this hole.
+  if [[ "${SETTLE:-15}" != "0" ]]; then
+    log "attempt $ATTEMPT: settle ${SETTLE:-15}s (warm-client race guard; v110.9c = attempt 1 included)"
+    sleep "${SETTLE:-15}"
   fi
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 

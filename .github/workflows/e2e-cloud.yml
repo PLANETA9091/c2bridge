@@ -601,6 +601,10 @@ jobs:
           cp -f /tmp/c2b_client_keys.log e2e-out/client_keys_root.txt 2>/dev/null || true
           cp -f /tmp/c2b-login-screen.png e2e-out/xvfb-login.png 2>/dev/null || true
           cp -f "$C2B_NODE_HOME/steamcmd-probe.log" e2e-out/ 2>/dev/null || true
+          # v110.6: licreq.log missed run593/594 artifacts (the cp in the
+          # licreq block lands in C2B_NODE_HOME only); the grant proof
+          # ('already owned' / license rows) is the appid-lane evidence
+          cp -f "$C2B_NODE_HOME/licreq.log" e2e-out/ 2>/dev/null || true
           # remaining client logs (connection_log etc.) + Xvfb screenshots:
           # the login form / guard dialog text IS the answer
           mkdir -p e2e-out/steam-logs

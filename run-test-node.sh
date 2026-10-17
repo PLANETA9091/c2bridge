@@ -677,6 +677,18 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     [[ -f "$CONLOG" ]] && cp -f "$CONLOG" "$RUNDIR/console.a$(( ATTEMPT - 1 )).log" 2>/dev/null || true
     log "attempt $ATTEMPT/$MAX_ATTEMPTS: relaunching"
     cleanup_engines
+    # v110.8: the INTER-ATTEMPT SETTLE (the warm-client race mitigation —
+    # the 596 lesson: a2/a3 hung pre-dyld with ZERO engine stdout while the
+    # bridge threads ran ('g126 nomap 3min'), launched just ~6s after the
+    # previous engine's death; the 595-PASS natural gaps were 20-30s).
+    # The previous engine's pipe disconnect can leave the warm client's
+    # steamclient session momentarily unsettled; sleep it off (default 15s,
+    # '0' = off) before the next engine launch.
+    SETTLE="${C2B_ATTEMPT_SETTLE:-15}"
+    if (( ATTEMPT > 1 )) && [[ "$SETTLE" != "0" ]]; then
+      log "attempt $ATTEMPT: inter-attempt settle ${SETTLE}s (warm-client race guard)"
+      sleep "$SETTLE"
+    fi
   fi
   OUT="$RUNDIR/csgo_stdout.a${ATTEMPT}.log"
 

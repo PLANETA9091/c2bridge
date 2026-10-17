@@ -16,6 +16,12 @@
 #   C2B_DURATION     per-attempt wait seconds (default 240)
 #   C2B_ATTEMPTS     launch retries (default 3)
 #   C2B_TRANSLATE    1 = bridge translate modes ON (default 1: C2B_UPLINK/DOWNLINK=1)
+#   C2B_TPARTS       v110.9: the translate-bundle BISECT (C2B_TRANSLATE=1 only).
+#                    'all' = the standing bundle (parity). CSV of per-attempt
+#                    part-sets: aN = token N (fallback = token 1). Each token
+#                    = CSV of keys from: uplink downlink clv2 baits fwdk cr gns
+#                    k27a k27k a2e c2fix crtfix gotpatch libcdet seccomp.
+#                    e.g. 'core,low,aux,corenogns' (the run598 A/B design).
 #   C2B_SMOKE        1 = boot-only mode: menu + bridge preload sanity, NO connect
 #                    (daily free-tier smoke; no target needed)
 #   C2B_FARM         1 = fake-S1-server response-matrix mode (tools/fake_s1_server.py):
@@ -45,6 +51,7 @@ MAX_ATTEMPTS="${C2B_ATTEMPTS:-3}"
 # unobserved; the g16/g17 + walk lines during the dwell = the next-barrier data).
 POST_DWELL="${C2B_POST_DWELL:-0}"
 TRANSLATE="${C2B_TRANSLATE:-1}"
+TPARTS="${C2B_TPARTS:-all}"
 SMOKE="${C2B_SMOKE:-0}"
 FARM="${C2B_FARM:-0}"
 FARM_TARGET="${C2B_FARM_TARGET:-127.0.0.1:29015}"
@@ -76,6 +83,44 @@ save_conlog() {
     || cp -f "$GAME_HOME/.local/share/Steam/config/loginusers.vdf" "$RUNDIR/loginusers.vdf" 2>/dev/null || true
   [[ -f /tmp/c2b-steam-login.log ]] && cp -f /tmp/c2b-steam-login.log "$RUNDIR/steam-login.log" 2>/dev/null || true
   [[ -f /tmp/c2b-steam-login-diag.txt ]] && cp -f /tmp/c2b-steam-login-diag.txt "$RUNDIR/steam-login-diag.txt" 2>/dev/null || true
+}
+
+# ---------- 0b. v110.9: the TPARTS composer (the translate-bundle bisect) ----------
+# c2b_tparts_modes <token> -> the C2B_* env string for the listed part keys.
+# Key map mirrors the standing bundle (the TRANSLATE=1 line at the MODES site):
+#   uplink downlink clv2(+fmt+a2sver) baits fwdk cr gns k27a k27k a2e(+a2eb)
+#   c2fix crtfix gotpatch libcdet seccomp
+# Usage: C2B_TPARTS="core,low,aux" -> attempt N picks token N (fallback tok 1).
+# THE POINT (run597 lesson): the bundle is REQUIRED for the protocol (translate=0
+# = the engine lives but sends raw S1 qconnect the CS2 server ignores) and LETHAL
+# under appid 4465480 (the silent exit right after the v75 scan). Any subset that
+# survives to the menu narrows the killer; the subsets partition the bundle.
+c2b_tparts_modes() {
+  local parts="$1" m=""
+  # presets first (expand to the key CSV), then key matching below
+  case "$parts" in
+    core)     parts="uplink,downlink,clv2,baits,fwdk,cr,gns" ;;  # the protocol lane (run598 a1)
+    low)      parts="gotpatch,libcdet,seccomp" ;;                # the low-level arms (run598 a2)
+    aux)      parts="k27a,k27k,a2e,c2fix,crtfix" ;;              # the aux protocol arms (run598 a3)
+    corenogns) parts="uplink,downlink,clv2,baits,fwdk,cr" ;;     # core minus the GNS-driver (run598 a4)
+  esac
+  has_tp() { case ",$parts," in *",$1,"*) return 0;; *) return 1;; esac; }
+  has_tp uplink   && m="$m C2B_UPLINK=1"
+  has_tp downlink && m="$m C2B_DOWNLINK=1"
+  has_tp clv2     && m="$m C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER"
+  has_tp baits    && m="$m C2B_CLV2_BAITS=1"
+  has_tp fwdk     && m="$m C2B_CLV2_FWDK=1"
+  has_tp cr       && m="$m C2B_CLV2_CR=3"
+  has_tp gns      && m="$m C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1"
+  has_tp k27a     && m="$m C2B_K27A=1"
+  has_tp k27k     && m="$m C2B_K27K=1"
+  has_tp a2e      && m="$m C2B_A2E=1 C2B_A2EB=1"
+  has_tp c2fix    && m="$m C2B_C2FIX=1"
+  has_tp crtfix   && m="$m C2B_CRTFIX=1"
+  has_tp gotpatch && m="$m C2B_GOTPATCH=1"
+  has_tp libcdet  && m="$m C2B_LIBCDET=1"
+  has_tp seccomp  && m="$m C2B_SECCOMP=1"
+  echo "${m# }"
 }
 
 finish() { # $1 exit code, $2 verdict
@@ -208,7 +253,7 @@ if (( ! SMOKE )); then
   fi
   [[ -n "$TARGET" ]] || finish 3 "FAIL: no target (set C2B_TARGET or $NODE_HOME/target.conf)"
 fi
-log "node e2e: mode=$([[ $FARM -eq 1 ]] && echo farm || ([[ $SMOKE -eq 1 ]] && echo smoke || echo full)) target=${TARGET:-none} game=$GAME_DIR bridge=$BRIDGE_DIR translate=$TRANSLATE"
+log "node e2e: mode=$([[ $FARM -eq 1 ]] && echo farm || ([[ $SMOKE -eq 1 ]] && echo smoke || echo full)) target=${TARGET:-none} game=$GAME_DIR bridge=$BRIDGE_DIR translate=$TRANSLATE tparts=$TPARTS"
 
 # ---------- 0e. fake-S1-server farm (C2B_FARM=1) ----------
 # Push-mode response matrix vs the engine (tools/fake_s1_server.py): the engine
@@ -699,7 +744,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
   # отравлял счётчик инициализации BSteamNetworkingSocketsLowLevelAddRef
   # (скип init -> s_hEpoll=-1 -> epoll_ctl EBADF -> ConnectByIPAddress h=0,
   # RE run181); больше не выставлять ни в каких MODES.
-  [[ $TRANSLATE -eq 1 ]] && MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=3 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
+  if [[ $TRANSLATE -eq 1 ]]; then
+    if [[ "$TPARTS" == "all" || -z "$TPARTS" ]]; then
+      MODES="C2B_UPLINK=1 C2B_DOWNLINK=1 C2B_CL_V2=1 C2B_CLV2_FMT=9 C2B_A2S_VERSION=$A2S_VER C2B_CLV2_BAITS=1 C2B_CLV2_FWDK=1 C2B_CLV2_CR=3 C2B_GNS_CONNECT=$TARGET C2B_GNS_RELAY=1 C2B_K27A=1 C2B_K27K=1 C2B_A2E=1 C2B_A2EB=1 C2B_C2FIX=1 C2B_CRTFIX=1 C2B_GOTPATCH=1 C2B_LIBCDET=1 C2B_SECCOMP=1"
+    else
+      # v110.9: per-attempt subset (aN = token N; fallback = token 1)
+      TP_TOK="$(echo "$TPARTS" | cut -d, -f$((ATTEMPT)))"
+      [[ -z "$TP_TOK" ]] && TP_TOK="$(echo "$TPARTS" | cut -d, -f1)"
+      MODES="$(c2b_tparts_modes "$TP_TOK")"
+      log "attempt $ATTEMPT: tparts=$TP_TOK -> MODES[$MODES]"
+    fi
+  fi
   # v78 (run479): C2B_CLV2_CR=2 -> =3 = NATIVE-CERT EXPLOIT (single-variable
   # A/B к run478): собственный 0x22 моста на legacy-челлендж = ПРИНЯТАЯ форма
   # (f1 cid + f2 chal + f3 sid + f4 CERT = капчуренный нативный блоб 0xae +

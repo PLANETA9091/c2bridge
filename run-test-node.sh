@@ -967,6 +967,19 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       4) EXTRA_ENV="C2B_DISABLE_PATCH=1"; VARIANT="client-up-bridge-passive" ;;
       5) EXTRA_ENV=""; LDPRELOAD=""; VARIANT="standalone-nopreload" ;;
     esac
+    # v110.9: under the TPARTS bisect the standing variant matrix would
+    # CONTAMINATE the A/B (a2 gdb = the no-fire flake class per the 0610
+    # round; a4 C2B_DISABLE_PATCH=1 = the bridge PASSIVE = the tparts token
+    # never engages). A bisect run (tparts != all) needs every
+    # bridge-carrying attempt IDENTICAL except the token => force the plain
+    # hello variant for a1-a4 (a5 = the standing no-preload control).
+    if [[ "$TPARTS" != "all" && -n "$TPARTS" ]]; then
+      if (( ATTEMPT <= 4 )); then
+        EXTRA_ENV="C2B_HELLO=1 C2B_CLV2_BHEX=0"
+        VARIANT="client-up-bridge-hello"
+        log "attempt $ATTEMPT: tparts bisect -> variant forced to $VARIANT (the matrix would contaminate: a2 gdb / a4 passive)"
+      fi
+    fi
   fi
   # v110.3: per-attempt fcon pw variant (comma-list; aN = variant N;
   # 'none' = control = NO pw line = the 591 parity). Values = space-free

@@ -6903,8 +6903,13 @@ struct c2b_sigaction {          /* glibc x86-64 layout */
     u32  flags;                 /* sa_flags; SA_SIGINFO = 4 */
     uptr restorer;              /* sa_restorer */
 };
-static __thread u8  g_probe_jb[512] __attribute__((aligned(16)));
-static __thread u8  g_probe_active;
+/* 50p-g72: ПАРА g_probe_jb/g_probe_active объявлена РОВНО ОДИН РАЗ —
+ * фовардом выше (L5714, до первого использования в детур-тунках).
+ * Дубль здесь (канонический блок 6906) убран: gcc14 молча мержил
+ * идентичные tentative-дефиниции, gcc15 (CachyOS, C23-дефолт) = ERROR
+ * 'redefinition' — сборка .so на ПК падала (v110.9f не собрался бы).
+ * Урок: push-CI собирает ТОЛЬКО selftest-конфиг (оба блока #ifndef
+ * выпадают) — .so-путь не покрыт; в push-CI добавлен .so-компайл-смоук. */
 static u8  g_segv_guard_on;   /* 50p-g69: хэндлер установлен перманентно
                                * (процесс-глобальный: install-once, НЕ TLS) */
 static u8  g_segv_foreign_logged; /* 58f-g77: last-gasp латч — ОДНОКРАТНЫЙ

@@ -32,6 +32,14 @@ jobs:
           ${{ matrix.cc }} -O2 -shared -fPIC -o build/c2bridge64.so src/c2bridge.c
           ${{ matrix.cc }} -O2 -shared -fPIC -o build/c2b_spy64.so   src/c2b_spy.c
 
+      # v110.9g: the PC (CachyOS, gcc15) builds the .so under C23 rules by
+      # default - gcc15 ERRORS on identical tentative definitions that gcc13/14
+      # silently merge (the g_probe_jb dup class). This leg keeps the C23-draft
+      # compile in the push gate so the class cannot return unnoticed.
+      - name: bridge .so under C23-draft mode
+        run: |
+          ${{ matrix.cc }} -O2 -shared -fPIC -std=c2x -o build/c2bridge64.c23.so src/c2bridge.c
+
       - name: upload artifacts
         uses: actions/upload-artifact@v4
         with:

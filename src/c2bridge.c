@@ -7109,6 +7109,18 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                                 if (*w88 == ' ') {
                                     sp88++;
                                     if (sp88 == 5) path88 = w88 + 1;
+                                    if (sp88 == 5) {
+                                        path88 = w88 + 1;
+                                        /* 5b1-g88p: ядро ПАДДИРУЕТ колонку
+                                         * inode — после 5-го пробела могут
+                                         * быть ЕЩЁ пробелы до пути (ПК
+                                         * 20261017: 23 пробела перед
+                                         * /tmp/c2b/c2bridge64.so => ложный
+                                         * "(anon)" у ИМЕНОВАННОГО модуля).
+                                         * Скипаем весь паддинг. */
+                                        while (path88 < e88 && *path88 == ' ')
+                                            path88++;
+                                    }
                                 }
                                 w88++;
                             }
@@ -7181,6 +7193,145 @@ static void c2b_probe_segv(i32 sig, void *si, void *uc)
                         C2B_LOGH((u32)(v89 >> 32)); C2B_LOGH((u32)v89);
                     }
                     c2b_log("\n");
+                }
+                /* 5a1-g93: ФАЙЛОВЫЙ ДАМП ФОЛТ-КОНТЕКСТА (сигнал-контекст:
+                 * только сырые syscall-ы, no stdio). (1) /proc/self/maps
+                 * целиком -> /tmp/c2b_anon_maps.txt (офлайн-атрибуция
+                 * стоп-слов и региона); (2) весь фолт-регион [lo,hi) ->
+                 * /tmp/c2b_anon_dump.bin (офлайн-дизасм relocated-блоба).
+                 * one-shot per process. */
+                {
+                    static volatile u32 g93_done;
+                    static const char g93_maps_p[] = "/proc/self/maps";
+                    static const char g93_out_p[]  = "/tmp/c2b_anon_maps.txt";
+                    static const char g93_bin_p[]  = "/tmp/c2b_anon_dump.bin";
+                    if (!g93_done) {
+                        g93_done = 1;
+                        long r93, mfd93, ofd93;
+                        long a0 = 0, a1 = 0, a2 = 0, nr93;
+                        const char *p93;
+                        /* open(maps, O_RDONLY) = syscall 2 */
+                        p93 = g93_maps_p;
+                        nr93 = 2; a0 = (long)p93; a1 = 0; a2 = 0;
+                        __asm__ volatile ("syscall"
+                            : "=a"(r93)
+                            : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                            : "rcx", "r11", "memory");
+                        mfd93 = r93;
+                        C2B_LOGS("[c2b] g93 maps fd=0x");
+                        C2B_LOGH((u32)mfd93);
+                        c2b_log("\n");
+                        if (mfd93 >= 0) {
+                            /* open(out, O_WRONLY|O_CREAT|O_TRUNC=0x241, 0644) */
+                            p93 = g93_out_p;
+                            nr93 = 2; a0 = (long)p93; a1 = 0x241; a2 = 0644;
+                            __asm__ volatile ("syscall"
+                                : "=a"(r93)
+                                : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                : "rcx", "r11", "memory");
+                            ofd93 = r93;
+                            C2B_LOGS("[c2b] g93 maps-copy fd=0x");
+                            C2B_LOGH((u32)ofd93);
+                            c2b_log("\n");
+                            if (ofd93 >= 0) {
+                                static char g93_buf[8192];
+                                for (;;) {
+                                    long n93, off93;
+                                    nr93 = 0; a0 = mfd93;
+                                    a1 = (long)g93_buf; a2 = (long)sizeof(g93_buf);
+                                    __asm__ volatile ("syscall"
+                                        : "=a"(n93)
+                                        : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                        : "rcx", "r11", "memory");
+                                    if (n93 <= 0) break;
+                                    off93 = 0;
+                                    while (off93 < n93) {
+                                        long w93;
+                                        nr93 = 1; a0 = ofd93;
+                                        a1 = (long)(g93_buf + off93); a2 = n93 - off93;
+                                        __asm__ volatile ("syscall"
+                                            : "=a"(w93)
+                                            : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                            : "rcx", "r11", "memory");
+                                        if (w93 <= 0) { off93 = -1; break; }
+                                        off93 += w93;
+                                    }
+                                    if (off93 < 0) break;
+                                }
+                                /* close(out); close(maps) = syscall 3 */
+                                nr93 = 3; a0 = ofd93; a1 = 0; a2 = 0;
+                                __asm__ volatile ("syscall"
+                                    : "=a"(r93) : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                    : "rcx", "r11", "memory");
+                                nr93 = 3; a0 = mfd93; a1 = 0; a2 = 0;
+                                __asm__ volatile ("syscall"
+                                    : "=a"(r93) : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                    : "rcx", "r11", "memory");
+                            } else {
+                                nr93 = 3; a0 = mfd93; a1 = 0; a2 = 0;
+                                __asm__ volatile ("syscall"
+                                    : "=a"(r93) : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                    : "rcx", "r11", "memory");
+                            }
+                        }
+                        /* (2) весь регион целиком (чтение из фолт-региона
+                         * валидно: он промаплен rx; пишем 64КБ чанками) */
+                        if (g_lg_lo && g_lg_hi > g_lg_lo) {
+                            uptr n93 = g_lg_hi - g_lg_lo;
+                            const volatile u8 *s93 = (const volatile u8 *)g_lg_lo;
+                            long off93 = 0;
+                            p93 = g93_bin_p;
+                            nr93 = 2; a0 = (long)p93; a1 = 0x241; a2 = 0644;
+                            __asm__ volatile ("syscall"
+                                : "=a"(r93) : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                : "rcx", "r11", "memory");
+                            ofd93 = r93;
+                            C2B_LOGS("[c2b] g93 DUMP region size=0x");
+                            C2B_LOGH((u32)((n93 >> 32) & 0xFFFFFFFFu));
+                            C2B_LOGH((u32)(n93 & 0xFFFFFFFFu));
+                            C2B_LOGS(" fd=0x");
+                            C2B_LOGH((u32)ofd93);
+                            c2b_log("\n");
+                            if (ofd93 >= 0) {
+                                static u8 g93_rbuf[65536];
+                                while (off93 < (long)n93) {
+                                    long chunk = (long)n93 - off93;
+                                    if (chunk > (long)sizeof(g93_rbuf))
+                                        chunk = (long)sizeof(g93_rbuf);
+                                    {
+                                        long i93;
+                                        u8 *d93 = g93_rbuf;
+                                        for (i93 = 0; i93 < chunk; i93++)
+                                            d93[i93] = s93[off93 + i93];
+                                    }
+                                    {
+                                        long done93 = 0, w93;
+                                        while (done93 < chunk) {
+                                            nr93 = 1; a0 = ofd93;
+                                            a1 = (long)(g93_rbuf + done93);
+                                            a2 = chunk - done93;
+                                            __asm__ volatile ("syscall"
+                                                : "=a"(w93)
+                                                : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                                : "rcx", "r11", "memory");
+                                            if (w93 <= 0) { done93 = -1; break; }
+                                            done93 += w93;
+                                        }
+                                        if (done93 < 0) break;
+                                    }
+                                    off93 += chunk;
+                                }
+                                nr93 = 3; a0 = ofd93; a1 = 0; a2 = 0;
+                                __asm__ volatile ("syscall"
+                                    : "=a"(r93) : "a"(nr93), "D"(a0), "S"(a1), "d"(a2)
+                                    : "rcx", "r11", "memory");
+                                C2B_LOGS("[c2b] g93 DUMP done bytes=0x");
+                                C2B_LOGH((u32)(((u64)off93 >> 32) & 0xFFFFFFFFu));
+                                C2B_LOGH((u32)((u64)off93 & 0xFFFFFFFFu));
+                                c2b_log("\n");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8543,6 +8694,66 @@ static void c2b_g7_client_utils(void)
 static volatile void **g_g8_slot;
 static u8 g_g8_armed;
 
+/* 5b1-g8w: perms-чек страницы по /proc/self/maps (нормальный контекст,
+ * open/read без stdio). Возврат 1 = в perms содержащей строки есть 'w'.
+ * Буфер 256KB (maps на ПК = 149КБ). Читается ВЕСЬ файл циклом — заодно
+ * закрывает класс chunk-truncation. */
+static i32 c2b_page_writable(uptr a)
+{
+    extern i32 open(const char *, i32, ...);
+    extern i64 read(i32, void *, u64);
+    extern i32 close(i32);
+    static char pw_buf[262144];
+    i32 fd, wflag = 0;
+    long n = 0;
+    char *p, *e;
+    fd = open("/proc/self/maps", 0);
+    if (fd < 0) return 0;
+    for (;;) {
+        long r = read(fd, pw_buf + n, (long)sizeof(pw_buf) - 1 - n);
+        if (r <= 0) break;
+        n += r;
+        if (n >= (long)sizeof(pw_buf) - 1) break;
+    }
+    close(fd);
+    if (n <= 0) return 0;
+    pw_buf[n] = 0;
+    p = pw_buf;
+    e = pw_buf + n;
+    while (p < e) {
+        uptr lo = 0, hi = 0;
+        char *q = p;
+        i32 writable = 0;
+        while (p < e && *p != '-') {
+            char c = *p;
+            if (c >= '0' && c <= '9') lo = (lo << 4) | (uptr)(c - '0');
+            else if (c >= 'a' && c <= 'f') lo = (lo << 4) | (uptr)(c - 'a' + 10);
+            else break;
+            p++;
+        }
+        if (p >= e || p == q) break;
+        p++;                                  /* '-' */
+        while (p < e && *p != ' ') {
+            char c = *p;
+            if (c >= '0' && c <= '9') hi = (hi << 4) | (uptr)(c - '0');
+            else if (c >= 'a' && c <= 'f') hi = (hi << 4) | (uptr)(c - 'a' + 10);
+            else break;
+            p++;
+        }
+        if (p < e && *p == ' ') {
+            p++;                              /* perms-токен */
+            while (p < e && *p != ' ' && *p != '\n') {
+                if (*p == 'w') writable = 1;
+                p++;
+            }
+        }
+        if (a >= lo && a < hi) { wflag = writable; break; }
+        while (p < e && *p != '\n') p++;
+        if (p < e) p++;
+    }
+    return wflag;
+}
+
 static i32 c2b_g8_phdr_cb(void *info_v, void *size_v, void *data_v)
 {
     struct c2b_g5_phdr *pi = (struct c2b_g5_phdr *)info_v;
@@ -8572,6 +8783,16 @@ static void c2b_g8_patch_apply(void)
         return;
     }
     slot = (volatile void **)(base + 0x2d1e1b0);
+    /* 5b1-g8w: слот = hard-coded RVA 0x2d1e1b0 (валиден для билда d975c5).
+     * ЧУЖОЙ билд steamclient.so (ПК, реальный Steam 2026) => RVA может ука-
+     * зывать в RO-страницу (RELRO/rodata): c2b_rd_once читает через
+     * /proc/self/mem ОК, а прямой store SEGV (краш c2b_auth_thread+0x368,
+     * runs 20261017T14x/15x). Гарда: страница не 'w' = скип инсталла с ло-
+     * гом. g_g8_slot остаётся 0 => rearm-цикл тоже безопасен. */
+    if (!c2b_page_writable((uptr)slot)) {
+        C2B_LOGS("[c2b] GNS g8: slot page NOT writable (build mismatch? RVA stale) — install skipped\n");
+        return;
+    }
     /* v4.3: чтение слота через /proc/self/mem (steam client может
      * анмапиться между phdr-итерацией и чтением — run165 SIGSEGV класс); */
     old = c2b_rd_once((uptr)slot);

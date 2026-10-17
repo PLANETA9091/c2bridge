@@ -2,7 +2,7 @@
 # c2b-test v5: on-demand test harness for the c2bridge project
 # (CS:GO legacy client [S1] -> c2bridge translate -> CS2 community servers [S2])
 #
-# Usage: run-test.sh [--target IP:PORT] [--duration SEC] [--no-sleep] [--menu-only] [--arm-hours N] [--variant NAME] [--no-bridge]
+# Usage: run-test.sh [--target IP:PORT] [--duration SEC] [--no-sleep] [--menu-only] [--arm-hours N] [--variant NAME] [--no-bridge] [--appid N]
 #                     [--game-dir DIR]  (default: PC steam library; env C2B_GAME_DIR also works)
 #  - boots Xvfb + CS:GO legacy client with c2bridge injected
 #  - coexists with a running CS2: engine lock is shadowed inside a PRIVATE mount
@@ -60,6 +60,8 @@ DO_SLEEP=1
 ARM_HOURS=0
 VARIANT=""
 NO_BRIDGE=0
+APPID_OVERRIDE=""   # v110.16: --appid N = swap steam_appid for the run (restore in finish); empty = the install untouched
+APPID_PATCHED=0
 MAX_ATTEMPTS=3
 STRACE=0
 OLD_CONNECT=0
@@ -122,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     --arm-hours) ARM_HOURS="$2"; shift 2 ;;
     --variant) VARIANT="$2"; shift 2 ;;
     --no-bridge) NO_BRIDGE=1; shift ;;
+    --appid) APPID_OVERRIDE="$2"; shift 2 ;;
     --strace) STRACE=1; shift ;;
     --oldconnect) OLD_CONNECT=1; shift ;;
     --game-dir) GAME_DIR="$2"; CONLOG="$GAME_DIR/csgo/console.log"; shift 2 ;;
@@ -155,6 +158,15 @@ finish() { # $1 = exit code, $2 = verdict text
     sudo -n sed -i '/^exec c2b_connect$/d' "$GAME_DIR/csgo/cfg/autoexec.cfg" 2>/dev/null
     sudo -n chown "$GAME_USER:$GAME_USER" "$GAME_DIR/csgo/cfg/autoexec.cfg" 2>/dev/null
     sudo -n rm -f "$GAME_DIR/csgo/cfg/c2b_connect.cfg" 2>/dev/null
+  fi
+  # v110.16: restore the steam_appid (the appid swap = opt-in, --appid N)
+  if [[ "${APPID_PATCHED:-0}" -eq 1 ]]; then
+    for cand in "$GAME_DIR/steam_appid" "$GAME_DIR/csgo/steam_appid"; do
+      if sudo -n test -f "$cand.c2b-bak"; then
+        sudo -n mv -f "$cand.c2b-bak" "$cand" 2>/dev/null
+      fi
+    done
+    log "appid restored: $(sudo -n cat "$GAME_DIR/steam_appid" 2>/dev/null || sudo -n cat "$GAME_DIR/csgo/steam_appid" 2>/dev/null)"
   fi
   echo "$2" > /home/agent/c2b-test/last-result.txt
   date -Iseconds >> /home/agent/c2b-test/last-result.txt
@@ -357,6 +369,29 @@ EOF
     AUTOEXEC_PATCHED=1
     CONNECT_ARG="+exec c2b_connect"
     log "test mode: connect to $TARGET (binds F12/F11/KP_END + direct cfg connect, xdotool retry)"
+  fi
+
+  # v110.16: the appid swap (OPT-IN, --appid N): the SDR config fetch =
+  # GetSDRConfig?appid=<steam_appid> — the cybershoke depot runs appid
+  # 4465480 (no SDR config exists) while the cloud client = appid 730
+  # (config OK, the relay mesh usable). Same class as the cfg patch:
+  # save -> swap -> RESTORE in finish().
+  if [[ -n "$APPID_OVERRIDE" ]]; then
+    SAI=""
+    for cand in "$GAME_DIR/steam_appid" "$GAME_DIR/csgo/steam_appid"; do
+      sudo -n test -f "$cand" && { SAI="$cand"; break; }
+    done
+    if [[ -n "$SAI" ]]; then
+      sudo -n cp -f "$SAI" "$SAI.c2b-bak" 2>/dev/null
+      echo "$APPID_OVERRIDE" | sudo -n tee "$SAI" >/dev/null
+      APPID_PATCHED=1
+      log "appid swap: $SAI $(sudo -n cat "$SAI.c2b-bak" 2>/dev/null) -> $APPID_OVERRIDE (restored in finish)"
+    else
+      SAI="$GAME_DIR/steam_appid"
+      echo "$APPID_OVERRIDE" | sudo -n tee "$SAI" >/dev/null
+      APPID_PATCHED=1
+      log "appid set: $SAI -> $APPID_OVERRIDE (no prior file)"
+    fi
   fi
 else
   CONNECT_ARG=""

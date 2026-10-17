@@ -398,6 +398,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     exec sudo -n -u "$GAME_USER" env HOME="$GAME_HOME" USER="$GAME_USER" \
       DISPLAY=:99 \
       C2B_UPLINK=1 C2B_DOWNLINK=1 \
+      C2B_CC_INJECT=1 C2B_CC_TARGET='$TARGET' \
       LD_LIBRARY_PATH=\"$BIN_DST/libs:$GAME_DIR/bin/linux64:$GAME_DIR/bin/x64:$GAME_DIR/bin\" \
       SDL_AUDIODRIVER=dummy \
       SDL_VIDEO_X11_VISUALID= \

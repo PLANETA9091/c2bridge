@@ -27641,6 +27641,82 @@ static void c2b_g107_detour_ssse(const void *out, const void *in, u64 len,
 }
 
 static u32 c2b_g107_nscan;
+
+/* ==================== v110.10-g95: the bridge-side ClientCmd injection ====================
+ * The 0040 decode: the cfg direct lane DELIVERED the connect ('Deferring connect
+ * command!' in the CONLOG) but the engine ONE-SHOT-defers it at cfg-exec time —
+ * the gate = call 4b8790 (the ready check) / jne 2857a2 (the ready->proceed path),
+ * xref @0x285b0b; the deferral never re-fires. The X-keys lane is dead at engine
+ * level (the focus-verified F12/backquote silent while clicks work), the steam://
+ * URL bootstraps a doomed second steam, the +connect argv defers identically. THE
+ * REMAINING LANE: execute the connect POST-MENU from INSIDE the process through
+ * the engine's own command machinery: dlopen("engine_client.so") (dlopen dedups
+ * an already-mapped lib = returns the loaded handle) -> dlsym CreateInterface
+ * (exported @0x651030, nm -D 'T') -> "VEngineClient014" -> vtable[8] =
+ * IVEngineClient::ClientCmd (the SDK2013 header order: 8 trace/collision utils,
+ * then ClientCmd, ClientCmdUnrestricted @9). VALIDATION = the 'echo
+ * C2B_CC_INJECT_OK' probe: the CONLOG echo proves the index; then
+ * 'connect <C2B_CC_TARGET>'. A wrong index likely faults -> the harness
+ * attempt-retry absorbs it, the conlog shows the fault. Gates: C2B_CC_INJECT=1
+ * + C2B_CC_TARGET=ip:port (the harness sets both when --target is on). Schedule
+ * from thread start: the probe @70s, the connect @+8s (the warm menu ~+30s; a
+ * cold boot defers -> the harness attempt-2 relaunch covers). */
+static void *c2b_g95_thread(void *arg)
+{
+    (void)arg;
+    const char *cc = getenv("C2B_CC_INJECT");
+    const char *tgt = getenv("C2B_CC_TARGET");
+    if (!cc || cc[0] != '1' || !tgt || !tgt[0]) return 0;
+    void *eh = dlopen("engine_client.so", C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
+    if (!eh) {
+        C2B_LOGS("[c2b] g95: engine dlopen FAILED (the already-loaded lib expected)\n");
+        return 0;
+    }
+    void *(*ci)(const char *, int *) = (void *(*)(const char *, int *))
+        dlsym(eh, "CreateInterface");
+    if (!ci) {
+        C2B_LOGS("[c2b] g95: CreateInterface dlsym MISS\n");
+        return 0;
+    }
+    usleep(70000000);                       /* 70s: the warm menu is up ~30s */
+    void *iface = ci("VEngineClient014", (int *)0);
+    if (!iface) {
+        C2B_LOGS("[c2b] g95: VEngineClient014 resolve FAILED\n");
+        return 0;
+    }
+    void **vt = *(void ***)iface;
+    uptr f8 = (uptr)vt[8], f9 = (uptr)vt[9];
+    C2B_LOGS("[c2b] g95: iface @");
+    c2b_gp_lh64((unsigned long long)(uptr)iface);
+    C2B_LOGS(" vt8=");
+    c2b_gp_lh64((unsigned long long)f8);
+    C2B_LOGS(" vt9=");
+    c2b_gp_lh64((unsigned long long)f9);
+    C2B_LOGS("\n");
+    if (!f8 || !f9 || f8 == f9 || ((f8 >> 48) != (f9 >> 48))) {
+        C2B_LOGS("[c2b] g95: slot sanity FAILED - no call\n");
+        return 0;
+    }
+    typedef void (*c2b_clientcmd_fn)(void *, const char *);
+    ((c2b_clientcmd_fn)f8)(iface, "echo C2B_CC_INJECT_OK\n");
+    C2B_LOGS("[c2b] g95: probe 'echo C2B_CC_INJECT_OK' dispatched\n");
+    usleep(8000000);                        /* 8s: let the probe hit the console */
+    {
+        char cbuf[160];
+        static const char g95_cmd[] = "connect ";
+        u32 bl = 0, ti;
+        for (; bl < sizeof(g95_cmd) - 1u; bl++) cbuf[bl] = g95_cmd[bl];
+        for (ti = 0; tgt[ti] && bl < (u32)sizeof(cbuf) - 2u; ti++) cbuf[bl++] = tgt[ti];
+        cbuf[bl++] = '\n';
+        cbuf[bl] = 0;
+        ((c2b_clientcmd_fn)f8)(iface, cbuf);
+        C2B_LOGS("[c2b] g95: connect injected: ");
+        C2B_LOGS(cbuf);
+        C2B_LOGS("\n");
+    }
+    return 0;
+}
+
 static void *c2b_g107_thread(void *arg)
 {
     extern i32 open(const char *, i32, ...);
@@ -30168,6 +30244,11 @@ i32 c2b_main(void)
     {   /* 59n-g107: the sdk64 steamclient.so hook (the SDR key/iv capture) */
         void *t107 = 0;
         pthread_create(&t107, 0, c2b_g107_thread, 0);
+    }
+    {   /* v110.10-g95: the bridge-side ClientCmd injection (the post-menu
+         * connect lane; env-gated C2B_CC_INJECT=1 + C2B_CC_TARGET) */
+        void *t95 = 0;
+        pthread_create(&t95, 0, c2b_g95_thread, 0);
     }
 #endif
     r = c2b_try_install();

@@ -241,6 +241,10 @@ fi
 sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -model pc105 -layout us 2>/dev/null \
   || sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap us 2>/dev/null \
   || log "WARNING: setxkbmap unavailable (keymap may be incomplete)"
+# keymap verdict (the 2310 round: the F12 presses reached X but the binds never
+# fired -> either the SDL keymap snapshot misses the keysyms or the focus gap):
+KM=$(sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -print 2>/dev/null)
+log "keymap: F12=$(echo "$KM" | grep -c '<F12>') F11=$(echo "$KM" | grep -c '<F11>') KP1=$(echo "$KM" | grep -c '<KP1>') (want 1/1/1)"
 
 # ---------- 2c. steam client for auth (must run AFTER Xvfb is up) ----------
 if ! pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1; then
@@ -429,6 +433,17 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
         $XD windowactivate "$WID" 2>/dev/null
         $XD windowfocus "$WID" 2>/dev/null
         sleep 1
+        # focus VERIFY (the 2310 round: XTEST keys = focus-routed; the clicks
+        # worked via the pointer path while the keys vanished -> verify+retry):
+        FOC=$($XD getwindowfocus 2>/dev/null | awk '{print $NF}')
+        if [[ "$FOC" != "$WID" ]]; then
+          $XD windowactivate --sync "$WID" 2>/dev/null
+          sleep 0.5
+          $XD windowfocus "$WID" 2>/dev/null
+          sleep 0.5
+          FOC=$($XD getwindowfocus 2>/dev/null | awk '{print $NF}')
+        fi
+        log "attempt $ATTEMPT: focus=$FOC want=$WID $( [[ "$FOC" == "$WID" ]] && echo OK || echo GAP )"
         # ---- modal gauntlet dismissal ----
         # The legacy client opens a CHAIN of blocking dialogs at the menu:
         #   1) "Старая версия CS:GO"  (ПРОДОЛЖИТЬ at ~(610,479))
@@ -447,8 +462,14 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
         # entirely between engine input pumps while the menu is still loading
         # (frames can take 100ms+), so the engine never sees the key.
         $XD keydown F12 2>/dev/null;    sleep 0.3; $XD keyup F12 2>/dev/null
+        # keycode twins (the 2310 round): the pure numeric args = the raw keycodes
+        # (96=F12 95=F11 87=KP_END/KP1) — bypass the keysym resolution entirely;
+        # EITHER the named or the numeric press must fire the bind
+        sleep 0.2; $XD keydown 96 2>/dev/null; sleep 0.3; $XD keyup 96 2>/dev/null
         sleep 0.5
         $XD keydown KP_END 2>/dev/null; sleep 0.3; $XD keyup KP_END 2>/dev/null
+        sleep 0.2; $XD keydown 87 2>/dev/null; sleep 0.3; $XD keyup 87 2>/dev/null
+        sleep 0.2; $XD keydown 95 2>/dev/null; sleep 0.3; $XD keyup 95 2>/dev/null
         PRESS_COOLDOWN=$((SECONDS + 12))
         WNAME=$($XD getwindowname "$WID" 2>/dev/null)
         log "attempt $ATTEMPT: modal-gauntlet + F12/KP_END (held) on window $WID '${WNAME:0:60}'"

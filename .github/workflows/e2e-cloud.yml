@@ -160,11 +160,6 @@ on:
         default: "all"
         required: false
         type: string
-      tparts:
-        description: "v110.9: the TPARTS BISECT (C2B_TPARTS_V -> C2B_TPARTS; effective only with translate=1). 'all' = the standing bundle (parity). CSV of per-attempt part-sets, aN = token N (fallback token 1). Each token = a preset (core = uplink,downlink,clv2,baits,fwdk,cr,gns = the protocol lane; low = gotpatch,libcdet,seccomp = the low-level arms; aux = k27a,k27k,a2e,c2fix,crtfix = the aux protocol arms; corenogns = core minus the GNS-driver) or a raw CSV of the 15 keys. THE RUN598 A/B (appid=4465480): 'core,low,aux,corenogns' — any subset that survives to the menu exonerates itself; the dying subset names the killer half (run597 proof: the full bundle under 4465480 = silent exit ~5s, translate=0 = menu + SDR + connect delivery 3/3 => the killer IS in the bundle)."
-        default: "all"
-        required: false
-        type: string
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -198,7 +193,6 @@ jobs:
       C2B_APPID_V: ${{ inputs.appid || '0' }}
       C2B_TRANSLATE_V: ${{ inputs.translate || '1' }}
       # v110.9: the translate-component bisect (per-attempt tokens; 'all' = parity)
-      C2B_TPARTS_V: ${{ inputs.tparts || 'all' }}
       C2B_TPARTS_V: ${{ inputs.tparts || 'all' }}
       # v53b/v54: ядерная правда о send-классе. STRACEGame = ВЫКЛ (run401/402:
       # TracerPid != 0 = анти-дебуг движка = отправитель 0x22 НЕ СТРЕЛЯЕТ под

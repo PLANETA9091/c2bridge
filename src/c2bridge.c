@@ -27642,25 +27642,30 @@ static void c2b_g107_detour_ssse(const void *out, const void *in, u64 len,
 
 static u32 c2b_g107_nscan;
 
-/* ==================== v110.10-g95: the bridge-side ClientCmd injection ====================
+/* ==================== v110.10a-g95: the bridge-side ClientCmd injection ====================
  * The 0040 decode: the cfg direct lane DELIVERED the connect ('Deferring connect
  * command!' in the CONLOG) but the engine ONE-SHOT-defers it at cfg-exec time —
  * the gate = call 4b8790 (the ready check) / jne 2857a2 (the ready->proceed path),
  * xref @0x285b0b; the deferral never re-fires. The X-keys lane is dead at engine
- * level (the focus-verified F12/backquote silent while clicks work), the steam://
- * URL bootstraps a doomed second steam, the +connect argv defers identically. THE
- * REMAINING LANE: execute the connect POST-MENU from INSIDE the process through
- * the engine's own command machinery: dlopen("engine_client.so") (dlopen dedups
- * an already-mapped lib = returns the loaded handle) -> dlsym CreateInterface
- * (exported @0x651030, nm -D 'T') -> "VEngineClient014" -> vtable[8] =
- * IVEngineClient::ClientCmd (the SDK2013 header order: 8 trace/collision utils,
- * then ClientCmd, ClientCmdUnrestricted @9). VALIDATION = the 'echo
- * C2B_CC_INJECT_OK' probe: the CONLOG echo proves the index; then
- * 'connect <C2B_CC_TARGET>'. A wrong index likely faults -> the harness
- * attempt-retry absorbs it, the conlog shows the fault. Gates: C2B_CC_INJECT=1
- * + C2B_CC_TARGET=ip:port (the harness sets both when --target is on). Schedule
- * from thread start: the probe @70s, the connect @+8s (the warm menu ~+30s; a
- * cold boot defers -> the harness attempt-2 relaunch covers). */
+ * level, the steam:// URL bootstraps a doomed second steam, the +connect argv
+ * defers identically. THE REMAINING LANE: execute the connect POST-MENU from
+ * INSIDE the process: dlopen(engine_client.so) (dlopen dedups the already-mapped
+ * lib) -> dlsym CreateInterface (exported @0x651030) -> 'VEngineClient014'.
+ * THE INDEX WAS DERIVED FROM THE BINARY (not the SDK memory!): the full static
+ * vtable @0xd64038 (64 slots, calibrated: runtime vt8/vt9 = the static slots 8/9
+ * exactly) + every slot body disassembled. v1 (idx 8, the SDK2013 memory) = the
+ * three attempts SEGV'd at engine+0x2796f6 = the slot-8 body 'cmp 0x420(rax)'
+ * with a garbage state-getter result — slot 8 = an int-arg state query, NOT
+ * ClientCmd. THE REAL ClientCmd = SLOT 50 (0x2787e0) — the ONLY string-routing
+ * slot: 'mov %rsi,(0x4301728)' (stash the cmd string global) -> rdi = *(0x4301658)
+ * (the engine command-queue holder) -> null-safe tail-call vf+0x58 (queue it).
+ * ClientCmd and ClientCmdUnrestricted both EXECUTE the string, so slot 50 works
+ * for either identity. CRASH-PROOF: the byte-signature check at vt50 via
+ * c2b_rd_once before ANY call: b[0..2] = 48 8d 05 (lea rip-rel) and b[7] = 0x55
+ * (push rbp) — a mismatch = NO call, honest log. VALIDATION = the 'echo
+ * C2B_CC_INJECT_OK' probe @70s (the CONLOG echo = the index is right), then
+ * 'connect <C2B_CC_TARGET>' @+8s. Gates: C2B_CC_INJECT=1 + C2B_CC_TARGET.
+ * A cold boot defers -> the harness attempt-2 relaunch covers. */
 static void *c2b_g95_thread(void *arg)
 {
     (void)arg;
@@ -27685,20 +27690,27 @@ static void *c2b_g95_thread(void *arg)
         return 0;
     }
     void **vt = *(void ***)iface;
-    uptr f8 = (uptr)vt[8], f9 = (uptr)vt[9];
+    uptr f50 = (uptr)vt[50];
     C2B_LOGS("[c2b] g95: iface @");
     c2b_gp_lh64((unsigned long long)(uptr)iface);
-    C2B_LOGS(" vt8=");
-    c2b_gp_lh64((unsigned long long)f8);
-    C2B_LOGS(" vt9=");
-    c2b_gp_lh64((unsigned long long)f9);
+    C2B_LOGS(" vt50=");
+    c2b_gp_lh64((unsigned long long)f50);
     C2B_LOGS("\n");
-    if (!f8 || !f9 || f8 == f9 || ((f8 >> 48) != (f9 >> 48))) {
-        C2B_LOGS("[c2b] g95: slot sanity FAILED - no call\n");
+    if (!f50) {
+        C2B_LOGS("[c2b] g95: vt50 NULL - no call\n");
+        return 0;
+    }
+    /* the crash-proof signature: lea rip-rel,%rax; push %rbp at vt50 */
+    u64 sig = c2b_rd_once(f50);
+    C2B_LOGS("[c2b] g95: vt50 sig=");
+    c2b_gp_lh64((unsigned long long)sig);
+    C2B_LOGS("\n");
+    if ((sig & 0xffffffull) != 0x058d48ull || ((sig >> 56) & 0xffull) != 0x55ull) {
+        C2B_LOGS("[c2b] g95: vt50 signature MISMATCH - no call\n");
         return 0;
     }
     typedef void (*c2b_clientcmd_fn)(void *, const char *);
-    ((c2b_clientcmd_fn)f8)(iface, "echo C2B_CC_INJECT_OK\n");
+    ((c2b_clientcmd_fn)f50)(iface, "echo C2B_CC_INJECT_OK\n");
     C2B_LOGS("[c2b] g95: probe 'echo C2B_CC_INJECT_OK' dispatched\n");
     usleep(8000000);                        /* 8s: let the probe hit the console */
     {
@@ -27709,7 +27721,7 @@ static void *c2b_g95_thread(void *arg)
         for (ti = 0; tgt[ti] && bl < (u32)sizeof(cbuf) - 2u; ti++) cbuf[bl++] = tgt[ti];
         cbuf[bl++] = '\n';
         cbuf[bl] = 0;
-        ((c2b_clientcmd_fn)f8)(iface, cbuf);
+        ((c2b_clientcmd_fn)f50)(iface, cbuf);
         C2B_LOGS("[c2b] g95: connect injected: ");
         C2B_LOGS(cbuf);
         C2B_LOGS("\n");

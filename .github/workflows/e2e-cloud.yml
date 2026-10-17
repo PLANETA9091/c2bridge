@@ -150,6 +150,11 @@ on:
         default: "0"
         required: false
         type: string
+      translate:
+        description: "v110.7: the TRANSLATE BISECT LEVER (C2B_TRANSLATE_V -> the full-mode invocation C2B_TRANSLATE). '0' = full mode with the translate bundle OFF (no uplink/downlink/CLV2/K27/A2E/GNS-driver/LIBCDET/SECCOMP; fcon stays armed by default = the raw legacy connect lane still probes the target). THE BISECT (run596 lesson): full mode under appid 4465480 = the silent exit right after 'GOT total=4 vt=1' + the v75 scan (596-a1/a4, 593/594 same point) while 595-SMOKE (translate=0) reached the menu in 5s WITH the same GOT line => the GOT-patch/sys-stubs EXONERATED; the remaining discriminator = the translate bundle itself. run597 = the single-variable flip: full+translate=0 => (a) menu reached + the raw connect lane alive = the bundle is the killer AND the identity probe runs on the legacy path; (b) still dies = the killer is mode-level outside MODES (the variant matrix/fcon driver/shim). '1' = the standing full mode."
+        default: "1"
+        required: false
+        type: string
       timeout_min:
         description: "v72c: DEPRECATED/UNUSED — the job timeout = HARDCODED 80 below (the job-level timeout-minutes = the expression via inputs = REJECTED workflow-level: run38518494260 (string) AND run38518912181 (number) = both 0-jobs instant-fail => the inputs context = NOT available in jobs.<id>.timeout-minutes). 80 fits the 3600s soak (~65 min wall); the 90s runs = unaffected (the timeout = a cap)."
         default: 60
@@ -181,6 +186,7 @@ jobs:
       C2B_FCON_PW_LIST: ${{ inputs.fconpw || 'none,0,cybershoke,cybershoke.net' }}
       # v110.4: the steam appid lever ('0' = off = the compiled-in 730)
       C2B_APPID_V: ${{ inputs.appid || '0' }}
+      C2B_TRANSLATE_V: ${{ inputs.translate || '1' }}
       # v53b/v54: ядерная правда о send-классе. STRACEGame = ВЫКЛ (run401/402:
       # TracerPid != 0 = анти-дебуг движка = отправитель 0x22 НЕ СТРЕЛЯЕТ под
       # любым трейсером — наблюдаемая добилась обратного). TRACEFS_GAME =
@@ -577,7 +583,8 @@ jobs:
             # 5 attempts in full mode: the CLV2 'A'-reply format matrix
             # (C2B_CLV2_FMT = (attempt-1) % 5) needs all five slots.
             # g94: 90s post-marker dwell = the signon progress + longevity data.
-            C2B_ATTEMPTS=5 C2B_POST_DWELL="${C2B_POST_DWELL_V}" bash run-test-node.sh
+            C2B_ATTEMPTS=5 C2B_POST_DWELL="${C2B_POST_DWELL_V}" \
+              C2B_TRANSLATE="${C2B_TRANSLATE_V:-1}" bash run-test-node.sh
           fi
 
       # ---------- artifacts ----------

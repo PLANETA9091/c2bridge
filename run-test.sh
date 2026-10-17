@@ -238,13 +238,24 @@ fi
 # an incomplete keymap: SDL then can't map F12/KP_END keycodes -> xdotool presses
 # reach the engine as UNKNOWN keys and binds never fire. Reloading the full evdev
 # map right after Xvfb start fixes the scancode table SDL will snapshot.
-sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -model pc105 -layout us 2>/dev/null \
-  || sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap us 2>/dev/null \
-  || log "WARNING: setxkbmap unavailable (keymap may be incomplete)"
-# keymap verdict (the 2310 round: the F12 presses reached X but the binds never
-# fired -> either the SDL keymap snapshot misses the keysyms or the focus gap):
-KM=$(sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -print 2>/dev/null)
-log "keymap: F12=$(echo "$KM" | grep -c '<F12>') F11=$(echo "$KM" | grep -c '<F11>') KP1=$(echo "$KM" | grep -c '<KP1>') (want 1/1/1)"
+# VERIFY-RETRY (run 181909: the single-shot repair flaked -> F12/F11/KP1=0/0/0
+# and the binds lane went dark for the whole boot). 3 rounds with the real RC
+# + stderr captured; the dump on persistent failure = the diagnosis feed.
+KM_OK=0
+for KMI in 1 2 3; do
+  KMERR="$RUNDIR/keymap-err.r${KMI}.log"
+  sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -model pc105 -layout us 2>"$KMERR" \
+    || log "keymap reload rc!=0 (round $KMI): $(tail -c 300 "$KMERR" 2>/dev/null | tr '\n' ' ')"
+  KM=$(sudo -n -u "$GAME_USER" env DISPLAY=:99 setxkbmap -print 2>/dev/null)
+  F12C=$(echo "$KM" | grep -c '<F12>'); F11C=$(echo "$KM" | grep -c '<F11>'); KP1C=$(echo "$KM" | grep -c '<KP1>')
+  log "keymap round $KMI: F12=$F12C F11=$F11C KP1=$KP1C (want 1/1/1)"
+  if (( F12C >= 1 && F11C >= 1 && KP1C >= 1 )); then KM_OK=1; break; fi
+  sleep 2
+done
+if (( ! KM_OK )); then
+  log "WARNING: keymap incomplete after 3 rounds - binds lane degraded (DIRECT cfg connect lane unaffected)"
+  log "keymap dump: $(echo "$KM" | sed -n '/xkb_keycodes/,+12p' | tr '\n' '|' | head -c 400)"
+fi
 
 # ---------- 2c. steam client for auth (must run AFTER Xvfb is up) ----------
 if ! pgrep -u "$GAME_USER" -f "ubuntu12_32/steam" >/dev/null 2>&1; then
@@ -311,12 +322,28 @@ if [[ -n "$TARGET" ]]; then
     # defer), hooked BOTH from autoexec.cfg (engine reads it natively) and
     # `+exec`; each bind echoes a marker so the harness can SEE whether the
     # cfg loaded and whether the synthetic key actually reached the engine.
+    # DIRECT LANE (run 181909 lesson: the presses die between X and the engine
+    # AND the steam:// URL forward is inert on the PC -> the connect command
+    # never reached the engine's own command machinery). A literal `connect`
+    # line in the cfg is processed by the engine's command buffer AT CFG-EXEC
+    # TIME (C2B_CONNECT_CFG_EXECUTED proved the buffer runs our cfg) - no X,
+    # no keys, no URL IPC. If the engine defers it, 'Deferring connect' is the
+    # POSITIVE marker (the command machinery engaged; the deferral-retry takes
+    # over). Env-gated: C2B_CFG_CONNECT=0 restores binds-only.
     CONNECT_CFG="$GAME_DIR/csgo/cfg/c2b_connect.cfg"
+    CFG_CONNECT_LINE=""
+    if [[ "${C2B_CFG_CONNECT:-1}" == "1" ]]; then
+      CFG_CONNECT_LINE="echo C2B_CFG_CONNECT_SENT; connect $TARGET"
+      log "test mode: DIRECT cfg connect lane ON (C2B_CFG_CONNECT=${C2B_CFG_CONNECT:-1})"
+    else
+      log "test mode: direct cfg connect lane OFF - binds only"
+    fi
     sudo -n tee "$CONNECT_CFG" >/dev/null <<EOF
 echo C2B_CONNECT_CFG_EXECUTED
 bind "F12" "echo C2B_F12_FIRED; connect $TARGET"
 bind "KP_END" "echo C2B_KP_END_FIRED; connect $TARGET"
 bind "F11" "echo C2B_F11_FIRED; connect $TARGET"
+$CFG_CONNECT_LINE
 EOF
     sudo -n chmod 644 "$CONNECT_CFG" 2>/dev/null
     AUTOEXEC_CFG="$GAME_DIR/csgo/cfg/autoexec.cfg"
@@ -329,7 +356,7 @@ EOF
     sudo -n chown "$GAME_USER:$GAME_USER" "$AUTOEXEC_CFG" 2>/dev/null
     AUTOEXEC_PATCHED=1
     CONNECT_ARG="+exec c2b_connect"
-    log "test mode: connect to $TARGET (binds F12/F11/KP_END via autoexec+exec, xdotool retry)"
+    log "test mode: connect to $TARGET (binds F12/F11/KP_END + direct cfg connect, xdotool retry)"
   fi
 else
   CONNECT_ARG=""
@@ -400,7 +427,11 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       CFG_LOADED=1
       log "attempt $ATTEMPT: c2b_connect.cfg executed (binds registered)"
     fi
-    if (( ! CONNECT_FIRED )) && { grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|Connecting to|deferred connect firing|\[c2b\] g17 (filt-in|verdict)' "$OUT" 2>/dev/null || sudo -n grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|Connecting to|deferred connect firing|\[c2b\] g17 (filt-in|verdict)' "$CONLOG" 2>/dev/null; }; then
+    # 'deferr' (case-insensitive) matches the engine's real deferral message
+    # ('Deferring connect...' -> the command reached the console machinery);
+    # the old 'deferred connect firing' string was harness-invented and could
+    # never match - the 0010 round bookkeeping lesson.
+    if (( ! CONNECT_FIRED )) && { grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|C2B_CFG_CONNECT_SENT|Connecting to|deferr|\[c2b\] g17 (filt-in|verdict)' "$OUT" 2>/dev/null || sudo -n grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|C2B_CFG_CONNECT_SENT|Connecting to|deferr|\[c2b\] g17 (filt-in|verdict)' "$CONLOG" 2>/dev/null; }; then
       CONNECT_FIRED=1
       log "attempt $ATTEMPT: connect bind FIRED"
     fi

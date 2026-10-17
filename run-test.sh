@@ -410,6 +410,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
 
   sleep 5  # let unshare->sudo->sh->exec chain materialize the game process
   CONNECTED=0; MENU=0; NEW_SNAP=0; DEAD_STREAK=0; DIED_EARLY=0; CONNECT_FIRED=0
+  AUTHGATE=0
   CFG_LOADED=0; PRESS_COOLDOWN=$((SECONDS + 4)); STEAM_URL_FIRED=0
   END=$((SECONDS + DURATION))
   while (( SECONDS < END )); do
@@ -435,6 +436,16 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
     if (( ! CONNECT_FIRED )) && { grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|C2B_CFG_CONNECT_SENT|Connecting to|deferr|\[c2b\] g17 (filt-in|verdict)' "$OUT" 2>/dev/null || sudo -n grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|C2B_CFG_CONNECT_SENT|Connecting to|deferr|\[c2b\] g17 (filt-in|verdict)' "$CONLOG" 2>/dev/null; }; then
       CONNECT_FIRED=1
       log "attempt $ATTEMPT: connect bind FIRED"
+    fi
+    # AUTHGATE: the engine's own connection loop is alive and retrying
+    # ('Connecting to public' -> 'Retrying public' cadence) = the connect
+    # reached the network layer and the blocker is server/token-side.
+    # The 204034 run census: the client sends connectionless
+    # 'ff ff ff ff "qconnect0x%08x"' (token=0) every ~2s, the cybershoke
+    # server drops it silently while answering A2S_INFO instantly.
+    if (( ! AUTHGATE )) && { grep -aq 'Retrying public' "$OUT" 2>/dev/null || sudo -n grep -aq 'Retrying public' "$CONLOG" 2>/dev/null; }; then
+      AUTHGATE=1
+      log "attempt $ATTEMPT: AUTHGATE hit (Connecting/Retrying loop = token/server-side blocker)"
     fi
     # loose match: catches both "INVALID -> MAINMENU" and "MAINMENU -> MAINMENU"
     if grep -aq 'CSGO_GAME_UI_STATE_MAINMENU' "$OUT" "$CONLOG" 2>/dev/null; then
@@ -539,7 +550,7 @@ done
 
 # ---------- 5a. failure detail ----------
 if [[ $VERDICT_CODE -ne 0 ]]; then
-  VERDICT_TEXT="FAIL: menu=$MENU cfg=$CFG_LOADED fired=$CONNECT_FIRED target=${TARGET:-none} (logs: $RUNDIR)"
+  VERDICT_TEXT="FAIL: menu=$MENU cfg=$CFG_LOADED fired=$CONNECT_FIRED authgate=$AUTHGATE target=${TARGET:-none} (logs: $RUNDIR)"
 fi
 
 # ---------- 5b. lite manifest (basis for the minimal client pack) ----------

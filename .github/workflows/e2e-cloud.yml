@@ -151,8 +151,13 @@ on:
         required: false
         type: string
       translate:
-        description: "v110.7: the TRANSLATE BISECT LEVER (C2B_TRANSLATE_V -> the full-mode invocation C2B_TRANSLATE). '0' = full mode with the translate bundle OFF (no uplink/downlink/CLV2/K27/A2E/GNS-driver/LIBCDET/SECCOMP; fcon stays armed by default = the raw legacy connect lane still probes the target). THE BISECT (run596 lesson): full mode under appid 4465480 = the silent exit right after 'GOT total=4 vt=1' + the v75 scan (596-a1/a4, 593/594 same point) while 595-SMOKE (translate=0) reached the menu in 5s WITH the same GOT line => the GOT-patch/sys-stubs EXONERATED; the remaining discriminator = the translate bundle itself. run597 = the single-variable flip: full+translate=0 => (a) menu reached + the raw connect lane alive = the bundle is the killer AND the identity probe runs on the legacy path; (b) still dies = the killer is mode-level outside MODES (the variant matrix/fcon driver/shim). '1' = the standing full mode."
+        description: "v110.7: the TRANSLATE BISECT LEVER (C2B_TRANSLATE_V -> the full-mode invocation C2B_TRANSLATE). RUN597 VERDICT: (a) full+translate=0 => the menu 4/4 + the raw connect lane alive (qconnecting; the 'q'connect0x00000000 x60 on the wire = ZERO server replies; the 'k'-full probes = field-level rejects 'Invalid cross-play platform id'/'No more split screen slots!'/'Bad challenge.' = the legacy lane is chal-gated and the challenge service is OFF) => the bundle is the menu-killer AND the SDR/GNS driver = the ONLY live transport left. '0' = full mode with the translate bundle OFF (no uplink/downlink/CLV2/K27/A2E/GNS-driver/LIBCDET/SECCOMP; fcon stays armed by default = the raw legacy connect lane still probes the target). THE BISECT (run596 lesson): full mode under appid 4465480 = the silent exit right after 'GOT total=4 vt=1' + the v75 scan (596-a1/a4, 593/594 same point) while 595-SMOKE (translate=0) reached the menu in 5s WITH the same GOT line => the GOT-patch/sys-stubs EXONERATED; the remaining discriminator = the translate bundle itself. run597 = the single-variable flip: full+translate=0 => (a) menu reached + the raw connect lane alive = the bundle is the killer AND the identity probe runs on the legacy path; (b) still dies = the killer is mode-level outside MODES (the variant matrix/fcon driver/shim). '1' = the standing full mode."
         default: "1"
+        required: false
+        type: string
+      tparts:
+        description: "v110.9: the TRANSLATE-COMPONENT BISECT (C2B_TPARTS_V -> C2B_TPARTS; C2B_TRANSLATE=1 required). 'all' = the standing bundle (parity). Otherwise: comma-separated per-attempt tokens (attempt N = token N, fallback = token 1); each token = a preset name or a single key. PRESETS: 'core' = uplink+downlink+clv2(+fmt9+a2sver)+baits+fwdk+cr+gns (the protocol lane WITH the GNS/SDR driver); 'low' = gotpatch+libcdet+seccomp (the low-level arms only); 'aux' = k27a+k27k+a2e(+a2eb)+c2fix+crtfix (the aux arms only); 'corenogns' = core MINUS gns (the GNS-driver single-variable A/B vs 'core'). RAW KEYS: uplink downlink clv2 baits fwdk cr gns k27a k27k a2e c2fix crtfix gotpatch libcdet seccomp. RUN598 A/B 'core,low,aux,corenogns': (a1 vs a4) = does the GNS-driver alone kill the menu inside the protocol lane; (a1 vs a2/a3) = which arm-class kills it; any subset reaching the menu WITH the GNS driver armed = the SDR lane re-probed under a fresh settle (v110.8)."
+        default: "all"
         required: false
         type: string
       tparts:
@@ -192,6 +197,8 @@ jobs:
       # v110.4: the steam appid lever ('0' = off = the compiled-in 730)
       C2B_APPID_V: ${{ inputs.appid || '0' }}
       C2B_TRANSLATE_V: ${{ inputs.translate || '1' }}
+      # v110.9: the translate-component bisect (per-attempt tokens; 'all' = parity)
+      C2B_TPARTS_V: ${{ inputs.tparts || 'all' }}
       C2B_TPARTS_V: ${{ inputs.tparts || 'all' }}
       # v53b/v54: ядерная правда о send-классе. STRACEGame = ВЫКЛ (run401/402:
       # TracerPid != 0 = анти-дебуг движка = отправитель 0x22 НЕ СТРЕЛЯЕТ под

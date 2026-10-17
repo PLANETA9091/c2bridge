@@ -18,9 +18,11 @@
 #   C2B_TRANSLATE    1 = bridge translate modes ON (default 1: C2B_UPLINK/DOWNLINK=1)
 #   C2B_TPARTS       v110.9: the translate-bundle BISECT (C2B_TRANSLATE=1 only).
 #                    'all' = the standing bundle (parity). CSV of per-attempt
-#                    part-sets: aN = token N (fallback = token 1). Each token
-#                    = CSV of keys from: uplink downlink clv2 baits fwdk cr gns
-#                    k27a k27k a2e c2fix crtfix gotpatch libcdet seccomp.
+#                    tokens: attempt N = token N (fallback = token 1). Each
+#                    token = a PRESET name (core/low/aux/corenogns) or a
+#                    single raw key from: uplink downlink clv2 baits fwdk cr
+#                    gns k27a k27k a2e c2fix crtfix gotpatch libcdet seccomp
+#                    (the presets expand to the key CSVs inside the composer).
 #                    e.g. 'core,low,aux,corenogns' (the run598 A/B design).
 #   C2B_SMOKE        1 = boot-only mode: menu + bridge preload sanity, NO connect
 #                    (daily free-tier smoke; no target needed)

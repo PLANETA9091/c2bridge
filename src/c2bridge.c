@@ -16546,10 +16546,14 @@ static u32 c2b_crt_maybe_rewrite(const u8 *p, u32 n, u8 *buf, u32 cap)
  * = 2 сравнения = чистый passthrough. Сигнатура детура = 7 long (арг7 =
  * [rsp+8] — ff25 rsp НЕ двигает; трамп (mov 0x8(%rsp),%r9) читает тот
  * же слот => addrlen проходит ОБА пути). Якорь = C2B_LDD_NR_VAR. */
-#if !defined(C2B_SELFTEST) && defined(__x86_64__)
+/* v110.11: hoisted OUT of the #if below — the g95 cbuf route needs dladdr in
+ * EVERY config (selftest included). Field order = the true glibc Dl_info ABI
+ * (dli_fname, dli_fbase, dli_saddr, dli_sname); the old 3rd/4th order was
+ * swapped (both unused by the ldd watchers, so the fix is impact-free). */
 struct c2b_ldd_dlinfo { const char *dli_fname; void *dli_fbase;
-                        const char *dli_sname; void *dli_saddr; };
+                        void *dli_saddr; const char *dli_sname; };
 extern int dladdr(void *, struct c2b_ldd_dlinfo *);
+#if !defined(C2B_SELFTEST) && defined(__x86_64__)
 extern i32 munmap(void *, u32);
 static void *volatile g_ldd_tr_st;      /* tramp sendto */
 static void *volatile g_ldd_tr_sm;      /* tramp sendmsg */
@@ -27673,7 +27677,25 @@ static u32 c2b_g107_nscan;
  * zombie (run VI: NO ARMED/GOT-total/g17 in 256 stdout lines vs the healthy
  * 4-line arming + 24 g17 verdicts per attempt in runs III-V; the console.log
  * never even appeared). FIX: sleep FIRST — by +70s the engine has loaded the
- * lib itself and the dlopen = the refcount dedup (no fresh init, no reorder). */
+ * lib itself and the dlopen = the refcount dedup (no fresh init, no reorder).
+ * v110.11: SLOT 50 RETIRED — the run VII forensics killed the ClientCmd
+ * identity: the probe call SEGV'd INSIDE the engine (engine+0xd9346, addr=0
+ * = a #GP on a non-canonical call target; rax = "echo C2B" = our own string
+ * BYTES loaded as a pointer). The decoded chain: slot 50 stashes rsi into
+ * 0x4301728 and tail-calls vf+0x58 of *(0x4301658); EVERY reader of the
+ * stash dereferences it as an OBJECT ('mov (%rax),%rax; call *0x398(%rax)')
+ * — slot 50's second arg = a CCommand-like object, NOT a string; the
+ * v110.10a 'only string-routing slot' verdict is dead. THE NEW SURFACE =
+ * the engine's own MUTEXED text queue 0x3f8350(cmd_source=2, text, 0, 0),
+ * found via the 'exec' ConCommand (ctor 64c6b0: obj/"exec"/cb 0x3f9fd0;
+ * its handler feeds the name through 0x3f8350). Owner-tid spinlock
+ * @0x101ac28, per-source 0x2078-byte CCommandBuffers @0x101ac40 (append =
+ * 64ac40). The MAIN thread drains src=2 every frame — proof: the boot
+ * '+exec c2b_connect' cfg text executed and echoed. Queueing
+ * 'connect <target>' there re-runs connect ON THE MAIN THREAD post-menu,
+ * past the one-shot 4b8790 deferral gate. CRASH-PROOF: base from
+ * dladdr(CreateInterface); the 55 48 89 e5 prologue verified via
+ * c2b_rd_once BEFORE any call; a mismatch = an honest log, no call. */
 static void *c2b_g95_thread(void *arg)
 {
     (void)arg;
@@ -27708,34 +27730,55 @@ static void *c2b_g95_thread(void *arg)
     c2b_gp_lh64((unsigned long long)f50);
     C2B_LOGS("\n");
     if (!f50) {
-        C2B_LOGS("[c2b] g95: vt50 NULL - no call\n");
-        return 0;
+        C2B_LOGS("[c2b] g95: vt50 NULL (canary only; the route is cbuf)\n");
     }
-    /* the crash-proof signature: lea rip-rel,%rax; push %rbp at vt50 */
-    u64 sig = c2b_rd_once(f50);
-    C2B_LOGS("[c2b] g95: vt50 sig=");
-    c2b_gp_lh64((unsigned long long)sig);
-    C2B_LOGS("\n");
-    if ((sig & 0xffffffull) != 0x058d48ull || ((sig >> 56) & 0xffull) != 0x55ull) {
-        C2B_LOGS("[c2b] g95: vt50 signature MISMATCH - no call\n");
-        return 0;
-    }
-    typedef void (*c2b_clientcmd_fn)(void *, const char *);
-    ((c2b_clientcmd_fn)f50)(iface, "echo C2B_CC_INJECT_OK\n");
-    C2B_LOGS("[c2b] g95: probe 'echo C2B_CC_INJECT_OK' dispatched\n");
-    usleep(8000000);                        /* 8s: let the probe hit the console */
+    /* v110.11: the CBUF TEXT-QUEUE ROUTE (the full rationale lives in the
+     * block comment above; slot 50 = an object-taking method, never called).
+     * target = engine_base + 0x3f8350, ABI = (i32 src, const char *text,
+     * i32, i32) — the exact shape of the 'exec' handler's own feed. */
     {
-        char cbuf[160];
-        static const char g95_cmd[] = "connect ";
-        u32 bl = 0, ti;
-        for (; bl < sizeof(g95_cmd) - 1u; bl++) cbuf[bl] = g95_cmd[bl];
-        for (ti = 0; tgt[ti] && bl < (u32)sizeof(cbuf) - 2u; ti++) cbuf[bl++] = tgt[ti];
-        cbuf[bl++] = '\n';
-        cbuf[bl] = 0;
-        ((c2b_clientcmd_fn)f50)(iface, cbuf);
-        C2B_LOGS("[c2b] g95: connect injected: ");
-        C2B_LOGS(cbuf);
+        typedef void (*c2b_addtext_fn)(i32, const char *, i32, i32);
+        struct c2b_ldd_dlinfo di;
+        uptr addfn = 0;
+        u64 sig;
+        di.dli_fname = 0; di.dli_fbase = 0; di.dli_saddr = 0; di.dli_sname = 0;
+        if (!dladdr((void *)ci, &di) || !di.dli_fbase) {
+            C2B_LOGS("[c2b] g95: dladdr(CreateInterface) MISS - no cbuf route\n");
+            return 0;
+        }
+        addfn = (uptr)di.dli_fbase + 0x3f8350ull;
+        C2B_LOGS("[c2b] g95: engine base ");
+        c2b_gp_lh64((unsigned long long)(uptr)di.dli_fbase);
+        C2B_LOGS(" cbuf-addfn ");
+        c2b_gp_lh64((unsigned long long)addfn);
         C2B_LOGS("\n");
+        sig = c2b_rd_once(addfn);
+        if ((sig & 0xffffffffull) != 0xe5894855ull) {   /* 55 48 89 e5 */
+            C2B_LOGS("[c2b] g95: cbuf sig MISMATCH (");
+            c2b_gp_lh64((unsigned long long)sig);
+            C2B_LOGS(") - no call\n");
+            return 0;
+        }
+        ((c2b_addtext_fn)addfn)(2, "echo C2B_CC_INJECT_OK\n", 0, 0);
+        C2B_LOGS("[c2b] g95: probe 'echo C2B_CC_INJECT_OK' queued (cbuf src=2)\n");
+        usleep(8000000);                /* 8s: let the main thread drain + echo */
+        {
+            char cbuf[160];
+            static const char g95_cmd[] = "connect ";
+            u32 bl = 0, ti;
+            for (; bl < sizeof(g95_cmd) - 1u; bl++) cbuf[bl] = g95_cmd[bl];
+            for (ti = 0; tgt[ti] && bl < (u32)sizeof(cbuf) - 2u; ti++)
+                cbuf[bl++] = tgt[ti];
+            cbuf[bl++] = '\n';
+            cbuf[bl] = 0;
+            ((c2b_addtext_fn)addfn)(2, cbuf, 0, 0);
+            C2B_LOGS("[c2b] g95: connect queued (cbuf src=2): ");
+            C2B_LOGS(cbuf);
+            C2B_LOGS("\n");
+            usleep(14000000);           /* 14s: the first drain shot */
+            ((c2b_addtext_fn)addfn)(2, cbuf, 0, 0);
+            C2B_LOGS("[c2b] g95: connect re-queued (retry, cbuf src=2)\n");
+        }
     }
     return 0;
 }

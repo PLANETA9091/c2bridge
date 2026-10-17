@@ -27665,13 +27665,25 @@ static u32 c2b_g107_nscan;
  * (push rbp) — a mismatch = NO call, honest log. VALIDATION = the 'echo
  * C2B_CC_INJECT_OK' probe @70s (the CONLOG echo = the index is right), then
  * 'connect <C2B_CC_TARGET>' @+8s. Gates: C2B_CC_INJECT=1 + C2B_CC_TARGET.
- * A cold boot defers -> the harness attempt-2 relaunch covers. */
+ * A cold boot defers -> the harness attempt-2 relaunch covers.
+ * v110.10b: THE CTOR-DLOPEN LESSON — v1/v10a dlopened engine_client.so AT CTOR
+ * TIME (the thread started with the dlopen before the 70s sleep): the engine
+ * had NOT loaded it yet -> a FRESH eager RTLD_NOW|RTLD_GLOBAL load ran the
+ * lib's static initializers in the WRONG boot order -> the engine boot went
+ * zombie (run VI: NO ARMED/GOT-total/g17 in 256 stdout lines vs the healthy
+ * 4-line arming + 24 g17 verdicts per attempt in runs III-V; the console.log
+ * never even appeared). FIX: sleep FIRST — by +70s the engine has loaded the
+ * lib itself and the dlopen = the refcount dedup (no fresh init, no reorder). */
 static void *c2b_g95_thread(void *arg)
 {
     (void)arg;
     const char *cc = getenv("C2B_CC_INJECT");
     const char *tgt = getenv("C2B_CC_TARGET");
     if (!cc || cc[0] != '1' || !tgt || !tgt[0]) return 0;
+    /* v110.10b: sleep FIRST (the ctor-time dlopen of the not-yet-loaded engine
+     * = the fresh eager load = the boot-order corruption; by +70s the lib is
+     * already mapped by the engine itself -> the dlopen = the pure dedup) */
+    usleep(70000000);                       /* 70s: the warm menu is up ~30s */
     void *eh = dlopen("engine_client.so", C2B_RTLD_NOW | C2B_RTLD_GLOBAL);
     if (!eh) {
         C2B_LOGS("[c2b] g95: engine dlopen FAILED (the already-loaded lib expected)\n");
@@ -27683,7 +27695,6 @@ static void *c2b_g95_thread(void *arg)
         C2B_LOGS("[c2b] g95: CreateInterface dlsym MISS\n");
         return 0;
     }
-    usleep(70000000);                       /* 70s: the warm menu is up ~30s */
     void *iface = ci("VEngineClient014", (int *)0);
     if (!iface) {
         C2B_LOGS("[c2b] g95: VEngineClient014 resolve FAILED\n");

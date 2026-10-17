@@ -400,7 +400,7 @@ for (( ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++ )); do
       CFG_LOADED=1
       log "attempt $ATTEMPT: c2b_connect.cfg executed (binds registered)"
     fi
-    if (( ! CONNECT_FIRED )) && { grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|Connecting to|deferred connect firing' "$OUT" 2>/dev/null || sudo -n grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|Connecting to|deferred connect firing' "$CONLOG" 2>/dev/null; }; then
+    if (( ! CONNECT_FIRED )) && { grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|Connecting to|deferred connect firing|\[c2b\] g17 (filt-in|verdict)' "$OUT" 2>/dev/null || sudo -n grep -aqiE 'C2B_F12_FIRED|C2B_F11_FIRED|C2B_KP_END_FIRED|Connecting to|deferred connect firing|\[c2b\] g17 (filt-in|verdict)' "$CONLOG" 2>/dev/null; }; then
       CONNECT_FIRED=1
       log "attempt $ATTEMPT: connect bind FIRED"
     fi

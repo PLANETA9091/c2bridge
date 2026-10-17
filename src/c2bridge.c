@@ -11157,11 +11157,31 @@ void c2b_g17b_log(uptr verdict, uptr obj)
     g_probe_active = 0;
 }
 
+/* v110.9f: guard для g17a-thunk (asm). Крash run 20261017T171538:
+ * SEGV rip в нашем же g17a-трамплине (anon-RWX у libvideo.so = наш mmap,
+ * код = 20 украденных байт фильтра + jmp engine+0x390d94), addr=0x1e,
+ * rdi=2. ПРИЧИНА: thunk протаскивал rdi в логгер, НЕ СОХРАНЯЯ его —
+ * c2b_g17a_log (C-функция) вправе затирать rdi (caller-saved), после
+ * call rdi=мусор, jmp в трамплин, а там УКРАДЕННЫЙ пролог 'mov ecx,
+ * [rdi+0x1c]' -> 2+0x1c=0x1e. Точное совпадение addr. Аудит 26 thunk'ов
+ * (scripts/thunk_audit.py): g17a = ЕДИНСТВЕННЫЙ без save rdi.
+ * Фикс: сохраняем rdi в слот 0x40 + рестор; СТРАХОВОЧНЫЙ ГАРД: если
+ * восстановленный rdi < 0x1000 (near-null) — вызываем c2b_g17a_refuse
+ * (лог + verdict 0) и ret: у движка это ЛЕГАЛЬНЫЙ путь 'фильтр сказал
+ * НЕТ' -> дроп пакета, трамплин с украденным прологом не исполняется. */
+__attribute__((used)) u32 c2b_g17a_refuse(uptr rdi)
+{
+    C2B_LOGS("[c2b] g17a: near-null rdi=");
+    C2B_LOGH((u32)(rdi & 0xffff));
+    C2B_LOGS(" - refuse (verdict 0, tramp skipped)\n");
+    return 0;
+}
+
 __asm__(
 ".text\n"
 ".globl c2b_g17a_thunk\n"
 ".type  c2b_g17a_thunk,@function\n"
-"c2b_g17a_thunk:\n"   /* вход: rdi=obj; rdi протаскиваем в логгер как есть */
+"c2b_g17a_thunk:\n"   /* вход: rdi=obj; СОХРАНЯЕМ rdi (v110.9f) - логгер его затирает */
 "  endbr64\n"
 "  sub  $0x58,%rsp\n"
 "  mov  %rax,0x00(%rsp)\n"
@@ -11172,6 +11192,7 @@ __asm__(
 "  mov  %r9, 0x28(%rsp)\n"
 "  mov  %r10,0x30(%rsp)\n"
 "  mov  %r11,0x38(%rsp)\n"
+"  mov  %rdi,0x40(%rsp)\n"
 "  call c2b_g17a_log\n"
 "  mov  0x00(%rsp),%rax\n"
 "  mov  0x08(%rsp),%rcx\n"
@@ -11181,6 +11202,13 @@ __asm__(
 "  mov  0x28(%rsp),%r9\n"
 "  mov  0x30(%rsp),%r10\n"
 "  mov  0x38(%rsp),%r11\n"
+"  mov  0x40(%rsp),%rdi\n"
+"  cmp  $0x1000,%rdi\n"
+"  jae  7f\n"
+"  call c2b_g17a_refuse\n" /* лог + eax=0 = легальный дроп-путь движка */
+"  add  $0x58,%rsp\n"
+"  ret\n"
+"7:\n"
 "  add  $0x58,%rsp\n"
 "  jmp  *c2b_g17a_tramp(%rip)\n"
 ".size c2b_g17a_thunk, .-c2b_g17a_thunk\n"

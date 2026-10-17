@@ -344,7 +344,15 @@ if [[ -n "$TARGET" ]]; then
     # over). Env-gated: C2B_CFG_CONNECT=0 restores binds-only.
     CONNECT_CFG="$GAME_DIR/csgo/cfg/c2b_connect.cfg"
     CFG_CONNECT_LINE=""
-    if [[ "${C2B_CFG_CONNECT:-1}" == "1" ]]; then
+    # v110.17: the pw lane (OPT-IN, C2B_CONNECT_PW=<value>): the A2S rules of
+    # the target exposed sv_password='0' (the string "0" = non-empty => the
+    # engine's signon reports 'requiring pw yes' and bounces to MAINMENU with-
+    # out it). Set the pw cvar BEFORE connect in the same cfg line (cvar set
+    # does not defer; it survives until the cbuf-injected connect runs).
+    if [[ -n "${C2B_CONNECT_PW:-}" ]]; then
+      CFG_CONNECT_LINE="password $C2B_CONNECT_PW; echo C2B_CFG_CONNECT_SENT; connect $TARGET"
+      log "test mode: DIRECT cfg connect lane ON + PW lane ON (pw len ${#C2B_CONNECT_PW})"
+    elif [[ "${C2B_CFG_CONNECT:-1}" == "1" ]]; then
       CFG_CONNECT_LINE="echo C2B_CFG_CONNECT_SENT; connect $TARGET"
       log "test mode: DIRECT cfg connect lane ON (C2B_CFG_CONNECT=${C2B_CFG_CONNECT:-1})"
     else

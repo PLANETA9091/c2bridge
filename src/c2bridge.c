@@ -28639,7 +28639,10 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             /* g42: verdict-лог на ВСЕХ fd — в run186 0x23 не дошёл до
              * движкового recvfrom (ни одной строки при 0x23 в pcap);
              * fd= покажет, на какой сокет садится ConnectOK. */
-            if (g_clv2_v23_logn < 8) {
+            /* v110.14: cap 8 -> 64 — 0x26-keepalive ретрансляции выжигали
+             * бюджет за ~2 аттемпта (run XI: 8x 0x26 на аттемпт уже в а1),
+             * и поздний 0x23 оставался бы без лога. */
+            if (g_clv2_v23_logn < 64) {
                 char ln[C2B_CL_DUMP_MAX * 3 + C2B_CL_DUMP_MAX + 8];
                 u32 dl2 = (u32)r;
                 if (dl2 > 96) dl2 = 96;
